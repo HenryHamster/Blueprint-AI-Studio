@@ -881,6 +881,72 @@ def test_normalize_manifest_skill_with_description():
 
 
 # ---------------------------------------------------------------------------
+# Compute section validation helpers (unit tests — no DB / no HTTP)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_manifest_compute_wellformed():
+    """A well-formed compute section passes validation."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_entry
+
+    assert _validate_manifest_compute_entry({"image": "my-image:latest"}) is None
+    assert _validate_manifest_compute_entry({}) is None  # empty compute is ok
+
+
+def test_validate_manifest_compute_not_an_object():
+    """A non-dict compute value is rejected."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_entry
+
+    err = _validate_manifest_compute_entry("not-a-dict")
+    assert err is not None
+    assert "object" in err
+
+
+def test_validate_manifest_compute_unknown_keys():
+    """Unknown keys in the compute section are rejected."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_entry
+
+    err = _validate_manifest_compute_entry({"image": "img", "unknown": 1})
+    assert err is not None
+    assert "unknown" in err
+
+
+def test_validate_manifest_compute_bad_image():
+    """Non-string or empty image value is rejected."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_entry
+
+    err = _validate_manifest_compute_entry({"image": 123})
+    assert err is not None
+
+    err2 = _validate_manifest_compute_entry({"image": ""})
+    assert err2 is not None
+
+
+def test_normalize_manifest_compute_shape():
+    """_normalize_manifest_compute produces the canonical shape."""
+    from app.routers.admin_project_tools import _normalize_manifest_compute
+
+    result = _normalize_manifest_compute({"image": "gcr.io/my-project/my-image:v1"})
+    assert result == {"image": "gcr.io/my-project/my-image:v1"}
+
+
+def test_normalize_manifest_compute_empty():
+    """An empty compute section normalizes to an empty dict."""
+    from app.routers.admin_project_tools import _normalize_manifest_compute
+
+    result = _normalize_manifest_compute({})
+    assert result == {}
+
+
+def test_normalize_manifest_compute_blank_image():
+    """A whitespace-only image normalizes to empty dict."""
+    from app.routers.admin_project_tools import _normalize_manifest_compute
+
+    result = _normalize_manifest_compute({"image": "   "})
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
 # Manifest discovery endpoint (member-gated, mocks GitHub)
 # ---------------------------------------------------------------------------
 
@@ -1992,6 +2058,126 @@ async def test_manifest_skills_only_no_tools(client: AsyncClient, db_session):
         assert body["tools"] == []
         assert len(body["skills"]) == 1
         assert body["skills"][0]["slug"] == "clean"
+
+
+@pytest.mark.asyncio
+async def test_manifest_with_compute_section(client: AsyncClient, db_session):
+    """A manifest with a compute section returns compute in the response."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [],
+        "compute": {
+            "image": "gcr.io/my-project/runner:v1",
+        },
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is None
+        assert body["compute"] == {"image": "gcr.io/my-project/runner:v1"}
+
+
+@pytest.mark.asyncio
+async def test_manifest_with_compute_and_skills(client: AsyncClient, db_session):
+    """A manifest with compute + tools + skills returns all three."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [
+            {"slug": "viewer", "title": "Viewer", "entry": "index.html"},
+        ],
+        "skills": [
+            {"slug": "deploy", "title": "Deploy", "command": "bash deploy.sh"},
+        ],
+        "compute": {
+            "image": "docker.io/org/my-image:latest",
+        },
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is None
+        assert len(body["tools"]) == 1
+        assert len(body["skills"]) == 1
+        assert body["compute"] == {"image": "docker.io/org/my-image:latest"}
+
+
+@pytest.mark.asyncio
+async def test_manifest_compute_bad_type_returns_error(client: AsyncClient, db_session):
+    """A compute section that is not an object produces a validation error."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [],
+        "compute": "not-an-object",
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is not None
+        assert "compute" in body["error"]
+        assert body["compute"] is None
 
 
 # ---------------------------------------------------------------------------

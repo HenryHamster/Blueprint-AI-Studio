@@ -465,6 +465,7 @@ def test_degraded_runner_deprioritized_in_dispatch():
     )
 
 
+
 def test_idle_runner_dispatch_rotates_across_ties():
     """When multiple runners are equally idle, different task UUIDs must route
     to different runners (rotation via dispatch_seed), so the fleet is balanced
@@ -510,6 +511,197 @@ def test_idle_runner_dispatch_rotates_across_ties():
     assert len(selected_ids) == 2, (
         f"Expected both runners to be selected across 20 dispatches, "
         f"but only {len(selected_ids)} runner(s) were chosen: {selected_ids}"
+    )
+
+
+# ── Container-capability gating in runner dispatch ─────────────────────────────
+
+
+def test_runner_has_container_capability_true_when_backend_reported():
+    """_runner_has_container_capability returns True when at least one
+    container backend is reported in isolation_backends."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True, "bwrap_ok": False},
+        },
+    )
+    assert _runner_has_container_capability(container_runner) is True
+
+    podman_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"podman_usable": True},
+        },
+    )
+    assert _runner_has_container_capability(podman_runner) is True
+
+
+def test_runner_has_container_capability_false_when_no_container_backend():
+    """_runner_has_container_capability returns False when no container
+    backend is reported."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    no_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True, "userns_ok": True},
+        },
+    )
+    assert _runner_has_container_capability(no_container_runner) is False
+
+
+def test_runner_has_container_capability_false_when_no_isolation_backends():
+    """_runner_has_container_capability returns False when isolation_backends
+    is absent (old runner that never reports it)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all"},
+    )
+    assert _runner_has_container_capability(old_runner) is False
+
+
+def test_runner_has_container_capability_false_when_empty_isolation_backends():
+    """_runner_has_container_capability returns False when isolation_backends
+    is present but empty (no backends reported at all)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_container_capability,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    empty_backends_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "isolation_backends": {}},
+    )
+    assert _runner_has_container_capability(empty_backends_runner) is False
+
+
+def test_select_eligible_runner_filters_container_image_no_capable_runner():
+    """When a container_image is declared and no runner has container capability,
+    _select_eligible_runner returns None."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    cpu_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [cpu_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "no runner should be selected when container_image is declared "
+        "but no runner has container capability"
+    )
+
+
+def test_select_eligible_runner_container_image_selects_capable():
+    """When a container_image is declared, only a container-capable runner is
+    selected."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    non_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+    cache = {project_id: [non_container_runner, container_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == container_runner.id, (
+        "the container-capable runner must be selected over the non-container one"
+    )
+
+
+def test_select_eligible_runner_no_container_image_ignores_container_cap():
+    """When no container_image is declared, runner selection does NOT filter
+    on container capability — a non-container runner is still eligible."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    non_container_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [non_container_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,  # no container image — should not filter
+    )
+    assert selected is not None, (
+        "a non-container runner must still be selectable when no "
+        "container_image is declared"
     )
 
 

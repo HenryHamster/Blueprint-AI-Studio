@@ -167,6 +167,39 @@ _MANIFEST_SKILL_KNOWN_KEYS = {
 
 _SLUG_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
 
+# ── Compute section schema (same manifest, optional key) ──────────────────────
+
+# The .blueprint/tools.json compute keys we accept.
+_MANIFEST_COMPUTE_KNOWN_KEYS = {
+    "image",
+}
+
+
+def _validate_manifest_compute_entry(compute: Dict[str, Any]) -> Optional[str]:
+    """Validate the optional ``compute`` section from the manifest.
+
+    Returns an error message string on failure, or ``None`` on success.
+    """
+    if not isinstance(compute, dict):
+        return "compute: must be an object"
+    unknown = set(compute.keys()) - _MANIFEST_COMPUTE_KNOWN_KEYS
+    if unknown:
+        return f"compute: unknown keys: {sorted(unknown)}"
+    image = compute.get("image")
+    if image is not None:
+        if not isinstance(image, str) or not image.strip():
+            return "compute.image: must be a non-empty string"
+    return None
+
+
+def _normalize_manifest_compute(compute: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a validated compute section into the canonical shape."""
+    result: Dict[str, Any] = {}
+    image = compute.get("image")
+    if isinstance(image, str) and image.strip():
+        result["image"] = image.strip()
+    return result
+
 
 def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:
     """Validate a single tool entry from the manifest.  Returns an error
@@ -247,10 +280,11 @@ async def _discover_manifest_tools(
 ) -> Dict[str, Any]:
     """Fetch and parse ``.blueprint/tools.json`` from the project's connected repo.
 
-    Returns a dict ``{tools: [...], skills: [...], error: str | None}``.
-    ``error`` is set only for a structural problem with the manifest (malformed
-    JSON, schema violation) — a missing repo or missing manifest file returns
-    empty lists with no error.
+    Returns a dict ``{tools: [...], skills: [...], compute: dict | None, error: str | None}``.
+    ``compute`` is an optional dict with an ``image`` key when the manifest declares
+    a compute section.  ``error`` is set only for a structural problem with the manifest
+    (malformed JSON, schema violation) — a missing repo or missing manifest file
+    returns empty lists with no error.
     """
     owner = (project.github_owner or "").strip()
     repo_name = (project.github_repo or "").strip()
@@ -278,7 +312,7 @@ async def _discover_manifest_tools(
                 "[project-tools] No read token for %s/%s — cannot fetch manifest",
                 owner, repo_name,
             )
-            result = {"tools": [], "skills": [], "error": None}
+            result = {"tools": [], "skills": [], "compute": None, "error": None}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
@@ -294,7 +328,7 @@ async def _discover_manifest_tools(
 
         if manifest_text is None:
             # File doesn't exist — not an error, just no project-declared tools.
-            result = {"tools": [], "skills": [], "error": None}
+            result = {"tools": [], "skills": [], "compute": None, "error": None}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
             return result
 
@@ -303,20 +337,20 @@ async def _discover_manifest_tools(
         except _json.JSONDecodeError as e:
             error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
             logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": [], "skills": [], "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
         if not isinstance(manifest, dict):
             error_msg = ".blueprint/tools.json must be a JSON object with a 'tools' array"
-            result = {"tools": [], "skills": [], "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
         raw_tools = manifest.get("tools")
         if not isinstance(raw_tools, list):
             error_msg = ".blueprint/tools.json 'tools' field must be an array"
-            result = {"tools": [], "skills": [], "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
@@ -334,6 +368,18 @@ async def _discover_manifest_tools(
                 continue
             seen_slugs.add(slug)
             tools.append(_normalize_manifest_tool(entry))
+
+        # Parse optional compute section alongside tools/skills.
+        raw_compute = manifest.get("compute")
+        compute: Optional[Dict[str, Any]] = None
+        if raw_compute is not None:
+            err = _validate_manifest_compute_entry(raw_compute)
+            if err:
+                errors.append(err)
+            else:
+                normalized = _normalize_manifest_compute(raw_compute)
+                if normalized:
+                    compute = normalized
 
         # Parse optional skills array alongside tools.
         raw_skills = manifest.get("skills")
@@ -355,11 +401,11 @@ async def _discover_manifest_tools(
         if errors:
             error_msg = "Manifest validation errors: " + "; ".join(errors)
             logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": tools, "skills": skills, "error": error_msg}
+            result = {"tools": tools, "skills": skills, "compute": compute, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
-        result = {"tools": tools, "skills": skills, "error": None}
+        result = {"tools": tools, "skills": skills, "compute": compute, "error": None}
         _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
         return result
 
@@ -367,7 +413,7 @@ async def _discover_manifest_tools(
         logger.warning(
             "[project-tools] Manifest fetch error for %s: %s", cache_key, e,
         )
-        result = {"tools": [], "skills": [], "error": f"Failed to fetch manifest: {e}"}
+        result = {"tools": [], "skills": [], "compute": None, "error": f"Failed to fetch manifest: {e}"}
         _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
         return result
 
@@ -874,10 +920,12 @@ async def discover_project_tool_manifest(
 ):
     """Discover tools declared in the project's ``.blueprint/tools.json``.
 
-    Returns a JSON object with a ``tools`` array and an optional ``error``
-    string.  Each tool entry carries ``slug``, ``title``, ``description``,
-    ``placement``, ``entry``, ``kind`` (always ``"project"``), and ``source``
-    (always ``"project"``).  An empty list means no project-declared tools.
+    Returns a JSON object with a ``tools`` array, a ``skills`` array, an optional
+    ``compute`` dict (with an ``image`` key when the project declares a compute
+    image), and an optional ``error`` string.  Each tool entry carries ``slug``,
+    ``title``, ``description``, ``placement``, ``entry``, ``kind`` (always
+    ``"project"``), and ``source`` (always ``"project"``).  An empty list means
+    no project-declared tools.
 
     Graceful handling: no connected repo → empty list; no manifest file →
     empty list; malformed manifest → structured error in the response body.

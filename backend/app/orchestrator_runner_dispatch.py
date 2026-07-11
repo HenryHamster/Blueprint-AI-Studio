@@ -171,6 +171,31 @@ def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     return available is not False
 
 
+_CONTAINER_BACKEND_KEYS = {
+    "docker_usable",
+    "podman_usable",
+    "apptainer_ok",
+    "enroot_ok",
+}
+
+
+def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Whether a runner advertises a container isolation backend.
+
+    Reads the heartbeat-reported ``isolation_backends`` map and returns True
+    when at least one container-capable backend (docker, podman, apptainer,
+    enroot) is reported as available. Runners that never report
+    ``isolation_backends`` (old runners) are treated as NOT container-capable:
+    the orchestrator cannot safely route a container-image job to a runner
+    whose isolation support is unknown.
+    """
+    caps = runner.capabilities or {}
+    backends = caps.get("isolation_backends")
+    if not isinstance(backends, dict):
+        return False
+    return any(backends.get(key) for key in _CONTAINER_BACKEND_KEYS)
+
+
 def _runner_at_capacity(
     runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
 ) -> bool:
@@ -360,6 +385,11 @@ async def _try_runner_dispatch(
     accelerator = payload.get("accelerator") or (
         payload.get("compute_experiment") or {}
     ).get("accelerator")
+    # A declared container_image restricts eligibility to runners with a
+    # container isolation backend. Read flat and nested, mirroring accelerator.
+    container_image = payload.get("container_image") or (
+        payload.get("compute_experiment") or {}
+    ).get("container_image")
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -368,6 +398,7 @@ async def _try_runner_dispatch(
         runner_pins_this_cycle,
         preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
         dispatch_seed=task.id.int,
+        container_image=container_image,
     )
     if runner is None:
         return False
@@ -571,16 +602,20 @@ def _select_eligible_runner(
     runner_pins_this_cycle: dict[uuid.UUID, int],
     preferred_runner_target_id: str | None = None,
     dispatch_seed: int = 0,
+    container_image: str | None = None,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
     not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
-    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). A preferred
-    runner wins only after those eligibility checks pass; otherwise selection
-    prefers the least EFFECTIVE load — heartbeat-reported active count plus pins
-    already made to the runner this cycle — so a same-cycle burst spreads across
-    a fleet instead of stacking onto one runner.
+    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU).  When a
+    ``container_image`` is declared the runner must advertise a container isolation
+    backend (docker, podman, etc.) — the orchestrator will not route a
+    container-image-dependent job to a runner whose isolation support is unknown.
+    A preferred runner wins only after those eligibility checks pass; otherwise
+    selection prefers the least EFFECTIVE load — heartbeat-reported active count
+    plus pins already made to the runner this cycle — so a same-cycle burst spreads
+    across a fleet instead of stacking onto one runner.
 
     When multiple runners are equally loaded, ``dispatch_seed`` (derived from the
     dispatched task/job UUID) breaks ties deterministically so repeated dispatch
@@ -600,6 +635,8 @@ def _select_eligible_runner(
     ]
     if accelerator:
         eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+    if container_image:
+        eligible = [r for r in eligible if _runner_has_container_capability(r)]
     if not eligible:
         return None
     if preferred_runner_target_id:
@@ -827,6 +864,11 @@ async def _dispatch_compute_experiment_directly(
     accelerator = payload.get("accelerator") or (
         payload.get("compute_experiment") or {}
     ).get("accelerator")
+    # Container-image (flat or nested) gates runner eligibility on container
+    # isolation backend capability.
+    container_image = payload.get("container_image") or (
+        payload.get("compute_experiment") or {}
+    ).get("container_image")
 
     # ── Select an eligible runner (shared rule with _try_runner_dispatch) ──────
     runner = _select_eligible_runner(
@@ -839,6 +881,7 @@ async def _dispatch_compute_experiment_directly(
             "preferred_runner_target_id"
         ),
         dispatch_seed=task.id.int,
+        container_image=container_image,
     )
 
     project = await session.get(Project, task.project_id)
