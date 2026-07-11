@@ -64,6 +64,7 @@ from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
 )
+from app.capability_proof import commission_proof_earn_loop
 from app.capability_registry import (
     annotate_capability_proof_status as _annotate_capability_proof_status,
     registry_capability_evidence_refs_map,
@@ -2337,6 +2338,33 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             if _demand_hint:
                 append_prompt_suffix(research_payload, _demand_hint)
+
+            # On-demand earn: attempt to prove demanded unproven capabilities
+            # that declare backing_paths by verifying each path at HEAD.  This
+            # commissions verification work at demand-detection time (not just
+            # on the reaper's hourly cadence) so proof can be earned before a
+            # dependent needs it.  Fail-open: any error is logged and swallowed.
+            try:
+                _pm = (
+                    project.problem_model
+                    if isinstance(project.problem_model, dict)
+                    else {}
+                )
+                _earn_result = await commission_proof_earn_loop(
+                    project, _missing_demand, _pm
+                )
+                if _earn_result.get("earned", 0) > 0:
+                    logger.info(
+                        "[AUTONOMOUS] earned proof for %d demanded unproven "
+                        "capability(ies) via on-demand earn loop",
+                        _earn_result["earned"],
+                    )
+            except Exception:  # noqa: BLE001 — earn loop is advisory; must not crash spawn
+                logger.warning(
+                    "[AUTONOMOUS] on-demand earn loop failed for project %s:",
+                    project.id,
+                    exc_info=True,
+                )
         # Compact, body-omitted index of existing knowledge documents
         # (web_research / design output), scoped to this project and — when the
         # cycle is directed — the current direction first. Lets the research

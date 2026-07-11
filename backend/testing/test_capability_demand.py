@@ -844,3 +844,18 @@ class TestComputeUnprovenDemandedCapabilities:
         result = compute_unproven_demanded_capabilities(demand, pm)
         assert len(result) == 1
         assert result[0]["proof_status"] == "unproven"
+
+    def test_backing_paths_shows_partial_not_unproven(self):
+        """A demanded capability with backing_paths but no evidence_refs
+        classifies as 'partial', not 'unproven', in the intersection."""
+        pm = _problem_model(caps=[
+            {"name": "backed-cap", "status": "working",
+             "backing_paths": ["backend/app/some_module.py"]},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "backed-cap", "dependent_count": 2},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert len(result) == 1
+        assert result[0]["ref"] == "backed-cap"
+        assert result[0]["proof_status"] == "partial"

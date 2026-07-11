@@ -531,6 +531,78 @@ def test_working_capability_proof_status_accepts_dict_form_problem_model():
     }
 
 
+def test_working_capability_proof_status_backing_paths_are_partial():
+    """A working capability with backing_paths but no evidence_refs → partial.
+
+    The presence of backing_paths distinguishes a structurally-backed claim
+    (the capability declares where its code lives) from a genuinely
+    evidence-less one.  This prevents every registry capability from starting
+    at 'unproven' — only capabilities with ZERO evidence (no evidence_refs
+    AND no backing_paths) are truly unproven.
+    """
+    from app.capability_registry import working_capability_proof_status
+
+    model = ProblemModel(
+        capabilities=[
+            # No evidence_refs but has backing_paths → partial.
+            Capability(
+                name="Has paths",
+                status="working",
+                backing_paths=["backend/app/some_module.py"],
+            ),
+            # No evidence_refs and no backing_paths → unproven.
+            Capability(name="No paths", status="working"),
+            # Has both: evidence_refs wins the classification.
+            Capability(
+                name="Both",
+                status="working",
+                evidence_refs=[_proven_ref()],
+                backing_paths=["backend/app/other.py"],
+            ),
+            # Non-working with backing_paths is excluded (not 'working').
+            Capability(
+                name="Planned with paths",
+                status="planned",
+                backing_paths=["backend/app/planned.py"],
+            ),
+        ]
+    )
+
+    proof = working_capability_proof_status(model)
+    assert proof["has-paths"] == "partial", (
+        "backing_paths present but no evidence_refs → partial"
+    )
+    assert proof["no-paths"] == "unproven", (
+        "no evidence_refs and no backing_paths → unproven"
+    )
+    assert proof["both"] == "proven", (
+        "evidence_refs proven → proven, even with backing_paths"
+    )
+    assert "planned-with-paths" not in proof, (
+        "non-working capabilities are excluded regardless of backing_paths"
+    )
+    assert set(proof) == {"has-paths", "no-paths", "both"}, (
+        "only working capabilities appear in the map"
+    )
+
+
+def test_working_capability_proof_status_backing_paths_dict_form():
+    """Dict-form payloads also respect backing_paths → partial upgrade."""
+    from app.capability_registry import working_capability_proof_status
+
+    payload = {
+        "capabilities": [
+            {"name": "Backed cap", "status": "working",
+             "backing_paths": ["backend/app/foo.py"]},
+            {"name": "Bare cap", "status": "working"},
+        ]
+    }
+
+    proof = working_capability_proof_status(payload)
+    assert proof["backed-cap"] == "partial"
+    assert proof["bare-cap"] == "unproven"
+
+
 # ---------------------------------------------------------------------------
 # Proof-gated capability resolution (enforce-mode toggle)
 # ---------------------------------------------------------------------------

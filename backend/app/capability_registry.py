@@ -148,7 +148,7 @@ def registry_capability_evidence_refs_map(problem_model: object) -> dict[str, li
     IO-free — reads only from the in-memory model.
     """
     refs_map: dict[str, list] = {}
-    for raw_name, _status, _absorbs, evidence_refs in _iter_capability_evidence_entries(
+    for raw_name, _status, _absorbs, evidence_refs, _backing_paths in _iter_capability_evidence_entries(
         problem_model
     ):
         normalized = normalize_capability_name(raw_name)
@@ -252,16 +252,17 @@ def registry_satisfies_capability_need(
 
 
 def _iter_capability_evidence_entries(problem_model: object):
-    """Yield ``(raw_name, status, absorbs, evidence_refs)`` quadruples.
+    """Yield ``(raw_name, status, absorbs, evidence_refs, backing_paths)`` quintuples.
 
     The evidence-aware sibling of :func:`_iter_capability_entries`: it draws from
     the exact same ``capabilities`` source (accepting either the pydantic
     ``ProblemModel`` instance or a dict-like payload) but additionally surfaces
-    each capability's ``evidence_refs`` so the proof-aware resolvers can classify
-    the backing evidence WITHOUT widening the shared 3-tuple contract three other
-    call sites unpack. ``evidence_refs`` is whatever the payload carries (a list,
-    ``None`` on older/dict payloads that omit it, or junk) — callers coerce it
-    before handing it to :func:`classify_evidence`.
+    each capability's ``evidence_refs`` and ``backing_paths`` so the proof-aware
+    resolvers can classify the backing evidence WITHOUT widening the shared
+    3-tuple contract three other call sites unpack. ``evidence_refs`` /
+    ``backing_paths`` are whatever the payload carries (a list, ``None`` on
+    older/dict payloads that omit it, or junk) — callers coerce them before
+    handing them to :func:`classify_evidence`.
     """
     if isinstance(problem_model, Mapping):
         raw_caps = problem_model.get("capabilities")
@@ -276,6 +277,7 @@ def _iter_capability_evidence_entries(problem_model: object):
                 cap.get("status"),
                 cap.get("absorbs"),
                 cap.get("evidence_refs"),
+                cap.get("backing_paths"),
             )
         else:
             yield (
@@ -283,6 +285,7 @@ def _iter_capability_evidence_entries(problem_model: object):
                 getattr(cap, "status", None),
                 getattr(cap, "absorbs", None),
                 getattr(cap, "evidence_refs", None),
+                getattr(cap, "backing_paths", None),
             )
 
 
@@ -300,6 +303,14 @@ def working_capability_proof_status(
     as ``unproven`` (the "declared working with zero proof" case this gate exists
     to surface); one carrying a ``proven=True`` ref classifies as ``proven``.
 
+    When ``evidence_refs`` is empty or missing but the capability declares a
+    non-empty ``backing_paths`` list, the status is upgraded to ``partial`` —
+    the capability at least declares *where* its code is in the repo, even if no
+    machine-checked verification has been recorded yet.  This prevents every
+    registry capability from starting at ``unproven`` and distinguishes genuinely
+    evidence-less claims from structurally-backed ones that simply haven't been
+    through the earning loop.
+
     IO-free and additive — the observe-mode wiring in both the spawn-time
     resolver and the blocked-resume sweep builds this map once per project
     (mirroring how they cache :func:`working_capability_names`) and looks needs up
@@ -307,7 +318,7 @@ def working_capability_proof_status(
     entries normalize to the same name, matching the name reader's dedupe order.
     """
     out: dict[str, EvidenceStatus] = {}
-    for raw_name, status, absorbs, evidence_refs in _iter_capability_evidence_entries(
+    for raw_name, status, absorbs, evidence_refs, backing_paths in _iter_capability_evidence_entries(
         problem_model
     ):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
@@ -317,6 +328,15 @@ def working_capability_proof_status(
         # of proof), matching the pydantic ``Capability`` default of ``[]``.
         refs = evidence_refs if isinstance(evidence_refs, list) else []
         proof_status = classify_evidence(refs)
+        # When evidence_refs is empty/missing but the capability declares
+        # backing_paths, upgrade to ``partial`` — the claim has structural
+        # evidence (it declares where its code lives) even if no formal
+        # machine-checked proof has been recorded yet.  This prevents ALL
+        # registry capabilities from starting at ``unproven`` and keeps the
+        # proof-gate readiness gap honest: only capabilities with ZERO evidence
+        # (no refs AND no backing_paths) are truly unproven.
+        if proof_status == "unproven" and isinstance(backing_paths, list) and backing_paths:
+            proof_status = "partial"
         for name in (
             normalize_capability_name(raw_name),
             *_normalized_absorbed_names(absorbs),
