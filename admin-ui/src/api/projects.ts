@@ -445,7 +445,7 @@ export interface ChangelogEntry {
 export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
-  coverage: 'covered' | 'attested' | 'partial' | 'uncovered';
+  coverage: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
@@ -464,6 +464,11 @@ export interface VersionCriterionCoverage {
    *  distinct, lower-confidence tier that is NOT included in `covered`. May be
    *  absent from older backends; treat undefined as 0. */
   attested?: number;
+  /** Active criteria covered by backfilled evidence (merge-before-CI, no
+   *  machine-verified artifact). Distinct from attested — backfilled is
+   *  derived from task history, not operator attestation. May be absent from
+   *  older backends; treat undefined as 0. */
+  backfilled?: number;
   partial: number;
   uncovered: number;
   retracted?: number;
