@@ -884,6 +884,73 @@ async def test_discount_stranded_pr_guards(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_discount_stranded_pr_best_effort_on_raiseload_projection(
+    db_session: AsyncSession, caplog
+):
+    """A raiseload projection missing project_id must not raise out of the discount.
+
+    Regression (2026-07-11 outage): strategic_spawning._build_recent_interventions
+    passed a Task loaded via load_only(..., raiseload=True) WITHOUT Task.project_id;
+    the guard reads sat before the function's try block, so the InvalidRequestError
+    escaped and aborted the entire per-project autonomous spawn cycle. Best-effort
+    means ALL attribute/context reads degrade to a logged warning + rollback.
+    """
+    import logging
+
+    from sqlalchemy import select
+    from sqlalchemy.exc import InvalidRequestError
+    from sqlalchemy.orm import load_only
+
+    from app.direction_outcomes import discount_stranded_pr_from_direction_credit
+
+    direction_id = "d-raiseload-best-effort"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+
+    task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="raiseload-projected",
+    )
+    task_id = task.id
+    project_id = project.id
+    # Commit so the function's internal best-effort rollback cannot discard the
+    # fixture rows, then drop the fully-loaded instances from the identity map so
+    # the select below actually applies the raiseload projection.
+    await db_session.commit()
+    db_session.expunge_all()
+
+    result = await db_session.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+    )
+    projected = result.scalars().one()
+    # Prove the fixture reproduces the failing condition: project_id not loadable.
+    with pytest.raises(InvalidRequestError):
+        _ = projected.project_id
+
+    # Must NOT raise — best-effort: returns cleanly, logs a warning, rolls back.
+    with caplog.at_level(logging.WARNING):
+        await discount_stranded_pr_from_direction_credit(projected, db_session)
+    assert "stranded-PR credit discount failed" in caplog.text
+
+    # Direction history untouched — no discount was applied.
+    refreshed = await db_session.get(Project, project_id)
+    entry = refreshed.directions[0]["research_history"][0]
+    assert entry.get("stranded_prs_merged") is None
+
+
+@pytest.mark.asyncio
 async def test_verify_rollup_merge_landed_stranded_invokes_discount(
     db_session: AsyncSession, mocker
 ):

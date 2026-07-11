@@ -12492,6 +12492,102 @@ async def test_verified_not_landed_persists_stranded_discount(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_verified_not_landed_discount_survives_projection_reload(
+    db_session, mocker
+):
+    """The stranded-discount path works on tasks loaded through the function's own projection.
+
+    Regression (2026-07-11 outage): tasks created in the test session stay fully
+    loaded in the identity map, so the sibling test above never exercised the
+    tasks_in_window load_only(..., raiseload=True) projection. When that
+    projection omitted Task.project_id, discount_stranded_pr_from_direction_credit
+    raised InvalidRequestError and aborted the entire per-project spawn cycle.
+    Expunging the task forces _build_recent_interventions to re-load it through
+    its real projection, pinning both the projection contents and the discount.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-stranded-projection"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "stranded discount projection test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 1,
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Stranded non-landing task (projection reload)",
+        description="merge commit NOT an ancestor of integration branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "pr_number": 503,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    task_id = task.id
+    # Drop the fully-loaded instance so the tasks_in_window query re-loads it
+    # under its load_only(..., raiseload=True) projection — as in production.
+    db_session.expunge(task)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha3", "head": {"sha": "h3"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    # Must not raise, and the discount must actually be applied — a projection
+    # missing project_id would silently skip it (best-effort) or, pre-fix, abort
+    # the whole spawn cycle.
+    await _build_recent_interventions(project, db_session)
+
+    reloaded = await db_session.get(Task, task_id)
+    ctx = reloaded.context or {}
+    assert ctx.get("stranded_discount_applied") is True, (
+        "stranded_discount_applied must be stamped even when the task was loaded "
+        "through the tasks_in_window raiseload projection"
+    )
+
+    await db_session.refresh(project)
+    the_dir = next(d for d in project.directions or [] if d.get("id") == direction_id)
+    entry = next(
+        h
+        for h in the_dir.get("research_history", [])
+        if h.get("task_id") == research_task_id
+    )
+    assert entry.get("stranded_prs_merged") == 1
+
+
+@pytest.mark.asyncio
 async def test_verified_not_landed_stranded_discount_idempotent(db_session, mocker):
     """A task already carrying stranded_discount_applied=True is not double-counted.
 
