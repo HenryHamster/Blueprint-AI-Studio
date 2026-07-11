@@ -794,6 +794,37 @@ async def recut_landed_cross_base_dependents(
 
     task_by_id = {t.id: t for t in candidate_tasks}
     dropped: set = set()
+
+    # Batch-fetch replacement tasks for CANCELLED dependencies to avoid N+1
+    # session.get calls inside the loop below. Collect all replacement_id_str
+    # values across eligible candidates, then fetch them in one query.
+    replacement_ids: set[uuid.UUID] = set()
+    for eid in eligible_ids:
+        cand = task_by_id.get(eid)
+        if cand is None or not (cand.depends_on or []):
+            continue
+        for raw in cand.depends_on or []:
+            try:
+                du = uuid.UUID(raw)
+            except (ValueError, AttributeError):
+                continue
+            dep = dep_by_id.get(du)
+            if dep is not None and dep.status == TaskStatus.CANCELLED:
+                rid_str = (dep.context or {}).get("_replaced_by_task_id")
+                if rid_str:
+                    try:
+                        replacement_ids.add(uuid.UUID(rid_str))
+                    except (ValueError, AttributeError):
+                        pass
+
+    replacement_by_id: dict[uuid.UUID, Task] = {}
+    if replacement_ids:
+        repl_result = await session.execute(
+            select(Task).where(Task.id.in_(replacement_ids))
+        )
+        for t in repl_result.scalars().all():
+            replacement_by_id[t.id] = t
+
     for eid in eligible_ids:
         cand = task_by_id.get(eid)
         if cand is None or not (cand.depends_on or []):
@@ -808,7 +839,19 @@ async def recut_landed_cross_base_dependents(
             if dep is not None:
                 # Follow the requeue-cancelled → replacement remap so a remapped
                 # cross-base code-dependency's landed code still triggers re-cut.
-                dep_tasks.append(await _effective_dep_task(dep, session))
+                # Resolution uses the batch-fetched replacement_by_id dict
+                # instead of a per-dep session.get.
+                if dep.status == TaskStatus.CANCELLED:
+                    rid_str = (dep.context or {}).get("_replaced_by_task_id")
+                    if rid_str:
+                        try:
+                            replacement = replacement_by_id.get(uuid.UUID(rid_str))
+                            if replacement is not None:
+                                dep_tasks.append(replacement)
+                                continue
+                        except (ValueError, AttributeError):
+                            pass
+                dep_tasks.append(dep)
         if not dep_tasks:
             continue
         if not await ensure_dependent_base_recut(cand, dep_tasks, session):

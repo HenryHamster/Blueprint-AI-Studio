@@ -1082,29 +1082,66 @@ async def get_project_strategic_state(
         project_id, current_user["user_id"], session, "member"
     )
 
-    active_cycle = (
-        await session.execute(
-            select(StrategicCycle)
-            .where(
-                StrategicCycle.project_id == project.id,
-                StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
-            )
-            .order_by(StrategicCycle.phase1_started_at.desc())
-            .limit(1)
+    # Sequential session.execute() calls: AsyncSession does not support
+    # concurrent coroutine-based calls (asyncpg raises InterfaceError when
+    # a second query is issued before the first completes).
+    _active_cycle_res = await session.execute(
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project.id,
+            StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
         )
-    ).scalar_one_or_none()
-
-    latest_cycle = (
-        await session.execute(
-            select(StrategicCycle)
-            .where(
-                StrategicCycle.project_id == project.id,
-                ~StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
-            )
-            .order_by(StrategicCycle.phase1_started_at.desc())
-            .limit(1)
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(1)
+    )
+    _latest_cycle_res = await session.execute(
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project.id,
+            ~StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
         )
-    ).scalar_one_or_none()
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(1)
+    )
+    _task_status_rows_res = await session.execute(
+        select(Task.status, func.count())
+        .where(Task.project_id == project.id, Task.archived.is_(False))
+        .group_by(Task.status)
+    )
+    _message_rows_res = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(12)
+    )
+    _message_count_rows_res = await session.execute(
+        select(ProjectMessage.status, func.count())
+        .where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+        )
+        .group_by(ProjectMessage.status)
+    )
+    task_focus = await _build_task_focus(session, project.id)
+    attention = await build_operator_attention(session, project, current_user["user_id"])
+    _open_version_res = await session.execute(
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.project_id == project.id,
+            ReleaseVersion.status == "open",
+        )
+        .order_by(ReleaseVersion.opened_at.desc())
+        .limit(1)
+    )
+    active_cycle = _active_cycle_res.scalar_one_or_none()
+    latest_cycle = _latest_cycle_res.scalar_one_or_none()
+    task_status_rows = _task_status_rows_res.all()
+    message_rows = _message_rows_res.scalars().all()
+    message_count_rows = _message_count_rows_res.all()
+    open_version = _open_version_res.scalars().first()
 
     active_task = None
     active_phase = None
@@ -1123,13 +1160,6 @@ async def get_project_strategic_state(
             else:
                 active_phase = None
 
-    task_status_rows = (
-        await session.execute(
-            select(Task.status, func.count())
-            .where(Task.project_id == project.id, Task.archived.is_(False))
-            .group_by(Task.status)
-        )
-    ).all()
     task_counts = {
         "queued": 0,
         "running": 0,
@@ -1188,40 +1218,11 @@ async def get_project_strategic_state(
             )
         ).scalar() or 0.0
         _COST_CACHE[_cost_key] = (float(cost_total), _cost_now + _COST_CACHE_TTL_S)
-    task_focus = await _build_task_focus(session, project.id)
-
-    message_rows = (
-        await session.execute(
-            select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-            )
-            .order_by(ProjectMessage.created_at.desc())
-            .limit(12)
-        )
-    ).scalars().all()
-    message_count_rows = (
-        await session.execute(
-            select(ProjectMessage.status, func.count())
-            .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-            )
-            .group_by(ProjectMessage.status)
-        )
-    ).all()
     message_counts = {"open": 0, "linked": 0}
     for status, count in message_count_rows:
         if status in message_counts:
             message_counts[status] = int(count or 0)
 
-    async with async_timed(request, "attention"):
-        attention = await build_operator_attention(
-            session,
-            project,
-            current_user["user_id"],
-        )
     active_cycle_summary = _cycle_summary(active_cycle, active_task=active_task)
     latest_cycle_summary = _cycle_summary(latest_cycle)
     running_update_summary = _running_update_summary(project)
@@ -1341,17 +1342,6 @@ async def get_project_strategic_state(
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
     sha_freshness: dict | None = None
-    open_version = (
-        await session.execute(
-            select(ReleaseVersion)
-            .where(
-                ReleaseVersion.project_id == project.id,
-                ReleaseVersion.status == "open",
-            )
-            .order_by(ReleaseVersion.opened_at.desc())
-            .limit(1)
-        )
-    ).scalars().first()
     from app.strategic_spawning import (
         _build_payload_staleness_block,
         _build_unknown_freshness_block,

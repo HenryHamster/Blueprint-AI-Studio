@@ -205,7 +205,7 @@ async def _check_module_size_violations(
     Returns ``[]`` when the limits file is absent, when no tracked modules are
     changed, or when all changed tracked modules are within cap.
     """
-    limits = _load_size_limits()
+    limits = await asyncio.to_thread(_load_size_limits)
     if not limits:
         return []
 

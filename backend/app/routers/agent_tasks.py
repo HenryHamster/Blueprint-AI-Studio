@@ -200,19 +200,33 @@ async def agent_get_task(
     # Allow visibility when the task itself is strategist-authored, OR any
     # ancestor reachable via parent_task_id (within this project) is.
     if task.created_by != _STRATEGIC_AGENT_CREATED_BY:
-        current = task
-        strategist_ancestor_found = False
-        for _ in range(_ANCESTOR_WALK_MAX_DEPTH):
-            if current.parent_task_id is None:
-                break
-            parent = await session.get(Task, current.parent_task_id)
-            if parent is None or parent.project_id != project_id:
-                break
-            if parent.created_by == _STRATEGIC_AGENT_CREATED_BY:
-                strategist_ancestor_found = True
-                break
-            current = parent
-        if not strategist_ancestor_found:
+        # Single recursive CTE replaces N+1 per-iteration session.get().
+        cte_result = await session.execute(
+            text("""
+                WITH RECURSIVE ancestor_chain AS (
+                    SELECT parent_task_id, created_by, 0 AS depth
+                    FROM task
+                    WHERE id = :task_id AND parent_task_id IS NOT NULL
+                    UNION ALL
+                    SELECT t.parent_task_id, t.created_by, ac.depth + 1
+                    FROM task t
+                    INNER JOIN ancestor_chain ac ON t.id = ac.parent_task_id
+                    WHERE ac.parent_task_id IS NOT NULL
+                      AND t.project_id = :project_id
+                      AND ac.depth < :max_depth
+                )
+                SELECT 1 FROM ancestor_chain
+                WHERE created_by = :created_by
+                LIMIT 1
+            """),
+            {
+                "task_id": tid,
+                "max_depth": _ANCESTOR_WALK_MAX_DEPTH,
+                "created_by": _STRATEGIC_AGENT_CREATED_BY,
+                "project_id": project_id,
+            },
+        )
+        if not cte_result.fetchone():
             raise HTTPException(status_code=404, detail="Task not found")
 
     pr_url: str | None = None

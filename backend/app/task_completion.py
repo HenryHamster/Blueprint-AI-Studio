@@ -2640,7 +2640,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
     """
     from app.compute_jobs import (
         COMPUTE_JOB_TERMINAL_WAKE_KIND,
-        build_compute_result_logs,
+        build_compute_result_logs_async,
     )
     from app.models import ComputeJob
 
@@ -2699,7 +2699,7 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
             with contextlib.suppress(Exception):
                 await _clear_post_commit_marker(session, registration)
             return False
-        logs = build_compute_result_logs(job)
+        logs = await build_compute_result_logs_async(job)
         criterion = (task.context or {}).get("compute_success_criterion")
         persisted = await _persist_compute_experiment_knowledge_best_effort(
             task, logs, criterion, session

@@ -22,7 +22,7 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.compute_jobs import (
-    build_compute_result_logs,
+    build_compute_result_logs_async,
     kill_compute_job,
     list_compute_jobs,
 )
@@ -215,7 +215,7 @@ async def _build_compute_job_payload(
             and job.status in _COMPUTE_JOB_TERMINAL_STATUSES
             and task_obj is not None
         ):
-            artifact_text = build_compute_result_logs(job)
+            artifact_text = await build_compute_result_logs_async(job)
             criterion_verdict = evaluate_compute_success_criterion(
                 task_obj, artifact_text
             )

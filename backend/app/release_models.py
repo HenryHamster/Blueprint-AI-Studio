@@ -306,6 +306,10 @@ class ReleaseVersion(SQLModel, table=True):
         Index("ix_releaseversion_project_opened_at", "project_id", "opened_at"),
         Index("ix_releaseversion_project_served_at", "project_id", "served_at"),
         Index("ix_releaseversion_project_promoted_at", "project_id", "promoted_at"),
+        # Standalone status index for cross-project scans (metrics sweep,
+        # release qualifier sweep, etc.) that filter by status without
+        # a project_id constraint.
+        Index("ix_releaseversion_status", "status"),
         UniqueConstraint(
             "project_id",
             "version_number",

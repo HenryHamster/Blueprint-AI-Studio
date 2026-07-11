@@ -1022,35 +1022,44 @@ async def backfill_direction_merge_evidence(
             from sqlalchemy.dialects.postgresql import JSONB as _JSONB
             direction_filter = Task.context.op("@>")(_cast({"direction_id": direction_key}, _JSONB))
 
-        result = await session.execute(
-            select(Task).where(
-                Task.project_id == project_id,
-                Task.status == TaskStatus.COMPLETED,
-                Task.completed_at >= version_opened_at,
-                landed_signal_predicate(session),
-                direction_filter,
-            )
-        )
-        tasks = list(result.scalars().all())
-
+        _BATCH_LIMIT = 500
         total = 0
-        for task in tasks:
-            if not is_merged_completion(task):
-                continue
-            try:
-                total += await record_task_merge_evidence(session, task, project_id)
-            except Exception:
-                logger.warning(
-                    "backfill_direction_merge_evidence: failed for task %s, skipping",
-                    task.id,
-                    exc_info=True,
+        offset = 0
+        while True:
+            batch_result = await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.completed_at >= version_opened_at,
+                    landed_signal_predicate(session),
+                    direction_filter,
                 )
+                .order_by(Task.id)
+                .limit(_BATCH_LIMIT)
+                .offset(offset)
+            )
+            batch = list(batch_result.scalars().all())
+            if not batch:
+                break
+            offset += len(batch)
+            for task in batch:
+                if not is_merged_completion(task):
+                    continue
+                try:
+                    total += await record_task_merge_evidence(session, task, project_id)
+                except Exception:
+                    logger.warning(
+                        "backfill_direction_merge_evidence: failed for task %s, skipping",
+                        task.id,
+                        exc_info=True,
+                    )
         logger.info(
             "backfill_direction_merge_evidence: direction=%s project=%s "
             "tasks_scanned=%d evidence_recorded=%d",
             direction_key,
             project_id,
-            len(tasks),
+            offset,
             total,
         )
         return total
@@ -1095,136 +1104,150 @@ async def backfill_unverified_merge_evidence(
         from app.database import resolve_dialect_name
         from app.release_version import current_open_version as _cur_open_ver
 
-        query = select(Task).where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            landed_signal_predicate(session),
-        )
-
-        if direction_key:
-            dialect = resolve_dialect_name(session)
-            if dialect == "sqlite":
-                from sqlalchemy import func as _func
-                query = query.where(
-                    _func.json_extract(Task.context, "$.direction_id") == direction_key
-                )
-            else:
-                from sqlalchemy import cast as _cast
-                from sqlalchemy.dialects.postgresql import JSONB as _JSONB
-                query = query.where(
-                    Task.context.op("@>")(_cast({"direction_id": direction_key}, _JSONB))
-                )
-
-        result = await session.execute(query)
-        tasks = list(result.scalars().all())
-
-        open_version = await _cur_open_ver(session, project_id)
-        if open_version is None:
-            logger.info(
-                "backfill_unverified_merge_evidence: no open version for "
-                "project %s — cannot resolve active criteria",
-                project_id,
-            )
-            return 0
-
+        _BATCH_LIMIT = 500
         total = 0
-        for task in tasks:
-            if not is_merged_completion(task):
-                continue
-
-            # Must carry an unverified merge reason — a real verified merge
-            # already goes through the normal record_task_merge_evidence path.
-            if not _task_unverified_reason(task):
-                continue
-
-            # Acceptance verdict must be named_test with satisfied=False
-            # (proven is False by extension).
-            verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
-            if not isinstance(verdict, dict):
-                continue
-            if verdict.get("kind") != "named_test":
-                continue
-            if verdict.get("satisfied") is not False:
-                continue
-
-            changed = _changed_files(task)
-            if not changed:
-                continue
-
-            # Verify the test IS in changed files — it was genuinely shipped,
-            # just not test-verified at merge time.
-            evidence = read_acceptance_evidence(task.first_payload)
-            if evidence is None or evidence.test_path is None:
-                continue
-
-            declared_test = evidence.test_path.rpartition("::")[0].strip()
-            test_present = any(_paths_match(p, declared_test) for p in changed)
-            if not test_present:
-                continue
-
-            # Must also have a production seam to exercise.
-            seam = [p for p in changed if not _is_test_path(p)]
-            if not seam:
-                continue
-
-            criterion_ids: list[str] = list(
-                getattr(task, "criterion_ids", None) or []
-            )
-            if not criterion_ids:
-                continue
-
-            criteria = await get_criteria_by_keys(
-                session,
-                project_id,
-                criterion_ids,
-                release_version_id=open_version.id,
-            )
-            active = [c for c in criteria if c.status == "active"]
-            if not active:
-                continue
-
-            # Batch-load already-present backfill evidence to skip duplicates.
-            active_ids = [c.id for c in active]
-            already_present: set[uuid.UUID] = set()
-            ev_result = await session.execute(
-                select(CriterionEvidence).where(
-                    CriterionEvidence.criterion_id.in_(active_ids),
-                    CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
-                    CriterionEvidence.source_id == str(task.id),
+        offset = 0
+        open_version: Any = None
+        while True:
+            query = (
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
                 )
+                .order_by(Task.id)
+                .limit(_BATCH_LIMIT)
+                .offset(offset)
             )
-            for ev in ev_result.scalars().all():
-                already_present.add(ev.criterion_id)
 
-            task_id_str = str(task.id)
-            unverified_reason = _task_unverified_reason(task) or "unknown"
-            for criterion in active:
-                if criterion.id in already_present:
+            if direction_key:
+                dialect = resolve_dialect_name(session)
+                if dialect == "sqlite":
+                    from sqlalchemy import func as _func
+                    query = query.where(
+                        _func.json_extract(Task.context, "$.direction_id") == direction_key
+                    )
+                else:
+                    from sqlalchemy import cast as _cast
+                    from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+                    query = query.where(
+                        Task.context.op("@>")(_cast({"direction_id": direction_key}, _JSONB))
+                    )
+
+            batch_result = await session.execute(query)
+            batch = list(batch_result.scalars().all())
+            if not batch:
+                break
+            offset += len(batch)
+
+            if open_version is None:
+                open_version = await _cur_open_ver(session, project_id)
+                if open_version is None:
+                    logger.info(
+                        "backfill_unverified_merge_evidence: no open version for "
+                        "project %s — cannot resolve active criteria",
+                        project_id,
+                    )
+                    return total
+
+            for task in batch:
+                if not is_merged_completion(task):
                     continue
 
-                detail: dict[str, Any] = {
-                    "proven": True,
-                    "backfilled": True,
-                    "backfill_reason": "unverified_merge",
-                    "unverified_merge_reason": unverified_reason,
-                    "proof_ref": verdict.get("proof_ref") or declared_test,
-                }
-                await record_evidence(
-                    session,
-                    criterion_id=criterion.id,
-                    project_id=project_id,
-                    source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
-                    source_id=task_id_str,
-                    detail=detail,
+                # Must carry an unverified merge reason — a real verified merge
+                # already goes through the normal record_task_merge_evidence path.
+                if not _task_unverified_reason(task):
+                    continue
+
+                # Acceptance verdict must be named_test with satisfied=False
+                # (proven is False by extension).
+                verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+                if not isinstance(verdict, dict):
+                    continue
+                if verdict.get("kind") != "named_test":
+                    continue
+                if verdict.get("satisfied") is not False:
+                    continue
+
+                changed = _changed_files(task)
+                if not changed:
+                    continue
+
+                # Verify the test IS in changed files — it was genuinely shipped,
+                # just not test-verified at merge time.
+                evidence = read_acceptance_evidence(task.first_payload)
+                if evidence is None or evidence.test_path is None:
+                    continue
+
+                declared_test = evidence.test_path.rpartition("::")[0].strip()
+                test_present = any(_paths_match(p, declared_test) for p in changed)
+                if not test_present:
+                    continue
+
+                # Must also have a production seam to exercise.
+                seam = [p for p in changed if not _is_test_path(p)]
+                if not seam:
+                    continue
+
+                criterion_ids: list[str] = list(
+                    getattr(task, "criterion_ids", None) or []
                 )
-                total += 1
+                if not criterion_ids:
+                    continue
+
+                criteria = await get_criteria_by_keys(
+                    session,
+                    project_id,
+                    criterion_ids,
+                    release_version_id=open_version.id,
+                )
+                active = [c for c in criteria if c.status == "active"]
+                if not active:
+                    continue
+
+                # Batch-load already-present backfill evidence to skip duplicates.
+                active_ids = [c.id for c in active]
+                already_present: set[uuid.UUID] = set()
+                ev_result = await session.execute(
+                    select(CriterionEvidence).where(
+                        CriterionEvidence.criterion_id.in_(active_ids),
+                        CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                        CriterionEvidence.source_id == str(task.id),
+                    )
+                )
+                for ev in ev_result.scalars().all():
+                    already_present.add(ev.criterion_id)
+
+                task_id_str = str(task.id)
+                unverified_reason = _task_unverified_reason(task) or "unknown"
+                for criterion in active:
+                    if criterion.id in already_present:
+                        continue
+
+                    detail: dict[str, Any] = {
+                        "proven": True,
+                        "backfilled": True,
+                        "backfill_reason": "unverified_merge",
+                        "unverified_merge_reason": unverified_reason,
+                        "proof_ref": verdict.get("proof_ref") or declared_test,
+                    }
+                    await record_evidence(
+                        session,
+                        criterion_id=criterion.id,
+                        project_id=project_id,
+                        source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                        source_id=task_id_str,
+                        detail=detail,
+                    )
+                    total += 1
 
         if total:
             logger.info(
                 "backfill_unverified_merge_evidence: project=%s "
                 "tasks_scanned=%d recorded=%d",
                 project_id,
-                len(tasks),
+                offset,
                 total,
             )
         return total

@@ -2851,6 +2851,18 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     return json.dumps(result)
 
 
+async def build_compute_result_logs_async(job: ComputeJob) -> str:
+    """Async wrapper around :func:`build_compute_result_logs`.
+
+    Offloads ``json.dumps`` to a thread-pool worker so the event loop
+    is not blocked when serializing large result payloads.  Production
+    callers that already run in an async context should use this;
+    synchronous callers (notably tests) can call
+    :func:`build_compute_result_logs` directly.
+    """
+    return await asyncio.to_thread(build_compute_result_logs, job)
+
+
 async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     """Turn a terminal job's durable artifact location into a first-class result.
 

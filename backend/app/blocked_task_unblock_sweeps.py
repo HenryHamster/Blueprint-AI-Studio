@@ -1185,23 +1185,26 @@ async def sweep_unblock_blocked_tasks(
                 )
 
     for task_id in due_ids:
-        # Per-row FOR UPDATE SKIP LOCKED: held for exactly this one task's
-        # processing window, then released by _commit_task_row before the
-        # next iteration's GitHub call begins.  populate_existing=True forces
-        # a fresh DB read even if this id is already in the session identity map
-        # (stale after a prior iteration's commit with expire_on_commit=False).
-        task = await session.scalar(
-            select(Task)
-            .where(
-                Task.id == task_id,
-                Task.status == TaskStatus.BLOCKED,
-                (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+        # Re-acquire a single-row FOR UPDATE SKIP LOCKED so the row lock is
+        # held ONLY during this task's processing — never across the per-task
+        # GitHub calls (_blocked_precondition_state → verify_pr_merged, up to
+        # 120s).  The per-row commit then releases it before the next task's
+        # I/O starts, keeping the locked window narrow enough that agent
+        # heartbeats are never starved.
+        task = (
+            await session.scalars(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status == TaskStatus.BLOCKED,
+                    (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+                )
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
-            .with_for_update(skip_locked=True)
-            .execution_options(populate_existing=True)
-        )
+        ).first()
         if task is None:
-            continue  # peer holds the lock, or task is no longer due/BLOCKED
+            continue
 
         _bc_start = len(pending_broadcasts)
         ctx = task.context or {}

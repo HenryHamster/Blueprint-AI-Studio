@@ -2904,6 +2904,14 @@ class StrategicCycle(SQLModel, table=True):
             "outcome",
             "phase1_started_at",
         ),
+        # Covers the stalled-cycle reaper cross-project scan:
+        # WHERE outcome IN (...) ORDER BY phase1_started_at LIMIT N.
+        # The two project_id-led indexes above cannot serve this query.
+        Index(
+            "ix_strategiccycle_outcome_phase1_started",
+            "outcome",
+            "phase1_started_at",
+        ),
     )
 
     @property
