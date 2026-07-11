@@ -77,6 +77,18 @@ _SECTION_PREFIXES: dict[str, str] = {
 # order); older entries are evicted.
 _MAX_RECORDED_SHAS = 50
 
+# Maximum concurrent GitHub API requests for file reads. The three scan helpers
+# (_scan_capped_files, _scan_uncapped_files, _scan_branch_literals) parallelize
+# per-file fetches with asyncio.gather across potentially 200+ files. Without a
+# cap, all requests fire concurrently, overwhelming the HTTP connection pool and
+# triggering GitHub secondary rate limiting — observed as spiky latency and
+# transient 429/503 responses on cold-compute paths. Using 10 concurrent slots
+# is generous enough to saturate a typical 4-core VM's HTTP stack while keeping
+# the outgoing connection burst well under GitHub's per-second rate limits.
+_DEFAULT_CONCURRENCY = 10
+
+_semaphore = asyncio.Semaphore(_DEFAULT_CONCURRENCY)
+
 # Line-count threshold above which an uncapped source file triggers a violation.
 # Mirrors check_size_limits._COVERAGE_THRESHOLD and test_invariants._COVERAGE_THRESHOLD.
 _UNCAPPED_THRESHOLD = 1500
@@ -187,28 +199,28 @@ async def _scan_capped_files(
             entries.append((section, rel, cap, f"{prefix}{rel}"))
 
     async def _fetch(path: str) -> str | None:
-        try:
-            return await github.get_file_text_at_ref(
-                path,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=ref,
-                project_id=project_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — never crash the producer
-            logger.debug(
-                "[CI-COMPLIANCE] read of %s at %s/%s@%s raised: %s — skipping",
-                path,
-                owner,
-                repo,
-                ref,
-                exc,
-            )
-            return None
+        async with _semaphore:
+            try:
+                return await github.get_file_text_at_ref(
+                    path,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=ref,
+                    project_id=project_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — never crash the producer
+                logger.debug(
+                    "[CI-COMPLIANCE] read of %s at %s/%s@%s raised: %s — skipping",
+                    path,
+                    owner,
+                    repo,
+                    ref,
+                    exc,
+                )
+                return None
 
     texts = await asyncio.gather(*(_fetch(path) for _, _, _, path in entries))
-
     violations: list[dict] = []
     checked = 0
     for (section, rel, cap, _path), text in zip(entries, texts):
@@ -278,25 +290,26 @@ async def _scan_uncapped_files(
         return []
 
     async def _fetch(path: str) -> str | None:
-        try:
-            return await github.get_file_text_at_ref(
-                path,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=ref,
-                project_id=project_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[CI-COMPLIANCE] uncapped read of %s at %s/%s@%s raised: %s — skipping",
-                path,
-                owner,
-                repo,
-                ref,
-                exc,
-            )
-            return None
+        async with _semaphore:
+            try:
+                return await github.get_file_text_at_ref(
+                    path,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=ref,
+                    project_id=project_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[CI-COMPLIANCE] uncapped read of %s at %s/%s@%s raised: %s — skipping",
+                    path,
+                    owner,
+                    repo,
+                    ref,
+                    exc,
+                )
+                return None
 
     texts = await asyncio.gather(*(_fetch(path) for _, _, path in candidates))
 
@@ -368,22 +381,23 @@ async def _scan_branch_literals(
     ]
 
     async def _fetch(path: str) -> str | None:
-        try:
-            return await github.get_file_text_at_ref(
-                path,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=ref,
-                project_id=project_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[CI-COMPLIANCE] branch-literal read of %s raised: %s — skipping",
-                path,
-                exc,
-            )
-            return None
+        async with _semaphore:
+            try:
+                return await github.get_file_text_at_ref(
+                    path,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=ref,
+                    project_id=project_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[CI-COMPLIANCE] branch-literal read of %s raised: %s — skipping",
+                    path,
+                    exc,
+                )
+                return None
 
     texts = await asyncio.gather(*(_fetch(path) for _, path, _ in all_entries))
 

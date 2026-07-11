@@ -3,12 +3,15 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
-  apiPost,
+  apiGet, apiPost,
   resolveBaseBranch,
 } from '../index.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import {
+  writeGitTokenFile, setupGitCredentialHelper,
+} from '../git-credential.js';
 import {
   buildContextPrefix, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper,
@@ -288,6 +291,20 @@ export async function handleStrategic(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
   });
+
+  // ── Git credential helper setup ──────────────────────────────────────────
+  // Write the initial token then switch the remote URL from the baked-in
+  // token-embedded form to a plain HTTPS URL backed by a credential helper that
+  // reads a refreshed token file. This prevents git operations from failing
+  // after the 60-minute GitHub App installation token TTL.
+  writeGitTokenFile(ghToken);
+  try {
+    setupGitCredentialHelper(owner, repo, WORKSPACE);
+    sendLog(ws, '[strategic] git credential helper configured (push-capable, auto-refresh)\n');
+  } catch (e) {
+    sendLog(ws, `[strategic] WARNING: git credential helper setup failed (git push may expire): ${String(e)}\n`);
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode, 'research');
@@ -1286,6 +1303,21 @@ ${proposedCriteriaBlock}
 9. **Guardrails.** Ensure at least 3 active directions remain after retires.
 
 10. Done. Do not write anything else.`;
+
+    // ── Git token refresh before executor ───────────────────────────────────
+    // Refresh the token file before the executor runs so any git operations
+    // (branch creation, pushes) authenticate with a fresh credential rather
+    // than the potentially-expired role-start token.
+    try {
+      const refreshResult = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}&force_refresh=true`) as { data?: { token?: string } } | null;
+      const newToken = refreshResult?.data?.token;
+      if (newToken) {
+        writeGitTokenFile(newToken);
+        sendLog(ws, '[strategic] git token refreshed before executor\n');
+      }
+    } catch (e) {
+      sendLog(ws, `[strategic] git token refresh before executor failed (keeping existing token): ${String(e)}\n`);
+    }
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

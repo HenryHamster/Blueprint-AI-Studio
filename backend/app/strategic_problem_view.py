@@ -12,6 +12,7 @@ import the whole cluster back into its namespace — every existing
 
 import json
 import logging
+import re
 from typing import Any
 
 from app.problem_model import compute_model_size_signal, parse_problem_model
@@ -115,6 +116,26 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
         # whether to push, refine, or retire a long-lived gap.
         if gap_memory_trimmed:
             trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
+
+    # Auto-heal: when the persisted model has a blank/placeholder intent.purpose
+    # but a populated user_purpose (the operator's durable backstop), restore
+    # purpose from user_purpose before the agent sees it. This prevents the
+    # strategic agent from deadlocking on a legally-persisted-but-blank purpose:
+    # thinker.ts rejects placeholder purposes, so the agent would fail before
+    # it could propose a fix. Healing here (at model-build time) means the agent
+    # always sees a valid purpose, and the next agent write-back re-persists it
+    # through _preserve_operator_intent's user_purpose fallback.
+    intent = trimmed.get("intent")
+    if isinstance(intent, dict):
+        purpose = (intent.get("purpose") or "").strip()
+        user_purpose = (intent.get("user_purpose") or "").strip()
+        if (not purpose or purpose == "..." or bool(re.match(r"^<[^>]+>$", purpose))) and user_purpose:
+            intent["purpose"] = user_purpose
+            logger.info(
+                "[STRATEGIC] Auto-healed blank intent.purpose from user_purpose "
+                "in agent-view problem model"
+            )
+
     return trimmed
 
 

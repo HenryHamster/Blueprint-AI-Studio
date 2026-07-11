@@ -2766,13 +2766,18 @@ async def orchestrator_worker():
                         if task.requires_approval:
                             await session.rollback()
                             continue
+                        # Snapshot vm_instance_id BEFORE the strategic local runner
+                        # path, which can commit or rollback and expire the ORM
+                        # object. Accessing task.vm_instance_id after that would
+                        # fire a sync lazy-load from async context → MissingGreenlet.
+                        _task_vm_id_str = str(task.vm_instance_id or "")
                         if await _try_strategic_local_required_runner_path(
                             session,
                             task,
                             _active_runners_cache,
                             _runner_pins_this_cycle,
                         ):
-                            if str(task.vm_instance_id or "").startswith("runner:"):
+                            if _task_vm_id_str.startswith("runner:"):
                                 _cycle_dispatched += 1
                             continue
                         resource_defer_msg = (
