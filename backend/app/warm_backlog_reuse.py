@@ -27,7 +27,7 @@ from app.orchestrator_filters import (
     file_conflict_defers,
 )
 from app.shared_state import runtime_config as _runtime_config
-from app.task_capabilities import READ_ONLY_TASK_TYPES
+from app.task_capabilities import COMPUTE_SUBSTRATE_TASK_TYPES, READ_ONLY_TASK_TYPES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
@@ -52,6 +52,21 @@ def _is_read_only_payloads(payloads) -> bool:
     """
     first = (payloads or [{}])[0]
     return (first or {}).get("type", "") in READ_ONLY_TASK_TYPES
+
+
+def _is_compute_substrate_payloads(payloads) -> bool:
+    """True if a task's payloads describe a compute-substrate task type.
+
+    Compute-substrate types (e.g. compute_experiment) have a dedicated
+    runner-aware direct-dispatch path (_dispatch_compute_experiment_directly)
+    that selects an eligible runner and pins runner_target_id before launch.
+    Warm backlog reuse has no runner-selection logic, so it must never claim
+    these tasks — doing so would default the GPU job to cloud dispatch and
+    bypass the enrolled local runner (or raise ComputeLaunchPreconditionFailed
+    when require_local_runner=true).
+    """
+    first = (payloads or [{}])[0]
+    return (first or {}).get("type", "") in COMPUTE_SUBSTRATE_TASK_TYPES
 
 
 def _task_pinned_providers(task_provider, ctx) -> set[str]:
@@ -365,6 +380,7 @@ async def _eligible_backlog_ids(
     skipped_pinned_vm = 0
     skipped_file_conflict = 0
     skipped_provider_mismatch = 0
+    skipped_direct_dispatch = 0
 
     for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, t_parent_id in rows:
         ctx = ctx or {}
@@ -389,6 +405,16 @@ async def _eligible_backlog_ids(
         # bypass the pool's lease accounting — even when it is pinned to THIS VM.
         if ctx.get("warm_pool_pin"):
             skipped_pinned_vm += 1
+            continue
+        # Compute-substrate types (e.g. compute_experiment) must flow through
+        # the runner-aware direct-dispatch path (_dispatch_compute_experiment_directly)
+        # which selects an eligible GPU runner and stamps runner_target_id.  Warm
+        # backlog reuse never consults runner eligibility, so a claimed
+        # compute_experiment would silently route to the cloud backend (or raise
+        # ComputeLaunchPreconditionFailed when require_local_runner=true),
+        # bypassing the enrolled local GPU runner.
+        if _is_compute_substrate_payloads(payloads):
+            skipped_direct_dispatch += 1
             continue
         # Read-only candidates (review/plan/research/...) produce no diff, so a
         # file overlap with in-flight work is never a real conflict — exempt them
@@ -435,7 +461,7 @@ async def _eligible_backlog_ids(
         "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
         "rows_fetched=%d rows_eligible=%d saturated=%s "
         "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d "
-        "skipped_provider_mismatch=%d",
+        "skipped_provider_mismatch=%d skipped_direct_dispatch=%d",
         project_id,
         vm_instance_id,
         rows_fetched,
@@ -445,6 +471,7 @@ async def _eligible_backlog_ids(
         skipped_pinned_vm,
         skipped_file_conflict,
         skipped_provider_mismatch,
+        skipped_direct_dispatch,
     )
 
     return eligible
