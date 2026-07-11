@@ -339,6 +339,37 @@ async def test_backlog_reuse_two_vms_single_claim(
 
 
 @pytest.mark.asyncio
+async def test_eligibility_excludes_compute_experiment(db_session):
+    """A QUEUED compute_experiment task is never returned by the warm-reuse
+    eligibility scan.
+
+    compute_experiment has a dedicated runner-aware direct-dispatch path that
+    selects an eligible GPU runner before launch.  Warm backlog reuse never
+    consults runner eligibility, so claiming it warm would either silently route
+    the GPU job to the cloud backend or raise ComputeLaunchPreconditionFailed
+    when require_local_runner=true.
+    """
+    project = await _make_project(db_session, name="ComputeExperiment Exclusion")
+    vm_id = "agent-vm-compute-excl"
+
+    # A QUEUED compute_experiment task — must never be warm-claimed.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        payloads=[{"type": "compute_experiment", "prompt": "run GPU experiment"}],
+    )
+
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+
+    # Add a regular create task in the same project — it IS eligible.
+    create_task = await _make_backlog_task(db_session, project.id)
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == create_task.id
+
+
+@pytest.mark.asyncio
 async def test_eligibility_skips_dependency_and_file_conflict(db_session):
     """select_backlog_reuse_candidate skips tasks with dependencies and tasks
     whose files overlap an IN_PROGRESS task in the same project."""
