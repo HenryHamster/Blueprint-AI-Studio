@@ -136,6 +136,7 @@
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 2150,
     "runner_health_alerts.py": 1950,
+    "runner_health_monitors.py": 1001,
     "routers/agent_strategic_fetch.py": 1750
   },
   "agent": {
