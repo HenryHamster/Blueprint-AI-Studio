@@ -465,6 +465,54 @@ def test_degraded_runner_deprioritized_in_dispatch():
     )
 
 
+def test_idle_runner_dispatch_rotates_across_ties():
+    """When multiple runners are equally idle, different task UUIDs must route
+    to different runners (rotation via dispatch_seed), so the fleet is balanced
+    rather than every task landing on the same first-in-order runner.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+
+    runner_a = RunnerDispatchSnapshot(
+        id=uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001"),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    runner_b = RunnerDispatchSnapshot(
+        id=uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002"),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [runner_a, runner_b]}
+
+    # Dispatch many tasks with distinct UUIDs; collect which runner is selected.
+    selected_ids = set()
+    for _ in range(20):
+        task_seed = uuid.uuid4().int
+        result = _select_eligible_runner(
+            active_runners_cache=cache,
+            project_id=project_id,
+            task_type="create",
+            accelerator=None,
+            runner_pins_this_cycle={},
+            dispatch_seed=task_seed,
+        )
+        assert result is not None
+        selected_ids.add(result.id)
+
+    assert len(selected_ids) == 2, (
+        f"Expected both runners to be selected across 20 dispatches, "
+        f"but only {len(selected_ids)} runner(s) were chosen: {selected_ids}"
+    )
+
+
 # ── DeepSeek routing preference invariant ───────────────────────────────────
 
 

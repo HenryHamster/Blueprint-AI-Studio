@@ -367,6 +367,7 @@ async def _try_runner_dispatch(
         accelerator,
         runner_pins_this_cycle,
         preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
+        dispatch_seed=task.id.int,
     )
     if runner is None:
         return False
@@ -569,6 +570,7 @@ def _select_eligible_runner(
     accelerator: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
     preferred_runner_target_id: str | None = None,
+    dispatch_seed: int = 0,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
@@ -579,6 +581,10 @@ def _select_eligible_runner(
     prefers the least EFFECTIVE load — heartbeat-reported active count plus pins
     already made to the runner this cycle — so a same-cycle burst spreads across
     a fleet instead of stacking onto one runner.
+
+    When multiple runners are equally loaded, ``dispatch_seed`` (derived from the
+    dispatched task/job UUID) breaks ties deterministically so repeated dispatch
+    bursts rotate across the fleet rather than always landing on the same runner.
 
     Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
     compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
@@ -607,10 +613,15 @@ def _select_eligible_runner(
     # Deprioritize degraded runners (consecutive_job_failures at threshold) so
     # healthy runners are always preferred; degraded runners remain eligible as
     # a fallback so they can receive a job and reset their failure streak.
+    # Among equally-loaded runners the XOR of the runner id with the dispatch
+    # seed (task UUID int) acts as a stable per-task offset so different tasks
+    # route to different runners instead of always picking the same first entry.
     def _dispatch_sort_key(r: "LocalRunner | RunnerDispatchSnapshot") -> tuple:
         failures = getattr(r, "consecutive_job_failures", 0) or 0
         is_degraded = int(failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD)
-        return (is_degraded, _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0))
+        load = _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0)
+        tiebreak = r.id.int ^ dispatch_seed
+        return (is_degraded, load, tiebreak)
 
     return min(eligible, key=_dispatch_sort_key)
 
@@ -827,6 +838,7 @@ async def _dispatch_compute_experiment_directly(
         preferred_runner_target_id=(task.context or {}).get(
             "preferred_runner_target_id"
         ),
+        dispatch_seed=task.id.int,
     )
 
     project = await session.get(Project, task.project_id)
