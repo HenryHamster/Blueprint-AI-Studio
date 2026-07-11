@@ -7,7 +7,7 @@ import {
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
-  buildStagedDirectionsText,
+  buildStagedDirectionsText, formatDirectionGroundingText,
   MESSAGE_POLL_LIMIT,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
@@ -16,7 +16,8 @@ import {
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
-  decisionsRegisterText,
+  decisionsRegisterText, serializeDecisionsReg, restoreDecisionsReg,
+  DECISIONS_REGISTER_CAP, DECISIONS_REG_MAX_BYTES,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
@@ -984,6 +985,72 @@ describe('decisionsRegisterText decisions register', () => {
   });
 });
 
+describe('serializeDecisionsReg / restoreDecisionsReg round-trip', () => {
+  const makeEntry = (tick: number, key: string): DecisionsRegisterEntry => ({
+    atTick: tick,
+    at: `2026-07-10T12:0${tick}:00Z`,
+    surfaceKey: key,
+    verdict: 'found',
+    note: `Settled decision at tick ${tick} — full-fidelity text, not truncated`,
+  });
+
+  it('test_decisions_reg_roundtrip_restores_entries_across_restart', () => {
+    const reg = [
+      makeEntry(1, 'direction:d-abc'),
+      makeEntry(2, 'qualification'),
+      makeEntry(3, 'direction:d-xyz'),
+    ];
+    const serialized = serializeDecisionsReg(reg);
+    // Must be valid JSON.
+    const parsed: unknown = JSON.parse(serialized);
+    expect(parsed).toBeTruthy();
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).not.toBeNull();
+    expect(restored).toHaveLength(3);
+    if (restored !== null) {
+      expect(restored[0].atTick).toBe(1);
+      expect(restored[0].surfaceKey).toBe('direction:d-abc');
+      expect(restored[0].note).toContain('full-fidelity text');
+      expect(restored[2].surfaceKey).toBe('direction:d-xyz');
+    }
+  });
+
+  it('test_decisions_reg_restore_returns_null_on_bad_input', () => {
+    expect(restoreDecisionsReg(null)).toBeNull();
+    expect(restoreDecisionsReg(undefined)).toBeNull();
+    expect(restoreDecisionsReg('')).toBeNull();
+    expect(restoreDecisionsReg('not-json')).toBeNull();
+    // Non-array entries field degrades to empty array (graceful fallback, not null).
+    expect(restoreDecisionsReg('{"entries":"not-array"}')).toEqual([]);
+  });
+
+  it('test_decisions_reg_serialize_empty_register_restores_to_empty_array', () => {
+    const serialized = serializeDecisionsReg([]);
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).toEqual([]);
+  });
+
+  it('test_decisions_reg_serialize_fits_within_byte_budget', () => {
+    // Build a register with notes long enough to stress the byte budget.
+    const bigReg: DecisionsRegisterEntry[] = Array.from({ length: DECISIONS_REGISTER_CAP }, (_, i) => ({
+      atTick: i,
+      at: `2026-07-10T12:00:00Z`,
+      surfaceKey: `direction:d-${i}`,
+      verdict: 'found',
+      note: 'x'.repeat(500),
+    }));
+    const serialized = serializeDecisionsReg(bigReg);
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(DECISIONS_REG_MAX_BYTES);
+    const restored = restoreDecisionsReg(serialized);
+    expect(restored).not.toBeNull();
+    // All restored entries must be valid.
+    for (const e of restored ?? []) {
+      expect(typeof e.surfaceKey).toBe('string');
+      expect(typeof e.note).toBe('string');
+    }
+  });
+});
+
 describe('buildSurfaceCatalog', () => {
   it('derives direction, diagnostic-fetch, standing, and code:<dir> surfaces', () => {
     const catalog = buildSurfaceCatalog(
@@ -1811,5 +1878,62 @@ describe('residentConfig compaction knobs', () => {
   it('clamps compaction cooldown to minimum 60s', () => {
     const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 10 });
     expect(c.compactionCooldownMs).toBe(60_000);
+  });
+});
+
+describe('formatDirectionGroundingText', () => {
+  it('returns empty string for empty or null directions', () => {
+    expect(formatDirectionGroundingText([])).toBe('');
+    expect(formatDirectionGroundingText(null)).toBe('');
+    expect(formatDirectionGroundingText(undefined)).toBe('');
+  });
+
+  it('formats a single active direction with id and text', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-1', text: 'Improve onboarding flow', status: 'active' },
+    ]);
+    expect(result).toMatch(/refreshed from heartbeat/);
+    expect(result).toContain('./fetch direction dir-1');
+    expect(result).toContain('Improve onboarding flow');
+    expect(result).not.toContain('[ACTIVE]');
+  });
+
+  it('appends status tag for non-active directions', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-2', text: 'Deprecated initiative', status: 'completed' },
+    ]);
+    expect(result).toContain('[COMPLETED]');
+  });
+
+  it('handles missing text gracefully', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'dir-3', text: '', status: 'active' },
+    ]);
+    expect(result).toContain('./fetch direction dir-3');
+    expect(result).not.toContain('—');
+  });
+
+  it('renders multiple directions separated by newlines', () => {
+    const result = formatDirectionGroundingText([
+      { id: 'a', text: 'One', status: 'active' },
+      { id: 'b', text: 'Two', status: 'paused' },
+      { id: 'c', text: 'Three', status: 'active' },
+    ]);
+    const lines = result.split('\n');
+    expect(lines[0]).toBe('(refreshed from heartbeat)');
+    expect(lines).toHaveLength(4); // header + 3 entries
+    expect(lines[1]).toContain('./fetch direction a');
+    expect(lines[2]).toContain('./fetch direction b');
+    expect(lines[2]).toContain('[PAUSED]');
+    expect(lines[3]).toContain('./fetch direction c');
+  });
+
+  it('truncates text beyond 120 characters', () => {
+    const longText = 'a'.repeat(200);
+    const result = formatDirectionGroundingText([
+      { id: 'dir-long', text: longText, status: 'active' },
+    ]);
+    expect(result).toContain('a'.repeat(120));
+    expect(result).not.toContain('a'.repeat(121));
   });
 });

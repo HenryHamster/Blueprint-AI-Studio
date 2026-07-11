@@ -4229,3 +4229,151 @@ def test_compaction_hints_surfaced_when_gap_history_exceeds_threshold():
     # None / empty input.
     assert _build_compaction_hints(None) is None
     assert _build_compaction_hints({}) is None
+
+
+# ---------------------------------------------------------------------------
+# Decisions-register persistence: heartbeat carries decisions_reg into the
+# project.vision blob and mirrors to task.context (same contract as exam
+# ledger — this is a separate write path that also needs explicit coverage).
+# ---------------------------------------------------------------------------
+
+_SAMPLE_DECISIONS_REG = (
+    '{"version": 1, "decisions": ['
+    '{"id": "dec-1", "tick": 1, "summary": "Use agent-foo for X"},'
+    '{"id": "dec-2", "tick": 2, "summary": "Skip Y until Z"}'
+    "]}"
+)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_decisions_reg_persisted_to_blob_and_task_context(db_session):
+    """The heartbeat ``decisions_reg`` field persists ``_decisions_reg`` into
+    the project.vision blob AND mirrors it to the task's ``task.context`` so a
+    full restart (VM recycle, process crash) can restore settled cross-tick
+    decisions instead of falling back to empty."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Establish a baseline lease so we can send a liveness heartbeat.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    baseline_lease = r0["leased_until"]
+    assert baseline_lease is not None
+
+    # Liveness heartbeat carrying the decisions register.
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+        decisions_reg=_SAMPLE_DECISIONS_REG,
+    )
+
+    # --- lease-immutability (liveness does NOT extend) ---------------------------
+    assert result["authority_held"] is True
+    assert result["leased_until"] == baseline_lease
+
+    # --- blob persistence --------------------------------------------------------
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+    assert "_decisions_reg" in blob
+    stored = _json.loads(blob["_decisions_reg"])
+    assert stored["version"] == 1
+    assert len(stored["decisions"]) == 2
+    assert stored["decisions"][0]["id"] == "dec-1"
+    assert stored["decisions"][1]["summary"] == "Skip Y until Z"
+
+    # --- task.context mirror -----------------------------------------------------
+    fresh_task = await db_session.get(Task, task.id)
+    assert fresh_task is not None
+    assert "_decisions_reg" in (fresh_task.context or {})
+    ctx_stored = _json.loads(fresh_task.context["_decisions_reg"])
+    assert ctx_stored["version"] == 1
+    assert len(ctx_stored["decisions"]) == 2
+    assert ctx_stored["decisions"][0]["id"] == "dec-1"
+    assert ctx_stored["decisions"][1]["tick"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Direction-grounding in heartbeat response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_direction_grounding(db_session):
+    """The heartbeat response includes ``direction_grounding`` populated from
+    Direction rows with non-retired statuses, structured as a list of
+    ``{id, text, status}`` dicts. Test verifies both presence and correct
+    structure when active Direction rows exist, and an empty list when none
+    do."""
+    from app.models import Direction as DirectionModel
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # No Direction rows yet → empty list.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    assert r0["direction_grounding"] == []
+
+    # Add active directions with text and status.
+    included_statuses = [
+        ("d-active1", "active", "Build observability dashboards"),
+        ("d-paused1", "paused", "Pause refactoring until data is ready"),
+        ("d-proposed1", "proposed", "Propose new caching layer"),
+    ]
+    excluded_statuses = [
+        ("d-retired1", "retired", "No longer needed"),
+        ("d-completed1", "completed", "Done in v23"),
+    ]
+    for key, status, text in included_statuses + excluded_statuses:
+        db_session.add(
+            DirectionModel(
+                project_id=project.id,
+                direction_key=key,
+                status=status,
+                text=text,
+                data={},
+            )
+        )
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    grounding = r1["direction_grounding"]
+    assert isinstance(grounding, list)
+
+    # All three included statuses must appear with correct structure.
+    for key, status, text in included_statuses:
+        match = [d for d in grounding if d["id"] == key]
+        assert len(match) == 1, f"{key} should appear once in direction_grounding"
+        assert match[0]["status"] == status
+        assert match[0]["text"] == text
+
+    # All excluded statuses must be absent.
+    for key, _, _ in excluded_statuses:
+        match = [d for d in grounding if d["id"] == key]
+        assert len(match) == 0, f"{key} should be excluded from direction_grounding"
+
+    # Each entry has exactly the three expected keys.
+    for entry in grounding:
+        assert set(entry.keys()) == {"id", "text", "status"}

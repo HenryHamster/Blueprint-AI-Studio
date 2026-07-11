@@ -73,6 +73,11 @@ export interface SessionHeartbeatResponse {
    *  yet retired. Used to refresh the surface catalog between restarts so
    *  new/retired directions enter/leave the rotation mid-session. */
   active_direction_ids?: string[];
+  /** Refreshable direction grounding: id + text + status for every active
+   *  direction. The agent updates its compaction checkpoint context from this
+   *  so the resumed session sees current directions rather than session-start
+   *  snapshots. Absent on older backends — agent degrades to bootstrap data. */
+  direction_grounding?: Array<{id: string; text: string; status: string}>;
 }
 
 /**
@@ -343,6 +348,25 @@ export function compactionThreshold(
     return explicitThreshold > 0 ? explicitThreshold : Number.POSITIVE_INFINITY;
   }
   return Math.floor(modelContextLimit(model) * COMPACTION_THRESHOLD_RATIO);
+}
+
+/**
+ * Format a compact directions section for the compaction checkpoint from
+ * heartbeat-refreshed direction_grounding data. Outputs a simple markdown
+ * list with fetch hints — the full directions_summary fields (cycles, PRs,
+ * etc.) are not available from the heartbeat, so the checkpoint shows a
+ * simpler view with a note to fetch full detail.
+ */
+export function formatDirectionGroundingText(
+  directions: Array<{id: string; text: string; status: string}> | null | undefined,
+): string {
+  if (!directions || directions.length === 0) return '';
+  const entries = directions.map(d => {
+    const statusNote = d.status !== 'active' ? ` [${d.status.toUpperCase()}]` : '';
+    const textNote = d.text ? ` — "${d.text.slice(0, 120)}"` : '';
+    return `- \`./fetch direction ${d.id}\`${textNote}${statusNote}`;
+  });
+  return `(refreshed from heartbeat)\n${entries.join('\n')}`;
 }
 
 export interface CompactionCheckpointContext {
@@ -1649,4 +1673,60 @@ export function decisionsRegisterText(
     lines.push(`- tick-${entry.atTick} [${entry.verdict}] ${entry.surfaceKey || '(none)'}${noteStr} (${entry.at})`);
   }
   return lines.join('\n');
+}
+
+/** Max byte size for the serialized decisions register persisted in the heartbeat. */
+export const DECISIONS_REG_MAX_BYTES = 32_000;
+
+/**
+ * Serialize the decisions register for heartbeat persistence.
+ * The result is stored as ``_decisions_reg`` in task.context and restored on
+ * full session restart so the strategist retains its settled-decision memory
+ * across process death/VM recycles (not just across in-process compaction).
+ */
+export function serializeDecisionsReg(register: DecisionsRegisterEntry[]): string {
+  const trimmed = register.slice(-DECISIONS_REGISTER_CAP);
+  const candidate = JSON.stringify({ entries: trimmed });
+  if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+    return candidate;
+  }
+  // Trim from the front until it fits.
+  for (let start = 1; start < trimmed.length; start++) {
+    const smaller = JSON.stringify({ entries: trimmed.slice(start) });
+    if (Buffer.byteLength(smaller, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+      return smaller;
+    }
+  }
+  return JSON.stringify({ entries: [] });
+}
+
+/**
+ * Restore the decisions register from a persisted string
+ * (``task.context._decisions_reg``). Returns null on parse error so the
+ * caller falls back to a clean empty register.
+ */
+export function restoreDecisionsReg(
+  value: string | undefined | null,
+): DecisionsRegisterEntry[] | null {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const p = parsed as Record<string, unknown>;
+    const rawEntries = Array.isArray(p.entries) ? p.entries : [];
+    const entries: DecisionsRegisterEntry[] = rawEntries
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .filter(e => typeof e.surfaceKey === 'string')
+      .slice(0, DECISIONS_REGISTER_CAP)
+      .map(e => ({
+        atTick: typeof e.atTick === 'number' ? e.atTick : 0,
+        at: typeof e.at === 'string' ? e.at : '',
+        surfaceKey: String(e.surfaceKey),
+        verdict: typeof e.verdict === 'string' ? e.verdict : '',
+        note: typeof e.note === 'string' ? e.note : '',
+      }));
+    return entries;
+  } catch {
+    return null;
+  }
 }

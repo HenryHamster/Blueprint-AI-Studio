@@ -32,8 +32,9 @@ import {
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
-  compactionThreshold, buildCompactionCheckpoint,
+  compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
   decisionsRegisterText, DECISIONS_REGISTER_CAP,
+  serializeDecisionsReg, restoreDecisionsReg,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
@@ -389,9 +390,13 @@ export async function handleStrategicResident(
 
   // ── Durable decisions register ──────────────────────────────────────────
   // Full-fidelity cross-tick memory of settled decisions, preserved across
-  // compaction restarts so the strategist stops re-deriving settled facts
-  // and re-proposing corrections tick over tick.
-  const decisionsReg: DecisionsRegisterEntry[] = [];
+  // compaction AND full session restarts (VM recycles, process crashes) so
+  // the strategist stops re-deriving settled facts and re-proposing
+  // corrections tick over tick. Restored from task.context._decisions_reg
+  // (written by the heartbeat round-trip, same pattern as the exam ledger).
+  const decisionsReg: DecisionsRegisterEntry[] = restoreDecisionsReg(
+    typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
+  ) ?? [];
 
   // ── Compaction state ─────────────────────────────────────────────────────
   // Track cumulative input tokens (latest turn) and the last compaction time
@@ -400,6 +405,12 @@ export async function handleStrategicResident(
   let compactionCount = 0;
   let lastCompactionAt = 0;
   const projectName = strVal(payload.project_name, 'this project');
+
+  // Refreshable direction grounding from the heartbeat. Initialized as null
+  // (degrading to the bootstrap directionsSummary) and updated on every
+  // heartbeat that returns direction_grounding; the compaction checkpoint
+  // uses this so it shows live directions rather than session-start snapshots.
+  let refreshedDirectionGrounding: Array<{id: string; text: string; status: string}> | null = null;
 
   /** Build the compaction checkpoint context from current handler state. */
   const buildCheckpointContext = (): CompactionCheckpointContext => {
@@ -439,7 +450,9 @@ export async function handleStrategicResident(
       strategicMemoryNotesText: strategicMemoryNotesText || undefined,
       openMessagesText: buildOpenMessagesText(openMessages) || undefined,
       priorSessionContextText: priorSessionContextText || undefined,
-      directionsText: buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
+      directionsText: refreshedDirectionGrounding
+        ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
+        : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
       runningUpdate: strVal(payload.running_update) || undefined,
       decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
     };
@@ -695,6 +708,9 @@ export async function handleStrategicResident(
       // blob — surfaced in the snapshot for operator visibility.
       compaction_count: compactionCount,
       last_compaction_at: lastCompactionAt > 0 ? new Date(lastCompactionAt).toISOString() : null,
+      // Persist the decisions register so a full restart (VM recycle, process
+      // crash) can restore settled decisions from task.context._decisions_reg.
+      decisions_reg: decisionsReg.length > 0 ? serializeDecisionsReg(decisionsReg) : null,
     };
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
@@ -714,6 +730,12 @@ export async function handleStrategicResident(
       // newly created or retired directions enter/leave the rotation mid-session.
       if (Array.isArray(resp.active_direction_ids)) {
         surfaceCatalog = refreshSurfaceCatalog(surfaceCatalog, resp.active_direction_ids, payload);
+      }
+      // Refresh direction grounding from the heartbeat so compaction
+      // checkpoints receive live direction text/status rather than the
+      // session-start snapshot baked into directionsSummary.
+      if (Array.isArray(resp.direction_grounding)) {
+        refreshedDirectionGrounding = resp.direction_grounding;
       }
       return resp;
     } catch (e) {

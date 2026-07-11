@@ -1962,6 +1962,7 @@ async def renew_resident_session_lease(
     turn_latency_summary: dict | None = None,
     compaction_count: int | None = None,
     last_compaction_at: str | None = None,
+    decisions_reg: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -2046,20 +2047,23 @@ async def renew_resident_session_lease(
             pass
 
     # Cheap indexed read of live direction keys for the agent's surface-catalog
-    # refresh. Returns only non-retired directions so newly created or newly
+    # refresh AND direction_grounding (text + status) so the compaction
+    # checkpoint can show current directions rather than session-start
+    # snapshots. Returns only non-retired directions so newly created or newly
     # retired directions immediately enter/leave the rotation on the next tick.
-    active_direction_ids: list[str] = list(
-        (
-            await session.execute(
-                select(Direction.direction_key).where(
-                    Direction.project_id == project.id,
-                    Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
-                )
+    _direction_rows = (
+        await session.execute(
+            select(Direction.direction_key, Direction.text, Direction.status).where(
+                Direction.project_id == project.id,
+                Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
+    active_direction_ids = [str(row[0]) for row in _direction_rows]
+    direction_grounding: list[dict[str, str]] = [
+        {"id": str(row[0]), "text": str(row[1] or ""), "status": str(row[2])}
+        for row in _direction_rows
+    ]
 
     # Stop-requested / ended (pre-lock snapshot): do NOT renew — let the lease
     # lapse so the cadence can reclaim, and signal the agent to wind down.
@@ -2076,6 +2080,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
 
     # Unattended cap: compare now against the last operator interaction, taking
@@ -2225,6 +2230,11 @@ async def renew_resident_session_lease(
         # an opaque blob the agent reads back via ``task.context`` on startup.
         if exam_ledger_str is not None:
             updated["_exam_ledger"] = exam_ledger_str
+        # Persist the decisions register so a full restart (VM recycle, process
+        # crash) can restore settled cross-tick decisions instead of falling back
+        # to empty (which re-opens the re-derivation gap the register closes).
+        if decisions_reg is not None:
+            updated["_decisions_reg"] = decisions_reg
         # Persist the advancing message cursor so a restart resumes from the
         # high-water mark rather than re-delivering already-answered messages.
         if message_cursor:
@@ -2245,7 +2255,7 @@ async def renew_resident_session_lease(
     # Mirror the exam ledger and message cursor into task.context so a runner
     # restart can read them back on startup (the agent reads task.context at pull
     # time; project.vision is not visible to the agent).
-    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor)
+    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor) or decisions_reg is not None
     if _need_ctx_update:
         try:
             _ledger_task_id = uuid.UUID(task_id)
@@ -2254,7 +2264,7 @@ async def renew_resident_session_lease(
         if _ledger_task_id is not None:
 
             def _mirror_ledger(ctx: dict) -> None:
-                # Only these two keys are the resident-heartbeat's durable
+                # Only these keys are the resident-heartbeat's durable
                 # restart state; every OTHER key in ``ctx`` (e.g. the
                 # strategic-API ``_strategic_api_called`` / ``_strategic_vision_set``
                 # flags) belongs to another writer and is preserved untouched.
@@ -2262,6 +2272,8 @@ async def renew_resident_session_lease(
                     ctx["_exam_ledger"] = exam_ledger_str
                 if message_cursor:
                     ctx["message_cursor"] = message_cursor
+                if decisions_reg is not None:
+                    ctx["_decisions_reg"] = decisions_reg
 
             # Re-read Task.context FRESH under FOR UPDATE (populate_existing)
             # before the read-modify-write so a concurrent strategic-API
@@ -2341,6 +2353,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
     if holder["capped"] or holder["lapsed"]:
         # Finding 1: the unattended cap was exceeded, or the lease genuinely
@@ -2374,6 +2387,7 @@ async def renew_resident_session_lease(
             "work_state_summary": work_state_summary,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
+            "direction_grounding": direction_grounding,
         }
     return {
         "authority_held": bool(cont.get("fresh"))
@@ -2386,6 +2400,7 @@ async def renew_resident_session_lease(
         "work_state_summary": work_state_summary,
         "exam_ledger": exam_ledger_str,
         "active_direction_ids": active_direction_ids,
+        "direction_grounding": direction_grounding,
     }
 
 
@@ -2404,6 +2419,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     turn_latency_summary: dict | None = None
     compaction_count: int | None = None
     last_compaction_at: str | None = None
+    decisions_reg: str | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2437,4 +2453,5 @@ async def resident_session_heartbeat(
         turn_latency_summary=payload.turn_latency_summary,
         compaction_count=payload.compaction_count,
         last_compaction_at=payload.last_compaction_at,
+        decisions_reg=payload.decisions_reg,
     )
