@@ -300,6 +300,101 @@ def test_named_test_cross_cutting_invariants_passes_semantic_grounding():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# named_test — GitHub-verified file list closes the self-declaration trust gap
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_named_test_github_verified_absent_fails_hard():
+    """When the changed-file list comes from GitHub's API (github_verified=True),
+    an absent declared test is an authoritative absence — no soft truncation
+    credit is granted even when the list was truncated.  This closes the agent
+    self-declaration trust gap: an agent can declare any test it likes, but the
+    webhook's GitHub-verified list is the ground truth.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],  # test NOT in list
+        unverified_reason=None,
+    )
+    # Simulate the webhook having stamped the GitHub-verified sentinel alongside
+    # a truncated list: without github_verified the gate would credit soft.
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_truncated"] = True
+    ctx["_pr_changed_files_github_verified"] = True
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False, (
+        "GitHub-verified absent test must fail closed, not receive soft truncation credit"
+    )
+    assert "not among" in verdict.reason
+
+
+def test_named_test_github_verified_present_still_passes():
+    """When the file list is GitHub-verified AND the declared test IS present,
+    the gate still passes (and proves) exactly as before."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_github_verified"] = True
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+
+
+def test_github_verified_sentinel_propagates_through_evaluate_code_acceptance():
+    """stamp_changed_files_signal with github_verified=True sets the sentinel,
+    and evaluate_code_acceptance reads it — confirming the end-to-end seam."""
+    from app.acceptance_gate import stamp_changed_files_signal
+
+    signal = stamp_changed_files_signal(
+        ["backend/app/acceptance_gate.py"], github_verified=True
+    )
+    assert signal.get("_pr_changed_files_github_verified") is True
+
+    # Build a task that would receive soft truncation credit WITHOUT the sentinel
+    # (test absent, list truncated, not github_verified) — verify that adding the
+    # sentinel flips the verdict to hard fail.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_truncated"] = True
+    task.context = ctx
+    # Without github_verified: soft credit
+    without = evaluate_code_acceptance(task)
+    assert without.satisfied is True, "baseline: truncated absent → soft credit"
+
+    # Apply the stamp (as the webhook would) and re-evaluate
+    ctx.update(signal)
+    task.context = ctx
+    with_sentinel = evaluate_code_acceptance(task)
+    assert with_sentinel.satisfied is False, (
+        "with github_verified sentinel: truncated absent → hard fail"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # observable_behavior / downstream_artifact — checkable subset
 # ─────────────────────────────────────────────────────────────────────────────
 

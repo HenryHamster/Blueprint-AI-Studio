@@ -2158,10 +2158,19 @@ function _readDiskMetrics(): { disk_free_mb?: number; disk_total_mb?: number } {
   return {};
 }
 
-function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
+type MetricsResult = { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number };
+
+function _memoryUsageBase(): Pick<MetricsResult, 'rss_mb' | 'heap_used_mb'> {
   const mem = process.memoryUsage();
-  const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
-  const heap_used_mb = Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10;
+  return {
+    rss_mb: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
+    heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10,
+  };
+}
+
+// Sync version for crash handler and sendHeartbeatSync (sync-only contexts).
+function collectMetrics(): MetricsResult {
+  const { rss_mb, heap_used_mb } = _memoryUsageBase();
   // Read cgroup memory (includes agent + Claude Code + all subprocesses).
   // The agent's own RSS (93MB) hides the real picture — Claude Code can use
   // several GB. MemoryMax=6G triggers cgroup OOM killer (SIGKILL, no handler).
@@ -2171,6 +2180,21 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
     const current = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf-8').trim();
     cgroup_mb = Math.round(parseInt(current, 10) / 1024 / 1024);
     const max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
+    if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
+  } catch { /* cgroup v2 not available */ }
+  const { disk_free_mb, disk_total_mb } = _readDiskMetrics();
+  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
+}
+
+// Async version for heartbeat ticks — avoids blocking the event loop on sysfs reads.
+async function collectMetricsAsync(): Promise<MetricsResult> {
+  const { rss_mb, heap_used_mb } = _memoryUsageBase();
+  let cgroup_mb: number | undefined;
+  let cgroup_limit_mb: number | undefined;
+  try {
+    const current = (await fs.promises.readFile('/sys/fs/cgroup/memory.current', 'utf-8')).trim();
+    cgroup_mb = Math.round(parseInt(current, 10) / 1024 / 1024);
+    const max = (await fs.promises.readFile('/sys/fs/cgroup/memory.max', 'utf-8')).trim();
     if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
   } catch { /* cgroup v2 not available */ }
   const { disk_free_mb, disk_total_mb } = _readDiskMetrics();
@@ -2208,7 +2232,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   // unhandledRejection event, the agent just goes silent until the orchestrator
   // reaper kills it minutes later with no forensic record.
   (async () => {
-    const metrics = collectMetrics();
+    const metrics = await collectMetricsAsync();
     const fix_loop_events = collectFixLoopEventsForFlush();
     const statusMessage = getMessage();
     const tool_trace = snapshotToolTrace({ refreshLastEntry: statusMessage.startsWith('Using tool:') });
@@ -2271,7 +2295,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     heartbeatInFlightSince = Date.now();
     const myGeneration = ++heartbeatGeneration;
     const start = Date.now();
-    const metrics = collectMetrics();
+    const metrics = await collectMetricsAsync();
     // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
     if (metrics.cgroup_mb && metrics.cgroup_limit_mb) {
       const memPct = metrics.cgroup_mb / metrics.cgroup_limit_mb;
@@ -2333,7 +2357,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
           await new Promise(r => setTimeout(r, delay));
           const retryStart = Date.now();
           try {
-            const retryMetrics = collectMetrics();
+            const retryMetrics = await collectMetricsAsync();
             const retryStatusMessage = getMessage();
             const retryToolTrace = snapshotToolTrace({ refreshLastEntry: retryStatusMessage.startsWith('Using tool:') });
             await apiPost('/api/agent/heartbeat', {

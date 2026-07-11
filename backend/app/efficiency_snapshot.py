@@ -17,6 +17,7 @@ each axis as ``current_value`` / ``baseline_value`` / ``drift_pct``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -2638,7 +2639,7 @@ def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
     return result.asdict()
 
 
-def _compute_prompt_static_bytes() -> int | None:
+async def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
     Reads agent/src/prompt.ts and measures the template-literal constants in
@@ -2659,8 +2660,7 @@ def _compute_prompt_static_bytes() -> int | None:
     if not os.path.exists(prompt_ts):
         return None
     try:
-        with open(prompt_ts, encoding="utf-8") as fh:
-            src = fh.read()
+        src = await asyncio.to_thread(lambda: open(prompt_ts, encoding="utf-8").read())
     except OSError:
         return None
     total = 0
@@ -2679,8 +2679,7 @@ def _compute_prompt_static_bytes() -> int | None:
     if not os.path.exists(task_type_focus_ts):
         return None
     try:
-        with open(task_type_focus_ts, encoding="utf-8") as fh:
-            ttf_src = fh.read()
+        ttf_src = await asyncio.to_thread(lambda: open(task_type_focus_ts, encoding="utf-8").read())
     except OSError:
         return None
     for name in _TASK_TYPE_FOCUS_CONST_NAMES:
@@ -2836,7 +2835,7 @@ async def compute_current_axes(
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
-        AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
+        AXIS_PROMPT_STATIC_BYTES: await _compute_prompt_static_bytes(),
         AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
         AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
         "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),

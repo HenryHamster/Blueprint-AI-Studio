@@ -2315,6 +2315,10 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
     meta["provisioning_deadline_at"] = (
         _utcnow() + timedelta(milliseconds=200)
     ).isoformat()
+    # Exhaust provisioning retry budget so the test still validates terminal
+    # behavior. Without this the new auto-retry logic would extend the deadline
+    # and keep the job STARTING instead of going TIMED_OUT.
+    meta["provisioning_retry_count"] = compute_jobs.MAX_PROVISIONING_RETRY_COUNT
     job.polling_metadata = meta
     job.wall_clock_deadline = _utcnow() + timedelta(milliseconds=200)
     await db_session.commit()
@@ -2408,6 +2412,8 @@ async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
     meta["provisioning_deadline_at"] = (
         _utcnow() - timedelta(seconds=1)
     ).isoformat()
+    # Exhaust retry budget so the test still validates terminal-at-sub-deadline.
+    meta["provisioning_retry_count"] = compute_jobs.MAX_PROVISIONING_RETRY_COUNT
     job.polling_metadata = meta
     # wall_clock_deadline stays far in the future (the full runtime budget).
     assert (job.wall_clock_deadline - _utcnow()).total_seconds() > 1000
@@ -11427,6 +11433,9 @@ async def test_provisioning_deadline_still_terminates_without_heartbeat(
     job.wall_clock_deadline = _utcnow() - timedelta(seconds=10)
     job.last_heartbeat_at = None  # No heartbeat — VM never booted
     job.status = ComputeJobStatus.STARTING
+    # Exhaust retry budget so the test still validates terminal behavior.
+    meta["provisioning_retry_count"] = compute_jobs.MAX_PROVISIONING_RETRY_COUNT
+    job.polling_metadata = meta
     await db_session.commit()
 
     terminate_reasons: list[str] = []
@@ -13478,3 +13487,149 @@ def test_materialize_local_manifest_accepts_normal_path():
     assert expected_file.read_text(encoding="utf-8") == "hello"
     assert "OUTPUT" in env
     assert env["OUTPUT"] == str(expected_file)
+
+
+@pytest.mark.asyncio
+async def test_retry_provisioning_timeout_extends_deadline(db_session):
+    """``_maybe_retry_provisioning_timeout`` extends the provisioning deadline
+    and increments the retry counter when retry budget remains."""
+    project = Project(name="Prov Retry", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="prov retry parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    # Put the job in STARTING (as the monitor does before provisioning timeout).
+    job.status = ComputeJobStatus.STARTING
+    db_session.add(job)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    now = _utcnow()
+
+    # First retry should succeed.
+    result = await compute_jobs._maybe_retry_provisioning_timeout(
+        session_factory, job.id, now
+    )
+    assert result is True
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("provisioning_retry_count") == 1
+    assert "provisioning_deadline_at" in meta
+    assert "retry 1/2" in meta.get("status_message", "")
+
+
+@pytest.mark.asyncio
+async def test_retry_provisioning_timeout_exhausted(db_session):
+    """``_maybe_retry_provisioning_timeout`` returns False when max retries have
+    been consumed, so the caller proceeds with the terminal transition."""
+    project = Project(name="Prov Retry Exhaust", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="prov retry exhaust parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.STARTING
+    # Set retry count at max so budget is exhausted.
+    meta = dict(job.polling_metadata or {})
+    meta["provisioning_retry_count"] = compute_jobs.MAX_PROVISIONING_RETRY_COUNT
+    job.polling_metadata = meta
+    db_session.add(job)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    result = await compute_jobs._maybe_retry_provisioning_timeout(
+        session_factory, job.id, _utcnow()
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_retry_provisioning_timeout_already_terminal(db_session):
+    """``_maybe_retry_provisioning_timeout`` returns True (no-op) when the job
+    is already terminal (concurrent race)."""
+    project = Project(name="Prov Retry Term", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="prov retry term parent",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    # Already terminal → retry should no-op.
+    job.status = ComputeJobStatus.SUCCEEDED
+    db_session.add(job)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    result = await compute_jobs._maybe_retry_provisioning_timeout(
+        session_factory, job.id, _utcnow()
+    )
+    assert result is True

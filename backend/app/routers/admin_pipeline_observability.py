@@ -375,6 +375,7 @@ async def get_fix_loop_convergence(
         .where(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
+            Task.fix_loop_history != {},
         )
         .options(
             load_only(
@@ -390,7 +391,7 @@ async def get_fix_loop_convergence(
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
 
-    _LIMIT = 1000
+    _LIMIT = 200
     result = await session.execute(stmt.limit(_LIMIT))
     tasks = result.scalars().all()
     if len(tasks) >= _LIMIT:
@@ -510,13 +511,14 @@ async def get_fix_loop_convergence_trend(
     """
     cutoff = _utcnow() - timedelta(days=days)
 
-    _TREND_LIMIT = 10_000
+    _TREND_LIMIT = 2_000
 
     stmt = (
         select(Task)
         .where(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
+            Task.fix_loop_history != {},
         )
         .options(
             load_only(

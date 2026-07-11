@@ -3544,6 +3544,7 @@ class Artifact(SQLModel, table=True):
         ),
         Index("ix_artifact_artifact_type", "artifact_type"),
         Index("ix_artifact_task_type", "task_id", "artifact_type"),
+        Index("ix_artifact_created_at", "created_at"),
     )
 
     # Git-based outputs

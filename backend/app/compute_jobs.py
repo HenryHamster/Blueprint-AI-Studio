@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
@@ -69,7 +69,7 @@ from app.models import (
 from app.compute_experiment_contract import resolve_compute_spend_approval
 from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, exponential_backoff
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
     resolve_compute_machine_type,
@@ -121,6 +121,20 @@ COMPUTE_PROVISIONING_DEADLINE_SECONDS = int(
 # indefinitely. Default 20 ≈ 5 minutes at the 15-second poll interval.
 COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES = int(
     os.getenv("COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES", "20")
+)
+# Max retries for provisioning-timeout failures. When a compute job TIMED_OUT
+# during the provisioning phase (before the VM reached RUNNING), the monitor
+# retries up to this many times with backoff before going terminal. Transient
+# GCP infrastructure issues (zone quota exhaustion, image family blips) are
+# recovered without operator intervention.
+MAX_PROVISIONING_RETRY_COUNT = int(
+    os.getenv("COMPUTE_MAX_PROVISIONING_RETRY_COUNT", "2")
+)
+# Base backoff in seconds for each provisioning retry. The actual wait between
+# retries is ``exponential_backoff(retry_number, base=this, cap=600)``, yielding
+# roughly 2 min for retry 1 and 4 min for retry 2.
+PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
+    os.getenv("COMPUTE_PROVISIONING_RETRY_BACKOFF_SECONDS", "120")
 )
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
@@ -1241,24 +1255,52 @@ async def active_compute_job_vm_ids(session) -> set[str]:
     return {vid for vid in result.scalars().all() if vid}
 
 
-async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
-    async with session_factory() as session:
-        result = await session.execute(
-            select(ComputeJob)
-            .where(ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES))
-            .order_by(ComputeJob.created_at)
-        )
-        jobs = result.scalars().all()
+_COMPUTE_JOB_BATCH_SIZE = 50
 
-    for job in jobs:
-        try:
-            await _process_single_compute_job(job, session_factory=session_factory)
-        except Exception as exc:  # noqa: PERF203
-            logger.exception(
-                "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                job.id,
-                exc,
+
+async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
+    last_created_at = None
+    last_id = None
+
+    while True:
+        async with session_factory() as session:
+            stmt = (
+                select(ComputeJob)
+                .where(ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES))
+                .order_by(ComputeJob.created_at, ComputeJob.id)
+                .limit(_COMPUTE_JOB_BATCH_SIZE)
             )
+            if last_created_at is not None:
+                stmt = stmt.where(
+                    or_(
+                        ComputeJob.created_at > last_created_at,
+                        and_(
+                            ComputeJob.created_at == last_created_at,
+                            ComputeJob.id > last_id,
+                        ),
+                    )
+                )
+            result = await session.execute(stmt)
+            jobs = result.scalars().all()
+
+        if not jobs:
+            break
+
+        for job in jobs:
+            try:
+                await _process_single_compute_job(job, session_factory=session_factory)
+            except Exception as exc:  # noqa: PERF203
+                logger.exception(
+                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
+
+        if len(jobs) < _COMPUTE_JOB_BATCH_SIZE:
+            break
+
+        last_created_at = jobs[-1].created_at
+        last_id = jobs[-1].id
 
 
 async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None:
@@ -1407,6 +1449,62 @@ async def _run_and_apply_preflight_smoke(
     )
 
 
+async def _maybe_retry_provisioning_timeout(
+    session_factory,
+    job_id: uuid.UUID,
+    now: datetime,
+) -> bool:
+    """Check if a provisioning-timeout job should be retried with backoff.
+
+    A job that TIMED_OUT during provisioning (deadline expired or launch LRO
+    timed out) can be retried up to ``MAX_PROVISIONING_RETRY_COUNT`` times
+    before going terminal, so transient GCP infrastructure issues (zone quota
+    exhaustion, image family blips, transient 503s) are recovered without
+    operator intervention.
+
+    Returns True when the job's provisioning deadline has been extended for
+    retry (the caller should return without marking the job terminal). Returns
+    False when retry budget is exhausted (caller should proceed with the
+    terminal transition).
+
+    The retry count is stored in ``polling_metadata['provisioning_retry_count']``;
+    the provisioning deadline is reset to ``now + backoff`` so the next monitor
+    tick attempts a fresh launch.
+    """
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return True  # Already terminal — concurrent race, no-op.
+        meta = dict(live.polling_metadata or {})
+        retry_count = int(meta.get("provisioning_retry_count", 0))
+        if retry_count >= MAX_PROVISIONING_RETRY_COUNT:
+            return False  # Budget exhausted — let the caller go terminal.
+        retry_count += 1
+        backoff = exponential_backoff(
+            retry_count,
+            base=PROVISIONING_RETRY_BACKOFF_BASE_SECONDS,
+            cap=600.0,
+        )
+        new_deadline = now + timedelta(seconds=backoff)
+        meta["provisioning_retry_count"] = retry_count
+        meta["provisioning_deadline_at"] = new_deadline.isoformat()
+        meta["status_message"] = (
+            f"provisioning timed out (retry {retry_count}/{MAX_PROVISIONING_RETRY_COUNT})"
+        )
+        live.polling_metadata = meta
+        live.updated_at = now
+        session.add(live)
+        await session.commit()
+    logger.info(
+        "[COMPUTE_JOB] provisioning retry %d/%d for job=%s (backoff=%.0fs)",
+        retry_count,
+        MAX_PROVISIONING_RETRY_COUNT,
+        job_id,
+        backoff,
+    )
+    return True
+
+
 async def _process_single_compute_job(
     job: ComputeJob, *, session_factory=AsyncSessionLocal
 ) -> None:
@@ -1503,6 +1601,10 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
+            if await _maybe_retry_provisioning_timeout(
+                session_factory, job.id, now
+            ):
+                return
             await _apply_polled_compute_job_result(
                 session_factory,
                 job.id,
@@ -1594,6 +1696,10 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
+            if await _maybe_retry_provisioning_timeout(
+                session_factory, job.id, now
+            ):
+                return
             await _apply_polled_compute_job_result(
                 session_factory,
                 job.id,

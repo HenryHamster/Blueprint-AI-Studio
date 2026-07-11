@@ -447,7 +447,7 @@ async def build_workbench_event_feed(
         Task.started_at,
         Task.created_at,
     )
-    task_activity_source_limit = max(source_limit, min(200, bounded_limit * 4))
+    task_activity_source_limit = source_limit
     _first_payload_col = Task.payloads[0].label("_projected_first_payload")
     task_base_query = (
         select(Task, _first_payload_col)

@@ -186,7 +186,9 @@ def _changed_files(task: Task) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
-def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+def stamp_changed_files_signal(
+    paths: list[str], *, github_verified: bool = False
+) -> dict[str, Any]:
     """Non-lossy acceptance signal for a PR's changed-file paths.
 
     ``_pr_changed_files`` is truncated to 50 entries when stamped onto task
@@ -197,6 +199,12 @@ def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
     that fails closed. Compute the acceptance-relevant summary over the FULL list
     here (whether any test path and any production path shipped, and whether the
     stored list was truncated) so downstream classification is truncation-proof.
+
+    When ``github_verified=True``, the caller sourced the file list directly from
+    GitHub's API rather than from the agent's self-report. The
+    ``_pr_changed_files_github_verified`` sentinel is stamped alongside so the
+    ``named_test`` gate can distinguish authoritative absence (hard fail) from an
+    agent self-report truncation (soft credit).
     """
     str_paths = [p for p in paths if isinstance(p, str) and p.strip()]
     signal: dict[str, Any] = {
@@ -206,6 +214,8 @@ def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
     }
     if len(str_paths) > 50:
         signal["_pr_changed_files_truncated"] = True
+    if github_verified:
+        signal["_pr_changed_files_github_verified"] = True
     return signal
 
 
@@ -311,6 +321,7 @@ def _evaluate_named_test(
     changed: list[str],
     verified: bool,
     truncated: bool = False,
+    github_verified: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -330,11 +341,17 @@ def _evaluate_named_test(
     artifact and block its merge from crediting as success, so instead the merge
     is credited soft (``satisfied=True, proven=False``) — the specific test could
     not be machine-verified from the truncated input.
+
+    ``github_verified`` marks that the changed-file list was sourced directly from
+    GitHub's API rather than from the agent's self-report. When the list is
+    GitHub-verified, an absent declared test is an authoritative absence — the
+    soft truncation credit is suppressed even when ``truncated=True`` because
+    GitHub's API paginates fully and the absence is not a data artifact.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
     if not test_present:
-        if truncated:
+        if truncated and not github_verified:
             return AcceptanceGateVerdict(
                 True,
                 True,
@@ -610,9 +627,12 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     changed = _changed_files(task)
     verified = _merge_was_test_verified(task)
     truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
+    github_verified_files = bool((task.context or {}).get("_pr_changed_files_github_verified"))
 
     if evidence.kind == "named_test":
-        return _evaluate_named_test(evidence, changed, verified, truncated)
+        return _evaluate_named_test(
+            evidence, changed, verified, truncated, github_verified=github_verified_files
+        )
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)

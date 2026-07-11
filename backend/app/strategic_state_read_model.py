@@ -218,6 +218,9 @@ async def _task_focus_bucket(
             select(func.count()).select_from(Task).where(*base_filters)
         )
         total = count_result.scalar() or 0
+    total = int(total)
+    if total == 0:
+        return {"total": 0, "limit": limit, "has_more": False, "items": []}
     rows_result = await session.execute(
         select(Task, task_type_expr, direction_id_expr)
         .where(*base_filters)
@@ -245,7 +248,6 @@ async def _task_focus_bucket(
         .order_by(*order_by)
         .limit(limit)
     )
-    total = int(total)
     rows = rows_result.all()
     return {
         "total": total,
