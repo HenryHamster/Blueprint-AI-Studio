@@ -1625,6 +1625,7 @@ export interface FleetRunner {
     task_types?: string | string[];
     has_gpu?: boolean;
     max_concurrent?: number;
+    max_concurrent_compute?: number;
     // Task ids the runner reported as currently executing in its last heartbeat.
     active_task_ids?: string[];
     active_compute_job_ids?: string[];
@@ -1663,9 +1664,13 @@ export interface FleetRunner {
     active_compute_job_count?: number;
     active_work_count?: number;
     max_concurrent: number | null;
+    max_concurrent_compute?: number | null;
     available_slots: number | null;
+    available_agent_slots?: number | null;
+    available_compute_slots?: number | null;
     stale_reason: string | null;
     agent_available?: boolean | null;
+    agent_unavailable_reason?: string | null;
     liveness_window_seconds: number;
     // Trust telemetry surfaced from the backend health computation.
     last_successful_job_at?: string | null;
@@ -1755,7 +1760,7 @@ export async function revokeFleetRunner(projectId: string, runnerId: string): Pr
 export async function updateRunnerCapabilities(
   projectId: string,
   runnerId: string,
-  capabilities: { max_concurrent?: number; task_types?: string | string[] },
+  capabilities: { max_concurrent?: number; task_types?: string | string[]; max_concurrent_compute?: number },
 ): Promise<FleetRunner> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/capabilities`,
@@ -1766,6 +1771,98 @@ export async function updateRunnerCapabilities(
     const msg = data?.detail || `Failed to update runner capabilities: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to update runner capabilities: ${res.status}`);
   }
+  return res.json();
+}
+
+/** Update a runner's lifecycle status (pause / drain / resume).
+ * Valid transitions: active→paused, active→draining, paused→active, draining→active, draining→paused.
+ * Returns the updated runner view. */
+export async function patchRunnerStatus(
+  projectId: string,
+  runnerId: string,
+  status: 'active' | 'paused' | 'draining',
+): Promise<FleetRunner> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/status`,
+    { method: 'PATCH', body: JSON.stringify({ status }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update runner status: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update runner status: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** One heartbeat time-series snapshot for a runner (from RunnerHeartbeatSnapshot). */
+export interface RunnerTelemetrySnapshot {
+  captured_at: string | null;
+  gpu_utilization_pct: number | null;
+  disk_free_bytes: number | null;
+  memory_free_bytes: number | null;
+  cpu_load_avg: number | null;
+  active_task_count: number;
+  active_compute_job_count: number;
+  agent_available: boolean | null;
+}
+
+export interface RunnerTelemetryResponse {
+  runner_id: string;
+  since_seconds: number;
+  count: number;
+  /** Oldest-first, ready to plot left-to-right. */
+  snapshots: RunnerTelemetrySnapshot[];
+}
+
+/** Fetch recent heartbeat time-series snapshots for one runner (default last hour). */
+export async function fetchRunnerTelemetry(
+  projectId: string,
+  runnerId: string,
+  opts?: { sinceSeconds?: number; limit?: number },
+): Promise<RunnerTelemetryResponse> {
+  const params = new URLSearchParams();
+  if (opts?.sinceSeconds != null) params.set('since', String(opts.sinceSeconds));
+  if (opts?.limit != null) params.set('limit', String(opts.limit));
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/telemetry${qs ? `?${qs}` : ''}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch runner telemetry: ${res.status}`);
+  return res.json();
+}
+
+export interface RunnerOutcome {
+  job_id: string;
+  task_id: string | null;
+  status: string;
+  outcome: string | null;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
+export interface RunnerStatsResponse {
+  runner_id: string;
+  jobs_run_count: number;
+  jobs_terminal_count: number;
+  jobs_succeeded_count: number;
+  /** succeeded / terminal, or null when no terminal jobs yet. */
+  jobs_success_rate: number | null;
+  last_n_outcomes: RunnerOutcome[];
+}
+
+/** Fetch per-runner compute-job rollups: total, success rate, recent outcomes. */
+export async function fetchRunnerStats(
+  projectId: string,
+  runnerId: string,
+  opts?: { recentLimit?: number },
+): Promise<RunnerStatsResponse> {
+  const params = new URLSearchParams();
+  if (opts?.recentLimit != null) params.set('recent_limit', String(opts.recentLimit));
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/stats${qs ? `?${qs}` : ''}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch runner stats: ${res.status}`);
   return res.json();
 }
 

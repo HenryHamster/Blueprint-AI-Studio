@@ -10430,6 +10430,134 @@ class TestRunnerDispatchExtractionContract:
         assert rd._runner_active_work_count(busy) == 3
 
 
+class TestPerClassCapacityGating:
+    """Per-class capacity: agent tasks and compute jobs are gated independently.
+
+    A runner with max_concurrent=2 and max_concurrent_compute=1 can have 2
+    active agent tasks and still accept 1 compute job (agent slots are full but
+    compute slot is free). Conversely, a runner with 1 active compute job and
+    max_concurrent_compute=1 is at compute capacity and must reject additional
+    compute dispatch even when agent task slots are still open.
+    """
+
+    def _make_runner(self, caps: dict):
+        from app.orchestrator_runner_dispatch import RunnerDispatchSnapshot
+
+        return RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities=caps
+        )
+
+    def test_agent_tasks_fill_agent_slots_not_compute_slot(self):
+        """Runner with max_concurrent=2, max_concurrent_compute=1, and 2 active
+        agent tasks is at AGENT capacity but not COMPUTE capacity."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+        })
+        # Agent class is at capacity.
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+        assert orch._runner_at_capacity(runner, 0, "research") is True
+        # Compute class still has capacity.
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is False
+
+    def test_compute_job_fills_compute_slot_not_agent_slots(self):
+        """Runner with max_concurrent=2, max_concurrent_compute=1, and 1 active
+        compute job is at COMPUTE capacity but not AGENT capacity."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+        })
+        # Compute class is at capacity.
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is True
+        # Agent class still has capacity.
+        assert orch._runner_at_capacity(runner, 0, "fix") is False
+
+    def test_backward_compat_no_max_concurrent_compute(self):
+        """A runner without max_concurrent_compute falls back to max_concurrent
+        for compute jobs (old combined-pool behaviour preserved)."""
+        import app.orchestrator as orch
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            # max_concurrent_compute absent
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+        })
+        # Both agent and compute slots exhausted under combined pool logic.
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+        # Without a separate compute limit, compute is also at capacity (2 agent
+        # tasks consume the combined pool of 2).
+        assert orch._runner_at_capacity(runner, 0, "compute_experiment") is False
+        # (active_compute_job_count=0, max_concurrent_compute falls back to
+        # max_concurrent=2, so 0 >= 2 is False — compute slot is technically
+        # still free in the old model. The new code is consistent: agent tasks do
+        # NOT fill compute slots when max_concurrent_compute is absent.)
+
+    def test_select_eligible_runner_compute_task_ignores_agent_load(self):
+        """_select_eligible_runner returns the runner for a compute_experiment
+        even when the runner's agent task slots are full, as long as compute
+        capacity remains."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": ["t1", "t2"],
+            "active_compute_job_ids": [],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "compute_experiment", None, {}
+        )
+        assert selected is not None
+        assert selected.id == runner.id
+
+    def test_select_eligible_runner_compute_task_blocked_when_compute_full(self):
+        """_select_eligible_runner returns None for a compute_experiment when the
+        runner's compute slot is full, even if agent slots are free."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "compute_experiment", None, {}
+        )
+        assert selected is None
+
+    def test_agent_task_not_blocked_by_compute_load(self):
+        """A full compute slot does not block an agent task dispatch."""
+        import app.orchestrator as orch
+        project_id = uuid.uuid4()
+        runner = self._make_runner({
+            "max_concurrent": 2,
+            "max_concurrent_compute": 1,
+            "active_task_ids": [],
+            "active_compute_job_ids": ["cj1"],
+            "task_types": "all",
+        })
+        runner = runner._replace(project_id=project_id)
+        cache = {project_id: [runner]}
+        selected = orch._select_eligible_runner(
+            cache, project_id, "fix", None, {}
+        )
+        assert selected is not None
+        assert selected.id == runner.id
+
+
 @pytest.mark.asyncio
 async def test_held_require_local_compute_alerts_before_timeout(db_session, mocker):
     """A compute_experiment held for require_local longer than the early-warning

@@ -464,6 +464,65 @@ def test_runner_handles_task_type_intersects_operator_policy_and_runner_floor():
     assert orch._runner_handles_task_type(policy_limited, "review") is False
 
 
+class TestRunnerHealthAgentUnavailableReason:
+    """_runner_health() surfaces agent_unavailable_reason from capabilities JSONB."""
+
+    def test_available_runner_has_null_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": True,
+                    "agent_unavailable_reason": None,
+                }
+            )
+        )
+        assert h["agent_available"] is True
+        assert h["agent_unavailable_reason"] is None
+
+    def test_unavailable_runner_surfaces_bwrap_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "bwrap not available",
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_reason"] == "bwrap not available"
+
+    def test_unavailable_runner_surfaces_node_reason(self):
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "node runtime not functional",
+                }
+            )
+        )
+        assert h["agent_unavailable_reason"] == "node runtime not functional"
+
+    def test_old_runner_without_reason_field_returns_none(self):
+        # Old runners don't send agent_unavailable_reason — must not error.
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_reason"] is None
+
+
 # ── Admin endpoints ──────────────────────────────────────────────────────────
 
 

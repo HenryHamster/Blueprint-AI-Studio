@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -4846,6 +4847,78 @@ class LocalRunner(SQLModel, table=True):
             "ix_localrunner_project_status",
             "project_id",
             "status",
+        ),
+    )
+
+
+class RunnerHeartbeatSnapshot(SQLModel, table=True):
+    """Append-only time-series of runner heartbeat telemetry.
+
+    The ``LocalRunner.capabilities`` JSONB holds only the *latest* telemetry
+    values — each heartbeat overwrites the previous ones — so there is no
+    history to sparkline GPU/disk/memory pressure over time, and per-runner
+    outcome rollups can only be computed by scanning every ``ComputeJob`` row.
+    This table captures one row per heartbeat (fire-and-forget on the heartbeat
+    path) so the Fleet panel can show recent trends without touching the hot
+    dispatch cache. Rows are retention-trimmed (default 7 days) by a periodic
+    sweep — they are pure telemetry, never a source of truth for dispatch.
+    """
+
+    __tablename__ = "runner_heartbeat_snapshot"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the runner so snapshots never outlive their runner row.
+    # No standalone index here: the composite (runner_id, captured_at) index
+    # below already covers the FK prefix and the per-runner window query, so a
+    # second single-column index would only add write cost on this hot path.
+    runner_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+    # When the telemetry was captured (heartbeat receipt time). Indexed so the
+    # per-runner recent-window query and the retention-cleanup delete are both
+    # index-driven.
+    captured_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
+    )
+    gpu_utilization_pct: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    disk_free_bytes: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    memory_free_bytes: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    cpu_load_avg: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    active_task_count: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    active_compute_job_count: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    agent_available: bool | None = Field(
+        default=None, sa_column=Column(Boolean, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # Retention-cleanup + per-runner recent-window scans both filter on
+        # (runner_id, captured_at). A composite index serves the panel query
+        # (one runner, last hour) and the sweep's global age filter.
+        Index(
+            "ix_runner_heartbeat_snapshot_runner_captured",
+            "runner_id",
+            "captured_at",
         ),
     )
 

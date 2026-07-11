@@ -911,6 +911,7 @@ class RunnerSubprocessBackend:
                 finished_at=finished_at or _utcnow(),
                 metrics=metrics,
                 command_log=command_log,
+                message="compute job succeeded" if cjs == ComputeJobStatus.SUCCEEDED else "compute job failed",
             )
         # Unknown status string — treat as still running.
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)

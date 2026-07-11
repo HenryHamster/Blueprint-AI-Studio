@@ -39,7 +39,7 @@ from app.broadcast import broadcast_to_project
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
-from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
+from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -155,10 +155,51 @@ def _parse_heartbeat_timestamp(raw: str | None) -> datetime | None:
     return parsed
 
 
+async def _persist_heartbeat_snapshot(
+    session: AsyncSession, *, runner_id: uuid.UUID, caps: Dict[str, Any]
+) -> None:
+    """Append one RunnerHeartbeatSnapshot row from the just-committed heartbeat.
+
+    Best-effort telemetry history: reads the display-only telemetry the handler
+    already merged into ``caps`` and writes a single time-series row. Any failure
+    (bad value, DB hiccup) is swallowed and the session rolled back so the
+    heartbeat response is never blocked or failed by snapshot persistence — the
+    LocalRunner.capabilities dict remains the dispatch source of truth.
+    """
+    try:
+        snapshot = RunnerHeartbeatSnapshot(
+            runner_id=runner_id,
+            gpu_utilization_pct=caps.get("gpu_utilization_pct"),
+            disk_free_bytes=caps.get("disk_free_bytes"),
+            memory_free_bytes=caps.get("memory_free_bytes"),
+            cpu_load_avg=caps.get("cpu_load_avg"),
+            active_task_count=len(caps.get("active_task_ids") or []),
+            active_compute_job_count=len(caps.get("active_compute_job_ids") or []),
+            agent_available=caps.get("agent_available"),
+        )
+        session.add(snapshot)
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "[RUNNERS] Failed to persist heartbeat snapshot for %s", runner_id
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[RUNNERS] rollback after heartbeat-snapshot failure failed for %s",
+                runner_id,
+            )
+
+
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
     active_compute_job_ids: List[str] = []
     agent_available: StrictBool | None = None
+    # Why the agent is unavailable (null when agent_available=True or unknown).
+    # Named failing leg(s): "bwrap not available", "agent binary not found",
+    # "node runtime not functional", "docker agent unavailable", or compound.
+    agent_unavailable_reason: str | None = None
     # Runner-DECLARED agent capability floor (optional; old runners omit it). A
     # docker-only runner (docker+image, NO bwrap) can run only the read-only agent
     # slice and declares those types here so the orchestrator intersects them with
@@ -516,7 +557,10 @@ async def heartbeat(
     # active here. This is the reactivation half of allowing inactive runners to
     # authenticate (see auth.verify_runner_token). Never resurrects a deleted row:
     # a deleted runner can no longer authenticate, so it never reaches this handler.
-    runner.status = "active"
+    # Do NOT re-arm operator-paused or draining runners — they heartbeat to keep
+    # liveness telemetry current, but their dispatch status must stay as set.
+    if runner.status not in ("paused", "draining"):
+        runner.status = "active"
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
     caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
@@ -525,6 +569,10 @@ async def heartbeat(
     # operator-configured fields (task_types, max_concurrent).
     if payload.agent_available is not None:
         caps["agent_available"] = payload.agent_available
+    if payload.agent_unavailable_reason is not None or payload.agent_available is True:
+        caps["agent_unavailable_reason"] = (
+            None if payload.agent_available else payload.agent_unavailable_reason
+        )
     # Runner-DECLARED agent capability floor. Stored under its own caps key so the
     # orchestrator can intersect it with the operator-configured `task_types`
     # ceiling. CRITICAL: this is a runner capability, NOT operator config — we never
@@ -572,10 +620,26 @@ async def heartbeat(
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:
-        runner.version = payload.version[:64]
+        new_version = payload.version[:64]
+        # Stamp the moment a self-update lands (version string changed) so the
+        # post-update silent-offline sweep can detect a runner that reported a
+        # new version and then went silent — the exact tmux/nohup failure mode
+        # where a successful auto-update kills the process with no supervisor to
+        # restart it. Only stamped on a genuine change so a steady-state runner
+        # never carries a stale "just updated" marker.
+        if previous_version is not None and new_version != previous_version:
+            caps["version_changed_at"] = now.isoformat()
+            caps["previous_version"] = previous_version
+        runner.version = new_version
     runner.capabilities = caps
     session.add(runner)
     await session.commit()
+    # Append one time-series snapshot of this heartbeat's telemetry. Best-effort
+    # and AFTER the runner commit — the capabilities dict on the LocalRunner row
+    # stays the dispatch source of truth; this table is display-only history for
+    # the Fleet panel's sparklines and per-runner rollups. A snapshot failure
+    # must never fail the heartbeat, so it is fully guarded.
+    await _persist_heartbeat_snapshot(session, runner_id=runner_id, caps=caps)
     await refresh_strategic_local_continuation_on_runner_heartbeat(
         session,
         project_id=runner_project_id,

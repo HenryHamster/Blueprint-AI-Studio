@@ -13149,6 +13149,35 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     assert status_result.status == ComputeJobStatus.SUCCEEDED
     assert status_result.exit_code == 0
     assert status_result.metrics == {"accuracy": 0.99, "loss": 0.01}
+    # message must be non-null so terminal_reason does not fall back to the
+    # stale initial "queued for compute-job launch" status_message.
+    assert status_result.message == "compute job succeeded"
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_status_failed_carries_message():
+    """RunnerSubprocessBackend.poll_status sets message='compute job failed' for
+    a failed job so terminal_reason is not stuck at 'queued for compute-job launch'."""
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME, RunnerSubprocessBackend
+
+    backend = RunnerSubprocessBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "runner_exec_status": "failed",
+            "runner_exit_code": 1,
+            "status_message": "queued for compute-job launch",  # stale initial message
+        },
+    )
+    status_result = await backend.poll_status(job)
+    assert status_result.status == ComputeJobStatus.FAILED
+    assert status_result.exit_code == 1
+    assert status_result.message == "compute job failed"
 
 
 @pytest.mark.asyncio

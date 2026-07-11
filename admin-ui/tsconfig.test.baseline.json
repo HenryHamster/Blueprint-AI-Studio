@@ -54,7 +54,7 @@
     "src/components/FleetRunnersPanel.test.tsx": {
       "TS2352: Conversion of type 'undefined' to type 'string' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.": 2,
       "TS2493: Tuple type '[]' of length '0' has no element at index '0'.": 2,
-      "TS2741: Property 'available_slots' is missing in type '{ device_status: string; device_status_reason: null; is_live: true; seconds_since_last_seen: number; active_task_count: number; active_compute_job_count: number; max_concurrent: number; stale_reason: null; agent_available: true; liveness_window_seconds: number; }' but required in type '{ device_status?: string | undefined; device_status_reason?: string | null | undefined; is_live: boolean; degraded?: boolean | undefined; degraded_reason?: string | null | undefined; ... 15 more ...; failure_streak_threshold?: number | undefined; }'.": 1
+      "TS2741: Property 'available_slots' is missing in type '{ device_status: string; device_status_reason: null; is_live: true; seconds_since_last_seen: number; active_task_count: number; active_compute_job_count: number; max_concurrent: number; stale_reason: null; agent_available: true; liveness_window_seconds: number; }' but required in type '{ device_status?: string | undefined; device_status_reason?: string | null | undefined; is_live: boolean; degraded?: boolean | undefined; degraded_reason?: string | null | undefined; ... 19 more ...; failure_streak_threshold?: number | undefined; }'.": 1
     },
     "src/components/KnowledgeBrowser.test.tsx": {
       "TS2339: Property 'click' does not exist on type 'Element'.": 5,
@@ -200,7 +200,6 @@
       "TS2488: Type 'StrategicContextResourceRef[] | undefined' must have a '[Symbol.iterator]()' method that returns an iterator.": 1
     },
     "src/components/StrategicContextWorkspace.viewport.test.tsx": {
-      "TS2352: Conversion of type '{ attention: { level: string; summary: string; last_seen_at: null; counts: { needs_operator: number; watch: number; unread: number; questions: number; blockers: number; approvals: number; manual_directions: number; failed_tasks: number; blocked_tasks: number; parked_tasks: number; }; items: never[]; }; context_packa...' to type 'StrategicStateResponse' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.": 1,
       "TS2322: Type '{ open: true; state: StrategicStateResponse; accountSpend: { totalAccounts: number; availableAccounts: number; enabledAccounts: number; trackedSpendUsd: number; }; ... 5 more ...; onUpdateSessionRefs: Mock<...>; }' is not assignable to type 'IntrinsicAttributes & StrategicContextWorkspaceProps'.": 1
     },
     "src/components/SystemHealthCard.test.tsx": {
@@ -287,16 +286,6 @@
     },
     "src/test/pipeline-composed.viewport.test.tsx": {
       "TS2322: Type '{ health: { last_cycle_seconds_ago: number; queued_tasks: number; active_tasks: number; pool_info: {}; deploy_state: { status: string; rollback_count: number; rollback_reason: null; pause_reason: null; monitoring_since: null; recent_outcomes: never[]; }; deploy_monitoring: null; }; ... 5 more ...; pipelineThrottle: ...' is not assignable to type 'OrchestratorHealthBarProps'.": 1
-    },
-    "src/test/viewport-coverage.test.ts": {
-      "TS7016: Could not find a declaration file for module './viewport-checks.js'. '/tmp/workspace/admin-ui/src/test/viewport-checks.js' implicitly has an 'any' type.": 1,
-      "TS7006: Parameter 'm' implicitly has an 'any' type.": 2,
-      "TS7006: Parameter 'c' implicitly has an 'any' type.": 1,
-      "TS7006: Parameter 'p' implicitly has an 'any' type.": 1
-    },
-    "src/test/viewport-diff.test.ts": {
-      "TS7016: Could not find a declaration file for module 'pngjs'. '/tmp/workspace/node_modules/pngjs/lib/png.js' implicitly has an 'any' type.": 1,
-      "TS7016: Could not find a declaration file for module '../../scripts/viewport-diff.mjs'. '/tmp/workspace/admin-ui/scripts/viewport-diff.mjs' implicitly has an 'any' type.": 1
     },
     "src/types/workbenchTargets.test.ts": {
       "TS2353: Object literal may only specify known properties, and 'secret' does not exist in type 'WorkbenchTargetInput'.": 1

@@ -28834,3 +28834,184 @@ async def test_get_message_attachment_upload_url_storage_unavailable(
         )
 
     assert resp.status_code == 503, f"Expected 503, got {resp.status_code}: {resp.text}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runner lifecycle: pause / drain / resume (PATCH /runners/{id}/status)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerStatusPatch:
+    """Tests for PATCH /api/admin/projects/{project_id}/runners/{runner_id}/status."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_workbench(self):
+        with patch("app.routers.admin_runners.emit_workbench_refetch", new_callable=AsyncMock):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_active_to_paused(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="a" * 64, hostname="host1", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "paused"
+        await db_session.refresh(runner)
+        assert runner.status == "paused"
+
+    @pytest.mark.asyncio
+    async def test_active_to_draining(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="b" * 64, hostname="host2", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "draining"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "draining"
+        await db_session.refresh(runner)
+        assert runner.status == "draining"
+
+    @pytest.mark.asyncio
+    async def test_paused_to_active(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="c" * 64, hostname="host3", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "active"
+        await db_session.refresh(runner)
+        assert runner.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_draining_to_active(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="d" * 64, hostname="host4", status="draining"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_draining_to_paused(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="e" * 64, hostname="host5", status="draining"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_invalid_transition_paused_to_draining_rejected(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="f" * 64, hostname="host6", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "draining"},
+        )
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.asyncio
+    async def test_deleted_runner_returns_404(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="9" * 64, hostname="gone", status="deleted"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_pause_releases_unpulled_pins(self, client: AsyncClient, db_session):
+        """Pausing a runner must release tasks pinned to it that haven't been pulled yet."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="7" * 64, hostname="pinned", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        # Create a pinned task (PROVISIONING, started_at=None, vm_instance_id=runner:{id})
+        pinned_task = Task(
+            task_type="fix",
+            project_id=project.id,
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(pinned_task)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(pinned_task)
+        # Pin must be released: task goes back to QUEUED with no runner binding
+        assert pinned_task.status == TaskStatus.QUEUED
+        assert pinned_task.vm_instance_id is None
+        assert "runner_target_id" not in (pinned_task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_idempotent_same_status(self, client: AsyncClient, db_session):
+        """Patching to the same status is a no-op (200 returned, no error)."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="8" * 64, hostname="steady", status="paused"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/status",
+            json={"status": "paused"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "paused"

@@ -63,6 +63,29 @@ Flags:
     --check   Print the preflight report and exit (claims no work). Exit code 0
               iff the orchestrator is reachable, the token is valid, and at least
               one task class is claimable.
+    --help/-h Print the RUNNER_RUNBOOK (recommended launch patterns) and exit.
+
+RUNNER_RUNBOOK — recommended launch patterns
+--------------------------------------------
+The runner self-updates: when the orchestrator advertises a newer version and
+the runner is idle, it updates and restarts. For that (and for crash recovery)
+it MUST be under a process supervisor, or wrapped so it comes back:
+
+  * systemd service (preferred) — auto-restarts on crash AND on self-update.
+    Add ``Restart=always`` to the unit; the runner exits 0 after a self-update
+    and systemd restarts the fresh binary.
+
+  * tmux / nohup / screen (manual) — no supervisor. The self-updater detects
+    this and re-execs in place (``os.execv``) so the UPDATE is not lost, but a
+    genuine CRASH still needs a restarter. Wrap the runner in a restart loop:
+
+        while true; do python3 scripts/local_runner.py; sleep 1; done
+
+    Set ``BLUEPRINT_RUNNER_SUPERVISED=1`` in that loop's environment to tell the
+    runner it IS supervised (it then exits cleanly on update instead of
+    re-exec'ing, letting the loop respawn it).
+
+``--check`` reports whether a supervisor was detected and warns if not.
 """
 
 import io
@@ -214,6 +237,88 @@ def _die(reason: str, code: int = 1) -> None:
     except Exception:
         pass  # best-effort only — must not block the exit
     os._exit(code)
+
+
+def _detect_process_supervisor() -> str | None:
+    """Return the name of the process supervisor managing this runner, or None.
+
+    A supervisor is what restarts the runner after it exits (crash or clean
+    exit-for-restart following a self-update). If NONE is detected, the runner
+    was almost certainly launched manually (tmux/nohup/screen) and a plain
+    ``os._exit`` leaves nothing to bring it back — the dgx-1 ~45min-outage
+    failure mode. Detection is intentionally broad and conservative: any
+    positive signal returns a supervisor name; only the genuinely-unsupervised
+    case returns None.
+
+    Signals checked (any hit wins):
+      * ``INVOCATION_ID`` / ``JOURNAL_STREAM`` env → launched by systemd.
+      * ``SUPERVISOR_ENABLED`` env → launched by supervisord.
+      * PID 1 is systemd/supervisord/runit (``/proc/1/comm``) AND we are a
+        child chain of it — a containerized runner with an init supervisor.
+      * ``BLUEPRINT_RUNNER_SUPERVISED=1`` → operator-declared restart wrapper
+        (documented in the RUNNER_RUNBOOK so a ``while true`` loop can opt in).
+    """
+    # systemd sets these for units it launches.
+    if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
+        return "systemd"
+    # supervisord exports this to managed children.
+    if os.environ.get("SUPERVISOR_ENABLED"):
+        return "supervisord"
+    # Operator-declared restart wrapper (see RUNNER_RUNBOOK). Lets a manual
+    # `while true; do local_runner ...; done` loop tell the runner it IS
+    # supervised so it exits cleanly instead of re-exec'ing in place.
+    if os.environ.get("BLUEPRINT_RUNNER_SUPERVISED") == "1":
+        return "declared"
+    # An init-style PID 1 (systemd/supervisord/runit) — typical of a container
+    # whose entrypoint is a supervisor that will restart this process.
+    try:
+        with open("/proc/1/comm", "r") as fh:
+            pid1 = fh.read().strip()
+        if pid1 in ("systemd", "supervisord", "runit", "runsv", "s6-svscan", "tini"):
+            return pid1
+    except Exception:
+        pass
+    return None
+
+
+def _reexec_after_update() -> None:
+    """Replace the current process with the updated runner, or exit for restart.
+
+    Called after a successful auto-update. If a process supervisor is present,
+    ``os._exit(0)`` (the supervisor restarts the fresh binary). If NONE is
+    detected (manual tmux/nohup launch), ``os.execv`` re-execs in place so the
+    updated code takes over WITHOUT relying on an external restarter — the fix
+    for the silent post-update death. Any failure in the re-exec path falls back
+    to ``os._exit(0)`` so we never leave a hung, half-updated process.
+    """
+    supervisor = None
+    try:
+        supervisor = _detect_process_supervisor()
+    except Exception:
+        supervisor = None
+    if supervisor is not None:
+        print(
+            f"[runner] auto-update complete — {supervisor} supervisor detected, "
+            "exiting for restart.",
+            flush=True,
+        )
+        os._exit(0)
+    # No supervisor: re-exec in place so the update is not silently lost.
+    print(
+        "[runner] auto-update complete — NO process supervisor detected "
+        "(manual tmux/nohup/screen launch); re-exec'ing in place so the update "
+        "takes effect. Wrap the runner in systemd or a restart loop to recover "
+        "from crashes too (see --check RUNNER_RUNBOOK).",
+        flush=True,
+    )
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        print(
+            f"[runner] re-exec failed ({exc!r}) — exiting for restart instead.",
+            flush=True,
+        )
+        os._exit(0)
 
 
 # ── Credential persistence ────────────────────────────────────────────────────
@@ -1312,6 +1417,16 @@ def _heartbeat_loop(
             # a distinct runner capability, not a clobber of operator config.
             docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
             agent_available = bwrap_agent_ok or docker_agent_ok
+            if agent_available:
+                agent_unavailable_reason = None
+            elif not agent_sandbox_ok:
+                agent_unavailable_reason = "bwrap not available"
+            elif not agent_binary_present:
+                agent_unavailable_reason = "agent binary not found"
+            elif not _node_runtime_ok():
+                agent_unavailable_reason = "node runtime not functional"
+            else:
+                agent_unavailable_reason = "docker agent unavailable"
             # Runner-DECLARED agent capability floor. A docker-ONLY box (docker+image
             # but NO bwrap) can only run the read-only agent slice — the prod agent
             # image is read-only-parity and write/heavy types would DECLINE at claim
@@ -1350,6 +1465,7 @@ def _heartbeat_loop(
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
                 "agent_available": agent_available,
+                "agent_unavailable_reason": agent_unavailable_reason,
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
@@ -1410,14 +1526,11 @@ def _heartbeat_loop(
                                     # (called inside do_update) will kill this
                                     # process via systemctl restart if a service
                                     # unit is installed. If still alive (no
-                                    # systemd), exit cleanly so any process
-                                    # supervisor restarts the updated runner.
-                                    print(
-                                        "[runner] auto-update complete — "
-                                        "exiting for restart.",
-                                        flush=True,
-                                    )
-                                    os._exit(0)
+                                    # systemd), _reexec_after_update re-execs in
+                                    # place when NO supervisor is detected (the
+                                    # manual tmux/nohup launch that otherwise
+                                    # dies silently), else exits for restart.
+                                    _reexec_after_update()
                                 else:
                                     print(
                                         f"[runner] auto-update failed "
@@ -2972,6 +3085,28 @@ def _preflight(
             flush=True,
         )
 
+    # Process-supervisor check. A runner with no supervisor that self-updates
+    # will `os._exit`/die and never come back (operator-observed dgx-1 ~45min
+    # outage). The auto-updater now re-execs in place when unsupervised, but a
+    # crash still needs a restarter — so surface the recommended launch patterns.
+    supervisor = None
+    try:
+        supervisor = _detect_process_supervisor()
+    except Exception:
+        supervisor = None
+    if supervisor is not None:
+        _fmt("supervisor", f"{supervisor} (auto-restart on crash/update)")
+    else:
+        print(
+            "  supervisor      : NONE DETECTED\n"
+            "                    No process supervisor found. If launched manually\n"
+            "                    (tmux, nohup, screen), the runner recovers from\n"
+            "                    auto-updates via in-place re-exec, but a CRASH will\n"
+            "                    NOT restart it. Wrap it in a restart loop or a\n"
+            "                    systemd service. See RUNNER_RUNBOOK (--help).",
+            flush=True,
+        )
+
     setup_ok = (
         (token_valid or token_401)
         and ws_writable
@@ -2985,6 +3120,7 @@ def _preflight(
         "claimable": claimable,
         "gpu_caps": gpu_caps,
         "workspace_writable": ws_writable,
+        "supervisor": supervisor,
         "setup_ok": setup_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
     }
@@ -3222,6 +3358,11 @@ def _spawn_agent_task(
 
 
 def main() -> None:
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        # Print the module docstring (which carries the RUNNER_RUNBOOK) and exit.
+        print(__doc__ or "", flush=True)
+        return
+
     check_mode = "--check" in sys.argv[1:]
 
     signal.signal(signal.SIGTERM, _handle_signal)

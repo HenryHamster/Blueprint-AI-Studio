@@ -1105,6 +1105,119 @@ async def _resolve_runner_low_disk_alert(
     return len(open_alerts)
 
 
+_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE = "runner.post_update_silent"
+
+
+def _runner_post_update_silent_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_post_update_silent_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    old_version: "str | None" = None,
+    new_version: "str | None" = None,
+    seconds_silent: "int | None" = None,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner self-updated then went silent.
+
+    Fires from the degraded-runner sweep when a runner reported a NEW version and
+    then stopped heartbeating within the post-update window — the tmux/nohup
+    auto-update failure mode where ``os._exit`` killed the process and nothing
+    restarted it (operator-observed dgx-1 ~45min outage). Deduplicated on
+    ``runner.post_update_silent:{runner_id}`` so repeated sweeps bump the
+    occurrence count. Clears via :func:`_resolve_runner_post_update_silent_alert`
+    once the runner heartbeats again. Returns ``True`` when a NEW alert was
+    created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    silent_for = (
+        f"{seconds_silent}s" if seconds_silent is not None else "an unknown interval"
+    )
+    version_note = (
+        f"from {old_version} to {new_version}"
+        if old_version and new_version
+        else f"to {new_version}" if new_version else ""
+    )
+    title = f"Fleet runner silent after self-update: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) reported a "
+        f"version change {version_note} and then went silent for {silent_for}. This "
+        f"is the auto-update-without-supervisor failure mode: the runner replaced "
+        f"itself and no supervisor restarted it. Check the host — if launched via "
+        f"tmux/nohup, wrap it in a restart loop or systemd service. The alert clears "
+        f"automatically when the runner heartbeats again."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_POST_UPDATE_SILENT_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_post_update_silent_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    return True
+
+
+async def _resolve_runner_post_update_silent_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open post-update-silent alert once the runner is live again.
+
+    Companion to :func:`_maybe_create_runner_post_update_silent_alert`. Called
+    from the sweep when the runner has heartbeated within the liveness window.
+    Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_post_update_silent_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 # ── Runner idle-GPU alert ──────────────────────────────────────────────────
 # Fires when a live GPU runner reports GPU utilization below the idle threshold,
 # indicating expensive GPU capacity may be wasting. Mirrors the low-disk pattern:

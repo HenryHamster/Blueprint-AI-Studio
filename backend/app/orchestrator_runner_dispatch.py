@@ -171,6 +171,18 @@ def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     return available is not False
 
 
+def _coerce_max_concurrent(raw) -> int | None:
+    """Coerce a raw capability value to a positive int, or None if invalid."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 _CONTAINER_BACKEND_KEYS = {
     "docker_usable",
     "podman_usable",
@@ -196,37 +208,61 @@ def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapsho
     return any(backends.get(key) for key in _CONTAINER_BACKEND_KEYS)
 
 
-def _runner_at_capacity(
-    runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
-) -> bool:
-    """True when the runner's EFFECTIVE load has reached its declared max_concurrent.
+def _runner_max_concurrent_compute(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> int | None:
+    """Max concurrent compute jobs for this runner, defaulting to max_concurrent.
 
-    Effective load = heartbeat-reported active count (tasks the runner has already
-    pulled and reported) PLUS ``pins_this_cycle`` (tasks pinned to this runner
-    earlier in the SAME dispatch pass but not yet pulled/reported). The
-    heartbeat-reported ``active_task_ids`` lags pins by at least one heartbeat, so
-    without counting same-cycle pins a burst of N QUEUED tasks would all pin to a
-    single idle runner (it reads as load 0 on every iteration) and the surplus —
-    beyond what the runner can actually pull (max_concurrent) — would sit
-    PROVISIONING until falsely reaped. Counting the in-cycle pins caps NEW work
-    per cycle at the runner's real pull capacity.
+    Reads ``capabilities['max_concurrent_compute']`` when set by the runner
+    heartbeat or operator PATCH.  Falls back to ``max_concurrent`` so runners
+    that do not yet advertise a separate compute limit keep the old combined
+    behaviour (backward compatible).
     """
     caps = runner.capabilities or {}
-    raw_max_concurrent = caps.get("max_concurrent")
-    if isinstance(raw_max_concurrent, bool):
-        max_concurrent = None
-    elif isinstance(raw_max_concurrent, float):
-        max_concurrent = (
-            int(raw_max_concurrent) if raw_max_concurrent.is_integer() else None
-        )
-    else:
-        try:
-            max_concurrent = int(raw_max_concurrent)
-        except (TypeError, ValueError):
-            max_concurrent = None
+    raw = caps.get("max_concurrent_compute")
+    if raw is not None:
+        result = _coerce_max_concurrent(raw)
+        if result is not None:
+            return result
+    # Fall back to the combined max_concurrent.
+    return _coerce_max_concurrent(caps.get("max_concurrent"))
+
+
+def _runner_at_compute_capacity(
+    runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
+) -> bool:
+    """True when the runner's compute-job load has reached max_concurrent_compute."""
+    max_compute = _runner_max_concurrent_compute(runner)
+    if max_compute is None:
+        return False
+    return _runner_active_compute_job_count(runner) + pins_this_cycle >= max_compute
+
+
+def _runner_at_capacity(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    pins_this_cycle: int = 0,
+    task_type: str = "agent",
+) -> bool:
+    """True when the runner's EFFECTIVE load has reached its class capacity limit.
+
+    For ``compute_experiment`` tasks, checks the COMPUTE-class capacity:
+    ``active_compute_job_count + pins >= max_concurrent_compute`` (falling back to
+    ``max_concurrent`` when ``max_concurrent_compute`` is absent — backward compat).
+
+    For all other task types (agent), checks the AGENT-class capacity:
+    ``active_task_count + pins >= max_concurrent``.
+
+    The in-cycle pin count prevents over-pinning within a single dispatch pass
+    when the heartbeat-reported active count still reflects the old state.
+    """
+    caps = runner.capabilities or {}
+    if task_type == "compute_experiment":
+        return _runner_at_compute_capacity(runner, pins_this_cycle)
+    # Agent task: check active AGENT task count against max_concurrent.
+    max_concurrent = _coerce_max_concurrent(caps.get("max_concurrent"))
     if max_concurrent is None:
         return False
-    return _runner_active_work_count(runner) + pins_this_cycle >= max_concurrent
+    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
 
 
 async def _load_active_runners_cache(
@@ -627,12 +663,13 @@ def _select_eligible_runner(
     a single eligibility / least-loaded rule.
     """
     candidates = active_runners_cache.get(project_id) or []
+    pins = runner_pins_this_cycle
     eligible = [
         r
         for r in candidates
         if _runner_handles_task_type(r, task_type)
         and (task_type == "compute_experiment" or _runner_agent_available(r))
-        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
+        and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
     ]
     if accelerator:
         eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
@@ -651,13 +688,20 @@ def _select_eligible_runner(
     # Deprioritize degraded runners (consecutive_job_failures at threshold) so
     # healthy runners are always preferred; degraded runners remain eligible as
     # a fallback so they can receive a job and reset their failure streak.
+    # Sort by per-class load so compute tasks sort by compute load and agent tasks
+    # sort by agent load — preventing one class from starving the other.
     # Among equally-loaded runners the XOR of the runner id with the dispatch
     # seed (task UUID int) acts as a stable per-task offset so different tasks
     # route to different runners instead of always picking the same first entry.
+    is_compute = task_type == "compute_experiment"
+
     def _dispatch_sort_key(r: "LocalRunner | RunnerDispatchSnapshot") -> tuple:
         failures = getattr(r, "consecutive_job_failures", 0) or 0
         is_degraded = int(failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD)
-        load = _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0)
+        if is_compute:
+            load = _runner_active_compute_job_count(r) + pins.get(r.id, 0)
+        else:
+            load = _runner_active_task_count(r) + pins.get(r.id, 0)
         tiebreak = r.id.int ^ dispatch_seed
         return (is_degraded, load, tiebreak)
 
