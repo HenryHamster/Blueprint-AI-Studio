@@ -1,4 +1,4 @@
-import { useState, type ComponentProps, type MutableRefObject, type ReactNode } from 'react';
+import { lazy, Suspense, useState, type ComponentProps, type MutableRefObject, type ReactNode } from 'react';
 import {
   RotateCw,
   Users,
@@ -6,13 +6,14 @@ import {
 } from 'lucide-react';
 import { ProjectToolHost } from './ProjectToolHost';
 import { DirectionsPanel } from './DirectionsPanel';
-import { ComputeJobsPanel } from './ComputeJobsPanel';
+const ComputeJobsPanel = lazy(() => import('./ComputeJobsPanel').then(m => ({ default: m.ComputeJobsPanel })));
 import { DashboardHome } from './DashboardHome';
 import { ConsoleHome } from './ConsoleHome';
 import { CompletionDebtPanel } from './CompletionDebtPanel';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
 import { RuntimeAccountsPanel } from './RuntimeAccountsPanel';
-import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
+import type { SettingsSectionRouterProps } from './SettingsSectionRouter';
+const SettingsSectionRouter = lazy(() => import('./SettingsSectionRouter').then(m => ({ default: m.SettingsSectionRouter })));
 import type { Task } from './TaskCard';
 import { WarmVmPanel } from './WarmVmPanel';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
@@ -433,7 +434,9 @@ export function ProjectWorkspace({
                   </div>
                 </div>
                 {activeProjectSettingsSection && (
-                  <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeProjectSettingsSection} />
+                  <Suspense fallback={null}>
+                    <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeProjectSettingsSection} />
+                  </Suspense>
                 )}
               </div>
             )}
@@ -685,15 +688,17 @@ export function RuntimeWorkspace({
               tone={globalActiveCount > 0 ? 'info' : 'neutral'}
             />
           </RuntimeSectionIntro>
-          <ComputeJobsPanel
-            projectId={selectedProjectId}
-            onNavigateToTask={onViewTaskById}
-            onLaunchCompute={onLaunchCompute}
-            onCloneExperiment={onCloneExperiment}
-            onApproveExperiment={onApproveExperiment}
-            onDismissExperiment={onDismissExperiment}
-            onNavigateToKnowledge={onNavigateToKnowledge}
-          />
+          <Suspense fallback={null}>
+            <ComputeJobsPanel
+              projectId={selectedProjectId}
+              onNavigateToTask={onViewTaskById}
+              onLaunchCompute={onLaunchCompute}
+              onCloneExperiment={onCloneExperiment}
+              onApproveExperiment={onApproveExperiment}
+              onDismissExperiment={onDismissExperiment}
+              onNavigateToKnowledge={onNavigateToKnowledge}
+            />
+          </Suspense>
         </div>
       ) : runtimeSection === 'analytics' ? (
         <DashboardHome
@@ -814,7 +819,9 @@ export function RuntimeWorkspace({
           <div className="min-h-0 overflow-auto p-3 custom-scrollbar">
             <div className="mx-auto max-w-6xl space-y-4">
               <RuntimeSectionIntro item={activeRuntimeSettingsItem} />
-              <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeRuntimeSettingsItem.id} />
+              <Suspense fallback={null}>
+                <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeRuntimeSettingsItem.id} />
+              </Suspense>
             </div>
           </div>
         </div>
