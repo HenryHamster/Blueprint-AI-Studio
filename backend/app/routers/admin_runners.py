@@ -74,6 +74,15 @@ class RunnerRegisterRequest(BaseModel):
     preset: RunnerPreset | None = None
 
 
+class RunnerUpdateCapabilitiesRequest(BaseModel):
+    """Request body for PATCH /projects/../runners/../capabilities.
+
+    Both fields are optional — only the provided fields are updated.
+    """
+    max_concurrent: int | None = None
+    task_types: str | list[str] | None = None
+
+
 def _normalize_capabilities(
     raw: Dict[str, Any] | None,
     preset: RunnerPreset | None = None,
@@ -402,6 +411,83 @@ async def register_runner(
     )
     # The token is surfaced ONCE here and never again.
     return {"runner_id": str(runner.id), "token": token}
+
+
+@router.patch("/projects/{project_id}/runners/{runner_id}/capabilities")
+async def update_runner_capabilities(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    payload: RunnerUpdateCapabilitiesRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update an existing runner's operator-configured capabilities in-place.
+
+    Only the fields provided in the request body are updated; all other
+    capabilities (including runner-reported hardware telemetry) are preserved.
+    The ``strategic_local`` preset invariant is enforced: ``max_concurrent``
+    is clamped to 1 and ``task_types`` is clamped to the strategic task set.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await session.execute(
+        select(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    runner = result.scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    # Start from existing capabilities so runner-reported fields survive.
+    caps = dict(runner.capabilities or {})
+
+    # Detect strategic workload: strategic preset or workload pins concurrency.
+    is_strategic = caps.get("runner_preset") in (
+        "strategic_local",
+    ) or caps.get("workload") == "strategic"
+
+    try:
+        if payload.max_concurrent is not None:
+            mc = _normalize_max_concurrent(payload.max_concurrent)
+            if is_strategic:
+                mc = 1  # strategic runners are pinned to single concurrency
+            caps["max_concurrent"] = mc
+
+        if payload.task_types is not None:
+            tt = _normalize_task_types(payload.task_types)
+            if is_strategic:
+                tt = list(_STRATEGIC_LOCAL_TASK_TYPES)
+            caps["task_types"] = tt
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    runner.capabilities = caps
+    session.add(runner)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Updated capabilities for runner %s on project %s",
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+        },
+    )
+    return _runner_view(runner)
 
 
 @router.get("/projects/{project_id}/runners")

@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, Edit2 } from 'lucide-react';
+import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities } from '../api';
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
@@ -444,6 +444,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   } | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [editingCapabilities, setEditingCapabilities] = useState<string | null>(null);
+  const [editMaxConcurrent, setEditMaxConcurrent] = useState<number>(2);
+  const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const mountedRef = useRef(true);
 
@@ -562,6 +565,19 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       } finally {
         setRevoking(null);
       }
+    }
+  };
+
+  const handleUpdateCapabilities = async (runner: FleetRunner, maxConcurrent: number) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingCapabilities(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { max_concurrent: maxConcurrent });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
     }
   };
 
@@ -778,9 +794,57 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         {activeCount} active
                       </span>
                     )}
-                    {slots !== null && (
-                      <span className="rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
+                    {slots !== null && editingCapabilities === runner.id ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                        <input
+                          type="number"
+                          min={1}
+                          max={64}
+                          value={editMaxConcurrent}
+                          onChange={e => setEditMaxConcurrent(Math.max(1, Math.min(64, Number(e.target.value) || 1)))}
+                          className="w-10 bg-transparent text-center text-xs text-blue-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                          autoFocus
+                        />
+                        <span>/ max</span>
+                        {updatingCapabilities !== runner.id ? (
+                          <>
+                            <button
+                              onClick={() => handleUpdateCapabilities(runner, editMaxConcurrent)}
+                              className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                              title="Save"
+                              aria-label="Save max concurrent"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => setEditingCapabilities(null)}
+                              className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                              title="Cancel"
+                              aria-label="Cancel"
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-blue-300 animate-pulse">saving…</span>
+                        )}
+                      </span>
+                    ) : slots !== null && (
+                      <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
                         {slots} slots free
+                        {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
+                          <button
+                            onClick={() => {
+                              setEditMaxConcurrent(runner.capabilities.max_concurrent ?? 2);
+                              setEditingCapabilities(runner.id);
+                            }}
+                            className="text-neutral-500 hover:text-neutral-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            title="Edit max concurrent"
+                            aria-label="Edit max concurrent"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        )}
                       </span>
                     )}
                     {runner.capabilities.has_gpu && (

@@ -1739,6 +1739,26 @@ export async function revokeFleetRunner(projectId: string, runnerId: string): Pr
   }
 }
 
+/** Update a runner's operator-configured capabilities in-place (partial merge).
+ * Only provided fields are updated; runner-reported hardware fields are preserved.
+ * Returns the updated runner view. */
+export async function updateRunnerCapabilities(
+  projectId: string,
+  runnerId: string,
+  capabilities: { max_concurrent?: number; task_types?: string | string[] },
+): Promise<FleetRunner> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/capabilities`,
+    { method: 'PATCH', body: JSON.stringify(capabilities) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update runner capabilities: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update runner capabilities: ${res.status}`);
+  }
+  return res.json();
+}
+
 /** Reset the review-fix iteration cap for a PR-linked task. Archives FAILED
  *  review/fix tasks on the PR to drop them from the global count and zeroes
  *  the per-chain iteration counter. */

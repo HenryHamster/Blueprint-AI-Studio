@@ -893,6 +893,237 @@ class TestAdminRunnerEndpoints:
             "released_unpulled_pins": 0,
         }
 
+    # ── Capabilities update (PATCH) ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_update_max_concurrent(
+        self, client: AsyncClient, db_session
+    ):
+        """Normal bump: register with max_concurrent=2, PATCH to 4 → response shows 4."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["capabilities"]["max_concurrent"] == 4
+
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 4
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_out_of_range(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        resp_0 = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 0},
+        )
+        assert resp_0.status_code == 422
+
+        resp_65 = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 65},
+        )
+        assert resp_65.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_update_strategic_local_pins_max_to_one(
+        self, client: AsyncClient, db_session
+    ):
+        """A strategic_local runner clamps max_concurrent to 1 regardless of what the
+        operator sends — the same invariant enforced at registration."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={
+                "hostname": "strategic-clamp",
+                "preset": "strategic_local",
+            },
+        )
+        assert resp.status_code == 200
+        runner_id = uuid.UUID(resp.json()["runner_id"])
+
+        # PATCH with max_concurrent=4 — must be clamped to 1.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["capabilities"]["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_runner_reported_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner-reported hardware fields survive a capabilities PATCH."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+
+        # First, Heartbeat to populate runner-reported GPU fields.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "has_gpu": True,
+                "gpu_count": 2,
+                "gpu_names": ["Tesla T4", "Tesla T4"],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200
+
+        # Now PATCH max_concurrent.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 6},
+        )
+        assert patch.status_code == 200
+        caps = patch.json()["capabilities"]
+        assert caps["max_concurrent"] == 6
+        assert caps["has_gpu"] is True
+        assert caps["gpu_count"] == 2
+        assert caps["gpu_names"] == ["Tesla T4", "Tesla T4"]
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_operator_fields_on_partial_patch(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH only max_concurrent leaves task_types untouched (and vice versa)."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["create", "fix"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+
+        # PATCH only max_concurrent — task_types must survive.
+        only_max = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 8},
+        )
+        assert only_max.status_code == 200
+        caps = only_max.json()["capabilities"]
+        assert caps["max_concurrent"] == 8
+        assert caps["task_types"] == ["create", "fix"]
+
+        # PATCH only task_types — max_concurrent must survive.
+        only_tt = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"task_types": ["review"]},
+        )
+        assert only_tt.status_code == 200
+        caps2 = only_tt.json()["capabilities"]
+        assert caps2["task_types"] == ["review"]
+        assert caps2["max_concurrent"] == 8
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_non_owner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        non_owner_project = await _make_project(
+            db_session, owner_id="other-owner", name="Member Only Runner Cap Project"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=non_owner_project.id,
+                user_id=TEST_USER_ID,
+                role="member",
+            )
+        )
+        non_owner_runner, _ = await _make_runner(
+            db_session, non_owner_project.id
+        )
+        await db_session.commit()
+
+        non_owner = await client.patch(
+            f"/api/admin/projects/{non_owner_project.id}/runners/{non_owner_runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert non_owner.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_update_deleted_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id, status="deleted")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_missing_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        missing_id = uuid.uuid4()
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{missing_id}/capabilities",
+            json={"max_concurrent": 4},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_emits_workbench_refetch(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.patch(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+                json={"max_concurrent": 4},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == project.id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "updated"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+        }
+
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────
 

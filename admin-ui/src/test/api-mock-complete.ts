@@ -119,6 +119,7 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     rotateFleetRunnerToken: vi.fn(),
     listFleetRunners: vi.fn(),
     revokeFleetRunner: vi.fn(),
+    updateRunnerCapabilities: vi.fn(),
     resetTaskIterationCap: vi.fn(),
     triggerTaskRollup: vi.fn(),
     fetchDeadLetters: vi.fn(),

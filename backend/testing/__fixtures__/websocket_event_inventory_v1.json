@@ -2962,6 +2962,22 @@
       "workbench_resource": "local_runner"
     },
     {
+      "callee": "emit_workbench_refetch",
+      "canonical_callee": "emit_workbench_refetch",
+      "classification": "workbench_v1_helper",
+      "event": "workbench_refetch",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 496,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "update_runner_capabilities",
+      "source_path": "backend/app/routers/admin_runners.py",
+      "workbench_action": "updated",
+      "workbench_resource": "local_runner"
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
