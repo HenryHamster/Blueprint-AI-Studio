@@ -179,21 +179,32 @@ async def test_list_tools_after_seed(client: AsyncClient, db_session):
     project = await _make_project_member(db_session)
     seed = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
     assert seed.status_code == 200
-    assert seed.json()["added"] == ["whiteboard"]
+    assert seed.json()["added"] == ["whiteboard", "notes"]
 
     resp = await client.get(f"{_BASE}/projects/{project.id}/tools")
     assert resp.status_code == 200
     tools = resp.json()["tools"]
-    assert len(tools) == 1
-    t = tools[0]
-    assert t["kind"] == "whiteboard"
-    assert t["slug"] == "whiteboard"
-    assert t["title"] == "Whiteboard"
-    assert t["placement"] == "project_section"
-    assert t["enabled"] is True
-    assert t["content_revision"] == 0
-    # Lean projection must NOT leak content.
-    assert "content" not in t
+    assert len(tools) == 2
+    by_slug = {t["slug"]: t for t in tools}
+
+    wb = by_slug["whiteboard"]
+    assert wb["kind"] == "whiteboard"
+    assert wb["title"] == "Whiteboard"
+    assert wb["placement"] == "project_section"
+    assert wb["enabled"] is True
+    assert wb["content_revision"] == 0
+
+    notes = by_slug["notes"]
+    assert notes["kind"] == "notes"
+    assert notes["slug"] == "notes"
+    assert notes["title"] == "Notes"
+    assert notes["placement"] == "project_section"
+    assert notes["enabled"] is True
+    assert notes["content_revision"] == 0
+
+    # Lean projection must NOT leak content for either tool.
+    for t in tools:
+        assert "content" not in t
 
 
 @pytest.mark.asyncio
@@ -468,17 +479,17 @@ async def test_seed_is_idempotent(client: AsyncClient, db_session):
 
     first = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
     assert first.status_code == 200
-    assert first.json()["added"] == ["whiteboard"]
+    assert first.json()["added"] == ["whiteboard", "notes"]
     assert first.json()["skipped"] == []
 
     second = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
     assert second.status_code == 200
     assert second.json()["added"] == []
-    assert second.json()["skipped"] == ["whiteboard"]
+    assert second.json()["skipped"] == ["whiteboard", "notes"]
 
-    # Still exactly one tool after repeated seeding.
+    # Still exactly two tools after repeated seeding.
     tools = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
-    assert len(tools) == 1
+    assert len(tools) == 2
 
 
 
@@ -2112,3 +2123,66 @@ async def test_claim_omits_skills_when_no_manifest(client, db_session):
             assert body["skills"] == [], (
                 "skills should be empty list when manifest has no skills"
             )
+
+
+@pytest.mark.asyncio
+async def test_research_claim_includes_project_skills(client, db_session):
+    """Research and plan task types receive project skills just like create/fix tasks."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    manifest_json = json.dumps({
+        "skills": [
+            {"slug": "benchmark", "title": "Benchmark", "command": "bash bench.sh"},
+        ],
+    })
+
+    for task_type in ("research", "plan"):
+        task = Task(
+            project_id=project.id,
+            vm_instance_id=f"test-vm-{task_type}-skills",
+            status="QUEUED",
+            payloads=[{"type": task_type, "prompt": "Investigate performance"}],
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        with (
+            patch(
+                "app.github_auth.get_repo_installation_read_token",
+                AsyncMock(return_value="ghs_testtoken"),
+            ),
+            patch(
+                "app.github_refs.get_repo_default_branch",
+                AsyncMock(return_value="main"),
+            ),
+            patch(
+                "app.github.get_file_text_at_ref",
+                AsyncMock(return_value=manifest_json),
+            ),
+        ):
+            agent_token = create_agent_token(str(task.id), f"test-vm-{task_type}-skills")
+            resp = await client.post(
+                "/api/agent/claim",
+                headers={"x-agent-token": agent_token},
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert "skills" in body, (
+                f"Claim response for task_type={task_type!r} missing 'skills' key. "
+                f"Available keys: {sorted(body.keys())}"
+            )
+            skills = body["skills"]
+            assert len(skills) == 1
+            assert skills[0]["slug"] == "benchmark"
+            assert skills[0]["command"] == "bash bench.sh"

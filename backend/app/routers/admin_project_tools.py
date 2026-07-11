@@ -76,6 +76,13 @@ TOOL_KINDS: Dict[str, Dict[str, Any]] = {
         "label": "Whiteboard",
         "description": "A collaborative canvas for sketching diagrams and ideas.",
     },
+    "notes": {
+        "config_schema": {},
+        "default_title": "Notes",
+        "default_placement": "project_section",
+        "label": "Notes",
+        "description": "A persistent Markdown scratchpad for notes, hypotheses, and equations (LaTeX renders in preview).",
+    },
 }
 
 # Default tool(s) installed by the seed endpoint, keyed by slug.
@@ -83,6 +90,11 @@ _SEED_TOOLS: Dict[str, Dict[str, Any]] = {
     "whiteboard": {
         "kind": "whiteboard",
         "title": "Whiteboard",
+        "placement": "project_section",
+    },
+    "notes": {
+        "kind": "notes",
+        "title": "Notes",
         "placement": "project_section",
     },
 }

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, test, expect, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { ProjectToolHost } from './ProjectToolHost';
@@ -13,11 +13,14 @@ vi.mock('../api/projectTools', async () => {
     fetchProjectTools: vi.fn(),
     fetchProjectToolManifest: vi.fn(),
     fetchAssetToken: vi.fn(),
+    fetchToolContent: vi.fn(),
+    saveToolContent: vi.fn(),
   };
 });
 
-import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken } from '../api/projectTools';
+import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent } from '../api/projectTools';
 import type { FetchProjectToolsResult } from '../api/projectTools';
+import NotesTool from './NotesTool';
 
 const TOOLS_RESULT: FetchProjectToolsResult = {
   tools: [
@@ -69,6 +72,7 @@ beforeAll(() => {
   registerToolKind('mock-widget', MockWidget);
   registerToolKind('mock-chart', MockChart);
   registerToolKind('mock-table', MockTable);
+  registerToolKind('notes', NotesTool);
 });
 
 describe('ProjectToolHost — viewport regression', () => {
@@ -275,6 +279,38 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     expect(host.textContent).not.toContain('No tools registered');
   });
 
+  test('hides a manifest-declared tool when Hide is clicked at 1280px', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'hidden-viewer',
+        title: 'Hidden Viewer',
+        description: 'A tool the operator wants to hide',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      error: null,
+    });
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-hide" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    // Tool is visible before hiding
+    expect(host.textContent).toContain('Hidden Viewer');
+    // Click the Hide button
+    const hideBtn = host.querySelector('button[data-viewport-allow-small-target]') as HTMLButtonElement | null;
+    expect(hideBtn).not.toBeNull();
+    await act(async () => { hideBtn!.click(); });
+    // Tool should no longer be rendered
+    expect(host.textContent).not.toContain('Hidden Viewer');
+  });
+
   test('renders manifest and registered tools without overflow at 1440px', async () => {
     vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({
@@ -302,5 +338,40 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     expect(host.textContent).toContain('Mock Widget');
     expect(host.textContent).toContain('Big Data Viewer');
     expect(host.textContent).toContain('Project-declared');
+  });
+
+  test('renders a Markdown notes tool at 1280px (acceptance evidence)', async () => {
+    vi.mocked(fetchToolContent).mockResolvedValue({
+      content: { text: '# Research notes\n\nHypothesis: $E = mc^2$' },
+      content_revision: 1,
+    });
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        {
+          id: 'notes-1',
+          kind: 'notes',
+          slug: 'notes',
+          title: 'Notes',
+          enabled: true,
+          placement: 'project_section',
+          content_revision: 1,
+        },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.width = '1280px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<ProjectToolHost projectId="proj-notes" />); });
+      await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+    });
+    if (!host) throw new Error('host not mounted');
+    // The notes tool renders inside its WorkbenchPanel with an editable textarea.
+    expect(host.textContent).toContain('Notes');
+    expect(host.querySelector('textarea')).toBeTruthy();
   });
 });

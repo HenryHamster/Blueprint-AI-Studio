@@ -32,6 +32,10 @@ const ORPHAN_ALLOWLIST = new Set<string>([
   // regex only tracks `from` and `import()` patterns, not bare side-effect
   // imports. The component is not dead; it is registered dynamically.
   'WhiteboardTool.tsx',
+  // Notes tool — same story as WhiteboardTool: reachable only via the
+  // side-effect import in appTools.ts (registerToolKind('notes', ...)), which
+  // the import-graph walker's regex does not track.
+  'NotesTool.tsx',
 ]);
 
 // ---------------------------------------------------------------------------

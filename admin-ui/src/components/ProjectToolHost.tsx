@@ -47,6 +47,7 @@ export function ProjectToolHost({ projectId }: Props) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
+  const [hiddenManifestSlugs, setHiddenManifestSlugs] = useState<Set<string>>(new Set());
 
   // Fetch registered tools on mount / projectId change
   useEffect(() => {
@@ -290,7 +291,8 @@ export function ProjectToolHost({ projectId }: Props) {
     if (effective.status !== 'ok') return null;
     const enabledTools = effective.tools.filter(t => t.enabled);
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
-    const manifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
+    const allManifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
+    const manifestTools = allManifestTools.filter(t => !hiddenManifestSlugs.has(t.slug));
     const hasAnyTool = registeredTools.length > 0 || manifestTools.length > 0;
 
     if (!hasAnyTool) {
@@ -349,6 +351,16 @@ export function ProjectToolHost({ projectId }: Props) {
             >
               <ProjectToolIframe projectId={projectId} tool={tool} />
             </WorkbenchPanel>
+            <div className="flex items-center gap-2 px-1">
+              <button
+                type="button"
+                data-viewport-allow-small-target
+                onClick={() => setHiddenManifestSlugs(prev => new Set([...prev, tool.slug]))}
+                className="text-xs text-neutral-500 hover:text-neutral-300"
+              >
+                Hide
+              </button>
+            </div>
           </div>
         ))}
 
