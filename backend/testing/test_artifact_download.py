@@ -12,13 +12,15 @@ GCS signing is mocked at ``app.storage.storage.Client`` so the real validation
 path runs but no network/credentials are required.
 """
 
+import io
+import tarfile
 import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
 
-from app import storage
+from app import compute_backends, storage
 from app.models import (
     Artifact,
     ArtifactType,
@@ -433,6 +435,313 @@ async def test_resolve_download_url_compute_job_artifact_storage_uri_ok(
     )
     assert resp.status_code == 200
     assert resp.json()["url"] == "https://signed.example/artifact-ok"
+
+
+# --------------------------------------------------------------------------
+# Viewable per-file artifact substrate
+# --------------------------------------------------------------------------
+
+# Minimal magic-byte-prefixed blobs so the payloads look plausible; extension
+# classification is what actually drives selection.
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
+_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"fake-mp4-body"
+
+
+def _make_tar_gz_bundle(files: dict[str, bytes]) -> bytes:
+    """Build an in-memory ``.tar.gz`` whose members mirror ``tar -C dir -czf - .``
+    (member names like ``./plot.png``)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+# ---- pure helper tests (no DB) ----
+
+
+def test_viewable_content_type_classifies_images_and_videos():
+    assert storage.viewable_content_type_for_filename("plot.png") == ("image/png", "image")
+    assert storage.viewable_content_type_for_filename("a.JPG") == ("image/jpeg", "image")
+    assert storage.viewable_content_type_for_filename("clip.mp4") == ("video/mp4", "video")
+    assert storage.viewable_content_type_for_filename("v.webm") == ("video/webm", "video")
+    # Non-viewable / no extension.
+    assert storage.viewable_content_type_for_filename("data.bin") is None
+    assert storage.viewable_content_type_for_filename("noext") is None
+
+
+def test_sanitize_viewable_basename_strips_traversal():
+    assert storage.sanitize_viewable_basename("../../etc/passwd.png") == "passwd.png"
+    assert storage.sanitize_viewable_basename("sub/dir/fig 1.png") == "fig_1.png"
+    assert storage.sanitize_viewable_basename("evil/../x.png") == "x.png"
+    # Degenerate names.
+    assert storage.sanitize_viewable_basename("..") is None
+    assert storage.sanitize_viewable_basename("/") is None
+    assert storage.sanitize_viewable_basename("") is None
+
+
+def test_compute_job_viewable_uri_lives_under_allowlisted_prefix():
+    jid = uuid.uuid4()
+    uri = storage.compute_job_viewable_uri(jid, "plot.png")
+    assert uri == f"gs://{BUCKET}/compute-jobs/{jid}/artifacts/viewable/plot.png"
+    # The existing compute-job authorization binds it to the owning job.
+    assert storage.compute_job_id_for_artifact_uri(uri) == jid
+
+
+def test_extract_viewable_candidates_selects_image_and_video():
+    bundle = _make_tar_gz_bundle(
+        {
+            "./plot.png": _PNG_BYTES,
+            "./clip.mp4": _MP4_BYTES,
+            "./notes.txt": b"ignore me",  # non-viewable
+        }
+    )
+    cands = compute_backends._extract_viewable_candidates_from_bundle(bundle)
+    by_name = {c.filename: c for c in cands}
+    assert set(by_name) == {"plot.png", "clip.mp4"}
+    assert by_name["plot.png"].kind == "image"
+    assert by_name["plot.png"].content_type == "image/png"
+    assert by_name["plot.png"].data == _PNG_BYTES
+    assert by_name["plot.png"].size_bytes == len(_PNG_BYTES)
+    assert by_name["clip.mp4"].kind == "video"
+    assert by_name["clip.mp4"].content_type == "video/mp4"
+
+
+def test_extract_viewable_candidates_excludes_nonviewable_and_oversized(monkeypatch):
+    monkeypatch.setattr(compute_backends, "_MAX_VIEWABLE_FILE_BYTES", 16)
+    bundle = _make_tar_gz_bundle(
+        {
+            "./huge.png": b"x" * 64,  # 64 bytes > 16-byte cap -> excluded
+            "./data.bin": b"binary-blob",  # non-viewable -> excluded
+            "./ok.webp": b"tiny",  # 4 bytes -> kept
+        }
+    )
+    cands = compute_backends._extract_viewable_candidates_from_bundle(bundle)
+    assert [c.filename for c in cands] == ["ok.webp"]
+    assert cands[0].content_type == "image/webp"
+    assert cands[0].kind == "image"
+
+
+def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch):
+    monkeypatch.setattr(compute_backends, "_MAX_VIEWABLE_FILE_COUNT", 2)
+    bundle = _make_tar_gz_bundle(
+        {f"./img{i}.png": _PNG_BYTES for i in range(5)}
+    )
+    cands = compute_backends._extract_viewable_candidates_from_bundle(bundle)
+    assert len(cands) == 2
+
+
+def test_extract_viewable_candidates_corrupt_or_empty_bundle_returns_empty():
+    assert compute_backends._extract_viewable_candidates_from_bundle(b"") == []
+    assert (
+        compute_backends._extract_viewable_candidates_from_bundle(b"not-a-gzip-tar")
+        == []
+    )
+
+
+def test_viewable_artifacts_descriptor_sanitizes_manifest():
+    from app.routers.admin_compute_jobs import _viewable_artifacts_descriptor
+
+    # Absent / malformed manifests degrade to an empty list.
+    assert _viewable_artifacts_descriptor(None) == []
+    assert _viewable_artifacts_descriptor("nope") == []
+    assert _viewable_artifacts_descriptor([{"filename": "x"}]) == []  # no storage_uri
+
+    out = _viewable_artifacts_descriptor(
+        [
+            {
+                "filename": "plot.png",
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/plot.png",
+                "content_type": "image/png",
+                "size_bytes": 128,
+                "kind": "image",
+            },
+            "not-a-dict",
+            {"storage_uri": "", "kind": "image"},  # empty uri dropped
+            {
+                "filename": None,
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/v.mp4",
+                "content_type": 5,  # wrong type -> None
+                "size_bytes": "big",  # wrong type -> None
+                "kind": "bogus",  # not image/video -> None
+            },
+        ]
+    )
+    assert len(out) == 2
+    assert out[0] == {
+        "filename": "plot.png",
+        "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/plot.png",
+        "content_type": "image/png",
+        "size_bytes": 128,
+        "kind": "image",
+    }
+    assert out[1] == {
+        "filename": None,
+        "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/v.mp4",
+        "content_type": None,
+        "size_bytes": None,
+        "kind": None,
+    }
+
+
+# ---- persist orchestration (mocked storage) ----
+
+
+async def _make_bundle_backed_job(session, project, task, backend="gcp"):
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend=backend,
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_persist_viewable_artifacts_builds_manifest(db_session, mocker):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    job = await _make_bundle_backed_job(db_session, project, task)
+
+    bundle = _make_tar_gz_bundle(
+        {"./plot.png": _PNG_BYTES, "./clip.mp4": _MP4_BYTES, "./log.txt": b"skip"}
+    )
+    mocker.patch("app.storage.download_compute_job_artifact_bundle", return_value=bundle)
+    # Real upload helper runs against a mocked GCS client (no network).
+    gcs_client = mocker.patch("app.storage.storage.Client")
+    blob = gcs_client.return_value.bucket.return_value.blob.return_value
+
+    manifest = await compute_backends.persist_viewable_artifacts(job)
+
+    by_name = {m["filename"]: m for m in manifest}
+    assert set(by_name) == {"plot.png", "clip.mp4"}
+    assert by_name["plot.png"]["kind"] == "image"
+    assert by_name["plot.png"]["content_type"] == "image/png"
+    assert by_name["plot.png"]["size_bytes"] == len(_PNG_BYTES)
+    assert by_name["plot.png"]["storage_uri"] == storage.compute_job_viewable_uri(
+        job.id, "plot.png"
+    )
+    assert by_name["clip.mp4"]["kind"] == "video"
+    assert by_name["clip.mp4"]["content_type"] == "video/mp4"
+    # Each viewable file uploaded once, with its content_type.
+    assert blob.upload_from_string.call_count == 2
+    content_types = {
+        call.kwargs.get("content_type")
+        for call in blob.upload_from_string.call_args_list
+    }
+    assert content_types == {"image/png", "video/mp4"}
+
+
+@pytest.mark.asyncio
+async def test_persist_viewable_artifacts_corrupt_bundle_degrades(db_session, mocker):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    job = await _make_bundle_backed_job(db_session, project, task, backend="runner-subprocess")
+
+    mocker.patch(
+        "app.storage.download_compute_job_artifact_bundle",
+        return_value=b"corrupt-not-a-tar",
+    )
+    upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
+
+    manifest = await compute_backends.persist_viewable_artifacts(job)
+    assert manifest == []
+    upload.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_persist_viewable_artifacts_missing_bundle_degrades(db_session, mocker):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    job = await _make_bundle_backed_job(db_session, project, task)
+
+    mocker.patch("app.storage.download_compute_job_artifact_bundle", return_value=None)
+    upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
+
+    manifest = await compute_backends.persist_viewable_artifacts(job)
+    assert manifest == []
+    upload.assert_not_called()
+
+
+# ---- download authorization for viewable objects ----
+
+
+async def _make_compute_job_with_viewable(session, project, task):
+    """Compute job whose polling_metadata carries a viewable-file manifest."""
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    session.add(job)
+    await session.flush()
+    viewable_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/plot.png"
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "plot.png",
+                "storage_uri": viewable_uri,
+                "content_type": "image/png",
+                "size_bytes": 42,
+                "kind": "image",
+            }
+        ]
+    }
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job, viewable_uri
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_artifact_ok(
+    client: AsyncClient, db_session, mocker
+):
+    """A URI recorded in the job's viewable-file manifest is signable."""
+    _mock_signing(mocker, url="https://signed.example/viewable-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    _job, viewable_uri = await _make_compute_job_with_viewable(db_session, project, task)
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/viewable-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_sibling_not_in_manifest_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A viewable-prefix sibling NOT recorded in the manifest stays 404."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job, viewable_uri = await _make_compute_job_with_viewable(db_session, project, task)
+
+    sibling = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/secret.png"
+    assert sibling != viewable_uri
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": sibling, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -141,6 +141,7 @@ export interface StrategicContextRenderableDescriptor {
     | 'markdown'
     | 'text'
     | 'image'
+    | 'video'
     | 'chart'
     | 'plot'
     | 'task_detail'
@@ -167,6 +168,10 @@ export interface StrategicContextRenderableDescriptor {
     alt?: string | null;
     width?: number | null;
     height?: number | null;
+  } | null;
+  video?: {
+    url?: string | null;
+    alt?: string | null;
   } | null;
   chart?: {
     kind?: 'bar' | 'line' | string;

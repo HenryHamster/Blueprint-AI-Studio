@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, Gauge, Network, Table2 } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, Gauge, Network, Table2, Video } from 'lucide-react';
 import type {
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
@@ -66,6 +66,7 @@ function descriptorIcon(kind: string): ReactNode {
   if (kind === 'metric_cards') return <Gauge className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'table') return <Table2 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'image') return <FileImage className="h-3.5 w-3.5" aria-hidden="true" />;
+  if (kind === 'video') return <Video className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'chart' || kind === 'plot') return <BarChart3 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'unsupported') return <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />;
   return <FileText className="h-3.5 w-3.5" aria-hidden="true" />;
@@ -242,6 +243,28 @@ function DescriptorCard({
           )}
         </div>
       )}
+
+      {descriptor.kind === 'video' && (() => {
+        const videoUrl = safeImageUrl(descriptor.video?.url);
+        return (
+          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+            {videoUrl ? (
+              <video
+                controls
+                className="max-h-48 w-full"
+                aria-label={descriptor.video?.alt || descriptor.title}
+              >
+                <source src={videoUrl} />
+                Your browser does not support the video element.
+              </video>
+            ) : (
+              <div className="px-2 py-2 text-xs text-neutral-500">
+                Video preview unavailable. Open the artifact for the source.
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
         <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">

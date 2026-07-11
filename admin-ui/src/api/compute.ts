@@ -729,6 +729,14 @@ export interface ComputeJobLiveOutput {
   truncated: boolean;
 }
 
+export interface ViewableArtifact {
+  storage_uri: string;
+  filename: string;
+  content_type?: string;
+  size_bytes?: number;
+  kind: 'image' | 'video';
+}
+
 export interface ComputeJob {
   id: string;
   project_id: string;
@@ -850,6 +858,11 @@ export interface ComputeJob {
       drafted_from_refinement?: boolean | null;
     } | null;
   } | null;
+  /** Per-file viewable-artifact manifest for artifacts produced by this compute
+   *  job. Present only on jobs whose backend persisted viewable files (images,
+   *  videos) as individually-addressable storage objects. Absent on legacy rows
+   *  or jobs without viewable output. */
+  viewable_artifacts?: ViewableArtifact[] | null;
 }
 
 export interface ComputeJobsSummary {

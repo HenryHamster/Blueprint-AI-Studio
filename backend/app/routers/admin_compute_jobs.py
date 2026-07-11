@@ -116,6 +116,46 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
     }
 
 
+def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
+    """Normalize a persisted viewable-file manifest into the operator-facing list.
+
+    Reads the ``viewable_files`` manifest stamped onto ``polling_metadata`` by
+    ``_link_terminal_artifact`` and returns a sanitized, backward-compatible list
+    of ``{filename, storage_uri, content_type, size_bytes, kind}``. A signed
+    preview URL is resolved lazily via ``/api/admin/artifacts/download-url`` from
+    ``storage_uri`` (which lives inside the allowlisted compute-job prefix), so no
+    URL is minted here. Returns ``[]`` when a job produced no viewable files or
+    the manifest is malformed (absent/empty is the common, expected case).
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        storage_uri = entry.get("storage_uri")
+        if not isinstance(storage_uri, str) or not storage_uri:
+            continue
+        filename = entry.get("filename")
+        content_type = entry.get("content_type")
+        size_bytes = entry.get("size_bytes")
+        kind = entry.get("kind")
+        out.append(
+            {
+                "filename": str(filename) if filename is not None else None,
+                "storage_uri": storage_uri,
+                "content_type": content_type
+                if isinstance(content_type, str)
+                else None,
+                "size_bytes": int(size_bytes)
+                if isinstance(size_bytes, int) and not isinstance(size_bytes, bool)
+                else None,
+                "kind": kind if kind in ("image", "video") else None,
+            }
+        )
+    return out
+
+
 async def _build_compute_job_payload(
     session: AsyncSession, jobs
 ) -> list[Dict[str, Any]]:
@@ -286,6 +326,12 @@ async def _build_compute_job_payload(
         )
         # Runner identity and wait-state fields.
         pm = job.polling_metadata or {}
+        # Additive per-file viewable-artifact manifest (empty when the job
+        # produced no viewable files) so the UI can enumerate individual
+        # image/video references alongside the opaque bundle `artifact`.
+        data["viewable_artifacts"] = _viewable_artifacts_descriptor(
+            pm.get("viewable_files")
+        )
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
         data["runner_target_id"] = runner_target_id_str

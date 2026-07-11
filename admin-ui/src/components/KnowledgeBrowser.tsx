@@ -10,6 +10,7 @@ import { computeJobExecutionLocation } from './ComputeJobsPanel.utils';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
+  resolveArtifactDownloadUrl,
   type KnowledgeCitation,
   type KnowledgeDocument,
   type KnowledgeForwardQualityVerdict,
@@ -463,6 +464,80 @@ function ExportMarkdown({ body }: { body?: string }) {
 
 const PAGE_SIZE = 50;
 
+/** File extensions we can render inline as images or videos. */
+const VIEWABLE_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'];
+const VIEWABLE_VIDEO_EXTS = ['.mp4', '.webm'];
+
+function viewableMediaKind(uri: string | null | undefined): 'image' | 'video' | null {
+  if (!uri) return null;
+  const lower = uri.toLowerCase();
+  if (VIEWABLE_IMAGE_EXTS.some(ext => lower.endsWith(ext))) return 'image';
+  if (VIEWABLE_VIDEO_EXTS.some(ext => lower.endsWith(ext))) return 'video';
+  return null;
+}
+
+/**
+ * Renders a single viewable-media citation (image or video) inline after
+ * resolving its `gs://` storage URI to a signed HTTPS URL. Shows a loading
+ * indicator while resolving, and falls back to a plain download link on error.
+ */
+function ViewableMediaInline({
+  projectId,
+  storageUri,
+  label,
+  kind,
+}: {
+  projectId: string;
+  storageUri: string;
+  label: string;
+  kind: 'image' | 'video';
+}) {
+  const [signedUrl, setSignedUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    resolveArtifactDownloadUrl(projectId, storageUri)
+      .then(url => { if (!cancelled) setSignedUrl(url); })
+      .catch(() => { if (!cancelled) setError('Failed to load preview.'); });
+    return () => { cancelled = true; };
+  }, [projectId, storageUri]);
+
+  if (error) {
+    return (
+      <a
+        href={storageUri}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-blue-400 hover:text-blue-300 break-all text-ui-sm"
+      >
+        {label} — {error} (open directly)
+      </a>
+    );
+  }
+
+  if (!signedUrl) {
+    return <div className="text-ui-sm text-neutral-600">Loading preview…</div>;
+  }
+
+  if (kind === 'video') {
+    return (
+      <video controls className="max-h-48 w-full rounded border border-neutral-800 bg-black" aria-label={label}>
+        <source src={signedUrl} />
+        Your browser does not support the video element.
+      </video>
+    );
+  }
+
+  return (
+    <img
+      src={signedUrl}
+      alt={label}
+      className="max-h-48 w-full rounded border border-neutral-800 bg-neutral-950/45 object-contain"
+    />
+  );
+}
+
 export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
   const routedDirectionId = initialDirectionId ?? null;
   const [query, setQuery] = useState<KnowledgeQuery>({
@@ -713,6 +788,36 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 </ul>
               </div>
             )}
+
+            {/* Inline viewable media artifacts — image/video citations rendered inline
+                instead of as click-to-download links. Grouped by kind for visual clarity. */}
+            {selectedProjectId && (selected.source_citations ?? []).length > 0 && (() => {
+              const viewableItems: Array<{ reference: string; label: string; kind: 'image' | 'video' }> = [];
+              for (const c of selected.source_citations) {
+                const { reference, label } = citationParts(c);
+                if (!reference) continue;
+                const kind = viewableMediaKind(reference);
+                if (kind) viewableItems.push({ reference, label, kind });
+              }
+              if (viewableItems.length === 0) return null;
+              return (
+                <div className="border-t border-neutral-800 pt-3">
+                  <div className="text-ui-sm uppercase tracking-wide text-neutral-500 mb-2">Artifacts</div>
+                  <div className="space-y-2">
+                    {viewableItems.map((item, i) => (
+                      <ViewableMediaInline
+                        key={i}
+                        projectId={selectedProjectId}
+                        storageUri={item.reference}
+                        label={item.label}
+                        kind={item.kind}
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
           </div>
         ) : (
           /* List view */

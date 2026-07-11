@@ -286,6 +286,120 @@ def compute_job_artifact_uri(job_id) -> str:
     return f"gs://{ARTIFACT_BUCKET_NAME}/{compute_job_artifact_object_name(job_id)}"
 
 
+# ---------------------------------------------------------------------------
+# Per-file viewable-artifact substrate.
+#
+# A finished compute job's outputs are stored as one opaque ``bundle.tar.gz``.
+# So an operator can preview the plots/images/videos a run produced WITHOUT
+# untarring, common viewable files are ALSO persisted as individually-addressable
+# objects under ``compute-jobs/<job_id>/artifacts/viewable/<basename>`` — inside
+# the same allowlisted prefix so the existing
+# ``compute_job_id_for_artifact_uri`` + ``verify_artifact_project_ownership``
+# authorization already covers them (no new IAM/bucket surface).
+# ---------------------------------------------------------------------------
+
+# Object-name segment under the per-job artifact prefix where individually
+# addressable viewable files live.
+_VIEWABLE_ARTIFACT_SUBDIR = "viewable"
+
+# Viewable file extension (lowercase, no dot) -> (content_type, kind). Only these
+# extensions are ever persisted as individual objects; everything else stays
+# inside the opaque bundle.
+_VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
+    "png": ("image/png", "image"),
+    "jpg": ("image/jpeg", "image"),
+    "jpeg": ("image/jpeg", "image"),
+    "webp": ("image/webp", "image"),
+    "gif": ("image/gif", "image"),
+    "svg": ("image/svg+xml", "image"),
+    "mp4": ("video/mp4", "video"),
+    "webm": ("video/webm", "video"),
+}
+
+# Any char outside the safe object-name subset (mirrors the object class in
+# ``_GS_URI_RE``, minus ``/`` so a basename can never re-introduce a path
+# segment) is collapsed to ``_`` when sanitizing a viewable basename.
+_VIEWABLE_BASENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
+    """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
+
+    ``kind`` is ``"image"`` or ``"video"``. Classification is by the lowercased
+    extension only; a filename with no recognised viewable extension yields
+    ``None`` so the caller skips it (it stays inside the opaque bundle).
+    """
+    if not isinstance(filename, str) or "." not in filename:
+        return None
+    ext = filename.rsplit(".", 1)[-1].lower()
+    return _VIEWABLE_CONTENT_TYPES.get(ext)
+
+
+def sanitize_viewable_basename(filename: str) -> str | None:
+    """Return a path-traversal-safe object basename for a viewable file, or ``None``.
+
+    Strips any directory component (``os.path.basename``) and collapses every
+    char outside the safe object-name subset to ``_`` so the result can never
+    re-introduce a ``/`` path segment or a ``..`` traversal. A degenerate name
+    (empty, or only dots/underscores) yields ``None``; the basename is capped at
+    128 chars.
+    """
+    if not isinstance(filename, str):
+        return None
+    base = os.path.basename(filename)
+    base = _VIEWABLE_BASENAME_RE.sub("_", base)
+    if not base or set(base) <= {".", "_"}:
+        return None
+    return base[:128]
+
+
+def compute_job_viewable_object_name(job_id, basename: str) -> str:
+    """Object-name (no bucket) for one individually-addressable viewable file."""
+    return (
+        f"{compute_job_artifact_object_prefix(job_id)}/"
+        f"{_VIEWABLE_ARTIFACT_SUBDIR}/{basename}"
+    )
+
+
+def compute_job_viewable_uri(job_id, basename: str) -> str:
+    """``gs://`` URI of one individually-addressable viewable file."""
+    return f"gs://{ARTIFACT_BUCKET_NAME}/{compute_job_viewable_object_name(job_id, basename)}"
+
+
+async def upload_compute_job_viewable_file(
+    job_id, basename: str, data: bytes, content_type: str
+) -> str | None:
+    """Best-effort upload of one viewable file as an individually-addressable object.
+
+    Writes ``data`` to ``compute-jobs/<job_id>/artifacts/viewable/<basename>`` in
+    the shared artifact bucket with the given ``content_type`` (using the same
+    orchestrator ADC the runner-artifact store uses). Returns the durable
+    ``gs://`` URI on success, or ``None`` on ANY error — NEVER raises, so
+    viewable-artifact persistence can never block a job's terminal completion.
+    """
+    if not basename or not data:
+        return None
+    object_name = compute_job_viewable_object_name(job_id, basename)
+
+    def _upload() -> None:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(data, content_type=content_type)
+
+    try:
+        await asyncio.to_thread(_upload)
+    except Exception:
+        logger.warning(
+            "Failed to upload viewable artifact %r for compute job %s",
+            basename,
+            job_id,
+            exc_info=True,
+        )
+        return None
+    return compute_job_viewable_uri(job_id, basename)
+
+
 async def generate_compute_job_artifact_upload_signed_url(
     job_id, *, expires_at: datetime.datetime | None = None
 ) -> str:

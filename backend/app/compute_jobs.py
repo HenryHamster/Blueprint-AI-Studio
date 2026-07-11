@@ -35,6 +35,7 @@ from app.compute_backends import (
     detect_local_gpu,
     get_compute_backend,
     is_zero_cost_backend,
+    persist_viewable_artifacts,
     run_preflight_smoke,
     validate_backend_name,
 )
@@ -2899,6 +2900,26 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
         durable_file_count=reference.file_count,
         durable_payload_bytes=reference.total_size_bytes,
     )
+    # Best-effort: persist common viewable files (images/videos) as individually-
+    # addressable objects + a recorded manifest so an operator can preview them
+    # inline without untarring the bundle. Fail-soft — any error degrades to no
+    # manifest and NEVER blocks the job's terminal completion (mirrors the
+    # surrounding helpers). Stamped onto polling_metadata regardless of whether
+    # the Artifact INSERT below succeeds so the manifest survives a linkage
+    # rollback.
+    viewable_files: list[dict[str, Any]] = []
+    try:
+        viewable_files = await persist_viewable_artifacts(job)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
+            "completing with no viewable manifest",
+            job.id,
+            exc_info=True,
+        )
+        viewable_files = []
+    if viewable_files:
+        _set_meta(job, viewable_files=viewable_files)
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():
@@ -2910,6 +2931,8 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
                 "outcome": (job.outcome.value if job.outcome is not None else None),
                 "final_cost_usd": job.final_cost_usd,
             }
+            if viewable_files:
+                artifact_logs["viewable_files"] = viewable_files
             command_log = (job.polling_metadata or {}).get("command_log")
             if command_log is not None:
                 if isinstance(command_log, dict) and isinstance(

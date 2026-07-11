@@ -7,6 +7,8 @@ omits heavy fields such as knowledge bodies and artifact logs.
 
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from typing import Any, Dict, List
 
@@ -26,7 +28,13 @@ from app.models import (
     StrategicCycle,
     Task,
 )
+from app.storage import (
+    generate_download_signed_url,
+    verify_artifact_project_ownership,
+)
 from app.workbench_contracts import normalize_target
+
+logger = logging.getLogger(__name__)
 
 
 def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
@@ -734,6 +742,7 @@ async def load_strategic_context_evidence(
                     Artifact.pr_url,
                     Artifact.storage_uri,
                     Artifact.logical_key,
+                    Artifact.logs,
                     Artifact.created_at,
                     raiseload=True,
                 )
@@ -797,22 +806,72 @@ async def load_strategic_context_evidence(
             or artifact_type
             or "Artifact"
         )
+        item = {
+            "id": str(artifact.id),
+            "kind": context_kind,
+            "label": _compact_text(label, max_chars=100),
+            "artifact_type": _compact_text(artifact_type, max_chars=80),
+            "has_logs": bool(has_logs),
+            "storage_uri": str(artifact.storage_uri) if artifact.storage_uri else None,
+            "task_id": str(task_id) if task_id else None,
+            "task_title": _compact_text(task_title, max_chars=120),
+            "task_status": getattr(task_status, "value", task_status),
+            "logical_key": _compact_text(artifact.logical_key, max_chars=160),
+            "created_at": artifact.created_at.isoformat()
+            if artifact.created_at
+            else None,
+        }
+        # Mint short-lived signed preview URLs for any viewable files (images/videos)
+        # recorded in the artifact's logs manifest.  Each file is independently
+        # verified for project ownership, and a failure for one file never breaks
+        # the whole package (that file is simply skipped).
+        viewable_previews: list[dict[str, Any]] = []
+        if artifact.logs:
+            try:
+                logs_data = (
+                    json.loads(artifact.logs)
+                    if isinstance(artifact.logs, str)
+                    else artifact.logs
+                )
+                viewable_files = (
+                    logs_data.get("viewable_files", [])
+                    if isinstance(logs_data, dict)
+                    else []
+                )
+                for vf in viewable_files:
+                    if not isinstance(vf, dict):
+                        continue
+                    vf_storage_uri = vf.get("storage_uri")
+                    vf_kind = vf.get("kind", "image")
+                    vf_filename = vf.get("filename", "")
+                    if not vf_storage_uri:
+                        continue
+                    try:
+                        await verify_artifact_project_ownership(
+                            vf_storage_uri, project_id, session
+                        )
+                        signed_url = await generate_download_signed_url(
+                            vf_storage_uri, expiration_minutes=5
+                        )
+                        viewable_previews.append(
+                            {
+                                "url": signed_url,
+                                "kind": vf_kind,
+                                "filename": vf_filename,
+                            }
+                        )
+                    except Exception:
+                        # Ownership violation or signing failure — skip this
+                        # file so it degrades gracefully rather than breaking
+                        # the whole evidence package.
+                        continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        if viewable_previews:
+            item["viewable_previews"] = viewable_previews
         artifact_items.append(
             _with_target(
-                {
-                    "id": str(artifact.id),
-                    "kind": context_kind,
-                    "label": _compact_text(label, max_chars=100),
-                    "artifact_type": _compact_text(artifact_type, max_chars=80),
-                    "has_logs": bool(has_logs),
-                    "task_id": str(task_id) if task_id else None,
-                    "task_title": _compact_text(task_title, max_chars=120),
-                    "task_status": getattr(task_status, "value", task_status),
-                    "logical_key": _compact_text(artifact.logical_key, max_chars=160),
-                    "created_at": artifact.created_at.isoformat()
-                    if artifact.created_at
-                    else None,
-                },
+                item,
                 {
                     "surface": "task",
                     "task_id": str(task_id) if task_id else None,
@@ -1100,6 +1159,8 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         for token in ["image", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
     ):
         return "image"
+    if any(token in fingerprint for token in ["video", ".mp4", ".webm"]):
+        return "video"
     if any(token in fingerprint for token in ["chart", "plot", "graph"]):
         return "chart"
     if any(
@@ -1150,10 +1211,27 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         )
         descriptor["language"] = "text"
     elif kind == "image":
-        descriptor["image"] = {"url": None, "alt": title}
-        descriptor[
-            "unsupported_reason"
-        ] = "Image artifact previews require a signed preview URL."
+        previews = artifact.get("viewable_previews", [])
+        image_url = next(
+            (p["url"] for p in previews if p.get("kind") == "image"),
+            previews[0]["url"] if previews else None,
+        )
+        descriptor["image"] = {"url": image_url, "alt": title}
+        if not image_url:
+            descriptor[
+                "unsupported_reason"
+            ] = "Image artifact previews require a signed preview URL."
+    elif kind == "video":
+        previews = artifact.get("viewable_previews", [])
+        video_url = next(
+            (p["url"] for p in previews if p.get("kind") == "video"),
+            previews[0]["url"] if previews else None,
+        )
+        descriptor["video"] = {"url": video_url, "alt": title}
+        if not video_url:
+            descriptor[
+                "unsupported_reason"
+            ] = "Video artifact previews require a signed preview URL."
     elif kind == "chart":
         descriptor["chart"] = {
             "kind": "bar",

@@ -1550,6 +1550,19 @@ async def resolve_artifact_download_url(
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None and artifact.storage_uri:
                 allowed_uris.add(artifact.storage_uri)
+        # Individually-addressable viewable files (images/videos) recorded in the
+        # job's `viewable_files` manifest are also signable — they let the canvas
+        # preview a run's plots/images inline. Only URIs actually recorded in the
+        # manifest are allowed; unknown siblings under the same prefix stay 404.
+        if job:
+            viewable = (job.polling_metadata or {}).get("viewable_files")
+            if isinstance(viewable, list):
+                for entry in viewable:
+                    if not isinstance(entry, dict):
+                        continue
+                    viewable_uri = entry.get("storage_uri")
+                    if isinstance(viewable_uri, str) and viewable_uri:
+                        allowed_uris.add(viewable_uri)
         if storage_uri not in allowed_uris:
             raise HTTPException(status_code=404, detail="Artifact not found")
 
