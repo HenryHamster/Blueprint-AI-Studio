@@ -909,7 +909,7 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
-  const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
+  const researchPrompt = `${codebaseSummary}${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
 
@@ -945,7 +945,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 
 # CODEBASE CONTEXT
 
-${codebaseSummary}${fileTreeSection}${gitHistorySection}
+${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}

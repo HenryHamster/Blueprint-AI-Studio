@@ -315,7 +315,7 @@ The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only 
 
 When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
       : '';
-  return `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
+  return `You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
 Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
 
@@ -323,6 +323,7 @@ Each cycle you look at what's happening and decide whether it's still on the rig
 ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
 ${p.userStateLine}
+${p.contextPrefix}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
