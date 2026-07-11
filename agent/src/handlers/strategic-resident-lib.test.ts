@@ -16,9 +16,10 @@ import {
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
+  decisionsRegisterText,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
-  type CompactionCheckpointContext,
+  type CompactionCheckpointContext, type DecisionsRegisterEntry,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -935,6 +936,54 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
   });
 });
 
+describe('decisionsRegisterText decisions register', () => {
+  it('test_decisions_register_rendered_in_prompt_and_checkpoint', () => {
+    const register: DecisionsRegisterEntry[] = [
+      { atTick: 1, at: '2026-07-10T12:00:00Z', surfaceKey: 'direction:d-1', verdict: 'found', note: 'Found high churn in recent activity - needs review' },
+      { atTick: 2, at: '2026-07-10T12:05:00Z', surfaceKey: 'direction:d-1', verdict: 'advanced', note: 'Spawned plan task to investigate churn root cause' },
+      { atTick: 3, at: '2026-07-10T12:10:00Z', surfaceKey: 'qualification', verdict: 'clear', note: 'Examined latest qualification findings - nothing new actionable' },
+    ];
+
+    // 1. decisionsRegisterText formats entries with full-fidelity notes.
+    const text = decisionsRegisterText(register, 20);
+    expect(text).toContain('Decisions register');
+    expect(text).toContain('tick-1 [found] direction:d-1');
+    expect(text).toContain('Found high churn');
+    expect(text).toContain('tick-2 [advanced] direction:d-1');
+    expect(text).toContain('Spawned plan task');
+    expect(text).toContain('tick-3 [clear] qualification');
+    expect(text).toContain('Examined latest qualification findings');
+
+    // 2. Decisions register renders into the autonomous prompt.
+    const prompt = buildAutonomousPrompt([], [], [], false, 3, text);
+    expect(prompt).toContain('Decisions register');
+    expect(prompt).toContain('tick-1 [found]');
+
+    // 3. Decisions register renders into the compaction checkpoint.
+    const checkpoint = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      decisionsRegisterText: text,
+    });
+    expect(checkpoint).toContain('Decisions register');
+    expect(checkpoint).toContain('tick-1 [found]');
+
+    // 4. Empty register returns empty string.
+    expect(decisionsRegisterText([], 20)).toBe('');
+
+    // 5. Checkpoint with no decisions register omits the section.
+    const noReg = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(noReg).not.toContain('Decisions register');
+  });
+});
+
 describe('buildSurfaceCatalog', () => {
   it('derives direction, diagnostic-fetch, standing, and code:<dir> surfaces', () => {
     const catalog = buildSurfaceCatalog(
@@ -1684,6 +1733,46 @@ describe('buildCompactionCheckpoint', () => {
     expect(result).toContain('You are the resident strategist for Acme');
     expect(result).toContain('Examination ledger (carried forward)');
     expect(result).toContain('Examination tick: 0');
+  });
+
+  it('test_checkpoint_grounding_marked_snapshot_not_current', () => {
+    // Grounding IS populated — verify it is marked as a session-start snapshot
+    // and includes a directive to ./fetch current state rather than rely on stale data.
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'You are the resident strategist for Test.',
+      examLedgerJson: JSON.stringify({ records: [], tick: 0, corrective: false }),
+      recentInteractions: '',
+      autonomousState: 'Examination tick: 0',
+      problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
+      directionsText: '- d-1 active',
+      visionJson: JSON.stringify({ future: 'testable code' }),
+      openMessagesText: 'msg: improve test coverage',
+    };
+    const result = buildCompactionCheckpoint(ctx);
+
+    // Grounding section header contains "(session-start snapshot)" marker.
+    expect(result).toContain('## Self-model grounding (session-start snapshot)');
+    // The "Snapshot note" preamble warns the data may be stale.
+    expect(result).toContain('Snapshot note');
+    expect(result).toMatch(/may not reflect/);
+    // ./fetch directives let the model recover current state.
+    expect(result).toContain('./fetch problem-model');
+    expect(result).toContain('./fetch direction <id>');
+    expect(result).toContain('./fetch open-messages');
+    // The top-level header must not claim the model 'retains ... all durable state'.
+    expect(result).not.toMatch(/retain.*all durable state/);
+
+    // WITHOUT grounding fields — the snapshot/stale markers MUST NOT appear.
+    const minimalCtx: CompactionCheckpointContext = {
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    };
+    const minimalResult = buildCompactionCheckpoint(minimalCtx);
+    expect(minimalResult).not.toContain('(session-start snapshot)');
+    expect(minimalResult).not.toContain('Snapshot note');
+    expect(minimalResult).not.toContain('may not reflect');
   });
 
   it('omits self-model grounding when no fields are populated', () => {

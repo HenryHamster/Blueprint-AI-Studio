@@ -29,13 +29,14 @@ import {
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
-  buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads,
+  buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, buildCompactionCheckpoint,
+  decisionsRegisterText, DECISIONS_REGISTER_CAP,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
-  type CompactionCheckpointContext,
+  type CompactionCheckpointContext, type DecisionsRegisterEntry,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -365,6 +366,12 @@ export async function handleStrategicResident(
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
 
+  // ── Durable decisions register ──────────────────────────────────────────
+  // Full-fidelity cross-tick memory of settled decisions, preserved across
+  // compaction restarts so the strategist stops re-deriving settled facts
+  // and re-proposing corrections tick over tick.
+  const decisionsReg: DecisionsRegisterEntry[] = [];
+
   // ── Compaction state ─────────────────────────────────────────────────────
   // Track cumulative input tokens (latest turn) and the last compaction time
   // so the session detects context-window pressure and compacts before the
@@ -413,6 +420,7 @@ export async function handleStrategicResident(
       priorSessionContextText: priorSessionContextText || undefined,
       directionsText: buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
       runningUpdate: strVal(payload.running_update) || undefined,
+      decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
     };
   };
   // An operator turn just completed → run an autonomous turn to act on it.
@@ -866,7 +874,7 @@ export async function handleStrategicResident(
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
       lastAutonomousTurnAt = Date.now();
-      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn), false);
+      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn, decisionsRegisterText(decisionsReg)), false);
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
 
@@ -905,6 +913,18 @@ export async function handleStrategicResident(
       examRecords.push(upd.record);
       if (examRecords.length > EXAM_RECORDS_CAP) {
         examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
+      }
+      // Build and push to the durable decisions register (full-fidelity notes).
+      const fullTickVerdict = parseTickVerdict(r.resultText);
+      decisionsReg.push({
+        atTick: upd.record.atTick,
+        at: upd.record.at,
+        surfaceKey: upd.record.surfaceKey,
+        verdict: upd.record.verdict,
+        note: fullTickVerdict?.note ?? upd.record.note,
+      });
+      if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
+        decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
       }
       correctiveNextTick = upd.corrective;
       previousTurnAgendaContinue = upd.agendaContinue;

@@ -372,6 +372,8 @@ export interface CompactionCheckpointContext {
   directionsText?: string;
   /** Running update text (payload.running_update). */
   runningUpdate?: string;
+  /** Formatted decisions register text (durable cross-tick decision memory). */
+  decisionsRegisterText?: string;
 }
 
 /**
@@ -394,8 +396,7 @@ export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): str
 
 The resident session's Claude subprocess was restarted because the context
 window approached its limit. This is a CHECKPOINT restore, not a fresh start.
-Your previous session was compacted; you retain your role, tools, and all
-durable state. Continue operating exactly where you left off.
+Your previous session was compacted. Continue operating exactly where you left off.
 
 ${ctx.roleIdentity}`);
 
@@ -445,7 +446,16 @@ ${ctx.autonomousState.trim()}`);
     grounding.push(`### Running update\n${ctx.runningUpdate.trim()}`);
   }
   if (grounding.length > 0) {
-    sections.push(`## Self-model grounding\n${grounding.join('\n\n')}`);
+    const note = `> **Snapshot note:** The data below was captured when the session started
+> and may not reflect current project state. Use \`./fetch problem-model\`,
+> \`./fetch direction <id>\`, and \`./fetch open-messages\` to retrieve
+> the latest state.`;
+    sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
+  }
+
+  // (vi) Durable decisions register — preserved across restarts.
+  if (ctx.decisionsRegisterText?.trim()) {
+    sections.push(ctx.decisionsRegisterText.trim());
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a
@@ -1098,6 +1108,17 @@ export interface ExamRecord {
 
 /** Cap on retained exam records (bounds a multi-hour session's memory). */
 export const EXAM_RECORDS_CAP = 200;
+
+export interface DecisionsRegisterEntry {
+  atTick: number;
+  at: string;
+  surfaceKey: string;
+  verdict: string;
+  /** Full-fidelity note — NOT truncated like exam record notes. */
+  note: string;
+}
+/** Cap on decisions register entries (durable cross-tick decision memory). */
+export const DECISIONS_REGISTER_CAP = 50;
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default floor-tick interval (ms): even with no state change, review at least
@@ -1388,6 +1409,7 @@ export function buildAutonomousPrompt(
   openFound: ExamRecord[],
   corrective: boolean,
   maxOpsPerTurn = 3,
+  decisionsRegisterText = '',
 ): string {
   const lines: string[] = [];
 
@@ -1417,6 +1439,11 @@ export function buildAutonomousPrompt(
     'Rotating examination focus (prefer the first; pick another ONLY with a concrete',
     'lead — your verdict MUST name the surface you actually examined):',
   );
+  // Durable decisions register — full-fidelity record of recent tick verdicts,
+  // rendered here so the model sees settled decisions before picking a surface.
+  if (decisionsRegisterText) {
+    lines.push('', decisionsRegisterText, '');
+  }
   for (const s of focus) lines.push(`- ${s.key} — ${s.hint}`);
 
   if (recentRecords.length > 0) {
@@ -1588,4 +1615,32 @@ export function refreshSurfaceCatalog(
   const firstNonDir = pruned.findIndex(s => s.kind !== 'direction');
   if (firstNonDir === -1) return [...pruned, ...newDirs];
   return [...pruned.slice(0, firstNonDir), ...newDirs, ...pruned.slice(firstNonDir)];
+}
+
+// ── Durable decisions register: cross-tick decision memory ──────────────────
+// Unlike the exam ledger (which truncates notes and caps retained history in
+// the prompt to 6 entries), the decisions register stores full-fidelity tick
+// verdicts and is rendered into BOTH the autonomous tick prompt and the
+// compaction checkpoint. This prevents the strategist from re-deriving
+// settled facts or re-proposing already-executed corrections tick over tick
+// and across session restarts.
+
+/**
+ * Format the decisions register for inclusion in the autonomous prompt or
+ * compaction checkpoint. Returns a markdown section header followed by one
+ * line per entry (most recent last). Returns empty string when the register
+ * is empty, so the caller can omit the section cleanly.
+ */
+export function decisionsRegisterText(
+  register: DecisionsRegisterEntry[],
+  limit = 20,
+): string {
+  if (register.length === 0) return '';
+  const slice = register.slice(-limit);
+  const lines: string[] = ['## Decisions register (durable cross-tick memory)'];
+  for (const entry of slice) {
+    const noteStr = entry.note ? ` — ${entry.note}` : '';
+    lines.push(`- tick-${entry.atTick} [${entry.verdict}] ${entry.surfaceKey || '(none)'}${noteStr} (${entry.at})`);
+  }
+  return lines.join('\n');
 }
