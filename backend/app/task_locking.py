@@ -48,6 +48,24 @@ logger = logging.getLogger(__name__)
 
 DESIGN_DOC_MAX_BYTES = 500_000
 
+# Keys in project.design_doc that are owned by internal orchestration (code-side
+# writers) and are excluded from the agent-write size cap. These keys have their
+# own internal retention caps and must not consume the agent-write budget.
+# This is the authoritative set — mirror of the guard in
+# admin_agent_ops.py (which imports from here). Keep in sync with the set/delete
+# guard in that module so the two never diverge.
+_RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
+    {
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    }
+)
+
 
 @asynccontextmanager
 async def task_lock(
@@ -552,16 +570,28 @@ async def with_design_doc_locked(
         if project is None:
             return False
         doc = dict(project.design_doc or {})
-        old_size = len(json.dumps(doc))
+
+        # Compute agent-owned size: reserved keys (code-side blobs like
+        # efficiency_baseline, lane_baselines, etc.) have their own retention
+        # caps and must not block agent writes.  Measure only the non-reserved
+        # portion so the cap reflects what agents can control.
+        def _agent_owned_size(d: dict) -> int:
+            return len(
+                json.dumps(
+                    {k: v for k, v in d.items() if k not in _RESERVED_DESIGN_DOC_KEYS}
+                )
+            )
+
+        old_agent_size = _agent_owned_size(doc)
         mutate_fn(doc)
-        new_size = len(json.dumps(doc))
-        if new_size > DESIGN_DOC_MAX_BYTES and new_size > old_size:
+        new_agent_size = _agent_owned_size(doc)
+        if new_agent_size > DESIGN_DOC_MAX_BYTES and new_agent_size > old_agent_size:
             logger.warning(
                 "[with_design_doc_locked] skipping write for project %s: "
-                "would grow design_doc from %d to %d bytes (ceiling %d)",
+                "would grow agent-owned portion from %d to %d bytes (ceiling %d)",
                 project_id,
-                old_size,
-                new_size,
+                old_agent_size,
+                new_agent_size,
                 DESIGN_DOC_MAX_BYTES,
             )
             return False

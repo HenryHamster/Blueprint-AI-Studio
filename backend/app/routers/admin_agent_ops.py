@@ -107,6 +107,7 @@ from app.task_capabilities import (
 from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
+    _RESERVED_DESIGN_DOC_KEYS,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
     with_design_doc_locked as _with_design_doc_locked,
@@ -119,20 +120,8 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
-# Keys in project.design_doc that are owned by the playbook system or reserved
-# for internal orchestration. These are excluded from design-doc list responses
-# and rejected by set/delete operations (use /api/agent/playbook instead).
-_RESERVED_DESIGN_DOC_KEYS = frozenset(
-    {
-        "playbook_archive",
-        "proposed_changes",
-        "lane_baselines",
-        "module_feedback",
-        "sr_catch_rate_trends",
-        "efficiency_baseline",
-        "retired_diagnoses_archive",
-    }
-)
+# _RESERVED_DESIGN_DOC_KEYS is imported from app.task_locking — the
+# authoritative definition lives alongside the size gate in that module.
 
 # Mixed surface marker: this module deliberately hosts both /api/admin and
 # /api/agent routes. The route-table invariant in backend/testing/test_invariants.py

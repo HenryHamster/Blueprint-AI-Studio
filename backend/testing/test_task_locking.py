@@ -1518,3 +1518,76 @@ async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_gr
 
     assert result is False, "growing an already-over-ceiling doc must return False"
     assert "extra" not in project.design_doc, "growth must not be persisted"
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
+    db_session,
+):
+    """Regression: when code-owned reserved blobs push total design_doc past
+    DESIGN_DOC_MAX_BYTES, agent-owned writes via with_design_doc_locked must
+    still succeed as long as the AGENT-OWNED content stays under the ceiling.
+
+    Steps:
+    1. Seed design_doc with reserved keys (efficiency_baseline, lane_baselines,
+       etc.) whose SERIALIZED SIZE alone exceeds DESIGN_DOC_MAX_BYTES.
+    2. Write a small agent-owned key — must succeed (reserved blobs excluded
+       from the size check).
+    3. Write an agent-owned key that would push agent-owned content over the
+       ceiling — must be rejected.
+    """
+    import json as _json
+
+    # Build large reserved blobs: a single 600KB string under a reserved key.
+    huge_blob = "z" * 600_000
+    project = Project(name="reserved-ceiling-regression", user_id="user")
+    project.design_doc = {
+        "efficiency_baseline": huge_blob,
+        "lane_baselines": huge_blob,
+    }
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Verify the total stored doc is indeed over the ceiling.
+    assert len(_json.dumps(project.design_doc)) > DESIGN_DOC_MAX_BYTES, (
+        "test setup must create a doc larger than the ceiling"
+    )
+
+    # Step 2: write a small agent-owned key — must succeed (reserved blobs
+    # are excluded from the size check).
+    def _write_small_agent_key(doc: dict) -> None:
+        doc["agent_key"] = "small_value"
+
+    result = await with_design_doc_locked(db_session, project.id, _write_small_agent_key)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result is True, (
+        "agent-owned write must succeed even though total doc exceeds ceiling"
+    )
+    assert project.design_doc.get("agent_key") == "small_value", (
+        "agent-owned write must be persisted"
+    )
+    # Reserved blobs must be preserved (mutate_fn only added a new key).
+    assert project.design_doc.get("efficiency_baseline") == huge_blob
+    assert project.design_doc.get("lane_baselines") == huge_blob
+
+    # Step 3: grow agent-owned content over the ceiling — must be rejected.
+    def _grow_agent_over_ceiling(doc: dict) -> None:
+        doc["another_agent_key"] = "x" * DESIGN_DOC_MAX_BYTES
+
+    result2 = await with_design_doc_locked(
+        db_session, project.id, _grow_agent_over_ceiling
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert result2 is False, (
+        "agent-owned write that exceeds ceiling must be rejected"
+    )
+    assert "another_agent_key" not in project.design_doc, (
+        "over-ceiling agent write must not be persisted"
+    )
