@@ -1470,3 +1470,64 @@ def plan_compute_execution(
     return ExecutionPlan(
         backend=backend, argv=argv, env=env, gpu_indices=list(gpu_indices)
     )
+
+
+def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, str]:
+    """Run ``nvidia-smi -L`` inside the EXACT sandbox the real job will use.
+
+    The probe reuses the plan's argv/env verbatim, substituting only the
+    terminal command argument so the sandbox construction is identical (same
+    bwrap bind mounts, same CUDA_VISIBLE_DEVICES, same /sys bind, same docker
+    flags). A GPU that can't be seen here will silently fall back to CPU in the
+    real job, which this gate is designed to prevent.
+
+    Returns ``(True, output)`` when at least one GPU is listed; ``(False, reason)``
+    on any failure (non-zero exit, timeout, OSError, or empty GPU list). Never
+    raises.
+    """
+    probe_command = "nvidia-smi -L"
+
+    if plan.backend == BACKEND_BWRAP:
+        # bwrap argv ends with: ... bash -lc <command>
+        # Replace the trailing command string with the probe.
+        if len(plan.argv) >= 3 and plan.argv[-2] == "-lc":
+            probe_argv = list(plan.argv[:-1]) + [probe_command]
+        else:
+            return False, "unexpected bwrap argv shape — cannot build probe"
+    elif plan.backend in (BACKEND_DOCKER, BACKEND_PODMAN):
+        # docker/podman run … image bash -lc <command>
+        # Replace everything after "bash -lc" with the probe.
+        try:
+            bash_idx = plan.argv.index("bash")
+        except ValueError:
+            return False, "unexpected docker argv shape — cannot build probe"
+        probe_argv = list(plan.argv[:bash_idx]) + ["bash", "-lc", probe_command]
+    elif plan.backend in (BACKEND_APPTAINER, BACKEND_ENROOT):
+        # apptainer exec … image <command>  →  replace terminal command
+        probe_argv = list(plan.argv[:-1]) + [probe_command]
+    else:
+        return False, f"unsupported backend {plan.backend!r} for GPU probe"
+
+    try:
+        result = subprocess.run(
+            probe_argv,
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"GPU probe timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"GPU probe failed to launch: {exc}"
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = (stdout + "\n" + stderr).strip() or f"exit {result.returncode}"
+        return False, f"nvidia-smi -L exited {result.returncode}: {detail}"
+
+    output = (result.stdout or "").strip()
+    if not output:
+        return False, "nvidia-smi -L returned no output"
+    return True, output

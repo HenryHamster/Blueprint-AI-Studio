@@ -1964,6 +1964,7 @@ def _run_compute_job(
     cancel_requested = bool(job_body.get("cancel_requested", False))
     repo_clone = job_body.get("repo_clone") or None
     repo_token = job_body.get("repo_token") or None
+    accelerator_type = job_body.get("accelerator_type") or None
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
@@ -2091,6 +2092,33 @@ def _run_compute_job(
                 },
             )
             return
+
+        # GPU-used enforcement: when the job declares an accelerator requirement,
+        # run a lightweight nvidia-smi -L probe INSIDE the same sandbox before
+        # the real command so torch/TF cannot silently fall back to CPU if CUDA
+        # is not actually reachable inside the sandbox.
+        if accelerator_type and assigned_gpus:
+            probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
+            if not probe_ok:
+                terminal_reason = (
+                    f"GPU declared (accelerator={accelerator_type}) but unusable "
+                    f"in sandbox: {probe_detail}"
+                )
+                print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
+                outcome = "failure"
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=1,
+                    command_log={
+                        "text": terminal_reason,
+                        "truncated": False,
+                    },
+                )
+                return
+            print(
+                f"[compute] GPU probe OK for job {job_id}: {probe_detail.splitlines()[0]}",
+                flush=True,
+            )
 
         # Per-job image downgrade: the job asked for a container_image but this host
         # has no container runtime, so it runs image-LESS under bwrap on the host
@@ -2797,6 +2825,54 @@ def _preflight(
         "gpu policy",
         f"allowlist=[{allowlist_str}]  per_job={gpu_state.get('per_job')}",
     )
+
+    # GPU sandbox smoke test: verify CUDA is actually reachable inside the bwrap
+    # sandbox that GPU compute jobs will use. Runs only when GPUs are detected and
+    # bwrap is available; a non-zero exit or empty output here means any
+    # accelerator-declared job would be aborted by the GPU probe gate.
+    if caps.has_gpu and caps.bwrap_ok and allowlist:
+        _smoke_indices = list(allowlist)[:1]
+        try:
+            import tempfile as _tempfile
+            _smoke_tmpdir = _tempfile.mkdtemp(prefix="bp_gpu_smoke_")
+            _smoke_result_file = os.path.join(_smoke_tmpdir, "result.json")
+            _smoke_artifact_dir = os.path.join(_smoke_tmpdir, "artifacts")
+            os.makedirs(_smoke_artifact_dir, exist_ok=True)
+            _smoke_ldconfig = _read_ldconfig() if iso.BACKEND_BWRAP else ""
+            _smoke_plan = iso.plan_compute_execution(
+                caps=caps,
+                command="nvidia-smi -L",
+                image=None,
+                registry_auth=None,
+                workspace_host=_smoke_tmpdir,
+                result_file_host=_smoke_result_file,
+                artifact_dir_host=_smoke_artifact_dir,
+                clone_dir_host=None,
+                cwd_host=None,
+                job_env={},
+                gpu_indices=_smoke_indices,
+                container_name="bp-smoke",
+                source_env=dict(os.environ),
+                ldconfig_output=_smoke_ldconfig,
+            )
+            import shutil as _shutil
+            _shutil.rmtree(_smoke_tmpdir, ignore_errors=True)
+            if not _smoke_plan.declined:
+                _probe_ok, _probe_detail = iso.probe_gpu_in_sandbox(_smoke_plan)
+                if _probe_ok:
+                    _fmt(
+                        "gpu sandbox",
+                        f"CUDA reachable: {_probe_detail.splitlines()[0]}",
+                    )
+                else:
+                    _fmt("gpu sandbox", f"WARNING — CUDA unreachable in sandbox: {_probe_detail}")
+            else:
+                _fmt("gpu sandbox", f"plan declined: {_smoke_plan.decline_reason}")
+        except Exception as _exc:
+            _fmt("gpu sandbox", f"smoke check error: {_exc}")
+    elif caps.has_gpu:
+        _fmt("gpu sandbox", "skipped (bwrap not usable)")
+
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 

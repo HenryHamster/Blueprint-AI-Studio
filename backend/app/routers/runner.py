@@ -828,6 +828,7 @@ async def next_compute_job(
         "cancel_requested": False,
         "repo_clone": repo_clone,
         "repo_token": repo_token,
+        "accelerator_type": job.accelerator_type,
     }
 
 

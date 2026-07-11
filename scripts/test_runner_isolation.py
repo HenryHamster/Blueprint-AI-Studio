@@ -1082,5 +1082,163 @@ class TestCapabilitiesInventory(unittest.TestCase):
             self.assertIsInstance(value, bool)
 
 
+# ── GPU sandbox probe ─────────────────────────────────────────────────────────
+
+class TestProbeGpuInSandbox(unittest.TestCase):
+    """probe_gpu_in_sandbox: runs nvidia-smi -L inside the plan's sandbox argv.
+
+    Tests use bwrap plans with a real-shaped argv so the probe logic can
+    substitute the command correctly without actually launching bwrap.
+    """
+
+    def _bwrap_plan(self, gpu_indices=None):
+        """Build a minimal bwrap ExecutionPlan with GPU assignment."""
+        indices = gpu_indices if gpu_indices is not None else [1]
+        caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, gpu_indices=tuple(indices))
+        return iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image=None,
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=indices,
+            container_name="bp-test",
+            source_env={"PATH": "/usr/bin"},
+        )
+
+    def test_probe_success_returns_true_with_output(self):
+        """Probe returns (True, output) when nvidia-smi -L succeeds with GPU list."""
+        plan = self._bwrap_plan([0])
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="GPU 0: NVIDIA A100 (UUID: GPU-abc123)\n",
+            stderr="",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertTrue(ok)
+        self.assertIn("GPU 0", detail)
+
+    def test_probe_nonzero_exit_returns_false(self):
+        """Probe returns (False, reason) when nvidia-smi exits non-zero."""
+        plan = self._bwrap_plan([1])
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=6,
+            stdout="",
+            stderr="GPU access blocked by the operating system",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("6", detail)
+
+    def test_probe_timeout_returns_false(self):
+        """Probe returns (False, reason) on subprocess timeout."""
+        plan = self._bwrap_plan([0])
+        with mock.patch.object(
+            iso.subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=30)
+        ):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
+    def test_probe_oserror_returns_false(self):
+        """Probe returns (False, reason) when the sandbox binary cannot be launched."""
+        plan = self._bwrap_plan([0])
+        with mock.patch.object(iso.subprocess, "run", side_effect=OSError("bwrap not found")):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("launch", detail)
+
+    def test_probe_uses_same_bwrap_argv_prefix(self):
+        """Probe argv shares the same bwrap flags as the real plan (same sandbox)."""
+        plan = self._bwrap_plan([2])
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="GPU 0: NVIDIA V100\n",
+                stderr="",
+            )
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            iso.probe_gpu_in_sandbox(plan)
+
+        probe_argv = captured["argv"]
+        # Same bwrap binary starts the probe.
+        self.assertEqual(probe_argv[0], "/usr/bin/bwrap")
+        # Terminal command is nvidia-smi -L, not the original python train.py.
+        self.assertEqual(probe_argv[-2:], ["-lc", "nvidia-smi -L"])
+        # Original plan's bash invocation preserved.
+        self.assertIn("bash", probe_argv)
+
+    def test_probe_replaces_only_command_not_env(self):
+        """Probe env is the same as the real plan's env (same CUDA_VISIBLE_DEVICES etc.)."""
+        plan = self._bwrap_plan([1])
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="GPU 0: NVIDIA T4\n",
+                stderr="",
+            )
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            iso.probe_gpu_in_sandbox(plan)
+
+        # CUDA_VISIBLE_DEVICES must be set (1 device → renumbered from 0).
+        self.assertEqual(captured["env"].get("CUDA_VISIBLE_DEVICES"), "0")
+        # Host GPU index preserved for driver hooks.
+        self.assertEqual(captured["env"].get("NVIDIA_VISIBLE_DEVICES"), "1")
+
+    def test_probe_declined_plan_shape_error(self):
+        """Probe returns (False, reason) for a declined plan without crashing."""
+        plan = iso.ExecutionPlan.decline("no bwrap")
+        ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+
+    def test_probe_non_zero_gpu_index_cuda_visible_devices_renumbered(self):
+        """Host GPU index 2 → CUDA_VISIBLE_DEVICES=0 inside sandbox (renumbering)."""
+        plan = self._bwrap_plan([2])
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="GPU 0: NVIDIA A100-SXM4\n",
+                stderr="",
+            )
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, _ = iso.probe_gpu_in_sandbox(plan)
+
+        self.assertTrue(ok)
+        # Single exposed device → always renumbered to 0 inside sandbox.
+        self.assertEqual(captured["env"].get("CUDA_VISIBLE_DEVICES"), "0")
+        # Host index preserved so driver hooks can find the physical device.
+        self.assertEqual(captured["env"].get("NVIDIA_VISIBLE_DEVICES"), "2")
+
+    def test_probe_empty_output_returns_false(self):
+        """Probe returns (False, reason) when nvidia-smi exits 0 but prints nothing."""
+        plan = self._bwrap_plan([0])
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("no output", detail)
+
+
 if __name__ == "__main__":
     unittest.main()

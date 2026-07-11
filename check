@@ -199,7 +199,7 @@ if touches "backend/"; then
     case "${DATABASE_URL:-}" in
       postgresql*) [ "$(printf '%s' "${USE_TEST_POSTGRES:-}" | tr '[:upper:]' '[:lower:]')" = "true" ] && _PG_ENV_OK=1 ;;
     esac
-    if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
+    if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
       if [ -n "${ALLOW_LOW_MEM:-}" ]; then
         # Explicit opt-in: force the full sanctioned harness regardless of memory.
@@ -217,11 +217,13 @@ if touches "backend/"; then
         # only with memory headroom for it.
         _GATE_MODE="harness"
       fi
-    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh; then
-      # Docker unavailable but harness supports --standalone --no-postgres: run
-      # the no-DB invariant + manifest suites directly (no Docker, no Postgres
-      # required). Keeps typed-mock/helper-leak/manifest violations from
-      # silently passing when they would only be caught at the promotion qualifier.
+    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh && ! command -v docker >/dev/null 2>&1; then
+      # Docker binary absent AND harness supports --standalone --no-postgres: run
+      # the no-DB invariant + manifest suites directly. When docker binary is
+      # present but the daemon is unavailable (docker info exits 1 — handled above),
+      # the harness still detects the binary and tries to build/pull, so we must
+      # not enter this path in that case. Without docker at all, the harness falls
+      # through to direct pytest which does not need a daemon.
       _GATE_MODE="harness-standalone"
     fi
     if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then

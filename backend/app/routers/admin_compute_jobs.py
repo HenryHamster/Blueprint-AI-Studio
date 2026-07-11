@@ -9,6 +9,7 @@ needs viewer, killing needs member.
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Any, Dict
 
@@ -667,3 +668,86 @@ async def ask_compute_job(
         logs=logs,
         history=[turn.model_dump() for turn in body.history],
     )
+
+
+# ── GPU contamination audit ───────────────────────────────────────────────────
+
+# Commit that introduced /sys ro-bind for bwrap GPU sandboxes (PR #14183).
+# Jobs that STARTED before this timestamp on local-runner may have been silently
+# running on CPU even when an accelerator was declared (cuInit returned rc=304).
+_GPU_SYS_FIX_UTC = datetime(2026, 7, 11, 7, 6, 21, tzinfo=timezone.utc)
+_RUNNER_SUBPROCESS_BACKEND = "runner-subprocess"
+
+
+@router.get("/compute-jobs/gpu-contamination-audit")
+async def gpu_contamination_audit(
+    project_id: uuid.UUID = Query(...),
+    user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, Any]:
+    """List accelerator-declared local-runner compute jobs started BEFORE the
+    /sys ro-bind fix (PR #14183, commit b92e368) that may have silently run on
+    CPU instead of GPU.
+
+    These jobs should be treated as suspect: CUDA likely failed inside the bwrap
+    sandbox with rc=304 CUDA_ERROR_OPERATING_SYSTEM, causing torch/TF to
+    silently fall back to CPU while reporting a successful exit code.
+
+    Returns a read-only report; no data is deleted or modified.
+    """
+    await _get_user_project_with_role(project_id, user, session, required_role="viewer")
+
+    from sqlalchemy import and_
+
+    result = await session.execute(
+        select(ComputeJob)
+        .where(
+            and_(
+                ComputeJob.project_id == project_id,
+                ComputeJob.backend == _RUNNER_SUBPROCESS_BACKEND,
+                ComputeJob.accelerator_type.isnot(None),
+                ComputeJob.started_at.isnot(None),
+                ComputeJob.started_at < _GPU_SYS_FIX_UTC,
+            )
+        )
+        .order_by(ComputeJob.started_at.asc())
+        .limit(500)
+    )
+    jobs = result.scalars().all()
+
+    task_ids = {j.task_id for j in jobs if j.task_id is not None}
+    task_titles: Dict[uuid.UUID, str | None] = {}
+    if task_ids:
+        task_rows = (
+            await session.execute(
+                select(Task)
+                .options(load_only(Task.id, Task.title, raiseload=True))
+                .where(Task.id.in_(task_ids))
+            )
+        ).scalars().all()
+        task_titles = {t.id: t.title for t in task_rows}
+
+    items = []
+    for job in jobs:
+        items.append({
+            "job_id": str(job.id),
+            "task_id": str(job.task_id) if job.task_id else None,
+            "task_title": task_titles.get(job.task_id) if job.task_id else None,
+            "accelerator_type": job.accelerator_type,
+            "status": job.status.value if job.status else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+            "suspect_reason": (
+                "started before /sys ro-bind fix (PR #14183); cuInit likely "
+                "returned CUDA_ERROR_OPERATING_SYSTEM (rc=304), causing silent "
+                "CPU fallback"
+            ),
+        })
+
+    return {
+        "fix_landed_at": _GPU_SYS_FIX_UTC.isoformat(),
+        "fix_pr": "#14183",
+        "fix_commit": "b92e36823",
+        "suspect_count": len(items),
+        "jobs": items,
+    }
