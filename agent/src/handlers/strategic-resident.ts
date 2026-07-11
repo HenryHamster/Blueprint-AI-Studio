@@ -401,7 +401,19 @@ export async function handleStrategicResident(
       `Compaction count: ${compactionCount + 1}`,
     ].filter(Boolean).join('\n');
 
-    return { roleIdentity, examLedgerJson, recentInteractions, autonomousState };
+    // Durable self-model grounding — carried from the bootstrap across compaction
+    // so the resumed session does NOT re-derive settled facts, re-read settled
+    // directions, or re-propose corrections the operator already made.
+    return {
+      roleIdentity, examLedgerJson, recentInteractions, autonomousState,
+      problemModelJson: problemModelJson || undefined,
+      visionJson: visionJson || undefined,
+      strategicMemoryNotesText: strategicMemoryNotesText || undefined,
+      openMessagesText: buildOpenMessagesText(openMessages) || undefined,
+      priorSessionContextText: priorSessionContextText || undefined,
+      directionsText: buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
+      runningUpdate: strVal(payload.running_update) || undefined,
+    };
   };
   // An operator turn just completed → run an autonomous turn to act on it.
   let operatorTurnJustCompleted = false;

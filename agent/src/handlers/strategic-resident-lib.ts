@@ -354,6 +354,24 @@ export interface CompactionCheckpointContext {
   recentInteractions: string;
   /** Current autonomous state snapshot (agenda, focus rotation, open leads). */
   autonomousState: string;
+  // ── Durable self-model grounding (carried from the bootstrap prompt) ──────
+  // These fields deliver the same grounding the bootstrap delivers on a fresh
+  // start so the restarted session does NOT re-derive settled facts, re-read
+  // settled directions, or re-propose corrections the operator already made.
+  /** Current problem model JSON (payload.problem_model). */
+  problemModelJson?: string;
+  /** Current vision JSON (payload.vision). */
+  visionJson?: string;
+  /** Formatted standing behavioral lessons (payload.strategic_memory_notes). */
+  strategicMemoryNotesText?: string;
+  /** Formatted open operator messages text (payload.open_messages). */
+  openMessagesText?: string;
+  /** Prior session context text (ctx._session_summary). */
+  priorSessionContextText?: string;
+  /** Formatted active directions summary (payload.directions_summary). */
+  directionsText?: string;
+  /** Running update text (payload.running_update). */
+  runningUpdate?: string;
 }
 
 /**
@@ -399,6 +417,35 @@ ${ctx.recentInteractions.trim()}`);
   if (ctx.autonomousState.trim()) {
     sections.push(`## Current state
 ${ctx.autonomousState.trim()}`);
+  }
+
+  // (v) Durable self-model grounding — preserved from the bootstrap so the
+  // restarted session retains its identity, problem context, and operator
+  // relationship rather than re-deriving settled facts across the restart.
+  const grounding: string[] = [];
+  if (ctx.problemModelJson?.trim()) {
+    grounding.push(`### Problem model\n\`\`\`json\n${ctx.problemModelJson.trim()}\n\`\`\``);
+  }
+  if (ctx.directionsText?.trim()) {
+    grounding.push(`### Active directions\n${ctx.directionsText.trim()}`);
+  }
+  if (ctx.visionJson?.trim()) {
+    grounding.push(`### Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  }
+  if (ctx.openMessagesText?.trim()) {
+    grounding.push(`### Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  if (ctx.strategicMemoryNotesText?.trim()) {
+    grounding.push(`### Standing behavioral lessons\n${ctx.strategicMemoryNotesText.trim()}`);
+  }
+  if (ctx.priorSessionContextText?.trim()) {
+    grounding.push(`### Prior session context\n${ctx.priorSessionContextText.trim()}`);
+  }
+  if (ctx.runningUpdate?.trim()) {
+    grounding.push(`### Running update\n${ctx.runningUpdate.trim()}`);
+  }
+  if (grounding.length > 0) {
+    sections.push(`## Self-model grounding\n${grounding.join('\n\n')}`);
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a

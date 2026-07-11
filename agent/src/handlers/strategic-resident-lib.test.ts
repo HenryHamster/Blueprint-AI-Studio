@@ -1644,6 +1644,58 @@ describe('buildCompactionCheckpoint', () => {
     const result = buildCompactionCheckpoint(fullCtx);
     expect(result).toContain('Resume from this checkpoint');
   });
+
+  it('buildCompactionCheckpoint carries durable self-model grounding', () => {
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'You are the resident strategist for Acme.',
+      examLedgerJson: JSON.stringify({ records: [], tick: 0, corrective: false }),
+      recentInteractions: '',
+      autonomousState: 'Examination tick: 0',
+      problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
+      visionJson: JSON.stringify({ future: 'testable code' }),
+      strategicMemoryNotesText: '- Prefer concrete action over abstract discussion\n- Verify findings before escalating',
+      openMessagesText: 'msg: improve test coverage',
+      priorSessionContextText: 'Prior session explored auth flows.',
+      directionsText: '- d-1 (active) — improve test coverage',
+      runningUpdate: 'Coverage improved by 12%',
+    };
+    const result = buildCompactionCheckpoint(ctx);
+
+    // The self-model grounding section appears as a top-level section.
+    expect(result).toContain('## Self-model grounding');
+
+    // Every grounding field that was present renders as a sub-section.
+    expect(result).toContain('### Problem model');
+    expect(result).toContain('improve testing');
+    expect(result).toContain('### Vision');
+    expect(result).toContain('testable code');
+    expect(result).toContain('### Standing behavioral lessons');
+    expect(result).toContain('Prefer concrete action');
+    expect(result).toContain('### Open operator messages');
+    expect(result).toContain('improve test coverage');
+    expect(result).toContain('### Prior session context');
+    expect(result).toContain('explored auth flows');
+    expect(result).toContain('### Active directions');
+    expect(result).toContain('d-1 (active)');
+    expect(result).toContain('### Running update');
+    expect(result).toContain('12%');
+
+    // Existing sections (role identity, ledger, interactions, state) are untouched.
+    expect(result).toContain('You are the resident strategist for Acme');
+    expect(result).toContain('Examination ledger (carried forward)');
+    expect(result).toContain('Examination tick: 0');
+  });
+
+  it('omits self-model grounding when no fields are populated', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result).not.toContain('## Self-model grounding');
+    expect(result).not.toContain('### Problem model');
+  });
 });
 
 describe('residentConfig compaction knobs', () => {
