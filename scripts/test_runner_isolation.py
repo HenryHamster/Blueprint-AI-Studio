@@ -887,6 +887,8 @@ class TestComputePlan(unittest.TestCase):
         # Result file translated to the in-sandbox workspace path.
         self.assertEqual(plan.env["BLUEPRINT_RESULT_FILE"], "/workspace/result.json")
         self.assertEqual(plan.env["MY_HP"], "0.1")
+        # /sys is GPU-only: non-GPU sandboxes must stay /sys-free.
+        self.assertNotIn(" /sys", " ".join(plan.argv))
 
     def test_bwrap_gpu_exposes_only_assigned_nodes(self):
         plan = self._common(
@@ -897,6 +899,9 @@ class TestComputePlan(unittest.TestCase):
         self.assertIn("/dev/nvidia2", joined)
         self.assertNotIn("/dev/nvidia0", joined)  # unassigned NOT exposed
         self.assertIn("/dev/nvidiactl", joined)
+        # CUDA/NVML walk /sys/bus/pci at init — without this ro bind cuInit
+        # fails with CUDA_ERROR_OPERATING_SYSTEM even with all /dev nodes bound.
+        self.assertIn("--ro-bind-try /sys /sys", joined)
         # Only 1 device exposed → CUDA re-enumerates from 0.
         self.assertEqual(plan.env["CUDA_VISIBLE_DEVICES"], "0")
         self.assertEqual(plan.env["NVIDIA_VISIBLE_DEVICES"], "2")
