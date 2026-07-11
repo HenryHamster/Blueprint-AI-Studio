@@ -31,6 +31,7 @@ from app.evidence_primitive import EvidenceRef  # noqa: F401 — imported for sh
 __all__ = [
     "annotate_capability_proof_status",
     "carry_proof_records_for_consolidation",
+    "commission_proof_earn_loop",
     "enrich_problem_model_capability_proofs",
     "record_capability_backing_path_proof",
     "record_capability_proof",
@@ -590,3 +591,158 @@ def carry_proof_records_for_consolidation(
         )
 
     return result
+
+
+async def commission_proof_earn_loop(
+    project: Any,
+    demand_result: dict[str, Any],
+    problem_model: dict[str, Any],
+    *,
+    verify_path=None,
+) -> dict[str, Any]:
+    """Earn proof for demanded unproven working capabilities.
+
+    This is the core of the capability-proof EARN loop. It:
+
+    1. Computes the intersection of **demanded capabilities** (from
+       ``demand_result``) and **unproven working capabilities** (from
+       ``problem_model``) via
+       :func:`app.capability_demand.compute_unproven_demanded_capabilities`.
+
+    2. For each demanded unproven capability that declares ``backing_paths``:
+       verifies each path at HEAD via ``verify_path`` (defaults to
+       :func:`app.source_ref_validation._path_exists_at_head`).  When ALL
+       paths are definitely present, records a bounded
+       ``backing_path`` proof via
+       :func:`record_capability_backing_path_proof`.
+
+    3. For each demanded unproven capability that has NO ``backing_paths``:
+       no automated verification is possible — the gap is reported in the
+       return summary so callers (reaper sweeps, advisory hint builders) can
+       surface it.
+
+    Parameters
+    ----------
+    project:
+        The project ORM object (must carry ``problem_model`` and
+        ``capability_proof_records``).
+    demand_result:
+        Output of :func:`collect_missing_capability_demand`.
+    problem_model:
+        The project's ``problem_model`` dict (the IO-free
+        ``working_capability_proof_status`` reader is used on this).
+    verify_path:
+        Callable ``(path: str) -> bool | None`` — async, returns True when
+        the path definitely exists at HEAD, False when definitely absent,
+        None when indeterminate.  Defaults to
+        :func:`app.source_ref_validation._path_exists_at_head`.  Injected
+        for testability (an ``AsyncMock`` or ``lambda`` can be substituted).
+
+    Returns
+    -------
+    A summary dict:
+    ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
+      "still_unproven": list[str]}``.
+    Total entries found, count of newly-earned proofs, capability names with
+    no backing_paths, and remaining unproven names (failed path check).
+    """
+    from app.capability_demand import compute_unproven_demanded_capabilities
+    from app.source_ref_validation import (
+        _looks_like_file_path,
+        _path_exists_at_head,
+    )
+
+    _verify = verify_path or _path_exists_at_head
+
+    # Step 1: compute the intersection.
+    demanded_unproven = compute_unproven_demanded_capabilities(
+        demand_result, problem_model
+    )
+    if not demanded_unproven:
+        return {
+            "total_demanded_unproven": 0,
+            "earned": 0,
+            "no_backing_paths": [],
+            "still_unproven": [],
+        }
+
+    # Build a lookup: canonical-name -> (raw_name, backing_paths).
+    # We read from the raw capabilities so we can inspect backing_paths regardless
+    # of proof_status (the intersection has already filtered by proof_status).
+    caps_raw = problem_model.get("capabilities") or []
+    cap_backing: dict[str, tuple[str, list[str]]] = {}
+    for cap in caps_raw:
+        if not isinstance(cap, dict):
+            continue
+        raw_name = cap.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        norm_name = normalize_capability_name(raw_name)
+        if not norm_name:
+            continue
+        bp = cap.get("backing_paths")
+        if isinstance(bp, list):
+            cap_backing[norm_name] = (raw_name, bp)
+
+    earned_names: list[str] = []
+    no_backing_paths: list[str] = []
+    still_unproven: list[str] = []
+
+    for entry in demanded_unproven:
+        ref = entry.get("ref", "")
+        canonical = normalize_capability_name(ref)
+        if not canonical:
+            continue
+
+        raw_name, backing_paths = cap_backing.get(canonical, (None, []))
+        if not backing_paths:
+            no_backing_paths.append(canonical)
+            continue
+
+        # Filter to file-like paths.
+        file_paths = [
+            p for p in backing_paths
+            if isinstance(p, str) and _looks_like_file_path(p)
+        ]
+        if not file_paths:
+            no_backing_paths.append(canonical)
+            continue
+
+        # Verify every path at HEAD.  A single None (indeterminate) or False
+        # (definitely absent) prevents proof recording — only definite True
+        # on ALL paths triggers record.
+        all_present = True
+        for p in file_paths:
+            try:
+                exists = await _verify(p)
+            except Exception:  # noqa: BLE001 — verification failure is non-fatal
+                exists = None
+            if exists is not True:
+                all_present = False
+                break
+
+        if all_present:
+            recorded = record_capability_backing_path_proof(project, raw_name or canonical)
+            if recorded:
+                earned_names.append(canonical)
+            else:
+                # Dedup hit: already recorded, count as earned (not a failure).
+                earned_names.append(canonical)
+        else:
+            still_unproven.append(canonical)
+
+    logger.info(
+        "[CAPABILITY_PROOF] commission_proof_earn_loop: "
+        "total_demanded_unproven=%d earned=%d no_backing_paths=%d still_unproven=%d",
+        len(demanded_unproven),
+        len(earned_names),
+        len(no_backing_paths),
+        len(still_unproven),
+    )
+
+    return {
+        "total_demanded_unproven": len(demanded_unproven),
+        "earned": len(earned_names),
+        "no_backing_paths": no_backing_paths,
+        "still_unproven": still_unproven,
+    }

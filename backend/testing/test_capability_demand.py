@@ -8,6 +8,7 @@ import pytest
 from app.capability_demand import (
     DEFAULT_LOOKBACK,
     collect_missing_capability_demand,
+    compute_unproven_demanded_capabilities,
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
     unresolved_capability_needs,
@@ -729,3 +730,117 @@ async def test_free_prose_demand_retires_when_kebab_foundation_lands(db_session)
     # The kebab foundation satisfies the free-prose demand → zero remaining demand.
     assert result["total"] == 0
     assert result["demands"] == []
+
+
+# ── compute_unproven_demanded_capabilities ───────────────────────────────────
+
+
+def _problem_model(*, caps: list[dict]) -> dict:
+    """Build a problem_model dict with capability entries.
+
+    Each cap dict supports: name, status, backing_paths, evidence_refs.
+    """
+    return {"capabilities": caps}
+
+
+def _demand_result(*, demands: list[dict]) -> dict:
+    return {"total": len(demands), "demands": demands}
+
+
+class TestComputeUnprovenDemandedCapabilities:
+    """Pure-function tests for compute_unproven_demanded_capabilities."""
+
+    def test_empty_demand_returns_empty(self):
+        """No demand → empty result regardless of problem_model."""
+        pm = _problem_model(caps=[
+            {"name": "my-capability", "status": "working"},
+        ])
+        result = compute_unproven_demanded_capabilities(
+            _demand_result(demands=[]), pm
+        )
+        assert result == []
+
+    def test_empty_problem_model_returns_empty(self):
+        """No problem_model → empty result."""
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "my-capability"},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, {})
+        assert result == []
+
+    def test_proven_capability_excluded(self):
+        """A demanded capability that IS proven is not in the intersection."""
+        pm = _problem_model(caps=[
+            {"name": "my-capability", "status": "working",
+             "evidence_refs": [{"proven": True, "ref": "test", "source_id": "s1"}]},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "my-capability", "dependent_count": 2},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert result == []
+
+    def test_unproven_demanded_included(self):
+        """An unproven working capability that IS demanded → in intersection."""
+        pm = _problem_model(caps=[
+            {"name": "my-capability", "status": "working"},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "my-capability", "dependent_count": 3},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert len(result) == 1
+        assert result[0]["ref"] == "my-capability"
+        assert result[0]["proof_status"] == "unproven"
+        assert result[0]["dependent_count"] == 3
+
+    def test_multiple_demands_only_unproven_returned(self):
+        """Among multiple demanded caps, only unproven ones are returned."""
+        pm = _problem_model(caps=[
+            {"name": "proven-cap", "status": "working",
+             "evidence_refs": [{"proven": True, "ref": "t1", "source_id": "s1"}]},
+            {"name": "unproven-cap", "status": "working"},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "proven-cap", "dependent_count": 1},
+            {"kind": "capability", "ref": "unproven-cap", "dependent_count": 5},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert len(result) == 1
+        assert result[0]["ref"] == "unproven-cap"
+
+    def test_non_capability_kind_excluded(self):
+        """Task-kind demands are excluded from the capability intersection."""
+        pm = _problem_model(caps=[
+            {"name": "my-capability", "status": "working"},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "task", "ref": "some-task-id", "dependent_count": 1},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert result == []
+
+    def test_no_backing_paths_in_intersection(self):
+        """An unproven demanded cap with no backing_paths IS still in the
+        intersection — the earning loop caller decides what to do next."""
+        pm = _problem_model(caps=[
+            {"name": "no-backing-cap", "status": "working"},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "no-backing-cap", "dependent_count": 2},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert len(result) == 1
+        assert result[0]["ref"] == "no-backing-cap"
+
+    def test_normalization_matches_flexibly(self):
+        """Free-prose ref normalizes to match the canonical capability name."""
+        pm = _problem_model(caps=[
+            {"name": "my-test-capability", "status": "working"},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "My Test Capability", "dependent_count": 2},
+        ])
+        result = compute_unproven_demanded_capabilities(demand, pm)
+        assert len(result) == 1
+        assert result[0]["proof_status"] == "unproven"

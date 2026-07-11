@@ -297,6 +297,7 @@ from app.reaper_sweeps import (
     sweep_metrics_integrity,
     sweep_capability_backing_proofs,
     sweep_closed_handmerge_prs,
+    sweep_proof_earn_loop,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -2926,6 +2927,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Capability backing-proof sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22b: Proof-earn loop — commission proof for demanded unproven
+                # working capabilities.  Computes the intersection of demanded
+                # capabilities (from the missing-foundation demand signal) and unproven
+                # working capabilities, then attempts to earn proof via backing-path
+                # verification.  Shares the hourly cadence of Step 22.
+                _mark_reaper_progress()
+                try:
+                    await sweep_proof_earn_loop(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Proof-earn loop error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

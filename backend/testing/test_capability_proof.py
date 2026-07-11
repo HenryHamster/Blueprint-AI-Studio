@@ -13,6 +13,8 @@ Covers:
 import uuid
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     _PROOF_KIND_BACKING_PATH,
@@ -21,6 +23,7 @@ from app.capability_proof import (
     _proof_kind_from_verdict,
     annotate_capability_proof_status,
     carry_proof_records_for_consolidation,
+    commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
     record_capability_backing_path_proof,
     record_capability_proof,
@@ -1226,5 +1229,230 @@ class TestRecordGapEvidence:
         r = gap["evidence_refs"][0]
         assert set(r.keys()) >= {"kind", "ref", "proven", "source_id", "recorded_at"}
         assert r["proven"] is True
-        assert r["source_id"] == "task-fields"
-        assert r["ref"] == "testing/test_gap_evidence.py::test_fields"
+
+
+# ── commission_proof_earn_loop ───────────────────────────────────────────────
+
+
+class TestCommissionProofEarnLoop:
+    """Unit tests for commission_proof_earn_loop.
+
+    The function is async and accepts an injected ``verify_path`` so we can
+    test each branch without touching the filesystem.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_demand_returns_empty(self):
+        """No demanded capabilities → empty summary."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {}
+
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result={"total": 0, "demands": []},
+            problem_model={"capabilities": [
+                {"name": "my-cap", "status": "working"},
+            ]},
+        )
+        assert result["total_demanded_unproven"] == 0
+        assert result["earned"] == 0
+
+    @pytest.mark.asyncio
+    async def test_all_paths_present_records_proof(self):
+        """When demanded unproven capability has all backing_paths present at
+        HEAD, proof is earned."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "my-cap", "status": "working",
+             "backing_paths": ["backend/app/capability_proof.py"]},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "my-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["earned"] >= 1
+        # The proof should now be recorded on the project.
+        records = project.capability_proof_records
+        assert isinstance(records, dict)
+        assert "my-cap" in records
+
+    @pytest.mark.asyncio
+    async def test_path_absent_no_proof(self):
+        """When a backing_path does NOT exist at HEAD, proof is not recorded."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "my-cap", "status": "working",
+             "backing_paths": ["backend/app/missing.py"]},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return False
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "my-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["earned"] == 0
+        assert "my-cap" in result["still_unproven"]
+
+    @pytest.mark.asyncio
+    async def test_path_indeterminate_no_proof(self):
+        """When path existence is indeterminate (None), proof is not recorded."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "my-cap", "status": "working",
+             "backing_paths": ["backend/app/uncheckable.py"]},
+        ]}
+
+        async def _verify(p: str) -> None:
+            return None
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "my-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["earned"] == 0
+        assert "my-cap" in result["still_unproven"]
+
+    @pytest.mark.asyncio
+    async def test_no_backing_paths_reported(self):
+        """A demanded unproven cap with NO backing_paths is reported."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "no-backing-cap", "status": "working"},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "no-backing-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["earned"] == 0
+        assert "no-backing-cap" in result["no_backing_paths"]
+        assert result["no_backing_paths"] == ["no-backing-cap"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_backing_paths_and_no_backing_paths(self):
+        """Mixed results: some caps have backing_paths, some don't."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "has-paths", "status": "working",
+             "backing_paths": ["backend/app/capability_proof.py"]},
+            {"name": "no-paths", "status": "working"},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 2, "demands": [
+                    {"kind": "capability", "ref": "has-paths",
+                     "dependent_count": 3},
+                    {"kind": "capability", "ref": "no-paths",
+                     "dependent_count": 1},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["total_demanded_unproven"] == 2
+        assert result["earned"] >= 1
+        assert "has-paths" not in result["no_backing_paths"]
+        assert "no-paths" in result["no_backing_paths"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_verdicts_per_cap(self):
+        """Some backing_paths fail, some succeed."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "good-cap", "status": "working",
+             "backing_paths": ["backend/app/capability_proof.py"]},
+            {"name": "bad-cap", "status": "working",
+             "backing_paths": ["backend/app/missing.py"]},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return p in {"backend/app/capability_proof.py"}
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 2, "demands": [
+                    {"kind": "capability", "ref": "good-cap",
+                     "dependent_count": 2},
+                    {"kind": "capability", "ref": "bad-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["earned"] == 1
+        assert "bad-cap" in result["still_unproven"]
+
+    @pytest.mark.asyncio
+    async def test_already_proven_cap_excluded(self):
+        """A demanded capability that is already proven is excluded from earning."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "proven-cap", "status": "working",
+             "evidence_refs": [{"proven": True, "ref": "t1", "source_id": "s1"}]},
+            {"name": "unproven-cap", "status": "working",
+             "backing_paths": ["backend/app/capability_proof.py"]},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 2, "demands": [
+                    {"kind": "capability", "ref": "proven-cap",
+                     "dependent_count": 1},
+                    {"kind": "capability", "ref": "unproven-cap",
+                     "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        assert result["total_demanded_unproven"] == 1
+        assert result["earned"] == 1

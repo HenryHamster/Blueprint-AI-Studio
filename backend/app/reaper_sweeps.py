@@ -11,6 +11,7 @@ import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlmodel import select
 
@@ -700,6 +701,110 @@ async def sweep_capability_backing_proofs(session, now=None) -> int:
             total_recorded,
         )
     return total_recorded
+
+
+async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
+    """Step 22b: Earn proof for demanded unproven working capabilities.
+
+    Computes the intersection of demanded capabilities and unproven working
+    capabilities via :func:`commission_proof_earn_loop` and attempts to earn
+    proof by verifying backing_paths at HEAD.  For demanded capabilities that
+    have no backing_paths, the gap is surfaced in the return summary so the
+    strategist layer can act.
+
+    Cadence-gated to the same hourly interval as the backing-path sweep.
+    Returns a summary dict (see ``commission_proof_earn_loop`` return doc),
+    or ``{}`` when gated.
+    """
+    global _last_backing_proof_sweep
+    from app.capability_demand import collect_missing_capability_demand
+    from app.capability_proof import commission_proof_earn_loop
+    from app.models import Project
+    from sqlalchemy.orm import load_only
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backing_proof_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
+    ):
+        return {}
+
+    max_projects = 25
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.problem_model,
+                        Project.capability_proof_records,
+                        raiseload=True,
+                    )
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        return {}
+
+    combined: dict[str, Any] = {
+        "total_demanded_unproven": 0,
+        "earned": 0,
+        "no_backing_paths": [],
+        "still_unproven": [],
+    }
+
+    for project in rows:
+        try:
+            pm = getattr(project, "problem_model", None)
+            if not isinstance(pm, dict):
+                continue
+            capabilities = pm.get("capabilities")
+            if not isinstance(capabilities, list) or not capabilities:
+                continue
+
+            # Fetch demand for this project.
+            demand_result = await collect_missing_capability_demand(
+                session, project.id, now=_now
+            )
+            if not demand_result.get("demands"):
+                continue
+
+            result = await commission_proof_earn_loop(
+                project, demand_result, pm
+            )
+            if result.get("total_demanded_unproven", 0) > 0:
+                combined["total_demanded_unproven"] += result["total_demanded_unproven"]
+                combined["earned"] += result["earned"]
+                combined["no_backing_paths"].extend(result.get("no_backing_paths", []))
+                combined["still_unproven"].extend(result.get("still_unproven", []))
+                if result["earned"] > 0:
+                    session.add(project)
+                    await session.commit()
+
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] Proof-earn loop failed for project %s:",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    if combined["earned"] or combined["still_unproven"]:
+        logger.info(
+            "[REAPER] Step 22b: proof-earn loop: total_demanded_unproven=%d "
+            "earned=%d no_backing_paths=%d still_unproven=%d",
+            combined["total_demanded_unproven"],
+            combined["earned"],
+            len(combined["no_backing_paths"]),
+            len(combined["still_unproven"]),
+        )
+    return combined
 
 
 async def sweep_stuck_qualifications(session, *, session_factory) -> int:
