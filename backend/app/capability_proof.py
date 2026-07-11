@@ -22,9 +22,13 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.capability_registry import (
     annotate_capability_proof_status,
     compose_capability_markers,
+    exempt_capability_names,
     normalize_capability_name,
 )
-from app.evidence_primitive import EvidenceRef  # noqa: F401 — imported for shape doc
+from app.evidence_primitive import (  # noqa: F401 — EvidenceRef imported for shape doc
+    EvidenceRef,
+    classify_evidence,
+)
 
 # Re-exported for back-compat: the annotation body lives in the IO-free
 # capability_registry leaf so every spawn path shares ONE implementation.
@@ -164,8 +168,18 @@ def enrich_problem_model_capability_proofs(
 ) -> Any:
     """Return a shallow-copied problem_model with capability proof evidence.
 
-    Each capability entry receives a ``proof_status`` field and, when proof
-    records exist, a ``proof_records`` list containing the durable entries.
+    Each capability entry receives a ``proof_status`` field derived via a
+    two-tier resolution:
+
+    1. **evidence_refs** (tier-1): when the capability carries an ``evidence_refs``
+       list, ``classify_evidence`` determines the status — ``"proven"`` /
+       ``"path_proven"`` / ``"partial"`` / ``"unproven"`` / ``"unverified"``.
+
+    2. **proof_records** (tier-2): when evidence_refs is absent, checks the
+       durable proof-record kinds — ``"proven"`` when at least one record has a
+       non-backing_path proof_kind, ``"path_proven"`` when records exist but ALL
+       are backing_path, ``"unproven"`` otherwise.
+
     Missing / empty / malformed records fail open to claimed-only.
     """
     if not isinstance(problem_model, dict):
@@ -187,7 +201,19 @@ def enrich_problem_model_capability_proofs(
             if isinstance(cap_name, str)
             else []
         )
-        entry2["proof_status"] = "proven" if entries else "unproven"
+        # Derive proof_status from evidence_refs (tier-1) when available,
+        # falling back to proof_record kind checking (tier-2).
+        refs = entry2.get("evidence_refs")
+        if isinstance(refs, list):
+            entry2["proof_status"] = classify_evidence(refs)
+        elif entries:
+            has_behavioral = any(
+                r.get("proof_kind") != _PROOF_KIND_BACKING_PATH
+                for r in entries
+            )
+            entry2["proof_status"] = "proven" if has_behavioral else "path_proven"
+        else:
+            entry2["proof_status"] = "unproven"
         if entries:
             entry2["proof_records"] = [dict(proof_entry) for proof_entry in entries]
         annotated_caps.append(entry2)
@@ -665,6 +691,24 @@ async def commission_proof_earn_loop(
             "no_backing_paths": [],
             "still_unproven": [],
         }
+
+    # Step 1b: defensive filter — skip exempt capabilities (they classify as
+    # "proven" via working_capability_proof_status, so they should never appear
+    # in demanded_unproven, but this is a belt-and-suspenders guard).
+    _exempt = exempt_capability_names(problem_model)
+    if _exempt:
+        demanded_unproven = [
+            e
+            for e in demanded_unproven
+            if normalize_capability_name(e.get("ref", "")) not in _exempt
+        ]
+        if not demanded_unproven:
+            return {
+                "total_demanded_unproven": 0,
+                "earned": 0,
+                "no_backing_paths": [],
+                "still_unproven": [],
+            }
 
     # Build a lookup: canonical-name -> (raw_name, backing_paths).
     # We read from the raw capabilities so we can inspect backing_paths regardless

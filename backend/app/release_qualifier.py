@@ -4953,17 +4953,23 @@ async def _finalize_qualification(
     capability_proof_blocked = False
     capability_proof_detail: dict[str, Any] = {"mode": _capability_proof_mode}
     if _capability_proof_mode == "enforce":
+        from app.capability_registry import exempt_capability_names as _exempt_names
         from app.capability_registry import working_capability_proof_status as _wcp_status
 
         _pm = getattr(_policy_project, "problem_model", None)
         if _pm:
             _proof_map = _wcp_status(_pm)
+            _exempt_set = _exempt_names(_pm)
+            # Exempt working capabilities classify as "proven" and are excluded
+            # from the unproven count — they do not block promotion.
             _unproven = [
                 n for n, s in _proof_map.items() if s != "proven"
             ]
             capability_proof_detail["total_working"] = len(_proof_map)
             capability_proof_detail["unproven_count"] = len(_unproven)
             capability_proof_detail["unproven"] = _unproven
+            capability_proof_detail["exempt_count"] = len(_exempt_set)
+            capability_proof_detail["exempt_names"] = sorted(_exempt_set)
             if _unproven:
                 capability_proof_blocked = True
         else:

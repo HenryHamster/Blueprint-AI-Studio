@@ -109,6 +109,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_spawn_budget_categories",
         "autonomous_spawn_budget_mode",
         "capability_proof_gate_mode",
+        "capability_proof_gate_auto_graduation_enabled",
+        "capability_proof_gate_auto_graduation_observe_threshold",
+        "capability_proof_gate_auto_graduation_enforce_threshold",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -438,6 +441,19 @@ async def get_settings(
         ),
         "capability_proof_gate_mode": str(
             _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+        ),
+        "capability_proof_gate_auto_graduation_enabled": bool(
+            _runtime_config.get("capability_proof_gate_auto_graduation_enabled", False)
+        ),
+        "capability_proof_gate_auto_graduation_observe_threshold": float(
+            _runtime_config.get(
+                "capability_proof_gate_auto_graduation_observe_threshold", 0.5
+            )
+        ),
+        "capability_proof_gate_auto_graduation_enforce_threshold": float(
+            _runtime_config.get(
+                "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+            )
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -1166,6 +1182,32 @@ async def _apply_settings(
         _runtime_config["capability_proof_gate_mode"] = val
         if val == "enforce":
             _debt_keys_to_resolve.append("dormant_knob:capability_proof_gate_mode")
+    if "capability_proof_gate_auto_graduation_enabled" in payload:
+        val = payload["capability_proof_gate_auto_graduation_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="capability_proof_gate_auto_graduation_enabled must be a boolean",
+            )
+        _runtime_config["capability_proof_gate_auto_graduation_enabled"] = val
+    for _cap_grad_key, _cap_grad_default in (
+        ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
+        ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
+    ):
+        if _cap_grad_key in payload:
+            try:
+                fval = float(payload[_cap_grad_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_cap_grad_key} must be a number",
+                )
+            if not (0.0 <= fval <= 1.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_cap_grad_key} must be between 0.0 and 1.0",
+                )
+            _runtime_config[_cap_grad_key] = round(fval, 4)
     for _mi_key, _mi_lo, _mi_hi in (
         ("metrics_integrity_sweep_interval_minutes", 1, 1440),
         ("metrics_integrity_sweep_max_checks", 1, 1000),
@@ -3579,6 +3621,28 @@ async def _apply_settings(
                     # operator's enforce graduation survives a Cloud Run restart.
                     "completion_debt_weight_mode": str(
                         _runtime_config.get("completion_debt_weight_mode", "observe")
+                    ),
+                    # Persist the capability proof gate mode so an operator
+                    # graduation (manual or auto) survives a Cloud Run restart.
+                    "capability_proof_gate_mode": str(
+                        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+                    ),
+                    # Persist capability proof gate auto-graduation config so an
+                    # operator enable/tune survives a Cloud Run restart.
+                    "capability_proof_gate_auto_graduation_enabled": bool(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_enabled", False
+                        )
+                    ),
+                    "capability_proof_gate_auto_graduation_observe_threshold": float(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_observe_threshold", 0.5
+                        )
+                    ),
+                    "capability_proof_gate_auto_graduation_enforce_threshold": float(
+                        _runtime_config.get(
+                            "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+                        )
                     ),
                     "adversarial_spawn_gate_infra_failure_mode": str(
                         _runtime_config.get(

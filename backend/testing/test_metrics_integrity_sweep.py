@@ -3885,12 +3885,9 @@ async def test_criterion_evidence_count_integrity_runs_in_sweep_tick(db):
 async def test_capability_proof_gate_gap_flags_unproven_working(db):
     """A project with working capabilities that carry no proven evidence is flagged.
 
-    This is the named acceptance test. It exercises the end-to-end path:
-    - a ``working`` capability with empty evidence_refs → proof_status ``unproven``
-    - the check reads the project's problem_model and flags the capability
-    - delta == number of unproven working capabilities
-    - detail names the capability
-    - the check is flag-only (never mutates the problem_model)
+    Caps with no backing_paths cannot be auto-resolved: they remain in delta and
+    are surfaced with ``needs_backing_paths`` in the detail string. The problem_model
+    is never mutated when no auto-resolution is possible.
 
     Uses a real merge-test verdict context (working capability + no evidence) so
     the assertion is concrete and non-trivially true.
@@ -3898,13 +3895,14 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
     from sqlalchemy.orm.attributes import flag_modified
 
     project = await _project(db)
-    # Two working capabilities: one unproven (no evidence_refs), one proven.
+    # Two working capabilities: one unproven (no evidence_refs, no backing_paths),
+    # one proven.
     project.problem_model = {
         "capabilities": [
             {
                 "name": "repo-map",
                 "status": "working",
-                "evidence_refs": [],  # no proof → unproven
+                "evidence_refs": [],  # no proof → unproven; no backing_paths either
             },
             {
                 "name": "ci-integration",
@@ -3939,19 +3937,99 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
     assert f.check == "capability_proof_gate_gap"
     # self_reported = total working capabilities (2: repo-map + ci-integration)
     assert f.self_reported == 2
-    # ground_truth = proven count (1: ci-integration)
+    # ground_truth = proven count (1: ci-integration); no auto-resolution possible
     assert f.ground_truth == 1
-    # delta = unproven count (1: repo-map)
+    # delta = unresolved gap (1: repo-map has no backing_paths → needs_backing_paths)
     assert f.delta == 1
     assert "repo-map" in f.detail
-    assert "proven" in f.detail
+    # No backing_paths → detail uses needs_backing_paths marker, not "proven"
+    assert "needs_backing_paths" in f.detail
 
-    # Flag-only: problem_model must be unchanged
+    # Flag-only for caps without backing_paths: problem_model must be unchanged
     await db.refresh(project)
     caps = (project.problem_model or {}).get("capabilities", [])
     repo_map = next((c for c in caps if c.get("name") == "repo-map"), None)
     assert repo_map is not None
     assert repo_map["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_triggers_self_heal(db):
+    """An unproven working capability with a backing_path present at HEAD is
+    auto-resolved: proof is recorded in capability_proof_records, the check
+    reports delta == 0 (fully self-healed), and ground_truth increases by 1.
+
+    This is the named acceptance test for the self-heal feature.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # One unproven working capability with a backing_path.
+    # backend/app/models.py is a real file in the repo.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # Mock _path_exists_at_head to return True for the backing path so the test
+    # doesn't depend on filesystem state. Patch at the source module since the
+    # check imports it with a local `from app.source_ref_validation import`.
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    # Fully self-healed → no flagged result, one OK result.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert flagged == [], f"expected no flagged results after self-heal, got {results}"
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1  # auto-resolved from 0 proven to 1
+    assert "auto-resolved" in ok[0].detail
+
+    # Proof must have been recorded in capability_proof_records.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    # normalize_capability_name("repo-map") == "repo-map"
+    assert "repo-map" in proof_records, (
+        f"expected proof entry for 'repo-map' in capability_proof_records, got {proof_records}"
+    )
+    entries = proof_records["repo-map"]
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "backing_path"
+
+    # evidence_refs should now carry a proven backing_path ref (written by
+    # _append_evidence_refs_to_capabilities inside record_capability_backing_path_proof).
+    caps = (project.problem_model or {}).get("capabilities", [])
+    repo_map = next((c for c in caps if c.get("name") == "repo-map"), None)
+    assert repo_map is not None
+    evidence_refs = repo_map.get("evidence_refs", [])
+    assert any(
+        e.get("proven") is True and e.get("kind") == "backing_path"
+        for e in evidence_refs
+    ), f"expected a proven backing_path evidence_ref, got {evidence_refs}"
 
 
 @pytest.mark.asyncio

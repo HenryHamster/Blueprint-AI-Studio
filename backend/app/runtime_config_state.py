@@ -284,6 +284,25 @@ runtime_config: Dict = {
     if os.getenv("CAPABILITY_PROOF_GATE_MODE", "off").lower()
     in ("off", "observe", "enforce")
     else "off",
+    # Auto-graduation sweep for the capability proof gate. When enabled, the
+    # metrics-integrity sweep automatically advances the gate mode (off→observe→enforce)
+    # based on fleet-wide proof coverage. Disabled by default — operators must opt in.
+    # The thresholds are the minimum proof-coverage ratios required for each step:
+    # observe_threshold for off→observe, enforce_threshold for observe→enforce.
+    "capability_proof_gate_auto_graduation_enabled": os.getenv(
+        "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    "capability_proof_gate_auto_graduation_observe_threshold": float(
+        os.getenv(
+            "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_OBSERVE_THRESHOLD", "0.5"
+        )
+    ),
+    "capability_proof_gate_auto_graduation_enforce_threshold": float(
+        os.getenv(
+            "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
+        )
+    ),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -2120,6 +2139,33 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("metrics_integrity_sweep_mode", raw_mode)
+                # Capability proof gate: mode + auto-graduation config. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances.
+                if "capability_proof_gate_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["capability_proof_gate_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("capability_proof_gate_mode", raw_mode)
+                if "capability_proof_gate_auto_graduation_enabled" in config_json:
+                    _set(
+                        "capability_proof_gate_auto_graduation_enabled",
+                        bool(config_json["capability_proof_gate_auto_graduation_enabled"]),
+                    )
+                for _cap_grad_float_key in (
+                    "capability_proof_gate_auto_graduation_observe_threshold",
+                    "capability_proof_gate_auto_graduation_enforce_threshold",
+                ):
+                    if _cap_grad_float_key in config_json:
+                        try:
+                            _fval = float(config_json[_cap_grad_float_key])
+                            if 0.0 <= _fval <= 1.0:
+                                _set(_cap_grad_float_key, _fval)
+                        except (TypeError, ValueError):
+                            pass
                 for _mi_int_key in (
                     "metrics_integrity_sweep_interval_minutes",
                     "metrics_integrity_sweep_max_checks",

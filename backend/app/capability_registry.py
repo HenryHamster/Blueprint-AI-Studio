@@ -14,8 +14,16 @@ from typing import TYPE_CHECKING
 from app.evidence_primitive import classify_evidence, classify_evidence_tiered
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from app.evidence_primitive import EvidenceStatus
     from app.models import Task
+
+    #: Valid proof gate modes — narrowing the parameter type so callers and
+    #: static analysis agree on the three-way mode knob.
+    _GateMode = Literal["off", "observe", "enforce"]
+else:
+    _GateMode = str
 
 _NORMALIZE_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _DERIVED_PROVIDER_PREFIX = "task-provider:"
@@ -148,7 +156,7 @@ def registry_capability_evidence_refs_map(problem_model: object) -> dict[str, li
     IO-free — reads only from the in-memory model.
     """
     refs_map: dict[str, list] = {}
-    for raw_name, _status, _absorbs, evidence_refs, _backing_paths in _iter_capability_evidence_entries(
+    for raw_name, _status, _absorbs, evidence_refs, _backing_paths, _proof_exempt in _iter_capability_evidence_entries(
         problem_model
     ):
         normalized = normalize_capability_name(raw_name)
@@ -252,17 +260,19 @@ def registry_satisfies_capability_need(
 
 
 def _iter_capability_evidence_entries(problem_model: object):
-    """Yield ``(raw_name, status, absorbs, evidence_refs, backing_paths)`` quintuples.
+    """Yield ``(raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt)`` sextuples.
 
     The evidence-aware sibling of :func:`_iter_capability_entries`: it draws from
     the exact same ``capabilities`` source (accepting either the pydantic
     ``ProblemModel`` instance or a dict-like payload) but additionally surfaces
-    each capability's ``evidence_refs`` and ``backing_paths`` so the proof-aware
-    resolvers can classify the backing evidence WITHOUT widening the shared
-    3-tuple contract three other call sites unpack. ``evidence_refs`` /
-    ``backing_paths`` are whatever the payload carries (a list, ``None`` on
-    older/dict payloads that omit it, or junk) — callers coerce them before
-    handing them to :func:`classify_evidence`.
+    each capability's ``evidence_refs``, ``backing_paths``, and ``proof_exempt``
+    so the proof-aware resolvers can classify the backing evidence and apply
+    exemption semantics WITHOUT widening the shared 3-tuple contract three other
+    call sites unpack. ``evidence_refs`` / ``backing_paths`` are whatever the
+    payload carries (a list, ``None`` on older/dict payloads that omit it, or
+    junk) — callers coerce them before handing them to
+    :func:`classify_evidence`. ``proof_exempt`` defaults to ``False`` for
+    backward-compatibility with payloads that omit the field.
     """
     if isinstance(problem_model, Mapping):
         raw_caps = problem_model.get("capabilities")
@@ -278,6 +288,7 @@ def _iter_capability_evidence_entries(problem_model: object):
                 cap.get("absorbs"),
                 cap.get("evidence_refs"),
                 cap.get("backing_paths"),
+                cap.get("proof_exempt", False),
             )
         else:
             yield (
@@ -286,6 +297,7 @@ def _iter_capability_evidence_entries(problem_model: object):
                 getattr(cap, "absorbs", None),
                 getattr(cap, "evidence_refs", None),
                 getattr(cap, "backing_paths", None),
+                getattr(cap, "proof_exempt", False),
             )
 
 
@@ -322,6 +334,14 @@ def working_capability_proof_status(
     evidence-less claims from structurally-backed ones that simply haven't been
     through the earning loop.
 
+    **Exemption**: a ``working`` capability with ``proof_exempt=True`` is
+    classified as ``"proven"`` unconditionally — it satisfies the proof gate
+    without machine-verified evidence, is excluded from the unproven count in
+    the release qualifier, and does not inflate the metrics-sweep delta.
+    Exemption is for capabilities that genuinely cannot have machine-verifiable
+    proof (e.g. purely human processes, external integrations without test
+    hooks) and must be explicitly set by an operator or strategic agent.
+
     IO-free and additive — the observe-mode wiring in both the spawn-time
     resolver and the blocked-resume sweep builds this map once per project
     (mirroring how they cache :func:`working_capability_names`) and looks needs up
@@ -329,30 +349,35 @@ def working_capability_proof_status(
     entries normalize to the same name, matching the name reader's dedupe order.
     """
     out: dict[str, EvidenceStatus] = {}
-    for raw_name, status, absorbs, evidence_refs, backing_paths in _iter_capability_evidence_entries(
+    for raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt in _iter_capability_evidence_entries(
         problem_model
     ):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        # Coerce a missing/None evidence_refs to the empty list so a capability
-        # that simply omits the field classifies as ``unproven`` (definite absence
-        # of proof), matching the pydantic ``Capability`` default of ``[]``.
-        refs = evidence_refs if isinstance(evidence_refs, list) else []
-        # Tier-aware classification for the ENFORCE-gate path: a proven set whose
-        # only proof is ``backing_path`` (declared files exist at HEAD, nothing
-        # machine-verified) is demoted to ``partial`` so it does NOT clear the
-        # gate as strongly as a machine-verified ``named_test``. The badge/display
-        # path (annotate_capability_proof_status) keeps the plain classifier.
-        proof_status = classify_evidence_tiered(refs)
-        # When evidence_refs is empty/missing but the capability declares
-        # backing_paths, upgrade to ``partial`` — the claim has structural
-        # evidence (it declares where its code lives) even if no formal
-        # machine-checked proof has been recorded yet.  This prevents ALL
-        # registry capabilities from starting at ``unproven`` and keeps the
-        # proof-gate readiness gap honest: only capabilities with ZERO evidence
-        # (no refs AND no backing_paths) are truly unproven.
-        if proof_status == "unproven" and isinstance(backing_paths, list) and backing_paths:
-            proof_status = "partial"
+        # Exempt working capabilities are unconditionally "proven" — they
+        # satisfy the proof gate without machine-verified evidence.
+        if proof_exempt:
+            proof_status: EvidenceStatus = "proven"
+        else:
+            # Coerce a missing/None evidence_refs to the empty list so a capability
+            # that simply omits the field classifies as ``unproven`` (definite absence
+            # of proof), matching the pydantic ``Capability`` default of ``[]``.
+            refs = evidence_refs if isinstance(evidence_refs, list) else []
+            # Tier-aware classification for the ENFORCE-gate path: a proven set whose
+            # only proof is ``backing_path`` (declared files exist at HEAD, nothing
+            # machine-verified) is demoted to ``partial`` so it does NOT clear the
+            # gate as strongly as a machine-verified ``named_test``. The badge/display
+            # path (annotate_capability_proof_status) keeps the plain classifier.
+            proof_status = classify_evidence_tiered(refs)
+            # When evidence_refs is empty/missing but the capability declares
+            # backing_paths, upgrade to ``partial`` — the claim has structural
+            # evidence (it declares where its code lives) even if no formal
+            # machine-checked proof has been recorded yet.  This prevents ALL
+            # registry capabilities from starting at ``unproven`` and keeps the
+            # proof-gate readiness gap honest: only capabilities with ZERO evidence
+            # (no refs AND no backing_paths) are truly unproven.
+            if proof_status == "unproven" and isinstance(backing_paths, list) and backing_paths:
+                proof_status = "partial"
         for name in (
             normalize_capability_name(raw_name),
             *_normalized_absorbed_names(absorbs),
@@ -360,6 +385,37 @@ def working_capability_proof_status(
             if name and name not in out:
                 out[name] = proof_status
     return out
+
+
+def exempt_capability_names(problem_model: object) -> set[str]:
+    """Return the canonical names of ``working`` capabilities marked ``proof_exempt``.
+
+    These are capabilities the operator or strategic agent has declared genuinely
+    cannot have machine-verifiable proof. They are excluded from the proof-gate
+    delta, the release-qualifier unproven count, and the earn-loop targets.
+
+    Alias-aware: same as :func:`working_capability_names`, an exempt entry
+    contributes its own canonical name AND every name in its ``absorbs`` list so
+    an absorbed old name still resolves as exempt.
+    """
+    exempt: set[str] = set()
+    for (
+        raw_name,
+        status,
+        absorbs,
+        _evidence_refs,
+        _backing_paths,
+        proof_exempt,
+    ) in _iter_capability_evidence_entries(problem_model):
+        if not proof_exempt:
+            continue
+        if not (isinstance(status, str) and status.strip().lower() == "working"):
+            continue
+        normalized = normalize_capability_name(raw_name)
+        if normalized:
+            exempt.add(normalized)
+        exempt.update(_normalized_absorbed_names(absorbs))
+    return exempt
 
 
 def capability_need_proof_status(
@@ -414,7 +470,7 @@ def capability_need_blocked_by_proof_gate(
     need: Mapping,
     proof_status_by_name: Mapping[str, EvidenceStatus],
     *,
-    mode: str = "off",
+    mode: _GateMode = "off",
 ) -> bool:
     """True iff ``mode`` is ``"enforce"`` and proof status blocks this capability need.
 
@@ -435,6 +491,13 @@ def capability_need_blocked_by_proof_gate(
     proven capability. In every ``False`` case the caller treats the need exactly
     as observe mode does, so switching to enforce only changes the unproven-match
     path.
+
+    Full-cycle contract: a capability transitions from blocked-under-enforce
+    (``True``, unproven) to allowed (``False``, proven) when the project's
+    ``evidence_refs`` for that capability gain at least one ``proven=True`` entry
+    (recorded by ``capability_proof.record_capability_proof``). The
+    blocked-resume sweep's ``_classify_blocker_needs`` re-evaluates against the
+    now-proven proof map, routing the need from residual to completed_needs.
     """
     if mode != "enforce":
         return False

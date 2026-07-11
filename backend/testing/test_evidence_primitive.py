@@ -24,6 +24,7 @@ from app.evidence_primitive import (
 def test_evidence_status_literal_members():
     assert set(get_args(EvidenceStatus)) == {
         "proven",
+        "path_proven",
         "partial",
         "unproven",
         "contradicted",
@@ -63,9 +64,31 @@ def test_backing_only_kinds_is_backing_path():
 # --- classify_evidence -------------------------------------------------------
 
 
-def test_classify_proven_when_any_ref_proven():
+def test_classify_path_proven_when_only_backing_path_proven():
+    """A backing_path ref with proven=True yields 'path_proven' — the files
+    exist at HEAD but there is no behavioural verification."""
     refs = [
         {"kind": "named_test", "ref": "a/b.py", "proven": False},
+        {"kind": "backing_path", "ref": "c/d.py", "proven": True},
+    ]
+    assert classify_evidence(refs) == "path_proven"
+
+
+def test_classify_proven_when_high_confidence_ref_proven():
+    """A single high-confidence proven ref (named_test) lifts the classification
+    to 'proven' even when other refs are unproven or low-confidence."""
+    refs = [
+        {"kind": "named_test", "ref": "a/b.py", "proven": True},
+        {"kind": "backing_path", "ref": "c/d.py", "proven": False},
+    ]
+    assert classify_evidence(refs) == "proven"
+
+
+def test_classify_proven_when_mixed_high_and_low_confidence():
+    """A mix of high-confidence (named_test) and low-confidence (backing_path)
+    proven refs returns 'proven' — a single high-confidence ref lifts the whole."""
+    refs = [
+        {"kind": "named_test", "ref": "a/b.py", "proven": True},
         {"kind": "backing_path", "ref": "c/d.py", "proven": True},
     ]
     assert classify_evidence(refs) == "proven"
@@ -109,22 +132,21 @@ def test_classify_treats_only_true_as_proven():
 # --- classify_evidence_tiered ------------------------------------------------
 
 
-def test_tiered_backing_path_only_returns_partial():
-    # A proven set whose ONLY proof is backing_path is demoted from proven to
-    # partial — files exist at HEAD, but nothing was machine-verified.
+def test_tiered_backing_path_only_returns_path_proven():
+    # A proven set whose ONLY proof is backing_path returns path_proven in both
+    # classifiers — files exist at HEAD but nothing was machine-verified.
     refs = [{"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True}]
-    assert classify_evidence_tiered(refs) == "partial"
-    # The plain classifier still reads this as proven (behavior unchanged).
-    assert classify_evidence(refs) == "proven"
+    assert classify_evidence_tiered(refs) == "path_proven"
+    assert classify_evidence(refs) == "path_proven"
 
 
-def test_tiered_multiple_backing_path_only_returns_partial():
-    # Even several backing_path proofs together are structural-only → partial.
+def test_tiered_multiple_backing_path_only_returns_path_proven():
+    # Even several backing_path proofs together are structural-only → path_proven.
     refs = [
         {"kind": "backing_path", "ref": "backend/app/a.py", "proven": True},
         {"kind": "backing_path", "ref": "backend/app/b.py", "proven": True},
     ]
-    assert classify_evidence_tiered(refs) == "partial"
+    assert classify_evidence_tiered(refs) == "path_proven"
 
 
 def test_tiered_mixed_backing_and_named_test_returns_proven():
@@ -198,6 +220,14 @@ def test_done_claim_contradicted_by_unbacked_evidence():
 def test_done_claim_not_contradicted_by_proven_evidence():
     assert claim_contradicts_evidence("closed", "proven") is False
     assert claim_contradicts_evidence("working", "proven") is False
+
+
+def test_done_claim_not_contradicted_by_path_proven_evidence():
+    """path_proven means the files exist at HEAD — there IS some backing,
+    just not enough for the enforce gate. It must not be treated as a
+    contradiction (which would flag a false positive)."""
+    assert claim_contradicts_evidence("closed", "path_proven") is False
+    assert claim_contradicts_evidence("working", "path_proven") is False
 
 
 def test_indeterminate_evidence_never_contradicts():

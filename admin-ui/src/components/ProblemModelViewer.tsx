@@ -15,7 +15,7 @@ import type {
   Source,
   SelfReflectionEntry,
 } from '../types';
-import type { CapabilityProofRecord } from '../types/problemModel';
+import type { CapabilityProofRecord, EvidenceRef } from '../types/problemModel';
 
 interface ProblemModelViewerProps {
   projectId: string;
@@ -56,7 +56,24 @@ const sizeColors: Record<string, string> = {
 
 const proofStatusLabels: Record<string, string> = {
   proven: 'Proven',
+  path_proven: 'Path-backed',
   unproven: 'Claimed only',
+  exempt: 'Exempt',
+};
+
+const proofStatusColors: Record<string, string> = {
+  proven: 'text-emerald-400',
+  path_proven: 'text-amber-400',
+  unproven: 'text-neutral-500',
+};
+
+const proofKindColors: Record<string, string> = {
+  backing_path: 'border-amber-500/30 bg-amber-500/8',
+  named_test: 'border-emerald-500/20 bg-emerald-500/5',
+  trial_adoption: 'border-emerald-500/20 bg-emerald-500/5',
+  downstream_artifact: 'border-emerald-500/20 bg-emerald-500/5',
+  visual: 'border-emerald-500/20 bg-emerald-500/5',
+  observable_behavior: 'border-emerald-500/20 bg-emerald-500/5',
 };
 
 function SourceBadge({ source }: { source: Source }) {
@@ -105,7 +122,20 @@ function SectionHeader({ children, icon, count, amberCount }: { children: React.
 function CapabilityBar({ capability }: { capability: Capability }) {
   const status = capability.status || 'planned';
   const proofRecords = Array.isArray(capability.proof_records) ? capability.proof_records : [];
-  const proofStatus = proofRecords.length > 0 ? 'proven' : 'unproven';
+  const evidenceRefs = Array.isArray(capability.evidence_refs) ? capability.evidence_refs : [];
+  const isExempt = !!capability.proof_exempt;
+  // Exempt working capabilities show "Exempt" instead of "Claimed only"
+  // — they are exempt from proof requirements and do not count as unproven.
+  // Derive proofStatus from the backend-enriched proof_status field;
+  // fall back to the old (proof-records-exist → proven) heuristic for
+  // payloads that haven't been through the backend enricher yet.
+  const proofStatus: string = capability.proof_status
+    || (proofRecords.length > 0 ? 'proven' : 'unproven');
+  const proofColor = proofStatusColors[proofStatus] || 'text-neutral-500';
+
+  function proofKindColor(kind: string): string {
+    return proofKindColors[kind] || 'border-neutral-500/20 bg-neutral-500/5';
+  }
   return (
     <div className="flex items-center gap-3 py-1.5">
       <div className={`w-2 h-2 rounded-full ${capabilityBarColors[status] || capabilityBarColors.planned}`} />
@@ -113,19 +143,43 @@ function CapabilityBar({ capability }: { capability: Capability }) {
         <div className="flex items-baseline gap-2">
           <span className="text-sm text-neutral-200 truncate">{capability.name}</span>
           <span className="text-xs text-neutral-500">{capabilityStatusLabels[status] || status}</span>
-          <span className={`text-ui-sm font-medium uppercase tracking-wide ${proofStatus === 'proven' ? 'text-emerald-400' : 'text-neutral-500'}`}>
-            {proofStatusLabels[proofStatus] || proofStatus}
-          </span>
+          {isExempt ? (
+            <span className="text-ui-sm font-medium uppercase tracking-wide text-neutral-500 border border-dashed border-neutral-600 rounded px-1 py-px">
+              Exempt
+            </span>
+          ) : (
+            <span className={`text-ui-sm font-medium uppercase tracking-wide ${proofColor}`}>
+              {proofStatusLabels[proofStatus] || proofStatus}
+            </span>
+          )}
         </div>
         {capability.notes && (
           <p className="text-xs text-neutral-500 truncate">{capability.notes}</p>
+        )}
+        {evidenceRefs.length > 0 && (
+          <div className="mt-1 space-y-0.5">
+            {evidenceRefs.map((ref: EvidenceRef, idx: number) => (
+              <div
+                key={`evidence-${ref.source_id || idx}-${idx}`}
+                className={`rounded border px-2 py-0.5 text-ui-md text-neutral-300 ${proofKindColor(ref.kind)}`}
+              >
+                <span className="text-neutral-500">{ref.kind}</span>{' '}
+                <span className="break-all">{ref.ref}</span>
+                {ref.proven ? (
+                  <span className="ml-1 text-emerald-400">✓</span>
+                ) : (
+                  <span className="ml-1 text-neutral-600">—</span>
+                )}
+              </div>
+            ))}
+          </div>
         )}
         {proofRecords.length > 0 && (
           <div className="mt-1 space-y-1">
             {proofRecords.map((record: CapabilityProofRecord, index: number) => (
               <div
                 key={`${record.task_id}-${record.proof_ref}-${index}`}
-                className="rounded border border-emerald-500/20 bg-emerald-500/5 px-2 py-1 text-ui-md text-neutral-300"
+                className={`rounded border px-2 py-1 text-ui-md text-neutral-300 ${proofKindColor(record.proof_kind)}`}
               >
                 <div className="flex flex-wrap gap-x-3 gap-y-0.5">
                   <span>

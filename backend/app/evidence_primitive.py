@@ -37,8 +37,12 @@ from typing import Any, Literal
 # as a model field type (see problem_model.Gap.evidence_refs).
 from typing_extensions import TypedDict
 
-# The five evidence states a claim's supporting refs can be in.
-#   proven       — at least one ref is machine-checked proven (proven=True).
+# The six evidence states a claim's supporting refs can be in.
+#   proven       — at least one high-confidence ref is machine-checked proven
+#                  (proven=True).
+#   path_proven  — all proven refs are low-confidence (kind=backing_path only).
+#                  The files exist at HEAD but there is no behavioural verification
+#                  — a distinct tier below "proven" that the enforce gate blocks.
 #   partial      — refs exist but none is proven yet.
 #   unproven     — no refs at all (the claim is asserted with zero evidence).
 #   contradicted — ground-truth re-verification disproved a previously-proven
@@ -46,7 +50,9 @@ from typing_extensions import TypedDict
 #                  the stored flags alone — a caller passes/overrides it.
 #   unverified   — structurally uncheckable (malformed refs, or an indeterminate
 #                  re-verification that a caller must NOT launder into absence).
-EvidenceStatus = Literal["proven", "partial", "unproven", "contradicted", "unverified"]
+EvidenceStatus = Literal[
+    "proven", "path_proven", "partial", "unproven", "contradicted", "unverified"
+]
 
 # The union of every proof kind already in use across the strategic self-model.
 # ``ref`` on an EvidenceRef holds a criterion_key / proof_ref / artifact_id /
@@ -115,7 +121,7 @@ def classify_evidence(refs: Any) -> EvidenceStatus:
 
     Pure and stored-flag-only — it never performs IO or re-verification:
 
-    * ``proven``     — at least one ref is explicitly ``proven=True``.
+    * ``proven``     — at least one ref is ``proven=True``.
     * ``partial``    — refs exist but none is proven.
     * ``unproven``   — the list is present but empty (a claim with zero refs).
     * ``unverified`` — structurally uncheckable: ``refs`` is not a list, or it
@@ -130,10 +136,13 @@ def classify_evidence(refs: Any) -> EvidenceStatus:
         return "unproven"
     checkable = [r for r in refs if isinstance(r, dict)]
     if not checkable:
-        # Refs are present but structurally unreadable — do not claim "unproven"
-        # (which reads as a definite absence of proof); stay honest.
         return "unverified"
-    if any(r.get("proven") is True for r in checkable):
+    proven = [r for r in checkable if r.get("proven") is True]
+    if proven:
+        # Backing-path-only proofs assert file existence at HEAD, not behavioural
+        # verification.  Demote to path_proven so callers can distinguish the tier.
+        if all(r.get("kind") in BACKING_ONLY_KINDS for r in proven):
+            return "path_proven"
         return "proven"
     return "partial"
 
@@ -171,10 +180,11 @@ def classify_evidence_tiered(refs: Any) -> EvidenceStatus:
     if not proven:
         return "partial"
     # At least one proven ref. If EVERY proven ref is a structural-only kind
-    # (backing_path), demote to partial — no machine-verified proof corroborates
-    # it. A missing/blank ``kind`` counts as non-backing, so it keeps ``proven``.
+    # (backing_path), return path_proven — files exist at HEAD but nothing was
+    # machine-verified. A missing/blank ``kind`` counts as non-backing, so it
+    # keeps ``proven`` (never silently demote an unlabeled proof).
     if all(r.get("kind") in BACKING_ONLY_KINDS for r in proven):
-        return "partial"
+        return "path_proven"
     return "proven"
 
 

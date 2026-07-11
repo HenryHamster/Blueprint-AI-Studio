@@ -3,11 +3,22 @@
 These exercise ``blocked_need_resolution.resolve_blocked_need`` as a pure matcher
 over in-memory ``Task`` objects (no DB / no session) — the sweep integration is
 covered separately in ``test_reaper.py``.
+
+Also includes the acceptance-evidence test for the capability proof gate
+auto-graduation sweep (``test_capability_proof_gate_graduation``), which requires
+an in-memory SQLite DB to exercise the sweep's project-scanning logic.
 """
 
 import asyncio
 import uuid
 from datetime import datetime, timedelta
+
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel
 
 from app.blocked_need_resolution import (
     completed_foundation_for_need,
@@ -357,6 +368,16 @@ def test_registry_satisfies_capability_need_matches_working_only():
 def _proven_ref() -> dict:
     """One machine-checked evidence ref (``proven=True``)."""
     return {"kind": "named_test", "ref": "testing/test_x.py::test_x", "proven": True}
+
+
+def _backing_path_ref() -> dict:
+    """One low-confidence backing-path evidence ref (``proven=True``)."""
+    return {"kind": "backing_path", "ref": "src/module.py", "proven": True}
+
+
+def _unproven_ref() -> dict:
+    """One machine-checked but unproven evidence ref (``proven=False``)."""
+    return {"kind": "named_test", "ref": "testing/test_x.py::test_x", "proven": False}
 
 
 def test_working_capability_proof_status_maps_names_to_status():
@@ -1654,3 +1675,482 @@ def test_ephemeral_url_citation_compute_doc_does_not_satisfy_prereq():
     ]
     need = {"kind": "task", "ref": "compute-ephemeral-1"}
     assert knowledge_substance_satisfies_need(need, substance) is False
+
+
+def test_capability_proof_gate_full_cycle():
+    """End-to-end: blocked → proof recorded → unblocked under enforce mode.
+
+    Phase 1 (unproven): a working capability with zero evidence blocks its
+    dependent under enforce mode — the need stays residual (task stays BLOCKED).
+
+    Phase 2 (proven): after proof is recorded (evidence_refs populated with a
+    proven=True ref), the same capability now satisfies the need — the need
+    routes to completed_needs so the task can resume.
+
+    This exercises the TRANSITION rather than each state in isolation:
+
+      working_capability_proof_status → classify_evidence →
+      capability_need_blocked_by_proof_gate → _classify_blocker_needs →
+      enforce-mode routing
+    """
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        working_capability_proof_status,
+    )
+    from app.problem_model import Capability, ProblemModel
+
+    # ── Phase 1: capability declared working with zero evidence → unproven ──
+    unproven_model = ProblemModel(
+        capabilities=[
+            Capability(name="Container runtime", status="working"),
+        ]
+    )
+    proof = working_capability_proof_status(unproven_model)
+    assert proof == {"container-runtime": "unproven"}
+
+    need = {"kind": "capability", "ref": "container-runtime"}
+
+    # The gate blocks an unproven capability under enforce mode.
+    assert capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
+
+    # The blocked-resume sweep routes the need to residual (stays BLOCKED).
+    disp_blocked = _classify_capability_need(
+        "container-runtime", proof, proof_gate_mode="enforce"
+    )
+    assert disp_blocked["residual"] == [
+        {"kind": "capability", "ref": "container-runtime"}
+    ]
+    assert disp_blocked["completed_needs"] == []
+
+    # ── Phase 2: proof recorded (evidence_refs populated with a proven ref) ──
+    proven_model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Container runtime",
+                status="working",
+                evidence_refs=[_proven_ref()],
+            ),
+        ]
+    )
+    proof = working_capability_proof_status(proven_model)
+    assert proof == {"container-runtime": "proven"}
+
+    # The gate now lets the proven capability through under enforce mode.
+    assert capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is False
+
+    # The blocked-resume sweep routes the need to completed_needs (task resumes).
+    disp_unblocked = _classify_capability_need(
+        "container-runtime", proof, proof_gate_mode="enforce"
+    )
+    assert disp_unblocked["completed_needs"] == [
+        {"kind": "capability", "ref": "container-runtime"}
+    ]
+    assert disp_unblocked["residual"] == []
+
+
+def test_backing_path_only_capability_stays_gated_under_enforce():
+    """ACCEPTANCE EVIDENCE. A capability declared 'working' with ONLY
+    backing_path proof (proven=True but kind=backing_path) must NOT satisfy
+    the enforce gate — it classifies as 'path_proven' rather than 'proven',
+    and ``capability_need_blocked_by_proof_gate`` returns True under enforce
+    mode because ``"path_proven" != "proven"``.
+
+    This is the key distinction: a file existing at HEAD is NOT equivalent
+    to a machine-verified test (named_test/trial_adoption) that actually
+    exercises the capability. The gate stays shut until at least one
+    high-confidence proven ref is recorded.
+    """
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        working_capability_proof_status,
+    )
+    from app.problem_model import Capability, ProblemModel
+
+    # ── Phase 1: backing_path-only capability classifies as path_proven ──
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Container runtime",
+                status="working",
+                evidence_refs=[_backing_path_ref()],
+            ),
+        ]
+    )
+    proof = working_capability_proof_status(model)
+    assert proof == {"container-runtime": "path_proven"}, (
+        "backing_path-only evidence must classify as 'path_proven', not 'proven'"
+    )
+
+    need = {"kind": "capability", "ref": "container-runtime"}
+
+    # ── Phase 2: gate blocks path_proven under enforce ──
+    assert (
+        capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
+    ), "path_proven must be gated under enforce (only 'proven' clears the gate)"
+
+    # The blocked-resume sweep routes the need to residual (stays BLOCKED).
+    disp = _classify_capability_need(
+        "container-runtime", proof, proof_gate_mode="enforce"
+    )
+    assert disp["residual"] == [
+        {"kind": "capability", "ref": "container-runtime"}
+    ], "backing_path-only capability must stay residual (gated) under enforce"
+    assert disp["completed_needs"] == []
+
+    # ── Phase 3: under observe/off mode, path_proven still satisfies ──
+    disp_observe = _classify_capability_need(
+        "container-runtime", proof, proof_gate_mode="observe"
+    )
+    assert disp_observe["completed_needs"] == [
+        {"kind": "capability", "ref": "container-runtime"}
+    ], "observe mode must still satisfy (never blocks)"
+
+    disp_off = _classify_capability_need(
+        "container-runtime", proof, proof_gate_mode="off"
+    )
+    assert disp_off["completed_needs"] == [
+        {"kind": "capability", "ref": "container-runtime"}
+    ], "off mode must still satisfy (never blocks)"
+
+
+# ---------------------------------------------------------------------------
+# Auto-graduation sweep integration tests (DB-backed)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture()
+async def _grad_db():
+    """In-memory SQLite session for auto-graduation sweep tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as s:
+        yield s
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _clean_grad_config():
+    """Restore auto-graduation runtime_config keys after each test."""
+    from app.shared_state import runtime_config as _rc
+
+    saved_enabled = _rc.get("capability_proof_gate_auto_graduation_enabled")
+    saved_observe = _rc.get("capability_proof_gate_auto_graduation_observe_threshold")
+    saved_enforce = _rc.get("capability_proof_gate_auto_graduation_enforce_threshold")
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    yield
+    if saved_enabled is not None:
+        _rc["capability_proof_gate_auto_graduation_enabled"] = saved_enabled
+    else:
+        _rc.pop("capability_proof_gate_auto_graduation_enabled", None)
+    if saved_observe is not None:
+        _rc["capability_proof_gate_auto_graduation_observe_threshold"] = saved_observe
+    else:
+        _rc.pop("capability_proof_gate_auto_graduation_observe_threshold", None)
+    if saved_enforce is not None:
+        _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = saved_enforce
+    else:
+        _rc.pop("capability_proof_gate_auto_graduation_enforce_threshold", None)
+    if saved_mode is not None:
+        _rc["capability_proof_gate_mode"] = saved_mode
+    else:
+        _rc.pop("capability_proof_gate_mode", None)
+
+
+async def _create_project_with_caps(
+    db: AsyncSession, caps: list[dict]
+) -> str:
+    """Insert a project with the given capability list in problem_model and return its id."""
+    from app.models import Project
+
+    p = Project(
+        name="grad-test",
+        user_id="u1",
+        problem_model={"capabilities": caps},
+    )
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return str(p.id)
+
+
+def _make_sweep_ctx(db: AsyncSession):
+    """Build a SweepContext suitable for the auto-graduation check."""
+    from app.metrics_integrity_sweep import SweepContext
+
+    return SweepContext(
+        session=db,
+        now=datetime.utcnow(),
+        mode="observe",
+        max_projects=10,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+# ── Core acceptance-evidence test ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_graduation(_grad_db):
+    """ACCEPTANCE EVIDENCE. Full auto-graduation cycle:
+    - Set up projects with all-proven capabilities (100% coverage)
+    - Enable auto-graduation with observe_threshold=0.5
+    - Gate starts at 'off'
+    - Run the sweep → advances to 'observe'
+    - With 100% coverage and enforce_threshold=0.95 → advances to 'enforce'
+    - Verify gate mode is now 'enforce'
+    """
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    # Setup: all-proven capabilities
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": [_proven_ref()]},
+        ],
+    )
+
+    # Configure auto-graduation
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+
+    # Step 1: off → observe (coverage = 2/2 = 1.0 >= 0.5)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.FLAGGED
+    assert "off → observe" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "observe"
+
+    # Step 2: observe → enforce (coverage still 1.0 >= 0.95)
+    results2 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results2) == 1
+    assert results2[0].status == CheckStatus.FLAGGED
+    assert "observe → enforce" in results2[0].detail
+    assert _rc["capability_proof_gate_mode"] == "enforce"
+
+    # Step 3: already at enforce — no-op
+    results3 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results3) == 1
+    assert results3[0].status == CheckStatus.OK
+    assert "already at enforce" in results3[0].detail
+    assert _rc["capability_proof_gate_mode"] == "enforce"
+
+
+# ── Disabled flag ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_noop_when_disabled(_grad_db):
+    """Auto-graduation returns OK immediately when the feature flag is disabled."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [{"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]}],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = False
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.OK
+    assert "disabled" in results[0].detail.lower()
+    # Gate mode unchanged
+    assert _rc["capability_proof_gate_mode"] == "off"
+
+
+# ── Below threshold ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_noop_when_below_threshold(_grad_db):
+    """Auto-graduation does NOT advance when coverage is below threshold."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    # One proven, one unproven → 50% coverage
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": [_unproven_ref()]},
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.51
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.OK
+    assert "below threshold" in results[0].detail.lower()
+    assert _rc["capability_proof_gate_mode"] == "off"
+
+
+# ── Exempt capabilities excluded ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_excludes_exempt_capabilities(_grad_db):
+    """Exempt capabilities are excluded from both numerator and denominator.
+    With 1 proven non-exempt and 1 exempt → 100% non-exempt coverage."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            # Exempt working cap — excluded from coverage calc.
+            {
+                "name": "Cap B (exempt)",
+                "status": "working",
+                "proof_exempt": True,
+            },
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    # Coverage = 1/1 = 100% (exempt excluded) → advances
+    assert results[0].status == CheckStatus.FLAGGED
+    assert "off → observe" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "observe"
+
+
+# ── Already at enforce is no-op ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_noop_when_already_enforce(_grad_db):
+    """When gate is already at enforce, the sweep returns OK immediately without
+    changing any state."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [{"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]}],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_mode"] = "enforce"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.OK
+    assert "already at enforce" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "enforce"
+
+
+# ── Never regresses ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_never_regresses(_grad_db):
+    """The sweep only advances, never dials back. When in enforce mode,
+    any coverage ratio returns a no-op (not a regression to observe)."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    # Zero proven — if gate were "off", coverage would be 0%.
+    await _create_project_with_caps(
+        _grad_db,
+        [{"name": "Cap A", "status": "working"}],  # no evidence_refs → unproven
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_mode"] = "enforce"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.OK
+    assert "already at enforce" in results[0].detail
+    # Gate mode stays enforce — never regresses to observe
+    assert _rc["capability_proof_gate_mode"] == "enforce"
+
+
+# ── All-exempt project excluded from aggregate ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_skips_when_all_exempt(_grad_db):
+    """Projects where all working capabilities are exempt are excluded from the
+    aggregate. If no projects contribute non-exempt working caps, the sweep
+    returns SKIPPED."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Exempt only",
+                "status": "working",
+                "proof_exempt": True,
+            },
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "no non-exempt" in results[0].detail.lower()
+    assert _rc["capability_proof_gate_mode"] == "off"

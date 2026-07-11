@@ -36,7 +36,7 @@ export interface ProjectContext {
 }
 
 export type CapabilityStatus = 'working' | 'partial' | 'planned';
-export type CapabilityProofStatus = 'proven' | 'unproven';
+export type CapabilityProofStatus = 'proven' | 'path_proven' | 'unproven';
 
 export interface CapabilityProofRecord {
   task_id: string;
@@ -46,6 +46,14 @@ export interface CapabilityProofRecord {
   commit_sha: string;
 }
 
+export interface EvidenceRef {
+  kind: string;
+  ref: string;
+  proven: boolean;
+  source_id?: string | null;
+  recorded_at?: string | null;
+}
+
 export interface Capability {
   name: string;
   status: CapabilityStatus;
@@ -53,6 +61,9 @@ export interface Capability {
   source?: Source | null;
   proof_status?: CapabilityProofStatus | null;
   proof_records?: CapabilityProofRecord[] | null;
+  evidence_refs?: EvidenceRef[] | null;
+  backing_paths?: string[] | null;
+  proof_exempt?: boolean | null;
 }
 
 export type GapSize = 'small' | 'medium' | 'large';

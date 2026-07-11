@@ -5803,8 +5803,8 @@ def test_evidence_met_summary_none_coverage_omits_acceptance_key():
 def test_evidence_met_summary_empty_model():
     summary = evidence_met_summary(ProblemModel())
     assert summary["capabilities"] == {
-        "proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+        "proven": 0, "path_proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
     }
     assert summary["gaps"] == {
-        "proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+        "proven": 0, "path_proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
     }

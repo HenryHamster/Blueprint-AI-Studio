@@ -188,6 +188,17 @@ class Capability(BaseModel):
     (``metrics_integrity_sweep.check_capability_claim_reconciliation``) overrides
     the derived status to ``contradicted`` when a proven ref is disproved."""
 
+    proof_exempt: bool = Field(default=False)
+    """When True, this working capability is declared exempt from proof
+    requirements. An exempt capability:
+    - classifies as ``"proven"`` in :func:`working_capability_proof_status`
+      (satisfies the proof gate without machine-verified evidence),
+    - is skipped by the proof earn loop,
+    - does not count as unproven in the release-qualifier gate,
+    - is reported separately (not in delta) by the metrics sweep.
+    Defaults to False; existing capabilities without this field are
+    unaffected (backward-compatible)."""
+
 
 # ---------------------------------------------------------------------------
 # Gaps
@@ -631,8 +642,8 @@ def evidence_met_summary(
     counts on the shared :data:`~app.evidence_primitive.EvidenceStatus` axis::
 
         {
-            "capabilities": {"proven": n, "partial": n, "unproven": n,
-                             "contradicted": n, "unverified": n},
+            "capabilities": {"proven": n, "path_proven": n, "partial": n,
+                             "unproven": n, "contradicted": n, "unverified": n},
             "gaps": {…same axes…},
             "acceptance": {…same axes…, "total": t},
         }
@@ -644,7 +655,7 @@ def evidence_met_summary(
     from app.acceptance_criteria import criterion_coverage_to_evidence_status
 
     _AXES: list[EvidenceStatus] = [
-        "proven", "partial", "unproven", "contradicted", "unverified"
+        "proven", "path_proven", "partial", "unproven", "contradicted", "unverified"
     ]
 
     def _zero() -> dict:

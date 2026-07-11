@@ -1463,6 +1463,252 @@ class TestCommissionProofEarnLoop:
         assert result["earned"] == 1
 
 
+# ── proof_exempt capability exemption ──────────────────────────────────────────
+
+
+def _proven_ref() -> dict:
+    return {"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True}
+
+
+def test_exempt_capability_not_blocked_by_gate():
+    """An exempt working capability is NOT blocked by the proof gate in enforce mode.
+
+    This is the load-bearing acceptance test for the proof_exempt feature:
+    a capability marked ``proof_exempt=True`` classifies as ``"proven"`` in
+    ``working_capability_proof_status()``, so the enforce-mode gate predicate
+    sees it as proven and returns ``False`` (not blocked).
+
+    Without proof_exempt=True, the same capability with no evidence_refs
+    classifies as ``"unproven"`` and the gate WOULD block it.
+    """
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        working_capability_proof_status,
+    )
+
+    # Exempt working capability with zero evidence.
+    model = {
+        "capabilities": [
+            {
+                "name": "human-code-review",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+            }
+        ]
+    }
+    proof = working_capability_proof_status(model)
+
+    # Exempt cap classifies as proven — the core semantic.
+    assert proof.get("human-code-review") == "proven", (
+        "exempt working capability must classify as 'proven'"
+    )
+
+    # In enforce mode, the gate predicate returns False (not blocked).
+    need = {"kind": "capability", "ref": "human-code-review"}
+    assert not capability_need_blocked_by_proof_gate(
+        need, proof, mode="enforce"
+    ), "exempt cap must not be blocked in enforce mode"
+
+    # Same capability without proof_exempt WOULD be blocked.
+    model_no_exempt = {
+        "capabilities": [
+            {
+                "name": "human-code-review",
+                "status": "working",
+                "evidence_refs": [],
+            }
+        ]
+    }
+    proof_no_exempt = working_capability_proof_status(model_no_exempt)
+    assert proof_no_exempt.get("human-code-review") == "unproven", (
+        "non-exempt working cap with no evidence must classify as 'unproven'"
+    )
+    assert capability_need_blocked_by_proof_gate(
+        need, proof_no_exempt, mode="enforce"
+    ), "non-exempt unproven cap must be blocked in enforce mode"
+
+
+def test_exempt_capability_not_in_unproven_count():
+    """Exempt working caps classify as 'proven' and do NOT appear in the unproven set."""
+    from app.capability_registry import working_capability_proof_status
+
+    model = {
+        "capabilities": [
+            {"name": "real-proven", "status": "working",
+             "evidence_refs": [_proven_ref()]},
+            {"name": "exempt-cap", "status": "working",
+             "evidence_refs": [], "proof_exempt": True},
+            {"name": "unproven-cap", "status": "working",
+             "evidence_refs": []},
+        ]
+    }
+    proof = working_capability_proof_status(model)
+
+    # All three map to 'proven', 'proven', and 'unproven' respectively.
+    assert proof == {
+        "real-proven": "proven",
+        "exempt-cap": "proven",
+        "unproven-cap": "unproven",
+    }
+
+    # Exempt cap is NOT in the unproven set.
+    unproven = {n for n, s in proof.items() if s != "proven"}
+    assert "exempt-cap" not in unproven
+    assert unproven == {"unproven-cap"}
+
+
+def test_exempt_capability_names_returns_correct_set():
+    """exempt_capability_names returns working+exempt names, excluding non-working/unexempt."""
+    from app.capability_registry import exempt_capability_names
+
+    model = {
+        "capabilities": [
+            {"name": "exempt-working", "status": "working", "proof_exempt": True},
+            {"name": "non-exempt-working", "status": "working", "proof_exempt": False},
+            {"name": "exempt-planned", "status": "planned", "proof_exempt": True},
+            {"name": "no-exempt-field", "status": "working"},
+        ]
+    }
+    exempt = exempt_capability_names(model)
+    assert exempt == {"exempt-working"}, (
+        "only working+exempt caps should be returned; got: " + str(exempt)
+    )
+
+    # Empty model returns empty set.
+    assert exempt_capability_names({}) == set()
+    assert exempt_capability_names(None) == set()
+
+
+def test_exempt_capability_skipped_in_earn_loop():
+    """commission_proof_earn_loop skips exempt caps (defensive guard).
+
+    ``working_capability_proof_status`` classifies exempt working caps as
+    ``"proven"``, so they never appear in the ``unproven_working`` set that
+    ``compute_unproven_demanded_capabilities`` builds. The earn loop never
+    tries to prove them — the exemption is enforced at the proof-status
+    layer, not inside the earn loop itself.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from app.capability_proof import commission_proof_earn_loop
+
+    # An exempt working cap with no evidence_refs and no proof_records.
+    # working_capability_proof_status classifies it as "proven", so
+    # compute_unproven_demanded_capabilities returns an empty list.
+    project = MagicMock()
+    project.problem_model = {
+        "capabilities": [
+            {"name": "exempt-no-proof", "status": "working",
+             "proof_exempt": True, "backing_paths": ["backend/app/main.py"]},
+        ]
+    }
+    project.capability_proof_records = {}
+
+    async def _verify(p: str) -> bool:
+        return True
+
+    with patch("app.capability_proof.flag_modified"):
+        result = asyncio.get_event_loop().run_until_complete(
+            commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "exempt-no-proof",
+                     "dependent_count": 1},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        )
+
+    # Exempt caps are "proven", so compute_unproven_demanded_capabilities
+    # returns []. Earn loop reports zero demanded unproven — the exempt
+    # cap was never a target for proof earning.
+    assert result["total_demanded_unproven"] == 0, (
+        "exempt cap should not appear in demanded_unproven because "
+        "working_capability_proof_status classifies it as 'proven'"
+    )
+    assert result["earned"] == 0
+
+    # Now test with a mix: one exempt unproven cap, one real unproven cap.
+    # The exempt cap is never demanded (proven), the real one is.
+    project2 = MagicMock()
+    project2.problem_model = {
+        "capabilities": [
+            {"name": "exempt-no-proof", "status": "working",
+             "proof_exempt": True},
+            {"name": "real-unproven", "status": "working",
+             "backing_paths": ["backend/app/main.py"]},
+        ]
+    }
+    project2.capability_proof_records = {}
+
+    with patch("app.capability_proof.flag_modified"):
+        result2 = asyncio.get_event_loop().run_until_complete(
+            commission_proof_earn_loop(
+                project2,
+                demand_result={"total": 2, "demands": [
+                    {"kind": "capability", "ref": "exempt-no-proof",
+                     "dependent_count": 1},
+                    {"kind": "capability", "ref": "real-unproven",
+                     "dependent_count": 1},
+                ]},
+                problem_model=project2.problem_model,
+                verify_path=_verify,
+            )
+        )
+
+    # Only the non-exempt unproven cap is demanded.
+    assert result2["total_demanded_unproven"] == 1, (
+        "only the non-exempt unproven cap should be in demanded_unproven"
+    )
+    assert result2["earned"] == 1, (
+        "the non-exempt cap with backing_paths should be earned"
+    )
+
+
+def test_release_qualifier_exempt_not_blocked():
+    """The release qualifier does NOT set capability_proof_blocked when the only
+    unproven caps are exempt."""
+    from app.capability_registry import working_capability_proof_status
+
+    # Scenario: 2 working caps. One exempt with no evidence, one non-exempt
+    # with no evidence. The non-exempt is the only real unproven.
+    model = {
+        "capabilities": [
+            {"name": "exempt-unproven", "status": "working",
+             "proof_exempt": True, "evidence_refs": []},
+            {"name": "real-unproven", "status": "working",
+             "evidence_refs": []},
+        ]
+    }
+    proof = working_capability_proof_status(model)
+
+    # Exempt classifies as proven, non-exempt as unproven.
+    assert proof["exempt-unproven"] == "proven"
+    assert proof["real-unproven"] == "unproven"
+
+    # Only real-unproven blocks.
+    unproven = [n for n, s in proof.items() if s != "proven"]
+    assert unproven == ["real-unproven"]
+
+    # Scenario 2: ONLY exempt caps are unproven → no blockage.
+    model2 = {
+        "capabilities": [
+            {"name": "exempt-only", "status": "working",
+             "proof_exempt": True, "evidence_refs": []},
+            {"name": "existent-proven", "status": "working",
+             "evidence_refs": [_proven_ref()]},
+        ]
+    }
+    proof2 = working_capability_proof_status(model2)
+    unproven2 = [n for n, s in proof2.items() if s != "proven"]
+    assert unproven2 == [], (
+        "exempt caps are classified as proven, so no unproven remain"
+    )
+
+
 # ── backing_path proof tiering: enforce-gate clearance ────────────────────────
 
 

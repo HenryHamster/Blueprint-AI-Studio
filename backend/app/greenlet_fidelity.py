@@ -118,11 +118,15 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # (which issues session.execute internally) before the .id read; scanner
     # cannot trace the re-fetch through the helper call.
     "review_pipeline.py::_spawn_verify_tests_task",
+    # auto_resolved and still_unproven at L3537-L3541 are plain Python lists,
+    # not ORM-mapped attributes; scanner cannot distinguish list reads from
+    # ORM lazy-load reads that would trigger a detached-instance error.
+    "metrics_integrity_sweep.py::check_capability_proof_gate_gap",
 })
 
 # Monotonic ceiling for the rollback-flow allowlist: can only shrink as entries
 # are fixed at the production code level. Bump when adding a new entry.
-ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 7
+ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 8
 
 
 def rollback_flow_allowlist_within_ceiling() -> bool:
