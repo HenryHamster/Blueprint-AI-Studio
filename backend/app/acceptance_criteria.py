@@ -1151,6 +1151,18 @@ async def backfill_unverified_merge_evidence(
                     )
                     return total
 
+            # Batch-load all existing backfill evidence for this batch in one query.
+            task_id_strs = [str(t.id) for t in batch]
+            ev_batch_result = await session.execute(
+                select(CriterionEvidence).where(
+                    CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                    CriterionEvidence.source_id.in_(task_id_strs),
+                )
+            )
+            all_present: dict[str, set[uuid.UUID]] = {}
+            for ev in ev_batch_result.scalars().all():
+                all_present.setdefault(ev.source_id, set()).add(ev.criterion_id)
+
             for task in batch:
                 if not is_merged_completion(task):
                     continue
@@ -1206,18 +1218,7 @@ async def backfill_unverified_merge_evidence(
                 if not active:
                     continue
 
-                # Batch-load already-present backfill evidence to skip duplicates.
-                active_ids = [c.id for c in active]
-                already_present: set[uuid.UUID] = set()
-                ev_result = await session.execute(
-                    select(CriterionEvidence).where(
-                        CriterionEvidence.criterion_id.in_(active_ids),
-                        CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
-                        CriterionEvidence.source_id == str(task.id),
-                    )
-                )
-                for ev in ev_result.scalars().all():
-                    already_present.add(ev.criterion_id)
+                already_present: set[uuid.UUID] = all_present.get(str(task.id), set())
 
                 task_id_str = str(task.id)
                 unverified_reason = _task_unverified_reason(task) or "unknown"
