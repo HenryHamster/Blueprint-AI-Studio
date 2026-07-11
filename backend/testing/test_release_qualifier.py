@@ -9950,6 +9950,68 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resolved_status", ["passed", "failed", "blocked"])
+async def test_infra_failure_does_not_downgrade_resolved_dimension(
+    db_session, resolved_status
+):
+    """_record_infra_dimension_unavailable must not overwrite a dimension row
+    that is already in a resolved state (passed/failed/blocked).
+
+    This is the asymmetry fix: _dual_write_dimension_results already skips
+    re-recording resolved dims, but the infra-failure writer (_upsert_dimension_result
+    called from _record_infra_dimension_unavailable) did not — it unconditionally
+    overwrote existing.status.  The guard must fire for all three resolved statuses
+    and return 0 (indicating no streak was recorded).
+    """
+    from app import release_qualifier as rq
+    from app.models import QualificationDimensionResult
+    from sqlalchemy import select as sa_select
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    # Seed a pre-resolved dimension row.
+    resolved_row = QualificationDimensionResult(
+        project_id=version.project_id,
+        release_version_id=version.id,
+        candidate_sha=candidate_sha,
+        dimension="audit",
+        status=resolved_status,
+        sub_score=1.0 if resolved_status == "passed" else 0.0,
+    )
+    db_session.add(resolved_row)
+    await db_session.flush()
+
+    streak = await rq._record_infra_dimension_unavailable(
+        db_session,
+        version,
+        candidate_sha,
+        "audit",
+        infra_error="some_transient_infra_error",
+        signature="sig-abc",
+    )
+    await db_session.flush()
+
+    # Guard must have fired: streak == 0, row status unchanged.
+    assert streak == 0, (
+        f"expected streak=0 (skipped) for resolved status '{resolved_status}', got {streak}"
+    )
+    row = (
+        await db_session.execute(
+            sa_select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+                QualificationDimensionResult.dimension == "audit",
+            )
+        )
+    ).scalar_one_or_none()
+    assert row is not None, "dimension row disappeared"
+    assert row.status == resolved_status, (
+        f"infra failure downgraded resolved status '{resolved_status}' to '{row.status}'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ledger_integrity_infra_failure_does_not_overwrite_passed_audit(
     db_session, mocker
 ):

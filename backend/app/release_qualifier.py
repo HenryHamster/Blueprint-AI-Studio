@@ -3383,6 +3383,18 @@ async def _record_infra_dimension_unavailable(
                 )
             )
         ).scalar_one_or_none()
+        if existing is not None and existing.status in _LEDGER_RESOLVED_STATUSES:
+            # Already resolved (passed/failed/blocked) — an infra failure in a
+            # different gate must never downgrade a fact that truly settled.
+            logger.debug(
+                "[RELEASE_QUALIFIER] skipping infra-unavailable write for dimension "
+                "'%s' on v%s/%s — already resolved as '%s'",
+                dimension,
+                getattr(version, "version_number", "?"),
+                candidate_sha[:8] if candidate_sha else "?",
+                existing.status,
+            )
+            return 0
         if existing is not None and isinstance(existing.detail, dict):
             prior = existing.detail.get("consecutive_infra_errors")
             if isinstance(prior, int) and not isinstance(prior, bool):
