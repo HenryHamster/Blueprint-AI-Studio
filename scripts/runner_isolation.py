@@ -1375,6 +1375,12 @@ def plan_compute_execution(
         injected["PYTHONPATH"] = clone_in
     if gpu_indices:
         gpu_nodes = gpu_device_nodes(gpu_indices)
+        # CUDA and NVML walk /sys/bus/pci at init to discover devices; without
+        # this read-only bind cuInit fails with CUDA_ERROR_OPERATING_SYSTEM (304)
+        # and nvidia-smi with "GPU access blocked by the operating system" even
+        # though the /dev nodes and driver libs are all present. GPU jobs only —
+        # non-GPU sandboxes stay /sys-free.
+        ro_binds.append("/sys")
         # Only the assigned /dev/nvidiaN nodes are exposed, so CUDA re-enumerates
         # them from 0. Set CUDA_VISIBLE_DEVICES to that renumbered range; keep the
         # host indices in NVIDIA_VISIBLE_DEVICES for any driver hooks.
