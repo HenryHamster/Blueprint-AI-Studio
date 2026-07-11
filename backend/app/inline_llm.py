@@ -417,6 +417,10 @@ async def call_inline_llm_json(
 
     for attempt in range(2):
         try:
+            # The discarded second element is Messages-API rate-limit header
+            # data for the ORG-LEVEL env credential these inline calls use —
+            # it cannot be attributed to any MaxPlanAccount, so the account
+            # usage meter is fed by the OAuth probe instead (max_plan_pool).
             raw, _ = await call_direct_llm(
                 target.api_key,
                 messages=payload_messages,

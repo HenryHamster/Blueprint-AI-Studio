@@ -28,6 +28,8 @@ from app.max_plan_pool import (
     _STARTUP_FAILURE_COOLDOWN_SECONDS,
     _STARTUP_FAILURE_THRESHOLD,
     _USAGE_HEADROOM_NEUTRAL,
+    _USAGE_METER_DISPLAY_STALE_SECONDS,
+    _USAGE_METER_REFRESH_INTERVAL_SECONDS,
     _USAGE_SNAPSHOT_TTL_SECONDS,
     _account_at_cap,
     _account_available_for_model,
@@ -53,7 +55,9 @@ from app.max_plan_pool import (
     _pending_rl_persists,
     _prune_health_events,
     _refresh_usage_snapshot,
+    _restore_usage_state,
     _serialize_disabled_model_info,
+    _snapshot_from_persisted_usage,
     _usage_gate_should_skip,
     _usage_headroom_rank,
     _usage_headroom_settings,
@@ -68,6 +72,7 @@ from app.max_plan_pool import (
     get_all_account_health_summaries,
     record_account_startup_failure,
     recheck_disabled_accounts,
+    refresh_usage_meter_snapshots,
     release_max_plan_account,
     select_max_plan_account,
     select_max_plan_account_balanced,
@@ -2520,12 +2525,26 @@ class TestUsageSnapshotSummary:
         assert out["five_hour_utilization"] is None
         assert out["stale"] is True
 
-    def test_stale_flag_set(self):
+    def test_stale_flag_uses_display_window_not_selection_ttl(self):
         now = _utcnow()
+        # Older than the 60s selection TTL but within the display window —
+        # NOT stale for the meter (the 300s refresh cadence makes the 60s TTL
+        # meaningless as a display signal).
         acct = _acct_usage(
             _acct(),
             _known_snap(10.0, 10.0),
             at=now - timedelta(seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1),
+        )
+        out = _usage_snapshot_summary(acct, now)
+        assert out["stale"] is False
+        assert out["known"] is True
+
+    def test_stale_flag_set_past_display_window(self):
+        now = _utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(10.0, 10.0),
+            at=now - timedelta(seconds=_USAGE_METER_DISPLAY_STALE_SECONDS + 1),
         )
         out = _usage_snapshot_summary(acct, now)
         assert out["stale"] is True
@@ -2961,6 +2980,222 @@ class TestNoIOUnderLock:
         assert acct.get("usage_probe_inflight") is True
         await asyncio.sleep(0)  # let the fire-and-forget task run
         assert ran["count"] == 1
+
+    async def test_refresh_failure_preserves_last_known_snapshot(self, monkeypatch):
+        now = _utcnow()
+        acct = _healthy_acct("a")
+        _acct_usage(acct, _known_snap(30.0, 40.0), at=now - timedelta(seconds=120))
+        _account_by_id["a"] = acct
+
+        class _Broken:
+            async def probe_usage(self, *a, **k):
+                raise RuntimeError("provider blew up")
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.get_provider", lambda *_a, **_k: _Broken()
+        )
+        await _refresh_usage_snapshot("a")
+        # The last-known values survive for the meter (they age into stale);
+        # only the failure stamp is recorded so schedulers back off.
+        snap = acct.get("usage_snapshot")
+        assert isinstance(snap, UsageSnapshot) and snap.known
+        assert snap.window_utilizations["five_hour"] == 30.0
+        assert acct.get("usage_probe_failed_at") is not None
+        assert acct.get("usage_probe_inflight") is None
+
+    async def test_refresh_success_clears_failure_stamp(self, monkeypatch):
+        acct = _healthy_acct("a", usage_probe_failed_at=_utcnow())
+        _account_by_id["a"] = acct
+
+        class _Probe:
+            async def probe_usage(self, *a, **k):
+                return _known_snap(15.0, 25.0)
+
+        monkeypatch.setattr(
+            "app.max_plan_pool.get_provider", lambda *_a, **_k: _Probe()
+        )
+        await _refresh_usage_snapshot("a")
+        assert acct.get("usage_probe_failed_at") is None
+        assert acct["usage_snapshot"].window_utilizations["five_hour"] == 15.0
+
+    async def test_maybe_schedule_backs_off_after_recent_failure(self, monkeypatch):
+        now = _utcnow()
+        acct = _healthy_acct("a", usage_probe_failed_at=now)  # no snapshot
+        _account_by_id["a"] = acct
+        ran = {"count": 0}
+
+        async def _fake_refresh(acct_id):
+            ran["count"] += 1
+
+        monkeypatch.setattr("app.max_plan_pool._refresh_usage_snapshot", _fake_refresh)
+        _maybe_schedule_usage_refresh(acct, now)
+        assert acct.get("usage_probe_inflight") is None
+        # Once the failure stamp ages past the TTL, scheduling resumes.
+        acct["usage_probe_failed_at"] = now - timedelta(
+            seconds=_USAGE_SNAPSHOT_TTL_SECONDS + 1
+        )
+        _maybe_schedule_usage_refresh(acct, now)
+        assert acct.get("usage_probe_inflight") is True
+        await asyncio.sleep(0)
+        assert ran["count"] == 1
+
+
+# ── Usage-meter persistence + periodic refresh ───────────────────────────────
+
+
+class TestSnapshotFromPersistedUsage:
+    def test_round_trips_persisted_blob(self):
+        at = _utcnow()
+        raw = {
+            "source": "oauth_usage_probe",
+            "updated_at": at.isoformat(),
+            "five_hour": {"utilization": 42.0, "resets_at": "2026-07-11T05:00:00Z"},
+            "seven_day": {"utilization": 63.5},
+        }
+        parsed = _snapshot_from_persisted_usage(raw)
+        assert parsed is not None
+        snap, stamp = parsed
+        assert stamp == at
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 42.0, "seven_day": 63.5}
+        assert snap.resets_at == {"five_hour": "2026-07-11T05:00:00Z"}
+        assert snap.probed_at == at.isoformat()
+
+    def test_rejects_foreign_source_and_garbage(self):
+        assert _snapshot_from_persisted_usage(None) is None
+        assert _snapshot_from_persisted_usage({"source": "messages_api_header"}) is None
+        assert (
+            _snapshot_from_persisted_usage(
+                {"source": "oauth_usage_probe", "updated_at": "not-a-date"}
+            )
+            is None
+        )
+        # No numeric windows → nothing to display → None.
+        assert (
+            _snapshot_from_persisted_usage(
+                {
+                    "source": "oauth_usage_probe",
+                    "updated_at": _utcnow().isoformat(),
+                    "five_hour": {"utilization": "high"},
+                }
+            )
+            is None
+        )
+
+
+class TestRestoreUsageState:
+    def test_seeds_from_persisted_when_no_previous(self):
+        at = _utcnow() - timedelta(seconds=200)
+        entry: dict = {}
+        _restore_usage_state(
+            entry,
+            None,
+            {
+                "source": "oauth_usage_probe",
+                "updated_at": at.isoformat(),
+                "five_hour": {"utilization": 10.0},
+            },
+        )
+        assert entry["usage_snapshot"].known is True
+        assert entry["usage_snapshot_at"] == at
+
+    def test_prefers_fresher_in_memory_over_persisted(self):
+        newer = _utcnow()
+        older = newer - timedelta(seconds=600)
+        entry: dict = {}
+        _restore_usage_state(
+            entry,
+            (_known_snap(55.0, 5.0), newer, None),
+            {
+                "source": "oauth_usage_probe",
+                "updated_at": older.isoformat(),
+                "five_hour": {"utilization": 10.0},
+            },
+        )
+        assert entry["usage_snapshot"].window_utilizations["five_hour"] == 55.0
+        assert entry["usage_snapshot_at"] == newer
+
+    def test_carries_failure_stamp_and_tolerates_nothing(self):
+        failed_at = _utcnow()
+        entry: dict = {}
+        _restore_usage_state(entry, (None, None, failed_at), None)
+        assert entry.get("usage_probe_failed_at") == failed_at
+        assert "usage_snapshot" not in entry
+        empty: dict = {}
+        _restore_usage_state(empty, None, None)
+        assert empty == {}
+
+
+@pytest.mark.asyncio
+class TestRefreshUsageMeterSnapshots:
+    def _register(self, acct):
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_schedules_only_eligible_accounts(self, monkeypatch):
+        scheduled: list[str] = []
+        monkeypatch.setattr(
+            "app.max_plan_pool._schedule_usage_refresh",
+            lambda acct: scheduled.append(acct["id"]),
+        )
+        self._register(
+            _acct(id="claude", provider="anthropic", auth_mode="oauth")
+        )
+        self._register(_acct(id="codex", provider="openai", auth_mode="oauth"))
+        self._register(
+            _acct(id="key", provider="anthropic", auth_mode="api_key")
+        )
+        self._register(
+            _acct(
+                id="off",
+                provider="anthropic",
+                auth_mode="oauth",
+                enabled=False,
+            )
+        )
+        self._register(
+            _acct(
+                id="no-secret",
+                provider="anthropic",
+                auth_mode="oauth",
+                oauth_token=None,
+            )
+        )
+        count = await refresh_usage_meter_snapshots()
+        assert scheduled == ["claude"]
+        assert count == 1
+
+    async def test_skips_fresh_snapshots_and_recent_failures(self, monkeypatch):
+        now = _utcnow()
+        scheduled: list[str] = []
+        monkeypatch.setattr(
+            "app.max_plan_pool._schedule_usage_refresh",
+            lambda acct: scheduled.append(acct["id"]),
+        )
+        fresh = self._register(
+            _acct(id="fresh", provider="anthropic", auth_mode="oauth")
+        )
+        _acct_usage(fresh, _known_snap(10.0, 10.0), at=now - timedelta(seconds=30))
+        aging = self._register(
+            _acct(id="aging", provider="anthropic", auth_mode="oauth")
+        )
+        _acct_usage(
+            aging,
+            _known_snap(10.0, 10.0),
+            at=now - timedelta(seconds=_USAGE_METER_REFRESH_INTERVAL_SECONDS + 1),
+        )
+        failed = self._register(
+            _acct(
+                id="failed",
+                provider="anthropic",
+                auth_mode="oauth",
+                usage_probe_failed_at=now - timedelta(seconds=30),
+            )
+        )
+        assert failed["id"] == "failed"
+        count = await refresh_usage_meter_snapshots(now)
+        assert scheduled == ["aging"]
+        assert count == 1
 
 
 # ── record_account_startup_failure / startup-failure breaker ────────────────

@@ -168,6 +168,13 @@ interface SettingsAccountsSectionProps {
   onAddAccount: () => void;
 }
 
+function usageUtilizationClass(utilization: number | null | undefined): string {
+  if (utilization == null) return 'text-neutral-500';
+  if (utilization >= 80) return 'text-amber-400';
+  if (utilization >= 60) return 'text-yellow-500';
+  return 'text-emerald-500';
+}
+
 function accountSupportsAvailabilityCheck(account: MaxPlanAccount): boolean {
   if (account.auth_mode !== 'api_key') return false;
   return account.provider === 'gemini' || account.provider === 'openai';
@@ -359,11 +366,19 @@ function AccountRow({
             {account.provider_metadata?.project && typeof account.provider_metadata.project === 'string' && <span className="ml-2">&middot; {account.provider_metadata.project}</span>}
             {account.provider_metadata?.location && typeof account.provider_metadata.location === 'string' && <span className="ml-2">@ {account.provider_metadata.location}</span>}
             {account.usage_snapshot?.known && (
-              <span className="ml-2" title={`5h: ${account.usage_snapshot.five_hour_utilization ?? '?'}% · 7d: ${account.usage_snapshot.seven_day_utilization ?? '?'}% headroom usage`}>
+              <span
+                className={`ml-2 ${account.usage_snapshot.stale ? 'opacity-60' : ''}`}
+                title={`5h: ${account.usage_snapshot.five_hour_utilization ?? '?'}% · 7d: ${account.usage_snapshot.seven_day_utilization ?? '?'}% plan usage${account.usage_snapshot.probed_at ? ` · probed ${account.usage_snapshot.probed_at}` : ''}${account.usage_snapshot.stale ? ' · STALE' : ''}`}
+              >
                 &middot; 5h&nbsp;
-                <span className={account.usage_snapshot.five_hour_utilization != null && account.usage_snapshot.five_hour_utilization >= 80 ? 'text-amber-400' : account.usage_snapshot.five_hour_utilization != null && account.usage_snapshot.five_hour_utilization >= 60 ? 'text-yellow-500' : 'text-emerald-500'}>
+                <span className={usageUtilizationClass(account.usage_snapshot.five_hour_utilization)}>
                   {account.usage_snapshot.five_hour_utilization == null ? '?' : `${Math.round(account.usage_snapshot.five_hour_utilization)}%`}
                 </span>
+                &nbsp;7d&nbsp;
+                <span className={usageUtilizationClass(account.usage_snapshot.seven_day_utilization)}>
+                  {account.usage_snapshot.seven_day_utilization == null ? '?' : `${Math.round(account.usage_snapshot.seven_day_utilization)}%`}
+                </span>
+                {account.usage_snapshot.stale && <span className="text-neutral-500"> (stale)</span>}
               </span>
             )}
           </div>

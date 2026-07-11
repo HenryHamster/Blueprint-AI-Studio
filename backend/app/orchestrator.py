@@ -354,6 +354,7 @@ def _warm_pin_still_honorable(
 # ---------------------------------------------------------------------------
 
 _last_pool_refresh: datetime = _utcnow()
+_last_usage_meter_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
@@ -972,6 +973,7 @@ async def orchestrator_worker():
     # Late imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         load_max_plan_pool,
+        refresh_usage_meter_snapshots,
         release_max_plan_account,
         recheck_disabled_accounts,
         _extract_task_model,
@@ -1026,7 +1028,7 @@ async def orchestrator_worker():
         _sweep_lane_baseline_backfill,
     )
 
-    global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
+    global _last_pool_refresh, _last_usage_meter_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
     global \
         _last_orphan_check, \
@@ -1065,6 +1067,14 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_pool_refresh, 300):
                 await load_max_plan_pool()
                 _last_pool_refresh = _utcnow()
+
+            # Periodic usage-meter refresh — keeps the admin usage meter
+            # (5h/7d plan utilization) populated independent of the
+            # default-off usage_headroom selection gate. Fire-and-forget
+            # probes; never blocks dispatch.
+            if _is_cadence_due(_last_usage_meter_refresh, 300):
+                await refresh_usage_meter_snapshots()
+                _last_usage_meter_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart
             global _last_zone_health_persist
