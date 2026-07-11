@@ -232,6 +232,7 @@ const LEGACY_API_MOCK_FILES = new Set([
   'components/StrategicAuditPanel.viewport.test.tsx',
   'components/TaskCard.test.tsx',
   'components/TaskCard.viewport.test.tsx',
+  'components/TaskComputeJobsSection.viewport.test.tsx',
   'components/TaskDetailDrawer.test.tsx',
   'components/TaskDetailDrawerDiagnostics.viewport.test.tsx',
   'components/TaskDetailDrawerMeta.viewport.test.tsx',
