@@ -504,6 +504,8 @@ export async function handleStrategicResident(
       ttftMs: r.ttftMs,
       interrupted: r.interrupted,
       toolCallCount: r.toolCallCount,
+      toolCallDurationMs: r.totalToolCallDurationMs,
+      meanInterTokenMs: r.meanInterTokenMs,
     });
     return r;
   };

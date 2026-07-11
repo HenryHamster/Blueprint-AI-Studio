@@ -479,11 +479,15 @@ interface ResidentTurnKindStats {
   ttftCount: number;
   interruptedCount: number;
   totalToolCalls: number;
+  totalToolCallDurationMs: number;
+  interTokenCount: number;
+  totalInterTokenMs: number;
 }
 
 const _emptyKindStats = (): ResidentTurnKindStats => ({
   count: 0, totalTurnMs: 0, maxTurnMs: 0, totalTtftMs: 0,
   ttftCount: 0, interruptedCount: 0, totalToolCalls: 0,
+  totalToolCallDurationMs: 0, interTokenCount: 0, totalInterTokenMs: 0,
 });
 
 let _residentTurnStats: Record<'operator' | 'autonomous', ResidentTurnKindStats> = { // @per-role
@@ -497,6 +501,11 @@ export interface ResidentTurnLatencyRecord {
   ttftMs: number | null;
   interrupted: boolean;
   toolCallCount: number;
+  /** cumulative ms spent inside tool calls during this turn. */
+  toolCallDurationMs: number;
+  /** mean ms between consecutive text tokens after the first; null when <=1
+   *  text token arrived. */
+  meanInterTokenMs: number | null;
 }
 
 /** Record one completed resident turn's latency metrics. */
@@ -515,12 +524,19 @@ export function recordResidentTurnLatency(record: ResidentTurnLatencyRecord): vo
   if (Number.isFinite(record.toolCallCount) && record.toolCallCount > 0) {
     s.totalToolCalls += record.toolCallCount;
   }
+  if (Number.isFinite(record.toolCallDurationMs) && record.toolCallDurationMs > 0) {
+    s.totalToolCallDurationMs += record.toolCallDurationMs;
+  }
+  if (record.meanInterTokenMs !== null && Number.isFinite(record.meanInterTokenMs) && record.meanInterTokenMs >= 0) {
+    s.totalInterTokenMs += record.meanInterTokenMs;
+    s.interTokenCount += 1;
+  }
 }
 
 /** Build a per-kind summary object from accumulated stats. Returns null when no turns have been recorded. */
 export function getResidentTurnLatencyTelemetry(): {
-  operator: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number };
-  autonomous: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number };
+  operator: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number; total_tool_call_duration_ms: number; mean_inter_token_ms: number | null };
+  autonomous: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number; total_tool_call_duration_ms: number; mean_inter_token_ms: number | null };
 } | null {
   const op = _residentTurnStats.operator;
   const au = _residentTurnStats.autonomous;
@@ -532,6 +548,8 @@ export function getResidentTurnLatencyTelemetry(): {
     mean_ttft_ms: s.ttftCount > 0 ? Math.round(s.totalTtftMs / s.ttftCount) : null,
     interrupted_count: s.interruptedCount,
     total_tool_calls: s.totalToolCalls,
+    total_tool_call_duration_ms: s.totalToolCallDurationMs,
+    mean_inter_token_ms: s.interTokenCount > 0 ? Math.round(s.totalInterTokenMs / s.interTokenCount) : null,
   });
   return { operator: summarize(op), autonomous: summarize(au) };
 }
