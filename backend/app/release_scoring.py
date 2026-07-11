@@ -69,6 +69,16 @@ ATTESTATION_PENALTY_WEIGHT = 0.15
 #: multiplier escalates when those attestations are completely uncorroborated.
 UNCORROBORATED_PENALTY_MULTIPLIER = 2.0
 
+# Confidence penalty applied when a version's acceptance criteria include
+# those covered ONLY by unverified-merge backfill evidence — the test file
+# shipped in the PR's changed files, but the merge was never CI-verified.
+# This is a lighter penalty than ATTESTATION_PENALTY_WEIGHT because backfill
+# evidence is machine-derived (the test was genuinely in the PR's changes),
+# not a pure operator waiver.  Proportional to the backfilled fraction:
+# ``BACKFILL_PENALTY_WEIGHT * (backfilled / total)``, applied as a multiplier
+# ``confidence *= (1 - penalty)`` after the attestation penalty.
+BACKFILL_PENALTY_WEIGHT = 0.05
+
 
 def coerce_completion_debt_weight(weights_raw: Any) -> float:
     """Read the OPTIONAL ``completion_debt`` blend weight from a weights mapping.
@@ -575,13 +585,15 @@ def compute_composite(
             int(criterion_coverage.get("total") or 0)
             - int(criterion_coverage.get("covered") or 0)
             - int(criterion_coverage.get("attested") or 0)
+            - int(criterion_coverage.get("backfilled") or 0)
         )
         > 0
     ):
         # A GENUINELY uncovered criterion (partial or no-evidence) still hard-
         # blocks.  Criteria covered only by a non-expired operator attestation
-        # are NOT counted here — they clear the blocker but incur the confidence
-        # penalty applied below (the attestation tier).
+        # OR unverified-merge backfill evidence are NOT counted here — they
+        # clear the blocker but incur the confidence penalty applied below
+        # (the attestation/backfill tier).
         blocker = "criterion_coverage_incomplete"
     elif capability_proof_blocked:
         # The capability proof gate is in ENFORCE mode and there are working
@@ -614,16 +626,20 @@ def compute_composite(
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
-    # Attestation observability: record how many active criteria are covered
-    # ONLY by a (non-expired) operator attestation.  Always recorded when a
-    # coverage summary is supplied so operators can see the attested surface
+    # Attestation/backfill observability: record how many active criteria
+    # are covered ONLY by a (non-expired) operator attestation or by
+    # unverified-merge backfill evidence.  Always recorded when a coverage
+    # summary is supplied so operators can see the lower-confidence surface
     # even when a blocker fired for a different reason.
     attested_count = 0
+    backfilled_count = 0
     total_criteria = 0
     if criterion_coverage is not None:
         attested_count = int(criterion_coverage.get("attested") or 0)
+        backfilled_count = int(criterion_coverage.get("backfilled") or 0)
         total_criteria = int(criterion_coverage.get("total") or 0)
         sub_scores["attested_count"] = attested_count
+        sub_scores["backfilled_count"] = backfilled_count
 
     if blocker is not None:
         return {
@@ -667,6 +683,15 @@ def compute_composite(
         if covered_count == 0:
             penalty *= UNCORROBORATED_PENALTY_MULTIPLIER
             sub_scores["uncorroborated_attested"] = True
+        confidence *= 1.0 - penalty
+
+    # Backfill penalty: criteria covered solely by unverified-merge backfill
+    # evidence (test shipped in PR changes but the merge was never CI-verified)
+    # incur a lighter proportional penalty to reflect their lower confidence
+    # relative to machine-verified evidence.  Like attestation, this is a
+    # confidence multiplier, not a hard block.
+    if backfilled_count > 0 and total_criteria > 0:
+        penalty = BACKFILL_PENALTY_WEIGHT * (backfilled_count / total_criteria)
         confidence *= 1.0 - penalty
 
     confidence = round(_clamp01(confidence), 4)

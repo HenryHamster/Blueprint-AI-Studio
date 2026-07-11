@@ -10343,6 +10343,7 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "total": 0,
         "covered": 0,
         "attested": 0,
+        "backfilled": 0,
         "partial": 0,
         "uncovered": 0,
         "retracted": 0,

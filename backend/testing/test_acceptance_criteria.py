@@ -465,6 +465,51 @@ def test_unproven_or_unreachable_merge_does_not_mark_criterion_covered():
     assert ac.compute_criterion_coverage([_make_evidence("reachability")]) == "covered"
 
 
+def test_unverified_merge_backfill_reports_distinct_tier():
+    """Unverified-merge backfill evidence produces the distinct 'backfilled' tier.
+
+    ``_evidence_proves_covered`` must NOT treat ``UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND``
+    as machine-verified covering evidence — that would score it at full parity with
+    reachability / proven task_merge, even though the merge was never CI-verified
+    (only the named_test file shipping was confirmed).  The test confirms:
+      - backfill evidence alone → ``compute_criterion_coverage`` returns ``'backfilled'``
+      - backfill + proven machine evidence → ``'covered'`` (backfill doesn't regress)
+      - backfill + operator attestation → ``'attested'`` (attestation still higher)
+    """
+    # Backfill evidence alone → distinct backfilled tier (not covered)
+    backfill_ev = _make_evidence(
+        ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        detail={"proven": True, "backfilled": True, "backfill_reason": "unverified_merge"},
+    )
+    assert not ac._evidence_proves_covered(backfill_ev), (
+        "UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND must NOT be treated as covering"
+    )
+    assert ac.compute_criterion_coverage([backfill_ev]) == "backfilled", (
+        "Backfill evidence alone should produce 'backfilled' coverage"
+    )
+
+    # Backfill + proven task_merge → covered (machine evidence dominates)
+    task_merge_ev = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.compute_criterion_coverage([backfill_ev, task_merge_ev]) == "covered", (
+        "Backfill + proven task_merge should be 'covered'"
+    )
+
+    # Backfill + operator attestation → attested (attestation higher than backfill)
+    attest_ev = _make_evidence("operator_attestation", detail={"reason": "waiver"})
+    assert ac.compute_criterion_coverage([backfill_ev, attest_ev]) == "attested", (
+        "Backfill + operator attestation should be 'attested' (attestation > backfill)"
+    )
+
+    # Backfill evidence WITHOUT backfilled=True flag → partial (not a valid backfill record)
+    bare_backfill = _make_evidence(ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND)
+    assert ac.compute_criterion_coverage([bare_backfill]) == "partial", (
+        "Bare backfill evidence without backfilled=True flag should be 'partial'"
+    )
+
+    # Coverage summary key is reported
+    assert ac.criterion_coverage_to_evidence_status("backfilled") == "partial"
+
+
 # ---------------------------------------------------------------------------
 # get_version_coverage_summary
 # ---------------------------------------------------------------------------
@@ -6242,7 +6287,9 @@ async def test_backfill_unverified_merge_covers_unproven_verdict(db_session):
     When a task merges with unverified_merge_reason set, the acceptance verdict
     is proven=False and record_task_merge_evidence records nothing. The backfill
     must find such tasks, verify the test was in changed files, and record
-    unverified_merge_backfill evidence so the criterion reaches 'covered'.
+    unverified_merge_backfill evidence.  The criterion reaches the distinct
+    'backfilled' tier (lower-confidence than fully 'covered') rather than
+    scoring at full parity with machine-verified evidence.
     """
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
     from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
@@ -6322,7 +6369,7 @@ async def test_backfill_unverified_merge_covers_unproven_verdict(db_session):
     assert evidence_after[0].detail.get("unverified_merge_reason") == "verify_setup_failed"
 
     coverage = ac.compute_criterion_coverage(evidence_after)
-    assert coverage == "covered", f"Expected 'covered', got '{coverage}'"
+    assert coverage == "backfilled", f"Expected 'backfilled', got '{coverage}'"
 
 
 @pytest.mark.asyncio
@@ -6794,3 +6841,233 @@ async def test_reattest_does_not_duplicate_corroboration_task(
     assert spawned.status == TaskStatus.QUEUED
     assert spawned.criterion_ids == [criterion.criterion_key]
     assert spawned.created_by == "SYSTEM_AUTO_REVIEW"
+
+
+# ---------------------------------------------------------------------------
+# Failed corroboration: surfaces and downgrades trust (acceptance test)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_surfaces_and_downgrades_trust(db_session):
+    """A FAILED corroboration task must both SURFACE in operator attention and
+    DOWNGRADE the attestation coverage.
+
+    When a spawned Verify: {key} task ends in FAILED or CANCELLED, the operator's
+    attestation must not remain at full 'attested' trust — coverage falls to
+    'partial' and a 'corroboration_failed' attention item appears so the operator
+    can re-attest or provide real machine evidence.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion with failed corroboration"
+    )
+
+    # Step 1: Record a valid (non-expired) operator attestation.
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "temporarily accepted"},
+    )
+
+    # With only a fresh attestation, coverage must be 'attested'.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before failed corroboration, got {crit1['coverage']}"
+    )
+
+    # Step 2: Create a FAILED corroboration task.
+    from app.models import Task as _Task, TaskStatus as _TaskStatus
+
+    failed_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+
+    # Step 3: Coverage must now be 'partial' (downgraded from 'attested').
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["attested"] == 0, (
+        f"Expected 0 attested after failed corroboration, got {summary2['attested']}"
+    )
+    assert summary2["partial"] >= 1, (
+        f"Expected ≥1 partial after failed corroboration, got {summary2['partial']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed corroboration, got {crit2['coverage']}"
+    )
+
+    # Step 4: Operator attention must surface a corroboration_failed item.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["corroboration_failed"] == 1, (
+        f"Expected corroboration_failed=1, got {attention['counts'].get('corroboration_failed')}"
+    )
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id in items_by_id, (
+        f"Expected corroboration_failed item {corrob_id} in {list(items_by_id)}"
+    )
+    item = items_by_id[corrob_id]
+    assert item["reason"] == "corroboration_failed", (
+        f"Expected reason=corroboration_failed, got {item['reason']}"
+    )
+    assert item["label"] == "Attestation verification failed", (
+        f"Unexpected label: {item['label']}"
+    )
+    assert item["criterion_key"] == criterion.criterion_key
+    assert item["release_version_id"] == str(version.id)
+
+
+@pytest.mark.asyncio
+async def test_reattest_after_failed_corroboration_restores_attested(
+    db_session,
+):
+    """Re-attestation after a failed corroboration must restore 'attested' coverage.
+
+    When a corroboration task FAILED, the old failure alone should NOT keep the
+    criterion at 'partial' once the operator re-attests and a new QUEUED
+    corroboration task is spawned. The ``get_failed_corroboration_keys`` function
+    must exclude keys that have a newer non-terminal task.
+    """
+    project = await _make_project(db_session, "ReAttest-After-Fail")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion re-attested after fail"
+    )
+
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "first attest"},
+    )
+
+    # Step 1: With only a fresh attestation, coverage must be 'attested'.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before failed corroboration, got {crit1['coverage']}"
+    )
+
+    # Step 2: Create a FAILED corroboration task.
+    from app.models import Task as _Task, TaskStatus as _TaskStatus
+
+    failed_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+
+    # Step 3: Coverage must now be 'partial' (downgraded from 'attested').
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed corroboration, got {crit2['coverage']}"
+    )
+
+    # Step 4: Operator re-attests (records a new attestation, and
+    # spawn_corroboration_task would create a new QUEUED task).  Simulate
+    # the re-attestation by recording fresh evidence and adding a QUEUED
+    # corroboration task.
+    re_fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": re_fresh_at, "reason": "re-attest after failure"},
+    )
+
+    queued_task = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": "operator_attestation",
+        },
+        payloads=[{"type": "research", "prompt": "Verify this criterion"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=_TaskStatus.QUEUED,
+    )
+    db_session.add(queued_task)
+    await db_session.commit()
+
+    # Step 5: Coverage must now be 'attested' again — the failed task is
+    # stale because a newer QUEUED task exists.
+    summary3 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary3["attested"] >= 1, (
+        f"Expected ≥1 attested after re-attest + new task, "
+        f"got {summary3['attested']}"
+    )
+    crit3 = next(
+        c for c in summary3["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit3["coverage"] == "attested", (
+        f"Expected 'attested' after re-attest + new task, got {crit3['coverage']}"
+    )
+
+    # Step 6: get_failed_corroboration_keys must NOT include this key.
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert criterion.criterion_key not in failed_keys, (
+        f"Expected criterion {criterion.criterion_key} to NOT be in failed "
+        f"corroboration keys (newer QUEUED task exists), but it was: "
+        f"{failed_keys}"
+    )
+
+    # Step 7: build_operator_attention must not surface a
+    # corroboration_failed item for this criterion.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id not in items_by_id, (
+        f"Expected NO corroboration_failed item for re-attested criterion, "
+        f"but found {items_by_id[corrob_id]}"
+    )

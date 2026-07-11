@@ -223,10 +223,13 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # (backfill citing the resolving commit). Treated as covering so the
         # criterion is satisfied once the backfill writes the evidence row.
         return True
-    # Evidence backfilled for tasks whose unverified merge prevented the normal
-    # record_task_merge_evidence path verifies that the declared named_test was
-    # in the PR's changed files, so the test genuinely shipped.
-    return e.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    # Unverified-merge backfill evidence is deliberately NOT covering here.  The
+    # evidence only proves that the declared named_test was in the PR's changed
+    # files — i.e. the test shipped — not that the merge was CI-verified or that
+    # the test genuinely passed.  Like operator_attestation, this is a visibly
+    # distinct, lower-confidence tier — see :func:`_evidence_is_backfilled` and
+    # the ``'backfilled'`` coverage tier in :func:`compute_criterion_coverage`.
+    return False
 
 
 def _evidence_is_attested(e: CriterionEvidence) -> bool:
@@ -260,6 +263,29 @@ def _evidence_is_attested(e: CriterionEvidence) -> bool:
         # formatting problem.
         return True
     return (_utcnow() - attested_at) <= timedelta(days=ATTESTATION_WINDOW_DAYS)
+
+
+def _evidence_is_backfilled(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record is unverified-merge backfill evidence.
+
+    Returns ``True`` only for ``source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND``
+    whose ``detail["backfilled"]`` is ``True``, confirming the evidence was genuinely
+    produced by :func:`backfill_unverified_merge_evidence` rather than being a bare
+    badge from an older or differently-provenanced write path.
+
+    Backfill evidence is a lower-confidence tier: it proves the declared named_test
+    was in the PR's changed files (the test shipped), but NOT that the merge was
+    CI-verified or that the test passed.  The ``'backfilled'`` coverage status
+    (see :func:`compute_criterion_coverage`) is a visibly distinct, lower-confidence
+    tier — between ``'attested'`` (operator waiver, no machine evidence) and
+    ``'partial'`` (unrecognised or non-covering evidence) — so a version whose
+    criteria are covered solely by backfill evidence scores below one with
+    machine-verified coverage while being a stronger signal than a pure operator
+    attestation.
+    """
+    if e.source_kind != UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND:
+        return False
+    return isinstance(e.detail, dict) and e.detail.get("backfilled") is True
 
 
 MAX_CRITERIA_PER_VERSION = 50
@@ -463,6 +489,8 @@ def criterion_coverage_to_evidence_status(coverage: str) -> str:
     """
     _MAP: dict[str, str] = {
         "covered": "proven",
+        "attested": "partial",
+        "backfilled": "partial",
         "partial": "partial",
         "uncovered": "unproven",
     }
@@ -472,19 +500,24 @@ def criterion_coverage_to_evidence_status(coverage: str) -> str:
 def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 
-    Priority: ``covered`` > ``attested`` > ``partial`` > ``uncovered``.
+    Priority: ``covered`` > ``attested`` > ``backfilled`` > ``partial`` > ``uncovered``.
 
     Returns:
-      'covered'   — at least one record is machine-verified covering evidence
-                    (``reachability``, ``acceptance_window_recompute``,
-                    ``metrics_integrity_sweep``, ``audit_finding_backfill``
-                    always; ``task_merge`` only with ``detail["proven"] is True``)
-      'attested'  — no machine-verified evidence, but a NON-EXPIRED operator
-                    attestation is present (a lower-confidence, time-bounded
-                    waiver — see :func:`_evidence_is_attested`)
-      'partial'   — evidence exists but none is covering or a valid attestation
-                    (includes an EXPIRED attestation)
-      'uncovered' — no evidence at all
+      'covered'    — at least one record is machine-verified covering evidence
+                     (``reachability``, ``acceptance_window_recompute``,
+                     ``metrics_integrity_sweep``, ``audit_finding_backfill``
+                     always; ``task_merge`` only with ``detail["proven"] is True``)
+      'attested'   — no machine-verified evidence, but a NON-EXPIRED operator
+                     attestation is present (a lower-confidence, time-bounded
+                     waiver — see :func:`_evidence_is_attested`)
+      'backfilled' — no machine-verified evidence and no valid attestation, but
+                     at least one unverified-merge backfill evidence record is
+                     present (the named_test shipped in the PR's changed files,
+                     but the merge was never CI-verified — see
+                     :func:`_evidence_is_backfilled`)
+      'partial'    — evidence exists but none is covering, attested, or backfilled
+                     (includes an EXPIRED attestation)
+      'uncovered'  — no evidence at all
     """
     if not evidence:
         return "uncovered"
@@ -492,6 +525,8 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
         return "covered"
     if any(_evidence_is_attested(e) for e in evidence):
         return "attested"
+    if any(_evidence_is_backfilled(e) for e in evidence):
+        return "backfilled"
     return "partial"
 
 
@@ -1683,6 +1718,7 @@ async def get_version_coverage_summary(
             'total': N,
             'covered': N,
             'attested': N,
+            'backfilled': N,
             'partial': N,
             'uncovered': N,
             'retracted': N,
@@ -1693,7 +1729,7 @@ async def get_version_coverage_summary(
                 {
                     'criterion_key': str,
                     'text': str,
-                    'coverage': 'covered' | 'attested' | 'partial' | 'uncovered',
+                    'coverage': 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered',
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
@@ -1704,10 +1740,13 @@ async def get_version_coverage_summary(
             ],
         }
 
-    ``total`` and the coverage buckets (covered + attested + partial + uncovered)
+    ``total`` and the coverage buckets (covered + attested + backfilled + partial + uncovered)
     count active criteria only, and ``total`` remains their sum for backward
-    compatibility. ``attested`` is the distinct, lower-confidence tier: active
+    compatibility. ``attested`` is a distinct, lower-confidence tier: active
     criteria whose only covering signal is a non-expired operator attestation.
+    ``backfilled`` is a distinct, lower-confidence tier for criteria covered
+    solely by unverified-merge backfill evidence (the test shipped in the PR's
+    changed files but the merge was never CI-verified).
     Inactive rows remain in ``criteria`` for audit, with
     ``retracted``/``superseded`` split by lifecycle status and ``inactive``
     carrying their aggregate. ``stuck_reason``
@@ -1721,6 +1760,7 @@ async def get_version_coverage_summary(
     counts: dict[str, int] = {
         "covered": 0,
         "attested": 0,
+        "backfilled": 0,
         "partial": 0,
         "uncovered": 0,
     }
@@ -1759,6 +1799,24 @@ async def get_version_coverage_summary(
             inactive_counts[criterion.status] = (
                 inactive_counts.get(criterion.status, 0) + 1
             )
+
+    # Downgrade 'attested' to 'partial' for criteria whose operator-attestation
+    # corroboration task FAILED or was CANCELLED — the system explicitly attempted
+    # to verify the waiver and failed, so the attestation must not remain trusted.
+    failed_corroboration: set[str] = set()
+    if criteria_in_order and counts.get("attested", 0) > 0:
+        failed_corroboration = await get_failed_corroboration_keys(
+            session, criteria_in_order[0].project_id
+        )
+        if failed_corroboration:
+            for criterion in criteria_in_order:
+                if criterion.status != "active":
+                    continue
+                co = coverage_by_criterion.get(criterion.id)
+                if co == "attested" and criterion.criterion_key in failed_corroboration:
+                    coverage_by_criterion[criterion.id] = "partial"
+                    counts["attested"] -= 1
+                    counts["partial"] = counts.get("partial", 0) + 1
 
     # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
     # merely in-progress. project_id is derived from a loaded criterion row —
@@ -1804,6 +1862,7 @@ async def get_version_coverage_summary(
         "total": sum(counts.values()),
         "covered": counts["covered"],
         "attested": counts["attested"],
+        "backfilled": counts["backfilled"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
         "retracted": inactive_counts["retracted"],
@@ -1811,7 +1870,68 @@ async def get_version_coverage_summary(
         "inactive": sum(inactive_counts.values()),
         "stuck_count": stuck_count,
         "criteria": criteria_detail,
+        "failed_corroboration_keys": list(failed_corroboration),
     }
+
+
+async def get_failed_corroboration_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> set[str]:
+    """Return criterion_keys whose operator-attestation corroboration task has
+    FAILED or been CANCELLED **and** no newer non-terminal task exists for the
+    same key.
+
+    When a spawned ``Verify: {criterion_key}`` task (see :func:`spawn_corroboration_task`)
+    ends in FAILED or CANCELLED status, the operator's attestation should no longer be
+    fully trusted — the system explicitly attempted to verify it and that attempt
+    failed.  Callers use this set to downgrade coverage from ``'attested'`` to
+    ``'partial'`` and to surface operator-attention items.
+
+    However, if the operator re-attests the criterion after a failure, a new
+    ``Verify: {criterion_key}`` task is spawned (the dedup in
+    :func:`spawn_corroboration_task` only excludes COMPLETED/FAILED/CANCELLED,
+    so a fresh QUEUED task is created).  The old failed task remains in the
+    database but is *stale* — this function excludes keys that have a newer
+    non-terminal task so that re-attested criteria are not stuck at ``'partial'``
+    coverage indefinitely.
+    """
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+
+    result = await session.execute(
+        select(Task.context).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        )
+    )
+    failed: set[str] = set()
+    for (context,) in result.all():
+        if isinstance(context, dict) and "corroboration_of" in context:
+            key = context["corroboration_of"]
+            if isinstance(key, str):
+                failed.add(key)
+
+    # Exclude keys that have a newer non-terminal task — the criterion was
+    # re-attested and a fresh verification attempt is in progress, so the old
+    # failure is stale.
+    if failed:
+        active_titles = [f"Verify: {key}" for key in failed]
+        active_result = await session.execute(
+            select(Task.context).where(
+                Task.project_id == project_id,
+                Task.title.in_(active_titles),
+                Task.status.not_in(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
+            )
+        )
+        for (context,) in active_result.all():
+            if isinstance(context, dict) and "corroboration_of" in context:
+                key = context["corroboration_of"]
+                if isinstance(key, str):
+                    failed.discard(key)
+
+    return failed
 
 
 async def spawn_corroboration_task(

@@ -124,6 +124,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stuck_acceptance_criterion"): 65,
     ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "attestation_expired"): 67,
+    ("needs_operator", "corroboration_failed"): 68,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "churn_retirement_recommended"): 72,
     ("needs_operator", "stale_completion_debt"): 75,
@@ -251,6 +252,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed_or_re_attested",
         "operator_action": "re_attest_or_provide_evidence",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "corroboration_failed": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed_or_re_attested",
+        "operator_action": "re_attest_or_provide_evidence_or_retry",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -728,6 +736,45 @@ def _attestation_expired_attention_item(
         "detail": _compact_text(
             f"Criterion '{criterion_text}' was operator-attested but the "
             f"attestation window has expired — re-attest or provide evidence",
+            max_chars=180,
+        ),
+        "criterion_key": criterion_key,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "ref": {
+            "kind": "acceptance_criterion",
+            "id": criterion_key,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "manage",
+        }),
+    }
+
+
+def _corroboration_failed_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    criterion_key: str,
+    criterion_text: str,
+) -> dict[str, Any]:
+    """Attention item for an active criterion whose corroboration verification task failed.
+
+    The system spawned a verification task for this operator-attested criterion
+    and that task FAILED or was CANCELLED — the attestation is no longer trusted
+    and the operator must re-attest or provide real evidence.
+    """
+    return {
+        "id": f"version:{version.id}:corroboration_failed:{criterion_key}",
+        "kind": "acceptance_criterion",
+        "severity": "needs_operator",
+        "reason": "corroboration_failed",
+        "label": "Attestation verification failed",
+        "detail": _compact_text(
+            f"Criterion '{criterion_text}' was operator-attested but the "
+            f"verification task failed — re-attest or provide machine evidence",
             max_chars=180,
         ),
         "criterion_key": criterion_key,
@@ -2011,10 +2058,21 @@ async def build_operator_attention(
     coverage_blocked_count = 0
     attestation_expired_count = 0
     attestation_expired_items: list[dict[str, Any]] = []
+    corroboration_failed_count = 0
+    corroboration_failed_items: list[dict[str, Any]] = []
+    failed_corroboration_keys: set[str] = set()
     try:
         open_version = await current_open_version(session, project.id)
         if open_version is not None:
             coverage = await get_version_coverage_summary(session, open_version.id)
+
+            # Read failed corroboration keys from the coverage summary, which
+            # already computed them via get_failed_corroboration_keys internally.
+            # This avoids a redundant DB round-trip and keeps the two in sync.
+            failed_corroboration_keys = set(
+                coverage.get("failed_corroboration_keys", [])
+            )
+
             stuck_criteria_count = coverage.get("stuck_count", 0)
             for criterion in coverage.get("criteria", []):
                 reason = criterion.get("stuck_reason")
@@ -2028,10 +2086,13 @@ async def build_operator_attention(
                     and reason is None
                 ):
                     coverage_blocked_count += 1
-                # Detect expired attestations: active criteria with 'partial'
-                # coverage whose evidence includes an operator_attestation (the
-                # attestation window lapsed, dropping coverage from 'attested' to
-                # 'partial' — re-attestation or machine evidence is needed).
+                # Detect expired attestations or failed corroborations: active
+                # criteria with 'partial' coverage whose evidence includes an
+                # operator_attestation (the attestation window lapsed, or the
+                # corroboration task failed, dropping coverage from 'attested'
+                # to 'partial' — re-attestation or machine evidence is needed).
+                # When a failed corroboration task exists it takes priority over
+                # the generic attestation-expired surface.
                 elif (
                     criterion.get("status") == "active"
                     and criterion.get("coverage") == "partial"
@@ -2042,15 +2103,27 @@ async def build_operator_attention(
                         for e in evidence
                     )
                     if has_operator_attestation:
-                        attestation_expired_count += 1
-                        attestation_expired_items.append(
-                            _attestation_expired_attention_item(
-                                project.id,
-                                open_version,
-                                criterion["criterion_key"],
-                                criterion.get("text", ""),
+                        ck = criterion["criterion_key"]
+                        if ck in failed_corroboration_keys:
+                            corroboration_failed_count += 1
+                            corroboration_failed_items.append(
+                                _corroboration_failed_attention_item(
+                                    project.id,
+                                    open_version,
+                                    ck,
+                                    criterion.get("text", ""),
+                                )
                             )
-                        )
+                        else:
+                            attestation_expired_count += 1
+                            attestation_expired_items.append(
+                                _attestation_expired_attention_item(
+                                    project.id,
+                                    open_version,
+                                    ck,
+                                    criterion.get("text", ""),
+                                )
+                            )
             stuck_by_key = {
                 c["criterion_key"]: c
                 for c in coverage.get("criteria", [])
@@ -2167,6 +2240,8 @@ async def build_operator_attention(
         add_candidate(item)
     for item in attestation_expired_items:
         add_candidate(item)
+    for item in corroboration_failed_items:
+        add_candidate(item)
     for alert in alerts:
         add_candidate(_alert_attention_item(alert))
     for task in held_tasks:
@@ -2217,6 +2292,7 @@ async def build_operator_attention(
         + stuck_criteria_count
         + coverage_blocked_count
         + attestation_expired_count
+        + corroboration_failed_count
         + (1 if stale_debt_count > 0 else 0)
     )
     total_watch = (
@@ -2285,6 +2361,7 @@ async def build_operator_attention(
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
             "attestation_expired": attestation_expired_count,
+            "corroboration_failed": corroboration_failed_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,
