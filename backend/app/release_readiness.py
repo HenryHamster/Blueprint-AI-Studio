@@ -1466,8 +1466,11 @@ async def compute_qualification_trigger_state(
     total = int(coverage.get("total") or 0)
     covered = int(coverage.get("covered") or 0)
     attested = int(coverage.get("attested") or 0)
+    backfilled = int(coverage.get("backfilled") or 0)
 
-    if total > 0 and (total - covered - attested) > 0:
+    # Mirror release_scoring.compute_composite: 'backfilled' clears the coverage
+    # gate alongside covered/attested, so a backfilled-only remainder is complete.
+    if total > 0 and (total - covered - attested - backfilled) > 0:
         return {
             "trigger_state": "blocked",
             "open_version_id": str(version.id),
@@ -1479,6 +1482,7 @@ async def compute_qualification_trigger_state(
             "coverage_total": total,
             "coverage_covered": covered,
             "coverage_attested": attested,
+            "coverage_backfilled": backfilled,
         }
 
     return {
@@ -1492,6 +1496,7 @@ async def compute_qualification_trigger_state(
         "coverage_total": total,
         "coverage_attested": attested,
         "coverage_covered": covered,
+        "coverage_backfilled": backfilled,
     }
 
 

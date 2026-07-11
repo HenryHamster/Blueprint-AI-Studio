@@ -156,7 +156,10 @@ def resolve_qualification_trigger(
     total = int((coverage or {}).get("total") or 0)
     covered = int((coverage or {}).get("covered") or 0)
     attested = int((coverage or {}).get("attested") or 0)
-    coverage_complete = not (total > 0 and (total - covered - attested) > 0)
+    backfilled = int((coverage or {}).get("backfilled") or 0)
+    # Mirror release_scoring.compute_composite's authoritative formula, which
+    # treats 'backfilled' as clearing the coverage gate alongside covered/attested.
+    coverage_complete = not (total > 0 and (total - covered - attested - backfilled) > 0)
 
     # T1 — coverage_complete: fire when coverage gate is met AND the version has
     # no conclusive verdict (never attempted, sitting at error, or not_promoted
@@ -185,7 +188,7 @@ def resolve_qualification_trigger(
             reason="coverage_incomplete",
             blocking=[
                 f"criterion coverage incomplete: {covered}/{total} active criteria covered, "
-                f"{attested} attested"
+                f"{attested} attested, {backfilled} backfilled"
             ],
         )
 

@@ -10731,6 +10731,7 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "inactive": 0,
         "superseded": 0,
         "criteria": [],
+        "failed_corroboration_keys": [],
     }
     promote_spy.assert_not_called()
 
@@ -34360,6 +34361,46 @@ async def test_compute_qualification_trigger_state_blocked_coverage_incomplete(
     assert result["reason"] == "coverage_incomplete"
     assert result["coverage_total"] == 2
     assert result["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_armed_backfilled_only(db_session):
+    """A remaining criterion covered only by the 'backfilled' tier clears the
+    coverage gate (mirroring release_scoring) → trigger armed, with
+    coverage_backfilled surfaced. Regression: backfilled tier previously omitted
+    from the trigger-state coverage predicate, stranding the version."""
+    from app.acceptance_criteria import UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfilled-only",
+        text="Covered solely by unverified-merge backfill evidence",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    db_session.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+            source_id="backfill-c-backfilled-only",
+            detail={"backfilled": True, "verdict": "merge-test"},
+        )
+    )
+    await db_session.commit()
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "armed"
+    assert result["reason"] == "armed"
+    assert result["coverage_total"] == 1
+    assert result["coverage_covered"] == 0
+    assert result["coverage_attested"] == 0
+    assert result["coverage_backfilled"] == 1
 
 
 @pytest.mark.asyncio

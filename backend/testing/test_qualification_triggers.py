@@ -135,6 +135,39 @@ class TestT1CoverageComplete:
         assert d.reason == "coverage_incomplete"
         assert "0/2" in d.blocking[0]
 
+    def test_backfilled_only_coverage_arms_trigger(self):
+        # All remaining criteria covered solely by the 'backfilled' tier — the
+        # authoritative release_scoring gate treats these as clearing the
+        # coverage blocker, so the T1 trigger must arm (no strand). Regression
+        # for: backfilled tier omitted from coverage-gate sibling predicates.
+        d = _resolve(
+            status=None,
+            coverage={"total": 2, "covered": 0, "attested": 0, "backfilled": 2},
+        )
+        assert d.fire is True
+        assert d.trigger == "coverage_complete"
+
+    def test_mixed_backfilled_covered_and_attested_fires(self):
+        # A mix spanning all three clearing tiers satisfies the gate.
+        d = _resolve(
+            status=None,
+            coverage={"total": 3, "covered": 1, "attested": 1, "backfilled": 1},
+        )
+        assert d.fire is True
+        assert d.trigger == "coverage_complete"
+
+    def test_backfilled_not_enough_when_uncovered_remains(self):
+        # Backfilled closes some but genuinely-uncovered criteria still block,
+        # and the blocking message surfaces the backfilled count.
+        d = _resolve(
+            status=None,
+            coverage={"total": 3, "covered": 0, "attested": 0, "backfilled": 1},
+        )
+        assert not d.fire
+        assert d.reason == "coverage_incomplete"
+        assert "0/3" in d.blocking[0]
+        assert "1 backfilled" in d.blocking[0]
+
 
 # ---------------------------------------------------------------------------
 # T2 — error_redrive

@@ -378,8 +378,11 @@ async def _reconcile_if_criterion_coverage_now_complete(
             total = int(coverage.get("total") or 0)
             covered = int(coverage.get("covered") or 0)
             attested = int(coverage.get("attested") or 0)
+            backfilled = int(coverage.get("backfilled") or 0)
 
-            if total > 0 and (total - covered - attested) > 0:
+            # Mirror release_scoring.compute_composite: 'backfilled' clears the
+            # coverage gate alongside covered/attested.
+            if total > 0 and (total - covered - attested - backfilled) > 0:
                 # Before giving up, attempt to backfill merge evidence for any
                 # uncovered criteria that have an active direction mapping.  Tasks
                 # that merged before the criterion-direction mapping was created
@@ -419,15 +422,17 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         total = int(coverage.get("total") or 0)
                         covered = int(coverage.get("covered") or 0)
                         attested = int(coverage.get("attested") or 0)
+                        backfilled = int(coverage.get("backfilled") or 0)
                         logger.info(
                             "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                             "backfilled evidence for %d direction(s) on v%d "
-                            "(total=%d covered=%d attested=%d after backfill)",
+                            "(total=%d covered=%d attested=%d backfilled=%d after backfill)",
                             len(keys_to_backfill),
                             version.version_number,
                             total,
                             covered,
                             attested,
+                            backfilled,
                         )
 
                 # Re-score the acceptance-window metric and, when the window is
@@ -443,15 +448,17 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
                     attested = int(coverage.get("attested") or 0)
+                    backfilled = int(coverage.get("backfilled") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d acceptance-window recompute evidence row(s) on v%d "
-                        "(total=%d covered=%d attested=%d after recompute)",
+                        "(total=%d covered=%d attested=%d backfilled=%d after recompute)",
                         window_recorded,
                         version.version_number,
                         total,
                         covered,
                         attested,
+                        backfilled,
                     )
 
                 # Record covering evidence for the data-integrity criterion when
@@ -467,18 +474,22 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
                     attested = int(coverage.get("attested") or 0)
+                    backfilled = int(coverage.get("backfilled") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d metrics-integrity sweep evidence row(s) on v%d "
-                        "(total=%d covered=%d attested=%d after mis-sweep evidence)",
+                        "(total=%d covered=%d attested=%d backfilled=%d after mis-sweep evidence)",
                         mis_recorded,
                         version.version_number,
                         total,
                         covered,
                         attested,
+                        backfilled,
                     )
 
-            if not (total == 0 or (covered + attested) >= total):
+            # Mirror release_scoring.compute_composite: 'backfilled' criteria clear
+            # the coverage gate alongside covered/attested.
+            if not (total == 0 or (covered + attested + backfilled) >= total):
                 return False
 
             project = await session.get(Project, version.project_id)
@@ -1214,6 +1225,7 @@ async def _run_auto_qualification_trigger_for_version(
             "total": int(coverage_raw.get("total") or 0),
             "covered": int(coverage_raw.get("covered") or 0),
             "attested": int(coverage_raw.get("attested") or 0),
+            "backfilled": int(coverage_raw.get("backfilled") or 0),
         }
     except Exception:
         logger.warning(
