@@ -2264,6 +2264,7 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
                 version_goal=version.goal,
             )
             audit_task_id = str(audit_task.id)

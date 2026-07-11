@@ -364,6 +364,17 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
   const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
   const DIFF_RANGE = `main...${CANDIDATE_SHA}`;
   const RELEASE_PAYLOAD = { base_branch: 'main', candidate_sha: CANDIDATE_SHA };
+  interface AuditReport {
+    audit_scope: {
+      mode: string;
+      effective_base_sha: string | null;
+      diff_range: string;
+      changed_paths: string[];
+      fallback_reason: string | null;
+    };
+    findings: Array<{ blob_sha: string; [key: string]: unknown }>;
+    [key: string]: unknown;
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -476,17 +487,6 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     const deltaRange = `${auditBaseSha}..${CANDIDATE_SHA}`;
     expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(`git diff ${deltaRange}`);
     const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
-    interface AuditReport {
-  audit_scope: {
-    mode: string;
-    effective_base_sha: string | null;
-    diff_range: string;
-    changed_paths: string[];
-    fallback_reason: string | null;
-  };
-  findings: Array<{ blob_sha: string; [key: string]: unknown }>;
-  [key: string]: unknown;
-}
     const report = JSON.parse(call?.logs as string) as AuditReport;
     expect(report.audit_scope).toMatchObject({
       mode: 'incremental',
@@ -514,17 +514,6 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
 
     expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(`git diff ${DIFF_RANGE}`);
     const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
-    interface AuditReport {
-  audit_scope: {
-    mode: string;
-    effective_base_sha: string | null;
-    diff_range: string;
-    changed_paths: string[];
-    fallback_reason: string | null;
-  };
-  findings: Array<{ blob_sha: string; [key: string]: unknown }>;
-  [key: string]: unknown;
-}
     const report = JSON.parse(call?.logs as string) as AuditReport;
     expect(report.audit_scope.mode).toBe('full');
     expect(report.audit_scope.effective_base_sha).toBeNull();
@@ -548,17 +537,6 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
-    interface AuditReport {
-  audit_scope: {
-    mode: string;
-    effective_base_sha: string | null;
-    diff_range: string;
-    changed_paths: string[];
-    fallback_reason: string | null;
-  };
-  findings: Array<{ blob_sha: string; [key: string]: unknown }>;
-  [key: string]: unknown;
-}
     const report = JSON.parse(call?.logs as string) as AuditReport;
     expect(report.findings[0].blob_sha).toBe('c'.repeat(40));
   });
