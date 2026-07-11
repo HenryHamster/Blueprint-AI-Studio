@@ -183,7 +183,7 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
-    compute_enforce_confidence_preview,  # noqa: F401 — re-exported for callers/tests
+    compute_enforce_confidence_preview,
     DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
     MAX_COMPLETION_DEBT_WEIGHT,
     _clamp01,  # noqa: F401
@@ -306,9 +306,7 @@ def _is_audited_surface_path(path: str) -> bool:
         return False
     if p.endswith(".test_durations"):
         return False
-    if p.endswith(".md"):
-        return False
-    return True
+    return not p.endswith(".md")
 
 
 def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
@@ -493,7 +491,7 @@ _MIN_AUDIT_WEIGHT = 0.2
 _AUDIT_VETO_MARGIN = 0.05
 
 
-def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
+def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
     """Resolve a per-project promotion rubric from ``Project.build_config``.
 
     A project may LEGITIMATELY promote at a different bar than the fleet default
@@ -548,7 +546,7 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
         # (audit_weight=0.2, threshold=0.5) a candidate with a PRESENT-but-terrible
         # audit (score 0.0 — no audit_missing hard block) still promotes
         # (0.2·0 + test_erosion + smoketest = 0.8 ≥ 0.5).  A zero-audit candidate
-        # scores at most (1 − audit_weight), so CLAMP the threshold up to strictly
+        # scores at most (1 - audit_weight), so CLAMP the threshold up to strictly
         # exceed that — the audit dimension can then ALWAYS veto a promotion, for
         # any per-project weights.  (Clamping up rather than rejecting keeps the
         # override usable; it only ever makes the gate stricter.)
@@ -625,7 +623,7 @@ def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]
 
 
 def _resolve_policy_with_provenance(
-    project: "Project | None" = None,
+    project: Project | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
     """Resolve the promotion rubric and return its active source + fallback reason.
 
@@ -725,7 +723,7 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
         )
 
 
-def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
+def _load_policy(project: Project | None = None) -> dict[str, Any]:
     """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
 
     Resolution order:
@@ -759,7 +757,7 @@ def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
 
 
 def _resolve_configured_completion_debt_weight(
-    project: "Project | None" = None,
+    project: Project | None = None,
 ) -> float:
     """Resolve the completion_debt blend weight through the SAME provenance chain
     the enforce blend reads (build_config > runtime_config > yaml), BEFORE the
@@ -875,10 +873,8 @@ async def _qualification_in_flight(
         # A child row is not (yet) persisted — the spawning run is still
         # in progress; treat as in flight.
         return True
-    if any(r.status not in _TERMINAL_STATUSES for r in rows):
-        return True
     # status == "pending" but every child already terminated → not in flight.
-    return False
+    return any(r.status not in _TERMINAL_STATUSES for r in rows)
 
 
 def _promotion_in_flight_result(
@@ -3173,7 +3169,7 @@ async def _count_project_actionable_open_completion_debt(
     """Count open completion-debt rows owned by the qualified project only."""
     if project_id is None:
         return 0
-    from app.models import CompletionDebtEntry  # noqa: PLC0415
+    from app.models import CompletionDebtEntry
 
     stmt = (
         select(sa_func.count())
@@ -4089,26 +4085,30 @@ async def _finalize_qualification(
                     session, version, qual, "audit_report_findings_wrong_type"
                 )
 
-    # Eager-write audit & test_erosion dimension results so they survive an infra
-    # failure on a later gate before _dual_write_dimension_results.
-    if candidate_sha:
-        _audit_inc_status = (
-            "failed" if audit_score is not None and audit_score < 1.0
-            else "passed"
-        )
-        await _upsert_dimension_result(
-            session, version, candidate_sha, "audit",
-            status=_audit_inc_status,
-            sub_score=audit_score,
-        )
-        _te_inc_detail = test_erosion_detail or {}
-        _te_inc_has_deletions = bool(_te_inc_detail.get("deleted_test_files"))
-        await _upsert_dimension_result(
-            session, version, candidate_sha, "test_erosion",
-            status="blocked" if _te_inc_has_deletions else "passed",
-            sub_score=test_erosion_score,
-            detail=_te_inc_detail,
-        )
+    # Persist audit and test_erosion to the per-dimension ledger immediately
+    # since both have now been resolved (from the ledger or live).  An infra
+    # failure in a later gate must not discard them — otherwise the re-drive
+    # re-spawns the audit child (~15 min) even though its results are intact.
+    # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
+    if audit_score is None:
+        _audit_status = "blocked"
+    elif audit_score < 1.0:
+        _audit_status = "failed"
+    else:
+        _audit_status = "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "audit",
+        status=_audit_status,
+        sub_score=audit_score,
+        producing_task_id=audit_task_id,
+    )
+    _te_status = "blocked" if test_erosion_score is None else "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "test_erosion",
+        status=_te_status,
+        sub_score=test_erosion_score,
+        producing_task_id=audit_task_id,
+    )
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
@@ -4152,15 +4152,21 @@ async def _finalize_qualification(
         # so the agent can target it when smoketest is the binding constraint.
         smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
-        # Eager-write smoketest dimension so this fact survives an infra failure
-        # on a later gate (challenge, migration) before _dual_write_dimension_results.
-        if candidate_sha:
-            await _upsert_dimension_result(
-                session, version, candidate_sha, "smoketest",
-                status="passed",
-                sub_score=smoketest_score,
-                detail=smoketest_detail,
-            )
+    # Persist smoketest to the per-dimension ledger immediately so it
+    # survives a later-gate infra failure before _dual_write_dimension_results.
+    # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
+    if not smoketest_enabled:
+        _smoke_status = "unavailable"
+    elif smoketest_score is None:
+        _smoke_status = "blocked"
+    else:
+        _smoke_status = "passed"
+    await _upsert_dimension_result(
+        session, version, candidate_sha, "smoketest",
+        status=_smoke_status,
+        sub_score=smoketest_score,
+        producing_task_id=smoketest_task_id,
+    )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
     # If the qualifying run intentionally deferred the challenge spawn, do the
@@ -4934,7 +4940,7 @@ async def _finalize_qualification(
     # with completion_debt=None (pressure score = None → omitted from sub_scores).
     _completion_debt: dict[str, Any] | None = None
     try:
-        from importlib import import_module  # noqa: PLC0415
+        from importlib import import_module
 
         _cd_mod = import_module("app.completion_debt")
         _completion_debt = await _cd_mod.get_open_completion_debt(
