@@ -307,6 +307,7 @@ def resolve_dimension_states(
         ("criterion_coverage", "Criterion Coverage"),
         ("debt_pressure", "Debt Pressure"),
         ("goal_alignment", "Goal Alignment"),
+        ("capability_proof", "Capability Proof"),
     ]
 
     _BLOCKER_TO_DIM: dict[str, str] = {
@@ -349,6 +350,7 @@ def resolve_dimension_states(
     merge_grade_coverage = q.get("merge_grade_coverage")
     criterion_coverage: dict[str, Any] = q.get("criterion_coverage") or {}
     goal_alignment = q.get("goal_alignment")
+    proof_gate_mode = str(q.get("capability_proof_gate_mode", "off") or "off")
 
     # The blocker dimension (if any) is always "failed".
     blocker_dim: str | None = _BLOCKER_TO_DIM.get(blocker) if blocker else None
@@ -466,6 +468,12 @@ def resolve_dimension_states(
                     dim_status = "passed"
             else:
                 dim_status = "passed"
+        elif key == "capability_proof":
+            if proof_gate_mode == "enforce":
+                dim_status = "passed"
+            else:
+                dim_status = "unavailable"
+                reason = proof_gate_mode
         else:
             dim_status = "unavailable"
 
@@ -476,12 +484,13 @@ def resolve_dimension_states(
     return result
 
 
-# Dimensions the QualificationDimensionResult ledger writes (10 total, 8 of which
-# overlap with the 10 UI dimensions). The 2 UI-only dimensions NOT in the ledger
+# Dimensions the QualificationDimensionResult ledger writes (11 total, 9 of which
+# overlap with the 11 UI dimensions). The 2 UI-only dimensions NOT in the ledger
 # (criterion_coverage, goal_alignment) must still be derived from the blob.
 _LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
     "audit", "test_erosion", "smoketest", "ci",
     "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
+    "capability_proof",
 })
 
 

@@ -271,6 +271,19 @@ runtime_config: Dict = {
     if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
     in ("off", "observe", "enforce")
     else "observe",
+    # Rollout mode for the capability proof gate — controls whether prerequisite
+    # resolution gates on machine-verified proof (enforce) or allows self-reported
+    # working status (off/observe). Ships "off" so the gate is inert until an
+    # operator graduates it via PATCH /api/admin/settings.
+    #   off     — proof status is advisory only; never blocks prerequisite resolution.
+    #   observe — proof status is recorded and surfaced but does not block.
+    #   enforce — unproven capabilities do not satisfy prerequisite resolution.
+    "capability_proof_gate_mode": os.getenv(
+        "CAPABILITY_PROOF_GATE_MODE", "off"
+    ).lower()
+    if os.getenv("CAPABILITY_PROOF_GATE_MODE", "off").lower()
+    in ("off", "observe", "enforce")
+    else "off",
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -1318,6 +1331,9 @@ _DORMANT_MODE_KNOBS = {
     ),
     "completion_debt_weight_mode": (
         "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
+    ),
+    "capability_proof_gate_mode": (
+        "Capability proof gate not yet enforcing (off/observe)"
     ),
 }
 # Master feature flags that ship OFF still owe an enablement decision.

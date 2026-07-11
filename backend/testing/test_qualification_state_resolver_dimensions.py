@@ -8,6 +8,7 @@ _ALL_KEYS = {
     "audit", "test_erosion", "smoketest", "ci",
     "migration_identity", "migration_apply", "merge_grade",
     "criterion_coverage", "debt_pressure", "goal_alignment",
+    "capability_proof",
 }
 
 
@@ -17,7 +18,7 @@ def _by_key(states):
 
 def test_none_last_qualification_returns_all_pending():
     result = resolve_dimension_states(None)
-    assert len(result) == 10
+    assert len(result) == 11
     d = _by_key(result)
     for key in _ALL_KEYS:
         assert d[key]["status"] == "pending", key
@@ -297,9 +298,9 @@ def test_debt_pressure_when_present():
     assert d["debt_pressure"]["score"] == pytest.approx(0.7)
 
 
-def test_returns_all_10_dimensions():
+def test_returns_all_11_dimensions():
     result = resolve_dimension_states(None)
-    assert len(result) == 10
+    assert len(result) == 11
     keys = {s["key"] for s in result}
     assert keys == _ALL_KEYS
 
@@ -386,7 +387,7 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 10
+    assert len(result) == 11
     d = {s["key"]: s for s in result}
 
     # 8 ledger-backed dimensions use ledger values (with status mapping).
@@ -448,7 +449,7 @@ async def test_ledger_empty_falls_back_to_blob(db_session):
     # Deliberately NO ledger rows.
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 10
+    assert len(result) == 11
     d = {s["key"]: s for s in result}
 
     # All derived from blob — same as calling resolve_dimension_states directly.
@@ -506,7 +507,7 @@ async def test_ledger_different_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 10
+    assert len(result) == 11
     d = {s["key"]: s for s in result}
 
     # CI is "passed" from blob (ci_resolution.state=green), NOT "failed" from ledger.
@@ -534,6 +535,193 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 10
+    assert len(result) == 11
     d = {s["key"]: s for s in result}
     assert d["ci"]["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# proof_gate dimension — informational deployment-health signal
+# ---------------------------------------------------------------------------
+
+
+def test_proof_gate_dimension_enforce_mode_passes():
+    """The proof_gate dimension is 'passed' when capability_proof_gate_mode is
+    'enforce', and stays purely informational (never a blocker)."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "merge_grade_status": "pass",
+        "criterion_coverage": {"total": 3, "covered": 3},
+        "smoketest_enabled": True,
+        "capability_proof_gate_mode": "enforce",
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["capability_proof"]["status"] == "passed"
+    assert d["capability_proof"]["score"] is None
+    assert d["capability_proof"]["reason"] is None
+
+
+def test_proof_gate_unavailable_when_off():
+    """The proof_gate dimension is 'unavailable' when mode is 'off'."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "merge_grade_status": "pass",
+        "criterion_coverage": {"total": 3, "covered": 3},
+        "smoketest_enabled": True,
+        "capability_proof_gate_mode": "off",
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["capability_proof"]["status"] == "unavailable"
+    assert d["capability_proof"]["reason"] == "off"
+
+
+def test_proof_gate_unavailable_when_observe():
+    """The proof_gate dimension is 'unavailable' when mode is 'observe'."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "merge_grade_status": "pass",
+        "criterion_coverage": {"total": 3, "covered": 3},
+        "smoketest_enabled": True,
+        "capability_proof_gate_mode": "observe",
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["capability_proof"]["status"] == "unavailable"
+    assert d["capability_proof"]["reason"] == "observe"
+
+
+def test_proof_gate_unavailable_when_mode_missing():
+    """The proof_gate dimension is 'unavailable' when capability_proof_gate_mode
+    is not present in the qualification dict (defaults to 'off')."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "merge_grade_status": "pass",
+        "criterion_coverage": {"total": 3, "covered": 3},
+        "smoketest_enabled": True,
+        # capability_proof_gate_mode intentionally absent
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["capability_proof"]["status"] == "unavailable"
+    assert d["capability_proof"]["reason"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_proof_gate_ledger_backed_path_works(db_session):
+    """When a QualificationDimensionResult row exists for proof_gate, the
+    ledger-backed path derives the dimension state from the ledger."""
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "abc123",
+            "sub_scores": {"audit": 0.9},
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "criterion_coverage": {"total": 3, "covered": 3},
+            "blocker": None,
+            "smoketest_enabled": True,
+            "capability_proof_gate_mode": "enforce",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Ledger row says proof_gate is "passed" (enforce mode).
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc123",
+        dimension="capability_proof",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    assert len(result) == 11
+    d = {s["key"]: s for s in result}
+    assert d["capability_proof"]["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_proof_gate_ledger_unavailable_when_not_enforce(db_session):
+    """When the ledger row for proof_gate says 'unavailable', the UI shows it."""
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "abc123",
+            "sub_scores": {"audit": 0.9},
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "criterion_coverage": {"total": 3, "covered": 3},
+            "blocker": None,
+            "smoketest_enabled": True,
+            "capability_proof_gate_mode": "off",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc123",
+        dimension="capability_proof",
+        status="unavailable",
+        sub_score=None,
+        blocker=None,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+    assert d["capability_proof"]["status"] == "unavailable"
