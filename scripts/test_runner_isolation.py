@@ -1082,6 +1082,93 @@ class TestCapabilitiesInventory(unittest.TestCase):
             self.assertIsInstance(value, bool)
 
 
+# ── LLM CLI probe ────────────────────────────────────────────────────────────
+
+class TestProbeLlmClis(unittest.TestCase):
+    """probe_llm_clis: checks shutil.which + subprocess.run for each LLM CLI."""
+
+    @staticmethod
+    def _which_side_effect(name):
+        mapping = {"claude": "/usr/bin/claude", "codex": "/usr/bin/codex", "gemini": "/usr/bin/gemini"}
+        return mapping.get(name)
+
+    def test_all_present_with_versions(self):
+        with mock.patch.object(iso, "_which", side_effect=self._which_side_effect):
+            with mock.patch.object(
+                iso.subprocess, "run",
+                side_effect=lambda args, **kw: subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=f"{args[0]} 0.2.0\n", stderr=""
+                ),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertEqual(set(result), {"claude", "codex", "gemini"})
+        for name in ("claude", "codex", "gemini"):
+            self.assertTrue(result[name]["present"])
+            self.assertIn("0.2.0", result[name]["version"])
+
+    def test_all_absent(self):
+        with mock.patch.object(iso, "_which", return_value=None):
+            result = iso.probe_llm_clis()
+        self.assertEqual(set(result), {"claude", "codex", "gemini"})
+        for name in ("claude", "codex", "gemini"):
+            self.assertFalse(result[name]["present"])
+            self.assertEqual(result[name]["version"], "")
+
+    def test_mixed_present_absent(self):
+        def which_mixed(name):
+            return "/usr/bin/claude" if name == "claude" else None
+
+        with mock.patch.object(iso, "_which", side_effect=which_mixed):
+            with mock.patch.object(
+                iso.subprocess, "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["/usr/bin/claude", "--version"], returncode=0,
+                    stdout="claude 0.3.0\n", stderr=""
+                ),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertTrue(result["claude"]["present"])
+        self.assertEqual(result["claude"]["version"], "claude 0.3.0")
+        self.assertFalse(result["codex"]["present"])
+        self.assertEqual(result["codex"]["version"], "")
+        self.assertFalse(result["gemini"]["present"])
+        self.assertEqual(result["gemini"]["version"], "")
+
+    def test_present_but_version_subprocess_fails(self):
+        with mock.patch.object(iso, "_which", side_effect=self._which_side_effect):
+            with mock.patch.object(
+                iso.subprocess, "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["/usr/bin/codex", "--version"], returncode=1,
+                    stdout="", stderr="error"
+                ),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertTrue(result["codex"]["present"])   # present because which found it
+        self.assertEqual(result["codex"]["version"], "")  # but no version string
+
+    def test_present_but_version_subprocess_oserror(self):
+        def which_all(name):
+            return "/usr/bin/claude"
+
+        with mock.patch.object(iso, "_which", side_effect=which_all):
+            with mock.patch.object(
+                iso.subprocess, "run",
+                side_effect=OSError("exec format error"),
+            ):
+                result = iso.probe_llm_clis()
+        self.assertTrue(result["claude"]["present"])   # present because which found it
+        self.assertEqual(result["claude"]["version"], "")  # but no version string
+
+    def test_empty_caps_on_capabilities_dataclass(self):
+        """llm_clis defaults to {} on a freshly-constructed Capabilities."""
+        caps = iso.Capabilities()
+        self.assertEqual(caps.llm_clis, {})
+        # Verify the dataclass still accepts its existing positional args.
+        caps2 = iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(caps2.llm_clis, {})
+
+
 # ── GPU sandbox probe ─────────────────────────────────────────────────────────
 
 class TestProbeGpuInSandbox(unittest.TestCase):

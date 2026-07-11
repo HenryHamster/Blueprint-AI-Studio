@@ -176,6 +176,10 @@ class HeartbeatRequest(BaseModel):
     isolation_backends: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
+    # LLM CLI inventory: {"claude": {"present": bool, "version": str}, ...}
+    # Probed and sent by the runner each heartbeat; persisted in capabilities JSONB
+    # so the orchestrator can filter pool LLM runtimes to clis the runner has.
+    llm_clis: dict | None = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
     has_gpu: StrictBool | None = None
     gpu_count: int | None = None
@@ -275,6 +279,7 @@ async def next_task(
                     task=task,
                     runtime_config=_rc_dict,
                     project_id=str(task.project_id) if task.project_id else None,
+                    runner_available_clis=(runner.capabilities or {}).get("llm_clis"),
                 )
                 if selection is not None and selection.account is not None:
                     account = selection.account
@@ -532,6 +537,8 @@ async def heartbeat(
     # All optional and tolerated as missing so older runners keep heartbeating.
     if payload.isolation_backends is not None:
         caps["isolation_backends"] = payload.isolation_backends
+    if payload.llm_clis is not None:
+        caps["llm_clis"] = payload.llm_clis
     if payload.agent_backend is not None:
         caps["agent_backend"] = payload.agent_backend
     if payload.compute_backend is not None:

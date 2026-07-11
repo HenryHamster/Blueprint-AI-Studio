@@ -65,10 +65,11 @@ import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
   RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  RuntimeUnavailableError,
   missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
-  __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
+  __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
@@ -78,11 +79,11 @@ import {
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing,
-  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError,
+  RateLimitError, AuthFailureError, NoProgressTimeoutError, VmConfigMissingError, RuntimeUnavailableError,
   missingProviderConfigFiles, requiredProviderConfigFiles,
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
-  __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
+  __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
@@ -90,7 +91,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned' | 'external_api' | 'vm_config_missing' | 'github_token_fetch_failed' | 'runtime_unavailable';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call
@@ -3432,6 +3433,7 @@ async function completeStartup(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 export async function main() {
+  let _pendingExitCode = 0;
   // Start forensic instrumentation as early as possible. The lag monitor + exit
   // markers don't depend on auth or task claim, so we want them recording from
   // the moment node starts so a pre-claim death still leaves /tmp logs.
@@ -3655,6 +3657,7 @@ export async function main() {
         // process.exit, no pollForNextRole re-entry, no double-role-start).
         if (roleErr instanceof GracefulShutdownSignal) {
           log(`Role abandoned gracefully (reason=${roleErr.reason}) — winding down`);
+          if (roleErr.exitCode !== 0) _pendingExitCode = roleErr.exitCode;
           break;
         }
         throw roleErr;
@@ -3687,6 +3690,7 @@ export async function main() {
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     log('Agent shutdown complete.');
   }
+  if (_pendingExitCode !== 0) process.exit(_pendingExitCode);
 }
 
 // ── Per-role lifecycle (extracted so warm roles re-enter cleanly) ────────────
@@ -4054,6 +4058,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
         parkDirective: parkedAfterFailure,
       };
     }
+    // runtime_unavailable is an infra decline (missing CLI binary), not a real
+    // task failure. Convert to GracefulShutdownSignal so main() can exit with
+    // code 42, signalling the runner to skip the failure-streak increment.
+    // eslint-disable-next-line @typescript-eslint/only-throw-error -- GracefulShutdownSignal is a typed control signal, not an Error
+    if (error instanceof RuntimeUnavailableError) throw new GracefulShutdownSignal('runtime_unavailable', 42);
     // Re-throw so the role loop terminates — failures don't get warm
     // continuity; the orchestrator cold-provisions for the next role.
     throw error;

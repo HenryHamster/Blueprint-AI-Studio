@@ -247,6 +247,53 @@ def _normalize_provider_list(raw: Any) -> list[str]:
     return [v for v in values if v]
 
 
+# Provider-to-CLI binary mapping for runner-side CLI inventory filtering.
+# When a runner advertises its available LLM CLI binaries via heartbeat, the
+# pool runtime selector filters providers whose required CLI is absent or
+# has present=False. This prevents dispatching a task to a runner that lacks
+# the CLI needed to execute it (e.g. codex ENOENT crash-requeues).
+_PROVIDER_REQUIRED_CLI: dict[str, str] = {
+    "anthropic": "claude",
+    "deepseek": "claude",
+    "zai": "claude",
+    "openai": "codex",
+    "gemini": "gemini",
+}
+
+
+def _filter_providers_by_cli(
+    providers: list[str],
+    runner_available_clis: dict[str, dict] | None,
+) -> list[str]:
+    """Filter *providers* to those whose required CLI is present on the runner.
+
+    When *runner_available_clis* is ``None``, no filtering is applied (backward
+    compat / cloud pre-provision path where all CLIs are installed).
+
+    When *runner_available_clis* is an empty dict (runner probed but found
+    nothing), apply the conservative fallback: assume ``claude`` is available
+    since all runners have it installed. This avoids starvation for runners
+    whose probe returned empty.
+
+    When *runner_available_clis* has entries, a provider is kept only when its
+    required CLI's ``"present"`` field is ``True``.
+    """
+    if runner_available_clis is None:
+        return providers
+    # Empty dict → conservative: assume only claude is available.
+    if not runner_available_clis:
+        return [p for p in providers if _PROVIDER_REQUIRED_CLI.get(p) == "claude"]
+    result: list[str] = []
+    for provider in providers:
+        required_cli = _PROVIDER_REQUIRED_CLI.get(provider)
+        if required_cli is None:
+            continue  # Unknown provider — can't determine requirement
+        cli_entry = runner_available_clis.get(required_cli)
+        if isinstance(cli_entry, dict) and cli_entry.get("present", False):
+            result.append(provider)
+    return result
+
+
 def _category_for_task_type(
     task_type: str, runtime_config: Mapping[str, Any]
 ) -> str | None:
@@ -3040,6 +3087,7 @@ async def select_llm_runtime_for_task(
     runtime_config: Mapping[str, Any],
     blacklist: List[str] | None = None,
     project_id: str | None = None,
+    runner_available_clis: dict[str, dict] | None = None,
 ) -> LLMSelectionResult | None:
     explicit_model = _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
@@ -3095,6 +3143,30 @@ async def select_llm_runtime_for_task(
             model_preferences = model_preferences[:1]
         if provider_preference:
             provider_preference = provider_preference[:1]
+
+    # Filter providers by runner CLI inventory: when a concrete runner is
+    # known (runner claim path), remove providers whose required CLI is not
+    # present on that runner. The orchestrator pre-provision / warm-retarget
+    # paths pass runner_available_clis=None and skip this filter entirely.
+    if runner_available_clis is not None:
+        provider_preference = _filter_providers_by_cli(
+            provider_preference, runner_available_clis
+        )
+        if model_preferences:
+            model_preferences = [
+                p
+                for p in model_preferences
+                if _filter_providers_by_cli(
+                    [p.get("provider", "")], runner_available_clis
+                )
+            ]
+        if not provider_preference and not model_preferences:
+            logger.info(
+                "[LLM_SELECT] All providers filtered by runner CLI inventory "
+                "— no runtime available for runner project=%s",
+                _log_project_id,
+            )
+            return None
 
     if model_preferences:
         for pref in model_preferences:

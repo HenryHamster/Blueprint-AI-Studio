@@ -178,6 +178,10 @@ class Capabilities:
     gpu_names: tuple[str, ...] = ()
     # Human-readable notes surfaced in the preflight (e.g. "docker socket denied").
     notes: tuple[str, ...] = ()
+    # LLM CLI inventory: {"claude": {"present": bool, "version": str}, ...}
+    # Probed once per heartbeat; appended to the capabilities JSONB so the
+    # orchestrator can filter pool LLM runtimes to clis the runner actually has.
+    llm_clis: dict = field(default_factory=dict)
 
     # ── Derived predicates ──
     @property
@@ -349,6 +353,46 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
         indices.append(int(m.group(1)))
         names.append(m.group(2).strip())
     return tuple(indices), tuple(names)
+
+
+# Known LLM CLI binaries the runner may advertise in the heartbeat.
+_LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
+
+
+def probe_llm_clis() -> dict[str, dict]:
+    """Probe for known LLM CLI binaries and return a present/version map.
+
+    ``shutil.which()`` establishes presence (the binary is on PATH), then
+    ``<binary> --version`` resolves the version string. Any failure in the
+    version subprocess is non-fatal — the entry reads as present with an empty
+    version string (the consumer can distinguish "present but no version info"
+    from "absent").
+
+    Returns a dict keyed on the canonical CLI name::
+
+        {"claude": {"present": True, "version": "0.2.0"},
+         "codex": {"present": False, "version": ""},
+         "gemini": {"present": False, "version": ""}}
+    """
+    result: dict[str, dict] = {}
+    for name in _LLM_CLI_NAMES:
+        path = _which(name)
+        present = path is not None
+        version = ""
+        if present:
+            try:
+                ver = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if ver.returncode == 0:
+                    version = (ver.stdout or ver.stderr or "").strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        result[name] = {"present": present, "version": version}
+    return result
 
 
 def detect_capabilities() -> Capabilities:

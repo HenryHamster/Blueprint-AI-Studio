@@ -43,6 +43,8 @@ from app.max_plan_pool import (
     _compute_avg_duration_24h,
     _compute_health_score,
     _compute_success_rate_7d,
+    _filter_providers_by_cli,
+    _PROVIDER_REQUIRED_CLI,
     _compute_success_rate_7d_for_type,
     _effective_success_rate,
     _cooldown_seconds_for_info,
@@ -76,6 +78,7 @@ from app.max_plan_pool import (
     release_max_plan_account,
     select_max_plan_account,
     select_max_plan_account_balanced,
+    select_llm_runtime_for_task,
     summarize_pool_state,
 )
 
@@ -155,6 +158,71 @@ class TestCascadeDisabledModels:
         # until we know empirically whether a fable 429 implies the shared
         # opus bucket is exhausted. Must not cascade to opus.
         assert cascade_disabled_models("claude-fable-5") == ("claude-fable-5",)
+
+
+# ── _filter_providers_by_cli ──────────────────────────────────────────────────
+
+
+class TestFilterProvidersByCLI:
+    """Runner CLI inventory filtering tests."""
+
+    ALL_PROVIDERS = ["anthropic", "deepseek", "zai", "openai", "gemini"]
+
+    def test_all_clis_present_all_providers_allowed(self):
+        clis = {"claude": {"present": True}, "codex": {"present": True}, "gemini": {"present": True}}
+        assert _filter_providers_by_cli(self.ALL_PROVIDERS, clis) == self.ALL_PROVIDERS
+
+    def test_only_claude_present_keeps_claude_providers(self):
+        clis = {"claude": {"present": True}}
+        result = _filter_providers_by_cli(self.ALL_PROVIDERS, clis)
+        assert result == ["anthropic", "deepseek", "zai"]
+
+    def test_only_codex_present_keeps_only_openai(self):
+        clis = {"codex": {"present": True}}
+        result = _filter_providers_by_cli(self.ALL_PROVIDERS, clis)
+        assert result == ["openai"]
+
+    def test_only_gemini_present_keeps_only_gemini(self):
+        clis = {"gemini": {"present": True}}
+        result = _filter_providers_by_cli(self.ALL_PROVIDERS, clis)
+        assert result == ["gemini"]
+
+    def test_none_runner_available_clis_returns_all(self):
+        """None → no filtering applied (backward compat / cloud path)."""
+        assert _filter_providers_by_cli(self.ALL_PROVIDERS, None) == self.ALL_PROVIDERS
+
+    def test_empty_dict_conservative_claude_only(self):
+        """Empty dict → conservative: assume only claude is available."""
+        result = _filter_providers_by_cli(self.ALL_PROVIDERS, {})
+        assert result == ["anthropic", "deepseek", "zai"]
+
+    def test_all_providers_filtered_returns_empty(self):
+        clis = {"claude": {"present": True}}
+        assert _filter_providers_by_cli(["openai", "gemini"], clis) == []
+
+    def test_cli_present_false_blocks_provider(self):
+        clis = {"claude": {"present": False}, "codex": {"present": True}}
+        result = _filter_providers_by_cli(["anthropic", "openai"], clis)
+        assert result == ["openai"]
+
+    def test_empty_provider_list_returns_empty(self):
+        assert _filter_providers_by_cli([], {"claude": {"present": True}}) == []
+
+    def test_cli_missing_key_returns_empty(self):
+        """When a required CLI key is entirely absent, the provider is blocked."""
+        clis = {"gemini": {"present": True}}
+        assert _filter_providers_by_cli(["openai"], clis) == []
+
+    def test_unknown_provider_name_returns_empty(self):
+        """An unknown provider name (not in _PROVIDER_REQUIRED_CLI) is skipped."""
+        assert _filter_providers_by_cli(["unknown_provider"], {"claude": {"present": True}}) == []
+
+    def test_PROVIDER_REQUIRED_CLI_has_expected_keys(self):
+        assert _PROVIDER_REQUIRED_CLI["anthropic"] == "claude"
+        assert _PROVIDER_REQUIRED_CLI["deepseek"] == "claude"
+        assert _PROVIDER_REQUIRED_CLI["zai"] == "claude"
+        assert _PROVIDER_REQUIRED_CLI["openai"] == "codex"
+        assert _PROVIDER_REQUIRED_CLI["gemini"] == "gemini"
 
 
 # ── _compute_health_score ───────────────────────────────────────────────────
@@ -4581,3 +4649,113 @@ class TestSelectRefreshesSecret:
     async def test_select_returns_none_on_empty_pool(self):
         result = await select_max_plan_account("no-such-user")
         assert result is None
+
+
+# ── select_llm_runtime_for_task — runner CLI filtering ──────────────────────
+
+
+class TestSelectLLMRuntimeFiltersByRunnerCLIs:
+    """Tests for runner_available_clis parameter in select_llm_runtime_for_task.
+
+    Mocks select_max_plan_account so the test doesn't need full pool state.
+    Verifies that when runner_available_clis filters out all providers, the
+    function returns None (caller should decline the task).
+    """
+
+    _USER = "test-cli-filter-user"
+
+    def _reset_pools(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    @patch("app.max_plan_pool.select_max_plan_account", new_callable=AsyncMock)
+    async def test_select_llm_runtime_filters_by_runner_clis(self, mock_select):
+        """runner_available_clis filters providers before account selection."""
+        self._reset_pools()
+        try:
+            mock_select.return_value = {
+                "id": "acct1",
+                "name": "acct1",
+                "oauth_token": "token",
+                "auth_mode": "oauth",
+                "provider": "anthropic",
+            }
+
+            task = MagicMock(
+                spec=[
+                    "first_payload",
+                    "payloads",
+                    "context",
+                    "project_id",
+                    "launched_by_user_id",
+                    "id",
+                ]
+            )
+            task.first_payload = {"type": "create"}
+            task.payloads = [{}]
+            task.context = {}
+            task.project_id = None
+            task.launched_by_user_id = None
+            task.id = "test-cli-filter-task"
+
+            rc = {
+                "provider_selection_mode": "preferred",
+                "category_routing": {
+                    "_default": {"providers": ["anthropic", "openai"]}
+                },
+                "task_type_categories": {},
+                "provider_settings_by_effort": {
+                    "anthropic": {"medium": {"model": "claude-opus-4-8"}},
+                },
+            }
+
+            # Test 1: runner has all CLIs → can find an account
+            result = await select_llm_runtime_for_task(
+                user_id=self._USER,
+                task=task,
+                runtime_config=rc,
+                runner_available_clis={
+                    "claude": {"present": True},
+                    "codex": {"present": True},
+                },
+            )
+            assert result is not None
+            # Should have selected the mocked anthropic account
+            assert mock_select.called
+
+            mock_select.reset_mock()
+
+            # Test 2: runner has only claude → anthropic passes, openai filtered
+            result = await select_llm_runtime_for_task(
+                user_id=self._USER,
+                task=task,
+                runtime_config=rc,
+                runner_available_clis={"claude": {"present": True}},
+            )
+            assert result is not None
+            assert result.provider == "anthropic"
+
+            mock_select.reset_mock()
+
+            # Test 3: runner has no relevant CLIs → all providers filtered → returns None
+            result = await select_llm_runtime_for_task(
+                user_id=self._USER,
+                task=task,
+                runtime_config=rc,
+                runner_available_clis={"gemini": {"present": True}},
+            )
+            assert result is None
+
+            mock_select.reset_mock()
+
+            # Test 4: no runner_available_clis → no filtering (backward compat)
+            result = await select_llm_runtime_for_task(
+                user_id=self._USER,
+                task=task,
+                runtime_config=rc,
+                runner_available_clis=None,
+            )
+            assert result is not None
+            assert mock_select.called
+        finally:
+            self._reset_pools()

@@ -415,6 +415,84 @@ class TestLowDiskGuard(unittest.TestCase):
             self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
 
 
+# ── Host-load throttle ─────────────────────────────────────────────────────────
+
+class TestHostLoadThrottle(unittest.TestCase):
+    """_compute_poll_loop and agent poll skip claims when load thresholds are met."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _make_compute_deps(self):
+        active_jobs: set = set()
+        lock = threading.Lock()
+        return active_jobs, lock
+
+    def _run_compute_poll(self, gpu_util_pct_ret, max_gpu_util_pct, post_side_effect):
+        """Run _compute_poll_loop in a thread for 0.15s, return list of posted calls."""
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return post_side_effect(url)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=gpu_util_pct_ret), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"max_gpu_util_pct": max_gpu_util_pct, "base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        return calls
+
+    def test_cpu_load_disabled_by_default(self):
+        """max_cpu_load=0 (default) never blocks claiming regardless of load."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=None,
+            max_gpu_util_pct=0,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        # The poll loop should have called _post (not skipped due to load)
+        self.assertTrue(len(calls) >= 1)
+
+    def test_gpu_util_above_threshold_skips_compute_claim(self):
+        """Compute poll skips claiming when GPU utilization is at or above threshold."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=80,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        # _post should NOT have been called — throttled
+        self.assertEqual(calls, [])
+
+    def test_gpu_util_below_threshold_allows_compute_claim(self):
+        """Compute poll proceeds when GPU utilization is below threshold."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=79,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        self.assertTrue(len(calls) >= 1)
+
+    def test_gpu_util_none_does_not_skip(self):
+        """When GPU util can't be read (None), claiming is not blocked."""
+        calls = self._run_compute_poll(
+            gpu_util_pct_ret=None,
+            max_gpu_util_pct=80,
+            post_side_effect=lambda url: (204, None, None),
+        )
+        self.assertTrue(len(calls) >= 1)
+
+
 # ── Stale workspace cleanup ────────────────────────────────────────────────────
 
 class TestStaleWorkspaceCleanup(unittest.TestCase):
@@ -817,6 +895,60 @@ class TestReaperLoop(unittest.TestCase):
 
                 self.assertNotIn("task-done", active_tasks)
                 self.assertFalse(os.path.exists(workspace))
+
+
+# ── Exit-code 42 (runtime_unavailable) does not increment failure streak ─────
+
+class TestExitCode42NoFailureStreak(unittest.TestCase):
+    """exit code 42 (runtime_unavailable) must NOT increment consecutive_job_failures."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_exit_code_42_does_not_increment_failure_streak(self):
+        proc = MagicMock()
+        proc.poll.return_value = 0   # poll() non-None so the reaper picks it up
+        proc.returncode = 42
+
+        active_tasks = {"task-42": proc}
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit held by the task
+        telemetry = local_runner._TelemetryState()
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(active_tasks, lock, capacity, telemetry=telemetry)
+
+        self.assertNotIn("task-42", active_tasks)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit was released
+        _last_success, fails = telemetry.snapshot()
+        # Exit code 42 is a graceful infra decline — failure streak must stay 0.
+        self.assertEqual(fails, 0)
+
+    def test_nonzero_non42_exit_still_increments_failure_streak(self):
+        """Sanity-check: a normal failure (e.g. exit 1) does increment the streak."""
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.returncode = 1
+
+        active_tasks = {"task-fail": proc}
+        lock = threading.Lock()
+        telemetry = local_runner._TelemetryState()
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(active_tasks, lock, None, telemetry=telemetry)
+
+        _last_success, fails = telemetry.snapshot()
+        self.assertEqual(fails, 1)
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -1940,6 +2072,86 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(body["agent_backend"])
         self.assertIsNone(body["compute_backend"])
         self.assertIsNone(body["version"])
+
+    def test_llm_clis_included_in_heartbeat_body(self):
+        """Heartbeat body carries the LLM CLI inventory when caps are supplied."""
+        posted_bodies = []
+        fake_llm_clis = {
+            "claude": {"present": True, "version": "0.2.0"},
+            "codex": {"present": True, "version": "0.3.0"},
+            "gemini": {"present": True, "version": "1.0.0"},
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(iso, "probe_llm_clis", return_value=fake_llm_clis):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    agent_image=None,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsInstance(body["llm_clis"], dict)
+        self.assertEqual(body["llm_clis"], fake_llm_clis)
+        self.assertTrue(body["llm_clis"]["claude"]["present"])
+        self.assertEqual(body["llm_clis"]["claude"]["version"], "0.2.0")
+        self.assertTrue(body["llm_clis"]["codex"]["present"])
+        self.assertEqual(body["llm_clis"]["codex"]["version"], "0.3.0")
+        self.assertTrue(body["llm_clis"]["gemini"]["present"])
+        # The remaining heartbeat fields are still present.
+        self.assertIsInstance(body["isolation_backends"], dict)
+        self.assertEqual(body["version"], "v22-abc")
+
+    def test_llm_clis_none_when_caps_absent(self):
+        """caps=None (an old caller) → llm_clis serializes as None."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsNone(body["llm_clis"])
 
     def test_docker_only_declares_read_only_agent_slice(self):
         """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent

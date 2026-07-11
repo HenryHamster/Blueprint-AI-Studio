@@ -3147,6 +3147,10 @@ async def orchestrator_worker():
                             runtime_config=_runtime_config,
                             blacklist=_effective_blacklist,
                             project_id=str(task.project_id) if task.project_id else None,
+                            # No runner_available_clis here: this is the cloud
+                            # pre-provision path where no concrete runner is known
+                            # yet. Cloud VMs are provisioned with all LLM CLIs
+                            # pre-installed, so CLI-based filtering is unnecessary.
                         )
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection

@@ -42,6 +42,12 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MIN_DISK_BYTES   Low-disk guard: stop claiming new agent work when
                                       free space on the workspace filesystem is below this
                                       many bytes (default: 0 = disabled)
+    BLUEPRINT_RUNNER_MAX_CPU_LOAD     Host-load guard: stop claiming new agent tasks when
+                                      the 1-minute load average meets or exceeds this value
+                                      (float, default: 0 = disabled)
+    BLUEPRINT_RUNNER_MAX_GPU_UTIL_PCT Host-load guard: stop claiming new compute jobs when
+                                      max GPU utilization meets or exceeds this percentage
+                                      (int 0–100, default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
@@ -1163,9 +1169,18 @@ def _reap_loop(
                     if telemetry is not None:
                         if code == 0:
                             telemetry.record_success()
+                        elif code == 42:
+                            # Exit 42 = runtime_unavailable (missing CLI binary).
+                            # This is an infra decline, not a task failure — do NOT
+                            # increment the failure streak so the runner never trips
+                            # degraded=job_failure_streak from a missing-CLI event.
+                            pass
                         else:
                             telemetry.record_failure()
-                    print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
+                    if code == 42:
+                        print(f"[DONE] task_id={tid} exit_code=42 (runtime_unavailable — not a failure)", flush=True)
+                    else:
+                        print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
                     # Reap the per-task workspace so stale dirs don't accumulate
                     # and silently exhaust the runner's disk (unlike compute-job
                     # scratch dirs, these are never otherwise removed).
@@ -1325,10 +1340,12 @@ def _heartbeat_loop(
                 compute_backend = iso.decide_compute_backend(
                     caps, has_image=agent_image is not None
                 )
+                llm_clis = iso.probe_llm_clis()
             else:
                 isolation_backends = None
                 agent_backend = None
                 compute_backend = None
+                llm_clis = None
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
@@ -1339,6 +1356,7 @@ def _heartbeat_loop(
                 "isolation_backends": isolation_backends,
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
+                "llm_clis": llm_clis,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / low on memory /
                 # pegged CPU.
@@ -2329,6 +2347,7 @@ def _compute_poll_loop(
     capabilities: "iso.Capabilities | None" = None,
     gpu_state: dict | None = None,
     telemetry: "_TelemetryState | None" = None,
+    max_gpu_util_pct: int = 0,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job.
 
@@ -2351,6 +2370,19 @@ def _compute_poll_loop(
             if not _try_acquire_capacity(capacity):
                 time.sleep(poll_interval)
                 continue
+
+            # Host-load guard: skip claiming when GPU is saturated.
+            if max_gpu_util_pct > 0:
+                util = _gpu_utilization_pct()
+                if util is not None and util >= max_gpu_util_pct:
+                    _release_capacity(capacity)
+                    print(
+                        f"[compute] gpu_utilization_pct {util} >= threshold {max_gpu_util_pct}"
+                        " — skipping compute claim",
+                        flush=True,
+                    )
+                    time.sleep(poll_interval)
+                    continue
 
             try:
                 resp = _post(url, token, {}, return_headers=True)
@@ -3239,6 +3271,8 @@ def main() -> None:
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
     max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
     failure_pause_threshold = _env_int("BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD", 0, minimum=0)
+    max_cpu_load = _env_float("BLUEPRINT_RUNNER_MAX_CPU_LOAD", 0.0, minimum=0.0)
+    max_gpu_util_pct = _env_int("BLUEPRINT_RUNNER_MAX_GPU_UTIL_PCT", 0, minimum=0)
 
     # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
     # (host toolchain); the docker backend is used only on an explicit opt-in:
@@ -3455,7 +3489,8 @@ def main() -> None:
                 compute_capacity,
             ),
             kwargs={"base_poll_interval": base_poll_interval, "capabilities": caps,
-                    "gpu_state": gpu_state, "telemetry": telemetry},
+                    "gpu_state": gpu_state, "telemetry": telemetry,
+                    "max_gpu_util_pct": max_gpu_util_pct},
             daemon=True,
         )
         compute_poll.start()
@@ -3514,6 +3549,19 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            # Host-load guard: skip claiming when the machine is overloaded.
+            if max_cpu_load > 0:
+                load = _cpu_load_avg()
+                if load is not None and load >= max_cpu_load:
+                    _release_capacity(agent_capacity)
+                    print(
+                        f"[runner] cpu_load_avg {load} >= threshold {max_cpu_load}"
+                        " — skipping agent claim",
+                        flush=True,
+                    )
+                    time.sleep(poll_interval)
+                    continue
 
             # Circuit-breaker: pause claiming after N consecutive task failures.
             if failure_pause_threshold > 0:

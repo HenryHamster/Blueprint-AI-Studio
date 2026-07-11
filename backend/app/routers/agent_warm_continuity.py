@@ -390,6 +390,8 @@ async def _resolve_retarget(
         runtime_config=runtime_config,
         blacklist=blacklist,
         project_id=str(task.project_id) if task.project_id else None,
+        # No runner_available_clis: warm retarget dispatches to cloud VMs that
+        # have all LLM CLIs pre-installed, so CLI-based filtering is not needed.
     )
     if selection is None:
         return None, ctx, None

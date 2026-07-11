@@ -900,6 +900,12 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # or fix. Similar to SCOPE_EMPTY (task had no work to do), routed to that
     # class so it doesn't consume retry budget or penalize direction health.
     "pr_branch_deleted": SCOPE_EMPTY,
+    # ``runtime_unavailable`` — agent detected a required CLI binary (e.g.
+    # ``codex``) is not installed on the runner BEFORE spawning. The agent exits
+    # with code 42 so the runner skips the failure-streak increment. Routes to
+    # PROVISION_FAILURE (INFRA class) so it requeues without burning retry budget
+    # and the orchestrator can blacklist the unavailable runtime for this runner.
+    "runtime_unavailable": PROVISION_FAILURE,
     # ``reassigned`` — agent self-terminated gracefully because the task is no
     # longer assigned to its VM (non-transient heartbeat 4xx = reassignment/
     # deauth, or cancel/supersede during startup). Posted synchronously from the

@@ -28,6 +28,45 @@ export type OutputMode = 'claude-stream-json' | 'codex-jsonl' | 'text';
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 
+/**
+ * Thrown when a required CLI binary (e.g. `codex`) is absent from PATH.
+ * The agent exits with code 42 so the runner does NOT increment its failure
+ * streak — a missing-CLI event is an infra decline, not a real task failure.
+ */
+export class RuntimeUnavailableError extends Error {
+  readonly failureCategory = 'runtime_unavailable' as const;
+  constructor(cli: string) {
+    super(`runtime_unavailable:${cli}`);
+    this.name = 'RuntimeUnavailableError';
+  }
+}
+
+/** Returns true if `command` resolves to an executable file on PATH. */
+export function commandExistsOnPath(command: string): boolean {
+  const pathEnv = process.env.PATH || '';
+  const sep = process.platform === 'win32' ? ';' : ':';
+  for (const dir of pathEnv.split(sep)) {
+    if (!dir) continue;
+    const fullPath = `${dir}/${command}`;
+    try {
+      fs.accessSync(fullPath, fs.constants.X_OK);
+      return true;
+    } catch { /* not found or not executable in this dir */ }
+  }
+  return false;
+}
+
+// Test override: allows unit tests to bypass the pre-flight CLI check without
+// actually installing provider binaries. Set to null to re-enable the real check.
+let _commandExistsOverride: ((command: string) => boolean) | null = null;
+export function __setCommandExistsOverrideForSmoke(fn: ((command: string) => boolean) | null): void {
+  _commandExistsOverride = fn;
+}
+
+function _commandExists(command: string): boolean {
+  return _commandExistsOverride ? _commandExistsOverride(command) : commandExistsOnPath(command);
+}
+
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
   anthropic: {
     oauth: [
@@ -1038,6 +1077,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
+
+  // Pre-flight: verify the CLI binary is present before spawning. A missing
+  // binary (e.g. `codex` not installed on this runner) is an infra decline —
+  // throw RuntimeUnavailableError so the agent exits with code 42 and the
+  // runner does NOT increment its failure streak.
+  const cliCommand = runCommand.command;
+  if (!_commandExists(cliCommand)) {
+    sendLog(ws, `[preflight] CLI binary '${cliCommand}' not found on PATH — declining task (runtime_unavailable)\n`);
+    throw new RuntimeUnavailableError(cliCommand);
+  }
 
   // Provision the ambient helper CLIs (./note, ./playbook, ./messages) that
   // every model task may use regardless of handler. Self-guarding and

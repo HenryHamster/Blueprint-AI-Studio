@@ -1860,6 +1860,46 @@ class TestRunnerEndpoints:
         assert "compute_backend" not in runner.capabilities
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_llm_clis(
+        self, client: AsyncClient, db_session
+    ):
+        """The heartbeat handler persists llm_clis in capabilities JSONB."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        llm_clis = {
+            "claude": {"present": True, "version": "0.2.0"},
+            "codex": {"present": False, "version": ""},
+            "gemini": {"present": False, "version": ""},
+        }
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "llm_clis": llm_clis,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["llm_clis"] == llm_clis
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_llm_clis(
+        self, client: AsyncClient, db_session
+    ):
+        """An old runner that doesn't send llm_clis must not cause a heartbeat
+        failure (backward compatibility)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "llm_clis" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_trust_telemetry(
         self, client: AsyncClient, db_session
     ):

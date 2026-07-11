@@ -81,6 +81,7 @@ import {
 import { buildFixtureCapabilityContract } from './testSetup.js';
 import {
   _setLastProviderRunErrorReportForTesting,
+  __setCommandExistsOverrideForSmoke,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -123,6 +124,9 @@ type FetchMock = ReturnType<typeof makeFetchMock>;
 const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
 
 beforeEach(() => {
+  // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
+  // are not installed in the test environment; spawn is mocked separately.
+  __setCommandExistsOverrideForSmoke(() => true);
   process.env.PROVIDER = 'anthropic';
   process.env.AUTH_MODE = 'oauth';
   delete process.env.LLM_MODEL;

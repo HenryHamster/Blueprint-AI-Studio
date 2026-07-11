@@ -83,6 +83,7 @@ import {
   runProviderAgent,
   getLastProviderRunErrorReport,
   _setLastProviderRunErrorReportForTesting,
+  __setCommandExistsOverrideForSmoke,
 } from './runners.js';
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
@@ -137,6 +138,13 @@ function emitStream(jsonLines: string[], exitCode = 0): void {
 }
 
 // ── Test suites ───────────────────────────────────────────────────────────────
+
+// Bypass the pre-flight CLI-exists check for all tests in this file.
+// Provider binaries (claude, codex, etc.) are not installed in the test
+// environment; spawn is mocked separately per test.
+beforeEach(() => {
+  __setCommandExistsOverrideForSmoke(() => true);
+});
 
 describe('drainJsonChunks — assistant event dispatch', () => {
   beforeEach(() => {
