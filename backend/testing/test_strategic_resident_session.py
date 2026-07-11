@@ -3913,6 +3913,49 @@ async def test_start_carries_message_cursor_forward_across_restart(db_session):
 
 
 @pytest.mark.asyncio
+async def test_start_carries_decisions_reg_forward_across_restart(db_session):
+    """A decisions register persisted by the session-1 heartbeat is carried into
+    the NEW task's ``context["_decisions_reg"]`` when a second session starts —
+    the same round-trip the exam ledger, message cursor, and session summary
+    already use."""
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    reg = '{"entries": [{"tick": 1, "surfaceKey": "g-1", "verdict": "accept"}]}'
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap1["session_id"],
+        task_id=snap1["task_id"],
+        progress=False,
+        decisions_reg=reg,
+    )
+
+    # Drive session-1 task to terminal and queue a fresh task for adoption.
+    task1 = await db_session.get(Task, task1.id)
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2; decisions register should be carried forward.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+
+    # The new task carries the decisions register in its context.
+    fresh_task2 = await db_session.get(Task, task2.id)
+    assert fresh_task2 is not None
+    assert (fresh_task2.context or {}).get("_decisions_reg") == reg
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_marks_handled_message_ids(db_session):
     """A heartbeat carrying ``handled_message_ids`` updates those messages'
     ``status`` from ``'open'`` to ``'handled'``, scoped to the project and session."""

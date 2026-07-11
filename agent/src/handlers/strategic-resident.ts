@@ -1,3 +1,4 @@
+import fs from 'fs';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
@@ -821,6 +822,18 @@ export async function handleStrategicResident(
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   try {
     for (;;) {
+      // Guard: verify the workspace is still present before each turn. An
+      // external event (OOM-kill, /tmp cleaner) can delete it mid-session.
+      if (!fs.existsSync(`${WORKSPACE}/.git`)) {
+        sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
+        streamer.status('workspace vanished — re-cloning');
+        await prepareWorkspaceForRole({
+          workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+          branch: baseBranch, baseBranch, depth: 0,
+        });
+        sendLog(ws, '[resident] workspace restored\n');
+      }
+
       if (!session.isAlive()) {
         stopReason = 'session_process_exited';
         break;

@@ -148,6 +148,11 @@ _ACTIVE_DIRECTION_STATUSES = ("active", "paused", "proposed")
 # Maximum bytes stored for the agent's serialized exam-ledger (note field).
 _EXAM_LEDGER_MAX_BYTES = 20_000
 
+# Maximum bytes stored for the agent's serialized decisions register. The TS
+# side caps serialization at 32,000 bytes (DECISIONS_REG_MAX_BYTES); this cap
+# is defense-in-depth against a malformed blob.
+_DECISIONS_REG_MAX_BYTES = 32_000
+
 # Rolling window (seconds) over which a STRATEGIC_AGENT task that reached a
 # terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
 # "how many of my spawned tasks just landed." Advisory only.
@@ -1180,8 +1185,12 @@ async def start_resident_session(
         # Carry the decisions register forward so a restarted session restores
         # the strategist's cross-tick decision memory instead of resetting to
         # an empty array (which would cause re-derivation of settled facts).
+        # Byte-size guard: defense-in-depth against a malformed blob matching the
+        # TS-side cap (DECISIONS_REG_MAX_BYTES in strategic-resident-lib.ts).
         _raw_decisions = existing.get("_decisions_reg")
-        if isinstance(_raw_decisions, str) and _raw_decisions.strip():
+        if isinstance(_raw_decisions, str) and 0 < len(
+            _raw_decisions.encode()
+        ) <= _DECISIONS_REG_MAX_BYTES:
             carried_decisions_register = _raw_decisions
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
