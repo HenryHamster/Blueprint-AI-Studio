@@ -103,27 +103,30 @@ _OAUTH_DEAD_AUTH_PATTERNS: tuple[str, ...] = (
 )
 
 _DEFAULT_TIER_MODELS = {
-    # Maps onto the current Codex CLI picker inventory. opus uses the
-    # flagship gpt-5.4 (which absorbs gpt-5.3-codex's coding capability
-    # per OpenAI's positioning), sonnet the coding-specialist 5.3-codex,
-    # haiku the fast/cost-efficient 5.4-mini. All three are Codex-entitled
-    # on ChatGPT Plus and available to API-key auth.
-    "opus": "gpt-5.4",
-    "sonnet": "gpt-5.3-codex",
-    "haiku": "gpt-5.4-mini",
+    # Maps onto the current Codex CLI picker inventory (GPT-5.6 family;
+    # models cache retrieved 2026-07-10, codex CLI 0.144.1): sol is the
+    # frontier agentic coding model, terra the balanced everyday coder,
+    # luna the fast/affordable one. All three are Codex-entitled on
+    # ChatGPT plans and marked supported_in_api (API-key auth works).
+    "opus": "gpt-5.6-sol",
+    "sonnet": "gpt-5.6-terra",
+    "haiku": "gpt-5.6-luna",
 }
 
 
 # Models that accept `service_tier="flex"` on the OpenAI Responses API.
 # Sourced from OpenAI's current pricing tables — flex has its own column
-# on the flagship pricing page (gpt-5.5, gpt-5.4, gpt-5.4-mini) but is
-# absent from the specialized-model table (gpt-5.3-codex etc.). Explicit
-# set rather than prefix match: the research showed prefix matching would
-# have reopened the 400 on codex variants and on older models with no
-# documented flex tier. gpt-5.5 flex confirmed on the pricing page
-# (developers.openai.com/api/docs/pricing, retrieved 2026-06).
+# for the models listed here but is absent for specialized variants
+# (e.g. gpt-5.3-codex-spark). Explicit set rather than prefix match: the
+# research showed prefix matching would have reopened the 400 on codex
+# variants and on older models with no documented flex tier. GPT-5.6
+# sol/terra/luna flex rates confirmed on the pricing page
+# (developers.openai.com/api/docs/pricing, retrieved 2026-07-11).
 _FLEX_SUPPORTED_MODELS: frozenset[str] = frozenset(
     {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -235,37 +238,45 @@ class OpenAIProvider(LLMProvider):
             "properties": {
                 "model": {
                     "type": "string",
-                    # Mirrors the current Codex CLI picker inventory. Dotted
-                    # names are literal `-m` identifiers, not display labels.
-                    # When OpenAI bumps the picker (e.g. 5.4 → 5.5), update
-                    # this list — old IDs 404 after their published shutdown
+                    # Mirrors the current Codex CLI picker inventory (5.6
+                    # family; picker cache 2026-07-10). Dotted names are
+                    # literal `-m` identifiers, not display labels. When
+                    # OpenAI bumps the picker (e.g. 5.6 → 5.7), update this
+                    # list — old IDs 404 after their published shutdown
                     # rather than auto-forwarding, so stale enums cause hard
-                    # failures. Leave blank in a settings bag to inherit the
-                    # tier mapping from provider_tier_model_map.
+                    # failures (gpt-5.3-codex and gpt-5.2 were dropped from
+                    # the picker in the 5.6 cycle). Leave blank in a settings
+                    # bag to inherit the tier mapping from
+                    # provider_tier_model_map.
                     "enum": [
+                        "gpt-5.6-sol",
+                        "gpt-5.6-terra",
+                        "gpt-5.6-luna",
                         "gpt-5.5",
                         "gpt-5.4",
                         "gpt-5.4-mini",
-                        "gpt-5.3-codex",
                         "gpt-5.3-codex-spark",
-                        "gpt-5.2",
                     ],
                     "description": (
                         "Codex CLI model. Leave blank to inherit the tier "
                         "mapping from provider_tier_model_map. "
-                        "gpt-5.3-codex-spark is ChatGPT-Pro-only (not on API "
-                        "key at launch) — picking it on an API-key pool will 404."
+                        "gpt-5.3-codex-spark is ChatGPT-plan-only (the picker "
+                        "marks it supported_in_api=false) — picking it on an "
+                        "API-key pool will 404."
                     ),
                 },
                 "reasoning_effort": {
                     "type": "string",
-                    "enum": ["minimal", "low", "medium", "high", "xhigh"],
+                    "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
                     "description": (
-                        "How hard Codex thinks before answering. `minimal`/`low` = "
-                        "fast but shallower; `high`/`xhigh` = deeper planning at "
-                        "higher cost and latency. Not every model accepts every "
-                        "level — e.g. GPT-5 rejects `xhigh`, 5.3-codex rejects "
-                        "`minimal`. Incompat shows up as a runtime 400 at dispatch."
+                        "How hard Codex thinks before answering. `low` = fast "
+                        "but shallower; `high`/`xhigh` = deeper planning at "
+                        "higher cost and latency; `max`/`ultra` are GPT-5.6-"
+                        "family-only (ultra adds automatic task delegation and "
+                        "is not offered on luna). Older gens cap at `xhigh`, "
+                        "and no current picker model accepts the retired "
+                        "`minimal`. Incompat shows up as a runtime 400 at "
+                        "dispatch."
                     ),
                 },
                 "verbosity": {

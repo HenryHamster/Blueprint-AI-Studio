@@ -37,8 +37,11 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("anthropic", "claude-opus-4-6"): (5e-6, 25e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
     ("anthropic", "claude-haiku-4-5-20251001"): (1e-6, 5e-6),
-    # OpenAI (developers.openai.com/api/docs/pricing, refreshed 2026-06 at
-    # gpt-5.5 launch — 5.4-generation rates dropped at the same time).
+    # OpenAI (developers.openai.com/api/docs/pricing, refreshed 2026-07-11 at
+    # the GPT-5.6 picker cycle; older rows kept so historical runs stay priced).
+    ("openai", "gpt-5.6-sol"): (5e-6, 30e-6),
+    ("openai", "gpt-5.6-terra"): (2.5e-6, 15e-6),
+    ("openai", "gpt-5.6-luna"): (1e-6, 6e-6),
     ("openai", "gpt-5.5"): (5e-6, 30e-6),
     ("openai", "gpt-5.4"): (2.5e-6, 15e-6),
     ("openai", "gpt-5.4-mini"): (0.75e-6, 4.5e-6),
@@ -80,6 +83,9 @@ CACHE_CREATION_INPUT_RATE_MULTIPLIER = 1.25
 
 # Provider/model cache-read rates; writes/misses use the base input rate.
 LLM_CACHE_READ_INPUT_PRICING: dict[tuple[str, str], float] = {
+    ("openai", "gpt-5.6-sol"): 0.50e-6,
+    ("openai", "gpt-5.6-terra"): 0.25e-6,
+    ("openai", "gpt-5.6-luna"): 0.10e-6,
     ("openai", "gpt-5.5"): 0.50e-6,
     ("openai", "gpt-5.4"): 0.25e-6,
     ("openai", "gpt-5.4-mini"): 0.075e-6,

@@ -130,14 +130,22 @@ def test_openai_schema_accepts_known_knobs():
     provider = get_provider(LLMProviderName.OPENAI)
     validated = provider.validate_settings(
         {
-            "model": "gpt-5.4",
-            "reasoning_effort": "minimal",
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "max",
             "verbosity": "low",
             "service_tier": "flex",
         }
     )
-    assert validated["reasoning_effort"] == "minimal"
+    assert validated["reasoning_effort"] == "max"
     assert validated["verbosity"] == "low"
+
+
+def test_openai_schema_rejects_retired_minimal_effort():
+    # `minimal` left the schema with the 5.6 picker cycle — no current model
+    # accepts it, so the enum rejects it up front instead of 400ing at dispatch.
+    provider = get_provider(LLMProviderName.OPENAI)
+    with pytest.raises(ValueError):
+        provider.validate_settings({"reasoning_effort": "minimal"})
 
 
 def test_openai_schema_rejects_unknown_model():
