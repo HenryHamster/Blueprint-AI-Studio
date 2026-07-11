@@ -3349,6 +3349,18 @@ async def _build_recent_interventions(
     # window. Lets the agent see "direction X shipped N things since my
     # last cycle" without having to cross-correlate merges[] by direction_id.
     per_direction_delta: list[dict[str, Any]] = []
+    # Stranded-PR reconciliation pairs — PLAIN-VALUE snapshots (task_id,
+    # had_pr_merged), never ORM instances — collected during the loops below
+    # and drained after them, each pair on its OWN fresh session (the #13191
+    # post-commit-fresh-session pattern). Rationale:
+    # discount_stranded_pr_from_direction_credit's best-effort except path
+    # rolls back the session it is handed, and a rollback expires EVERY
+    # instance loaded in that session (regardless of expire_on_commit=False).
+    # Run inline on the shared session, one failed discount made the next
+    # iteration's `t.context` read — and the caller's later `project` reads
+    # (_spawn_strategic_review → source_ref_validation) — fire a sync
+    # lazy-load → MissingGreenlet and abort the whole autonomous spawn cycle.
+    _stranding_queue: list[tuple[uuid.UUID, bool]] = []
     for d in project.directions or []:
         d_id = d.get("id")
         if not d_id or d.get("status") != "active":
@@ -3411,12 +3423,11 @@ async def _build_recent_interventions(
             if merge_verdict == "verified_not_landed" and (t.context or {}).get(
                 LANDED_ON_INTEGRATION_KEY
             ) is not False:
-                _had_pr_merged = bool((t.context or {}).get("pr_merged"))
-                mark_stranded_non_landing(
-                    t, reason="cycle_start_reconciliation_ancestry_check"
-                )
-                await discount_stranded_pr_from_direction_credit(
-                    t, session, had_pr_merged=_had_pr_merged
+                # Deferred: see _stranding_queue above — snapshot plain values
+                # only; the pair runs later on its own fresh session so a
+                # failure can never poison this session's loaded instances.
+                _stranding_queue.append(
+                    (t.id, bool((t.context or {}).get("pr_merged")))
                 )
         if recent_merges_dicts:
             entry["recent_merged_titles"] = recent_merges_dicts[
@@ -3509,6 +3520,45 @@ async def _build_recent_interventions(
                 if len(_slot["merge_titles"]) < 5:
                     _slot["merge_titles"].append(_m.get("pr_title") or "")
         undeployed_directions = list(_undeployed_by_dir.values())
+
+    # Cycle-start stranded-PR reconciliation — each queued pair runs on its
+    # OWN fresh session (#13191 post-commit-fresh-session pattern): the task
+    # is re-fetched by id, marked stranded, discounted, and committed there.
+    # A failure rolls back only that private session — the shared `session`
+    # and every instance loaded in it (including `project`, which the caller
+    # _spawn_strategic_review keeps reading) are never touched. Each pair is
+    # individually guarded, so one task's failure skips just that task (it
+    # simply re-strands next cycle) and never aborts the interventions build
+    # or the remaining strandings. Guard logging uses the snapshotted id, not
+    # ORM attributes — an attribute read on an expired instance would itself
+    # raise MissingGreenlet inside the except.
+    if _stranding_queue:
+        from app.database import AsyncSessionLocal as _StrandSession
+
+        for _st_task_id, _st_had_pr_merged in _stranding_queue:
+            try:
+                async with _StrandSession() as _st_session:
+                    _st_task = await _st_session.get(Task, _st_task_id)
+                    if _st_task is None:
+                        continue
+                    mark_stranded_non_landing(
+                        _st_task, reason="cycle_start_reconciliation_ancestry_check"
+                    )
+                    await discount_stranded_pr_from_direction_credit(
+                        _st_task, _st_session, had_pr_merged=_st_had_pr_merged
+                    )
+                    # Persist the stranding marker even when the discount
+                    # early-returned before its own commit (e.g. missing
+                    # research_task_id / direction attribution) — marker
+                    # durability must not depend on discount applicability.
+                    # No-op when the discount already committed.
+                    await _st_session.commit()
+            except Exception:  # noqa: BLE001 — per-pair isolation is the point
+                logger.warning(
+                    "[STRATEGIC] stranded-PR reconciliation failed for task %s",
+                    _st_task_id,
+                    exc_info=True,
+                )
 
     result: dict[str, Any] = {
         "merges": merges_out,

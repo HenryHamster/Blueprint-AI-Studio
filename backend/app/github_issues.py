@@ -159,8 +159,10 @@ async def submit_pr_review(
 
     Fetches the HEAD commit SHA first, then POSTs the review.
 
-    Handles the two distinct 422 causes separately so a review is always
-    posted and no futile retries are wasted:
+    Handles the two distinct 422 causes so a review is always posted and no
+    futile retries are wasted. GitHub reports only ONE 422 cause per response,
+    so the two causes can surface in EITHER order on the same review and must
+    compose — each is remediated at most once (max 3 POSTs total):
 
     * **Self-authored review** — GitHub forbids APPROVE / REQUEST_CHANGES on a
       PR you authored (only COMMENT is allowed). The verdict already lives in
@@ -169,7 +171,7 @@ async def submit_pr_review(
       author differs from the reviewing identity (future separate-reviewer or
       external-contributor PRs).
     * **Bad inline comments** — a comment anchored to a path/line outside the
-      diff. We drop the inline comments and retry with the original event.
+      diff. We drop the inline comments and retry, keeping the current event.
 
     Returns None on 404.
     """
@@ -203,23 +205,36 @@ async def submit_pr_review(
 
     response = await _post()
 
-    if response.status_code == 422 and _is_self_review_422(response.text):
-        # Self-authored PR: GitHub rejects APPROVE/REQUEST_CHANGES. The verdict
-        # is already in the review body — submit it as a COMMENT review instead.
-        logger.info(
-            f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — self-authored, "
-            f"downgrading event {event!r} -> 'COMMENT' and retrying"
-        )
-        payload["event"] = "COMMENT"
-        response = await _post()
-
-    if response.status_code == 422:
-        # Remaining 422 cause: inline comments anchored outside the diff.
-        # Retry without them so a review is still posted.
-        logger.warning(
-            f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — retrying without inline comments: {response.text[:300]}"
-        )
-        payload["comments"] = []
+    # GitHub reports one 422 cause at a time, so a comments-422 on the first
+    # POST can mask a self-review-422 (and vice versa) — seen in production as
+    # "Path could not be resolved" followed by "Can not request changes on
+    # your own pull request". Remediate each cause at most once, in whatever
+    # order GitHub surfaces them: up to 2 remediation retries (3 POSTs total).
+    event_downgraded = False
+    for _ in range(2):
+        if response.status_code != 422:
+            break
+        if _is_self_review_422(response.text) and not event_downgraded:
+            # Self-authored PR: GitHub rejects APPROVE/REQUEST_CHANGES. The
+            # verdict is already in the review body — submit it as a COMMENT
+            # review instead.
+            logger.info(
+                f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — self-authored, "
+                f"downgrading event {event!r} -> 'COMMENT' and retrying"
+            )
+            payload["event"] = "COMMENT"
+            event_downgraded = True
+        elif payload["comments"]:
+            # Other 422 cause: inline comments anchored outside the diff.
+            # Retry without them so a review is still posted.
+            logger.warning(
+                f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — retrying without inline comments: {response.text[:300]}"
+            )
+            payload["comments"] = []
+        else:
+            # Both remediations exhausted (or inapplicable) — fall through to
+            # the generic non-2xx handling below.
+            break
         response = await _post()
 
     if response.status_code == 404:

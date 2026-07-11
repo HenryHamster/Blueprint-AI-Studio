@@ -319,6 +319,11 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                     Task.account_id,
                                     Task.vm_instance_id,
                                     Task.description,
+                                    # Read by classify_failure → _stuck_llm_call_no_progress
+                                    # (failure_classification.py); without it the raiseload
+                                    # error is silently swallowed there and the RATE_LIMIT
+                                    # reclassification is disabled.
+                                    Task.api_call_summary,
                                     raiseload=True,
                                 )
                             )

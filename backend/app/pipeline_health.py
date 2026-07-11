@@ -248,6 +248,11 @@ async def compute_pipeline_health_summary(
                 Task.latest_status_message,
                 Task.payloads,
                 Task.status_log,
+                # Read by classify_failure → _stuck_llm_call_no_progress
+                # (failure_classification.py); without it the raiseload error is
+                # silently swallowed there and the RATE_LIMIT reclassification
+                # is disabled.
+                Task.api_call_summary,
             raiseload=True,)
         )
         .order_by(Task.created_at.desc())

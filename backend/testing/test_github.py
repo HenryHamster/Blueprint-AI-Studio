@@ -3938,6 +3938,52 @@ async def test_submit_pr_review_self_authored_then_bad_comments(mocker):
 
 
 @pytest.mark.asyncio
+async def test_submit_pr_review_bad_comments_then_self_authored(mocker):
+    """
+    Regression (prod PR #14176, 2026-07-11): GitHub reports one 422 cause at a
+    time, so a bad-inline-comments 422 can MASK a self-review 422. The first
+    POST returns "Path could not be resolved"; the comments-stripped retry then
+    returns "Can not request changes on your own pull request". The handler
+    must remediate the second cause too (downgrade to COMMENT) instead of
+    raising — three POSTs, final payload COMMENT with no inline comments.
+    """
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(
+                422,
+                {"message": "Validation Failed"},
+                text="Path could not be resolved",
+            ),
+            MockResponse(
+                422,
+                {},
+                text="Can not request changes on your own pull request",
+            ),
+            MockResponse(201, {"id": 14176, "state": "COMMENTED"}),
+        ],
+    )
+
+    inline = [{"path": "gone.py", "line": 12, "body": "[MAJOR] anchored outside diff"}]
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 14176, "REQUEST_CHANGES", "verdict body", inline
+    )
+
+    assert result == {"id": 14176, "state": "COMMENTED"}
+    assert req.await_count == 3
+    # First retry: comments stripped, event still REQUEST_CHANGES.
+    assert req.await_args_list[1].kwargs["json"]["event"] == "REQUEST_CHANGES"
+    assert req.await_args_list[1].kwargs["json"]["comments"] == []
+    # Second retry: event downgraded to COMMENT, comments stay stripped.
+    assert req.await_args_list[2].kwargs["json"]["event"] == "COMMENT"
+    assert req.await_args_list[2].kwargs["json"]["comments"] == []
+
+
+@pytest.mark.asyncio
 async def test_submit_pr_review_404_returns_none(mocker):
     """A 404 from the reviews endpoint returns None (PR gone)."""
     from app.github import submit_pr_review

@@ -370,6 +370,86 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_evaluating_sweep_projection_loads_api_call_summary(eval_db, mocker):
+    """Regression: the EVALUATING sweep's per-row load_only(..., raiseload=True)
+    projection (recovery_evaluating.py Phase B) must include Task.api_call_summary.
+    classify_failure → _stuck_llm_call_no_progress (failure_classification.py)
+    reads it inside a broad ``try/except Exception: return False`` — when the
+    projection omits the column the raiseload InvalidRequestError is silently
+    swallowed and the silent-provider-hang → RATE_LIMIT reclassification is
+    disabled for every failure classified by this sweep (misclassified as
+    AGENT_TIMEOUT/CODE_ERROR, skewing retry budgets and analytics)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    project = Project(name="Projection Regression Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    summary = {"llm_call_count": 3, "total_output_tokens": 0}
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-running task"}],
+        status=TaskStatus.EVALUATING,
+        api_call_summary=summary,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # A non-terminal child prevents the missed-rollup path from firing,
+    # allowing the hard-timeout classify path to run instead.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+
+    # Spy on classify_failure at the hard-timeout call site: read
+    # api_call_summary off the SAME projected instance the sweep loaded.
+    # Pre-fix this read raises raiseload's InvalidRequestError (which
+    # _stuck_llm_call_no_progress would swallow, silently disabling the
+    # reclassification); post-fix the value round-trips.
+    from app.failure_classification import classify_failure as _real_classify
+
+    seen: dict = {}
+
+    def _spy(task, *args, **kwargs):
+        if task.id == parent.id:
+            seen["api_call_summary"] = task.api_call_summary
+        return _real_classify(task, *args, **kwargs)
+
+    mocker.patch("app.failure_classification.classify_failure", side_effect=_spy)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED but got {parent.status}"
+    )
+    assert seen.get("api_call_summary") == summary, (
+        "classify_failure received a projected Task without api_call_summary "
+        f"loaded (got {seen!r}) — the sweep projection must include the column"
+    )
+
+
+@pytest.mark.asyncio
 async def test_evaluating_hard_timeout_preserves_parked_child(eval_db, mocker):
     """Regression: a PARKED child of a hard-timed-out EVALUATING parent must NOT be
     cascade-CANCELLED. PARKED is a durable non-terminal state (in-flight wake
