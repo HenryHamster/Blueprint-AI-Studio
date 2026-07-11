@@ -958,6 +958,33 @@ async def _handle_infra_failure(
         else None
     )
 
+    # Phase 1b read: compose already-resolved dimension facts from the per-dimension
+    # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
+    # visible in the verdict instead of being discarded by a transient infra defer
+    # on a DIFFERENT gate.  Best-effort — any read failure leaves resolved_dimensions
+    # empty and the infra-failure hold proceeds exactly as before.
+    resolved_dimensions: dict[str, Any] = {}
+    _ledger_candidate_sha = qual.get("candidate_sha")
+    if _ledger_candidate_sha:
+        try:
+            _prior = await _rq._load_prior_dimension_results(
+                session, version, _ledger_candidate_sha
+            )
+            _resolved_statuses = _rq._LEDGER_RESOLVED_STATUSES
+            for _dim, _row in _prior.items():
+                if _row.status in _resolved_statuses:
+                    resolved_dimensions[_dim] = {
+                        "status": _row.status,
+                        "sub_score": _row.sub_score,
+                        "blocker": _row.blocker,
+                    }
+        except Exception:  # noqa: BLE001 — read is best-effort, never fatal
+            resolved_dimensions = {}
+
+    if resolved_dimensions:
+        record["resolved_dimensions"] = resolved_dimensions
+        flag_modified(version, "last_qualification")
+
     if (
         current_streak >= _MIN_INFRA_ERROR_STREAK
         and current_streak % _MIN_INFRA_ERROR_STREAK == 0
@@ -1040,10 +1067,12 @@ async def _handle_infra_failure(
         current_streak,
     )
     promotion_enabled = resolve_project_promotion_enabled(version.project_id)
+    _verdict_sub_scores: dict[str, Any] = {"infra_failure": infra_evidence}
+    _verdict_sub_scores.update(resolved_dimensions)
     await _record_qualification_verdict(
         session,
         version,
-        {**record, "sub_scores": {"infra_failure": infra_evidence}},
+        {**record, "sub_scores": _verdict_sub_scores},
         terminal_status="infra_failure",
         would_promote=False,
         promotion_enabled=promotion_enabled,

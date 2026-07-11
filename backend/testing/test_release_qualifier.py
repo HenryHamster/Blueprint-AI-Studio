@@ -10011,6 +10011,89 @@ async def test_ledger_integrity_infra_failure_does_not_overwrite_passed_audit(
 
 
 @pytest.mark.asyncio
+async def test_infra_failure_surfaces_passed_audit_from_ledger(db_session):
+    """A passed audit dimension already in the per-dimension ledger is surfaced in
+    version.last_qualification['resolved_dimensions'] and in the recorded
+    QualificationVerdict sub_scores when a DIFFERENT gate (migration_identity) hits
+    a transient infra defer.
+
+    Acceptance evidence for criterion c-1caa7785 (Phase 1b read cutover): the
+    infra-failure verdict must not be a black-box 'everything unknown' — already-
+    resolved dimension facts survive the transient defer on an unrelated gate.
+    """
+    from app import release_qualifier_audit as rqa
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed an already-passed audit row for this candidate tree, simulating an
+    # earlier eager write that completed the audit gate before migration_identity
+    # hit a transient infra defer.
+    await _seed_dimension_row(
+        db_session, project, version, "audit", status="passed", sub_score=1.0
+    )
+    await db_session.flush()
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_identity_check_unavailable",
+    )
+    await db_session.commit()
+
+    # Infra-failure hold is still in place — control flow is unchanged.
+    assert result["status"] == "infra_failure"
+    assert result["failing_dimension"] == "migration_identity"
+
+    # version.last_qualification must surface the passed audit via resolved_dimensions.
+    lq = version.last_qualification
+    assert "resolved_dimensions" in lq, (
+        "resolved_dimensions missing from last_qualification — passed audit was discarded"
+    )
+    assert "audit" in lq["resolved_dimensions"], (
+        "audit not present in resolved_dimensions despite having a passed ledger row"
+    )
+    assert lq["resolved_dimensions"]["audit"]["status"] == "passed"
+    assert lq["resolved_dimensions"]["audit"]["sub_score"] == 1.0
+
+    # The failing dimension (migration_identity) must NOT appear among resolved facts
+    # — it was just marked unavailable, not resolved.
+    assert "migration_identity" not in lq["resolved_dimensions"], (
+        "migration_identity should not appear in resolved_dimensions"
+    )
+
+    # The recorded QualificationVerdict sub_scores must also expose the passed audit.
+    verdict_row = (
+        await db_session.execute(
+            select(QualificationVerdict).where(
+                QualificationVerdict.release_version_id == version.id
+            ).order_by(QualificationVerdict.finalized_at.desc())
+        )
+    ).scalars().first()
+    assert verdict_row is not None, "no QualificationVerdict recorded"
+    assert verdict_row.sub_scores is not None, "QualificationVerdict.sub_scores is None"
+    assert "infra_failure" in verdict_row.sub_scores, "infra_failure sub_score missing"
+    assert "audit" in verdict_row.sub_scores, (
+        "audit not surfaced in QualificationVerdict sub_scores"
+    )
+    assert verdict_row.sub_scores["audit"]["status"] == "passed"
+    assert verdict_row.sub_scores["audit"]["sub_score"] == 1.0
+    assert "migration_identity" not in verdict_row.sub_scores, (
+        "migration_identity (unavailable) must not appear in verdict sub_scores"
+    )
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_ledger_empty_on_redrive(db_session, mocker):
     """When the per-dimension ledger is completely empty at the promotion gate
     on a RE-DRIVE (qualification_attempts > 1), the promotion is HELD as an
