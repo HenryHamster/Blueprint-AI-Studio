@@ -4828,7 +4828,7 @@ class TestMessages:
 
     @pytest.mark.asyncio
     async def test_canonical_message_arm_rollback_does_not_500(
-        self, client: AsyncClient, db_session
+        self, client: AsyncClient, db_session, expire_fidelity
     ):
         """Under real row contention the arm path rolls the session back to
         clear the aborted bounded-lock acquire, which EXPIRES the

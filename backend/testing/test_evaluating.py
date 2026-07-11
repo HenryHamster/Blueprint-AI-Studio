@@ -442,7 +442,7 @@ async def test_evaluating_hard_timeout_preserves_parked_child(eval_db, mocker):
 
 @pytest.mark.asyncio
 async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired(
-    eval_db, mocker
+    eval_db, expire_fidelity, mocker
 ):
     """Regression: the hard-timeout path must broadcast terminal status LITERALS
     (parent FAILED, child CANCELLED), never a post-commit task.status/child.status
@@ -465,26 +465,15 @@ async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     async def _expire_alert(task, session, *args, **kwargs):
-        # Mimic the prod poison/rollback: rewrite the persisted parent + children
-        # status to a non-terminal sentinel and expire the instances, so a
-        # post-commit ORM status read would lazy-load the WRONG value (an
-        # autoflush would otherwise persist the in-memory terminal status and
-        # mask the bug). The literal-based broadcast must be immune.
-        from sqlalchemy import update
-
-        kids = (
-            (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
-            .scalars()
-            .all()
-        )
-        await session.execute(
-            update(Task)
-            .where((Task.id == task.id) | (Task.parent_task_id == task.id))
-            .values(status=TaskStatus.QUEUED)
-        )
-        for k in kids:
-            session.expire(k)
-        session.expire(task)
+        # Simulate a production rollback that reverts pending changes and
+        # expires all tracked instances (rollback always expires, regardless
+        # of expire_on_commit). After this, the handler's pending status
+        # mutations (task.status=FAILED, child.status=CANCELLED) are
+        # reverted in the DB, and all loaded attributes (including FK and
+        # PK) are expired. The broadcast must use FAILED/CANCELLED literals
+        # and pre-captured identifiers — not post-rollback lazy-loads that
+        # would return stale pre-timeout status or crash MissingGreenlet.
+        await session.rollback()
 
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", side_effect=_expire_alert

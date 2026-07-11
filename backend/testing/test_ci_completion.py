@@ -3053,7 +3053,7 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
-    db_session, mocker
+    db_session, expire_fidelity, mocker
 ):
     """Regression for the ci_completion.py fix-spawn broadcast MissingGreenlet.
 

@@ -201,6 +201,18 @@ async def _handle_evaluating_hard_timeout(
                     f"[EVAL TIMEOUT] Failed to close PR #{child_pr}: {pr_err}"
                 )
 
+    # Pre-capture identifiers before the alert. The alert (which may
+    # fail and trigger a rollback) and the subsequent commit can expire
+    # the session's instances — even PK attributes (due to dict_.clear()
+    # in InstanceState._expire) require a lazy-load that crashes with
+    # MissingGreenlet on asyncpg.  Capture literals now and use them in
+    # the post-commit broadcast instead of reading from expired instances.
+    _bcast_project_id = str(task.project_id)
+    _bcast_parent_id = str(task.id)
+    _bcast_child_ids = [
+        str(c.id) for c in non_terminal_children
+    ]
+
     # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
     await maybe_create_failure_alert(
         task,
@@ -211,17 +223,17 @@ async def _handle_evaluating_hard_timeout(
     # task.status=FAILED / children=CANCELLED were set above; the
     # PR-close calls + alert + commit can poison/expire these
     # instances, so broadcast the known literals rather than
-    # post-commit lazy-loads. child.id (PK) is always safe to read.
+    # post-commit lazy-loads on expired instances.
     await services.broadcast_to_project(
-        str(task.project_id),
+        _bcast_project_id,
         "task_updated",
-        {"task_id": str(task.id), "status": TaskStatus.FAILED},
+        {"task_id": _bcast_parent_id, "status": TaskStatus.FAILED},
     )
-    for child in non_terminal_children:
+    for child_id in _bcast_child_ids:
         await services.broadcast_to_project(
-            str(task.project_id),
+            _bcast_project_id,
             "task_updated",
-            {"task_id": str(child.id), "status": TaskStatus.CANCELLED},
+            {"task_id": child_id, "status": TaskStatus.CANCELLED},
         )
     for child_vm in vms_to_delete:
         await _ensure_vm_deleted(child_vm, reason="parent_eval_timeout")

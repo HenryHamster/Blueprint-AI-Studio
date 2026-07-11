@@ -14789,7 +14789,7 @@ class TestDesignDocCompletionStrategistEvent:
 
     @pytest.mark.asyncio
     async def test_phase2_raise_writes_retry_marker_even_when_task_expired(
-        self, strat_fail_db, mocker
+        self, strat_fail_db, expire_fidelity, mocker
     ):
         """The except path must rely only on pre-captured identifiers: a failed
         spawn that expires the Task instance previously raised MissingGreenlet
@@ -14912,7 +14912,7 @@ class TestDesignDocCompletionStrategistEvent:
 
     @pytest.mark.asyncio
     async def test_deferred_path_survives_task_and_project_expiry(
-        self, strat_fail_db, mocker
+        self, strat_fail_db, expire_fidelity, mocker
     ):
         """Deferred Phase 2 on an expired session must stay whole.
 
