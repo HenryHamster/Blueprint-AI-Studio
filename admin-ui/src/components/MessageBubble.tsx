@@ -6,6 +6,7 @@ import { MarkdownContent } from './MarkdownContent';
 import type { CitationState, MessageAttachment, ProjectMessage, ProjectMessageContext, ProvenanceWarnings } from '../types/messages';
 import { buildMessageStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
+import { AttachmentPreviewModal } from './AttachmentPreviewModal';
 
 export type { ProjectMessage, ProjectMessageContext } from '../types/messages';
 
@@ -121,29 +122,43 @@ const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: s
   },
 };
 
-function AttachmentThumbnails({ attachments }: { attachments: MessageAttachment[] }) {
+function AttachmentThumbnails({ attachments, onPreview }: { attachments: MessageAttachment[]; onPreview: (att: MessageAttachment) => void }) {
   if (!attachments.length) return null;
   return (
     <div className="mt-2 flex flex-wrap gap-2">
       {attachments.map((att, i) => {
         if (att.mime_type?.startsWith('image/') && att.data) {
           return (
-            <img
+            <button
               key={i}
-              src={`data:${att.mime_type};base64,${att.data}`}
-              alt={att.name || 'Image attachment'}
-              className="max-h-48 max-w-full rounded border border-neutral-700/60 object-contain"
-            />
+              type="button"
+              onClick={() => onPreview(att)}
+              className="cursor-pointer border-0 bg-transparent p-0 leading-none"
+              aria-label={`Preview ${att.name || 'image'}`}
+              data-viewport-allow-small-target
+            >
+              <img
+                src={`data:${att.mime_type};base64,${att.data}`}
+                alt={att.name || 'Image attachment'}
+                className="max-h-48 max-w-full rounded border border-neutral-700/60 object-contain"
+              />
+            </button>
           );
         }
         return (
-          <div key={i} className="inline-flex items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300">
+          <button
+            key={i}
+            type="button"
+            onClick={() => onPreview(att)}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300 hover:border-neutral-500/60 transition-colors"
+            aria-label={`Preview ${att.name || att.mime_type || 'File'}`}
+          >
             <FileText className="h-3.5 w-3.5 shrink-0 text-neutral-500" />
             <span className="max-w-[200px] truncate">{att.name || att.mime_type || 'File'}</span>
             {att.size_bytes != null && (
               <span className="text-neutral-500 shrink-0">({att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)</span>
             )}
-          </div>
+          </button>
         );
       })}
     </div>
@@ -280,6 +295,7 @@ export const MessageBubble = memo(function MessageBubble({
   onReply,
   onOpenStrategicContext,
 }: MessageBubbleProps) {
+  const [previewAttachment, setPreviewAttachment] = useState<MessageAttachment | null>(null);
   const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
   const Icon = config.icon;
   const userMsg = isUserMessage(msg);
@@ -308,6 +324,7 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   return (
+    <>
     <div
       data-testid="message-bubble"
       data-message-id={msg.id}
@@ -405,7 +422,7 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
           {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (
-            <AttachmentThumbnails attachments={msg.context.attachments} />
+            <AttachmentThumbnails attachments={msg.context.attachments} onPreview={setPreviewAttachment} />
           )}
           {showOpsChrome && <StaleCitationBadge msg={msg} />}
           {/* Context badges */}
@@ -565,5 +582,13 @@ export const MessageBubble = memo(function MessageBubble({
         )}
       </div>
     </div>
+    {previewAttachment && (
+      <AttachmentPreviewModal
+        attachment={previewAttachment}
+        open={true}
+        onClose={() => setPreviewAttachment(null)}
+      />
+    )}
+    </>
   );
 });
