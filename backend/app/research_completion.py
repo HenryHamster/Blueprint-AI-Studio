@@ -4804,6 +4804,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _spawn_criterion_ids = _direction_criterion_cache.get(
             _spawn_effective_dir_id or "", []
         )
+        # Fall back to the parent task's own criterion_ids when the direction
+        # cache has no entry (e.g. corroboration tasks that carry criterion_ids
+        # directly on the Task row but have no direction_id). Without this
+        # fallback, research children spawned from a corroboration task would
+        # inherit empty criterion_ids and record_task_merge_evidence would
+        # produce no evidence, defeating the attestation->covered upgrade.
+        if not _spawn_criterion_ids and task.criterion_ids:
+            _spawn_criterion_ids = list(task.criterion_ids)
         new_task = Task(
             project_id=task.project_id,
             title=title,

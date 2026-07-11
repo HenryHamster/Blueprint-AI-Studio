@@ -91,6 +91,13 @@ _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 _STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
 _STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
 
+# How long before an operator attestation expires the system starts warning
+# the operator.  Attestations carry ATTESTATION_WINDOW_DAYS (7 days) from
+# attested_at; when the remaining time drops below this threshold, an
+# 'attestation_expiring_soon' attention item surfaces so the operator can
+# re-attest or provide evidence before the criterion lapses to 'partial'.
+_ATTESTATION_EXPIRY_WARNING_BEFORE = timedelta(days=2)
+
 # Scalar columns consumed by _task_attention_item / build_task_movement_explanation.
 # Used with load_only(..., raiseload=True) on every bare select(Task) for attention
 # item builders to avoid transferring large JSONB blobs that are never read there.
@@ -125,6 +132,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "attestation_expired"): 67,
     ("needs_operator", "corroboration_failed"): 68,
+    ("needs_operator", "attestation_expiring_soon"): 69,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "churn_retirement_recommended"): 72,
     ("needs_operator", "stale_completion_debt"): 75,
@@ -252,6 +260,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed_or_re_attested",
         "operator_action": "re_attest_or_provide_evidence",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "attestation_expiring_soon": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed_or_re_attested_or_expires",
+        "operator_action": "re_attest_or_provide_machine_evidence",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -736,6 +751,47 @@ def _attestation_expired_attention_item(
         "detail": _compact_text(
             f"Criterion '{criterion_text}' was operator-attested but the "
             f"attestation window has expired — re-attest or provide evidence",
+            max_chars=180,
+        ),
+        "criterion_key": criterion_key,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "ref": {
+            "kind": "acceptance_criterion",
+            "id": criterion_key,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "manage",
+        }),
+    }
+
+
+def _attestation_expiring_soon_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    criterion_key: str,
+    criterion_text: str,
+) -> dict[str, Any]:
+    """Attention item for an active criterion whose operator attestation is about to expire.
+
+    The attestation is still valid (coverage='attested') but the remaining
+    time before TTL expiry is below the warning threshold.  The operator
+    should re-attest or provide machine evidence so the criterion does not
+    lapse to 'partial' coverage.
+    """
+    return {
+        "id": f"version:{version.id}:attestation_expiring_soon:{criterion_key}",
+        "kind": "acceptance_criterion",
+        "severity": "needs_operator",
+        "reason": "attestation_expiring_soon",
+        "label": "Attestation approaching expiry",
+        "detail": _compact_text(
+            f"Criterion '{criterion_text}' was operator-attested and is "
+            f"approaching its expiry window — re-attest or provide "
+            f"machine evidence before the criterion lapses",
             max_chars=180,
         ),
         "criterion_key": criterion_key,
@@ -2058,6 +2114,8 @@ async def build_operator_attention(
     coverage_blocked_count = 0
     attestation_expired_count = 0
     attestation_expired_items: list[dict[str, Any]] = []
+    attestation_expiring_count = 0
+    attestation_expiring_items: list[dict[str, Any]] = []
     corroboration_failed_count = 0
     corroboration_failed_items: list[dict[str, Any]] = []
     failed_corroboration_keys: set[str] = set()
@@ -2124,6 +2182,32 @@ async def build_operator_attention(
                                     criterion.get("text", ""),
                                 )
                             )
+                # Detect attestations approaching expiry: active criteria with
+                # 'attested' coverage whose TTL is close to lapsing.  Unlike the
+                # 'partial' branches above (already-lapsed), this is a proactive
+                # warning — the attestation is still valid but will soon expire
+                # and drop coverage to 'partial'.
+                elif (
+                    criterion.get("status") == "active"
+                    and criterion.get("coverage") == "attested"
+                ):
+                    expiry_str = criterion.get("attestation_expires_at")
+                    if expiry_str is not None:
+                        try:
+                            expiry_dt = datetime.fromisoformat(str(expiry_str))
+                            if _utcnow() >= expiry_dt - _ATTESTATION_EXPIRY_WARNING_BEFORE:
+                                ck = criterion["criterion_key"]
+                                attestation_expiring_count += 1
+                                attestation_expiring_items.append(
+                                    _attestation_expiring_soon_attention_item(
+                                        project.id,
+                                        open_version,
+                                        ck,
+                                        criterion.get("text", ""),
+                                    )
+                                )
+                        except (TypeError, ValueError):
+                            pass
             stuck_by_key = {
                 c["criterion_key"]: c
                 for c in coverage.get("criteria", [])
@@ -2240,6 +2324,8 @@ async def build_operator_attention(
         add_candidate(item)
     for item in attestation_expired_items:
         add_candidate(item)
+    for item in attestation_expiring_items:
+        add_candidate(item)
     for item in corroboration_failed_items:
         add_candidate(item)
     for alert in alerts:
@@ -2292,6 +2378,7 @@ async def build_operator_attention(
         + stuck_criteria_count
         + coverage_blocked_count
         + attestation_expired_count
+        + attestation_expiring_count
         + corroboration_failed_count
         + (1 if stale_debt_count > 0 else 0)
     )
@@ -2361,6 +2448,7 @@ async def build_operator_attention(
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
             "attestation_expired": attestation_expired_count,
+            "attestation_expiring": attestation_expiring_count,
             "corroboration_failed": corroboration_failed_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,

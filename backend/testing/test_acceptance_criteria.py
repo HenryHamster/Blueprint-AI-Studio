@@ -844,6 +844,59 @@ async def test_fresh_attestation_no_expiry_attention_item(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_attestation_approaching_expiry_warns_before_lapse(db_session):
+    """A near-expiry operator attestation emits attestation_expiring_soon attention.
+
+    When the attestation is still valid (coverage='attested') but within the
+    warning window of its TTL, build_operator_attention must surface an
+    'attestation_expiring_soon' item so the operator can re-attest or provide
+    machine evidence before the criterion lapses to 'partial'.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Near-expiry attestation criterion"
+    )
+    # Set attested_at so the attestation expires in ~1 day — well within the
+    # 2-day warning window.
+    near_expiry_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS - 1)
+    ).isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": near_expiry_at, "reason": "still valid but close"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["attestation_expiring"] == 1, (
+        f"Expected 1 attestation_expiring item, got "
+        f"{attention['counts'].get('attestation_expiring')}"
+    )
+    assert attention["counts"]["attestation_expired"] == 0, (
+        "A near-expiry attestation must NOT surface as already-expired"
+    )
+    expiring_id = (
+        f"version:{version.id}:attestation_expiring_soon:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert expiring_id in items_by_id, (
+        f"Expected attestation_expiring_soon item {expiring_id} in "
+        f"{list(items_by_id)}"
+    )
+    item = items_by_id[expiring_id]
+    assert item["reason"] == "attestation_expiring_soon"
+    assert item["label"] == "Attestation approaching expiry"
+    assert "re-attest" in item["detail"].lower()
+    assert item["release_version_id"] == str(version.id)
+    assert item["criterion_key"] == criterion.criterion_key
+
+
 def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
     """When NO criterion carries machine-verified evidence (covered=0, attested>0),
     the attestation penalty is DOUBLED — escalation beyond the flat proportional penalty.
@@ -7070,4 +7123,158 @@ async def test_reattest_after_failed_corroboration_restores_attested(
     assert corrob_id not in items_by_id, (
         f"Expected NO corroboration_failed item for re-attested criterion, "
         f"but found {items_by_id[corrob_id]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_corroboration_child_inherits_criterion_ids_and_upgrades_attested_to_covered(
+    db_session, mocker
+):
+    """A child task spawned from a corroboration parent (which carries
+    criterion_ids on the Task row but has no direction_id) must inherit the
+    parent's criterion_ids, so that when the child task completes with a
+    proven acceptance verdict the criterion coverage upgrades from 'attested'
+    to 'covered'.
+
+    This is the load-bearing happy path of the attestation tier — that an
+    operator attestation is provisional until a verification task produces
+    machine-verified evidence. Without this inheritance chain the corroboration
+    flow can never actually upgrade a criterion to 'covered'.
+    """
+    from app.models import ReleaseVersion
+    from app import acceptance_criteria as _ac
+
+    project = await _make_project(db_session, "Corroboration-Upgrade")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _ac.create_criterion(
+        db_session, project.id, version.id,
+        "Criterion for corroboration upgrade test",
+    )
+    criterion_key = criterion.criterion_key
+
+    # Step 1: Record operator attestation evidence.
+    fresh_at = _utcnow().isoformat()
+    await _ac.record_evidence(
+        db_session, criterion.id, project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "provisional accept"},
+    )
+
+    # Coverage must be 'attested' before corroboration.
+    summary1 = await _ac.get_version_coverage_summary(db_session, version.id)
+    crit1 = next(c for c in summary1["criteria"] if c["criterion_key"] == criterion_key)
+    assert crit1["coverage"] == "attested", (
+        f"Expected 'attested' before corroboration, got {crit1['coverage']!r}"
+    )
+
+    # Step 2: Create a research task mimicking a corroboration task:
+    # it has criterion_ids=[criterion_key] but NO direction_id in context
+    # (the exact shape spawn_corroboration_task produces).
+    corrob_task = Task(
+        project_id=project.id,
+        title=f"Verify: {criterion_key}",
+        payloads=[{"type": "research", "base_branch": "main"}],
+        context={"research_depth": 0},
+        criterion_ids=[criterion_key],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="SYSTEM_AUTO_REVIEW",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(corrob_task)
+    await db_session.commit()
+    await db_session.refresh(corrob_task)
+
+    # Step 3: Run _handle_research_completion with a finding that has
+    # acceptance_evidence but no direction_id — just like a finding
+    # the corroboration task's research agent would produce.
+    from app.research_completion import _handle_research_completion
+    from test_autonomous_research import _patch_research_externals
+
+    finding = {
+        "title": "Verify criterion with automated test",
+        "description": "Write and run a test proving the criterion is met",
+        "prompt": "Implement a test that verifies this acceptance criterion",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_criteria.py",
+        },
+    }
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(corrob_task, "", db_session)
+
+    # Step 4: The spawned child must have inherited criterion_ids from
+    # the parent task (falling back from the empty direction cache to
+    # task.criterion_ids).
+    children = (
+        (await db_session.execute(
+            select(Task).where(Task.parent_task_id == corrob_task.id)
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, f"expected 1 spawned child, got {len(children)}"
+    child = children[0]
+    assert child.criterion_ids == [criterion_key], (
+        f"spawned child must inherit criterion_ids from parent task; "
+        f"got {child.criterion_ids!r}"
+    )
+
+    # Step 5: Simulate the child completing with a proven acceptance
+    # verdict (as a real merge-test verification would produce).
+    child.status = TaskStatus.COMPLETED
+    child.context = {
+        **(child.context or {}),
+        "code_acceptance_verdict": {
+            "satisfied": True,
+            "proven": True,
+            "kind": "named_test",
+            "reason": "CI-verified test passes",
+        },
+    }
+    await db_session.commit()
+
+    # Step 6: Record merge evidence using the child's criterion_ids.
+    recorded = await _ac.record_task_merge_evidence(
+        db_session, child, project.id
+    )
+    assert recorded >= 1, (
+        f"record_task_merge_evidence must record at least 1 evidence row "
+        f"for a child that inherited criterion_ids; got {recorded}"
+    )
+
+    # Step 7: Coverage must now be 'covered' — the task_merge evidence
+    # proves the criterion satisfied, upgrading from the provisional
+    # 'attested' tier.
+    summary2 = await _ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["covered"] >= 1, (
+        f"Expected >=1 covered after successful corroboration, "
+        f"got {summary2['covered']}"
+    )
+    assert summary2["attested"] == 0, (
+        f"Expected 0 attested after corroboration upgrade, "
+        f"got {summary2['attested']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"] if c["criterion_key"] == criterion_key
+    )
+    assert crit2["coverage"] == "covered", (
+        f"Expected 'covered' after successful corroboration, "
+        f"got {crit2['coverage']!r}"
     )
