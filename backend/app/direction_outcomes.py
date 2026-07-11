@@ -2800,22 +2800,31 @@ async def discount_stranded_pr_from_direction_credit(
     import contextlib
     import logging
 
-    ctx = task.context or {}
-    direction_id = ctx.get("direction_id")
-    research_task_id = ctx.get("research_task_id")
-    if not (direction_id and research_task_id) or task.project_id is None:
-        return
-    # Use caller-supplied snapshot when available — mark_stranded_non_landing
-    # pops pr_merged before this function is called, so ctx.get("pr_merged")
-    # would be falsy even for previously badge-counted tasks.
-    _was_badge_counted = had_pr_merged if had_pr_merged is not None else bool(ctx.get("pr_merged"))
-    if not _was_badge_counted:
-        # Never badge-counted; no stale credit to retract.
-        return
-    if ctx.get("stranded_discount_applied"):
-        # Idempotency guard: discount already applied on a prior cycle; skip.
-        return
     try:
+        # All attribute/context reads live INSIDE the try: a caller may pass a
+        # Task loaded through a load_only(..., raiseload=True) projection that
+        # omits project_id (or context), and the resulting InvalidRequestError
+        # must degrade to the best-effort warning below — not escape and abort
+        # the caller (2026-07-11: it aborted every autonomous spawn cycle via
+        # strategic_spawning._build_recent_interventions).
+        ctx = task.context or {}
+        direction_id = ctx.get("direction_id")
+        research_task_id = ctx.get("research_task_id")
+        if not (direction_id and research_task_id) or task.project_id is None:
+            return
+        # Use caller-supplied snapshot when available — mark_stranded_non_landing
+        # pops pr_merged before this function is called, so ctx.get("pr_merged")
+        # would be falsy even for previously badge-counted tasks.
+        _was_badge_counted = (
+            had_pr_merged if had_pr_merged is not None else bool(ctx.get("pr_merged"))
+        )
+        if not _was_badge_counted:
+            # Never badge-counted; no stale credit to retract.
+            return
+        if ctx.get("stranded_discount_applied"):
+            # Idempotency guard: discount already applied on a prior cycle; skip.
+            return
+
         _discount_was_applied: list[bool] = [False]
 
         def _apply_stranded_discount(dirs: list) -> None:

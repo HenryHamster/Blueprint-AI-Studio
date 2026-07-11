@@ -2767,6 +2767,12 @@ async def _build_recent_interventions(
                 # silently and the strategic cycle stalls.
                 Task.title,
                 Task.description,
+                # project_id is read by the stranded-PR discount path
+                # (direction_outcomes.discount_stranded_pr_from_direction_credit,
+                # invoked from the cycle-start reconciliation below). Excluding
+                # it raised InvalidRequestError under raiseload=True and aborted
+                # the entire per-project autonomous spawn cycle.
+                Task.project_id,
                 raiseload=True,
             )
         )
