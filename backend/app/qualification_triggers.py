@@ -107,7 +107,10 @@ def resolve_qualification_trigger(
     qualification_attempts:
         Total qualification attempt count recorded on the version.
     coverage:
-        Dict with integer "total" and "covered" keys, or None when unavailable.
+        Dict with integer "total", "covered", and (optionally) "attested" keys,
+        or None when unavailable.  "attested" counts criteria covered only by
+        operator attestation — those are treated as satisfying the gate for
+        coverage_complete purposes (matching release_scoring).
     requalification_ready:
         True when all gating not_promoted findings are ledger-resolved/stale;
         False or None when not.
@@ -152,15 +155,18 @@ def resolve_qualification_trigger(
     # Convenience helpers
     total = int((coverage or {}).get("total") or 0)
     covered = int((coverage or {}).get("covered") or 0)
-    coverage_complete = not (total > 0 and covered < total)
+    attested = int((coverage or {}).get("attested") or 0)
+    coverage_complete = not (total > 0 and (total - covered - attested) > 0)
 
     # T1 — coverage_complete: fire when coverage gate is met AND the version has
     # no conclusive verdict (never attempted, sitting at error, or not_promoted
-    # with a coverage-incomplete blocker).
+    # with a coverage-incomplete or uncorroborated-attestation blocker).
     _T1_ELIGIBLE_STATUSES = {None, "error"}
-    _T1_NOT_PROMOTED_BLOCKER = "criterion_coverage_incomplete"
+    _T1_NOT_PROMOTED_BLOCKERS = {"criterion_coverage_incomplete", "uncorroborated_attestation"}
     is_t1_eligible = status in _T1_ELIGIBLE_STATUSES or (
-        status == "not_promoted" and blocker == _T1_NOT_PROMOTED_BLOCKER
+        status == "not_promoted"
+        and blocker in _T1_NOT_PROMOTED_BLOCKERS
+        and (blocker != "uncorroborated_attestation" or covered > 0)
     )
     if is_t1_eligible and coverage_complete:
         return TriggerDecision(
@@ -178,7 +184,8 @@ def resolve_qualification_trigger(
             trigger="none",
             reason="coverage_incomplete",
             blocking=[
-                f"criterion coverage incomplete: {covered}/{total} active criteria covered"
+                f"criterion coverage incomplete: {covered}/{total} active criteria covered, "
+                f"{attested} attested"
             ],
         )
 
@@ -234,7 +241,7 @@ def resolve_qualification_trigger(
     # T4 — blockers_cleared: existing re-drive conditions surfaced through the
     # same decision shape for observability.  These mirror the existing bespoke
     # redrive functions and will remain as separate paths until Phase 1 folding.
-    if status == "not_promoted" and blocker != _T1_NOT_PROMOTED_BLOCKER:
+    if status == "not_promoted" and blocker not in _T1_NOT_PROMOTED_BLOCKERS:
         if requalification_ready is True:
             return TriggerDecision(
                 fire=True,

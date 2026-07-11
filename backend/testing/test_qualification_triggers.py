@@ -29,7 +29,7 @@ def _resolve(**kwargs):
         status=None,
         error_code=None,
         qualification_attempts=0,
-        coverage={"total": 1, "covered": 1},
+        coverage={"total": 1, "covered": 1, "attested": 0},
         requalification_ready=None,
         candidate_sha=None,
         automain_sha=None,
@@ -96,7 +96,7 @@ class TestT1CoverageComplete:
         d = _resolve(
             status="not_promoted",
             blocker="criterion_coverage_incomplete",
-            coverage={"total": 1, "covered": 1},
+            coverage={"total": 1, "covered": 1, "attested": 0},
         )
         assert d.fire
         assert d.trigger == "coverage_complete"
@@ -112,6 +112,28 @@ class TestT1CoverageComplete:
         d = _resolve(status=None, coverage=None)
         assert d.fire
         assert d.trigger == "coverage_complete"
+
+    def test_attested_only_is_not_coverage_incomplete(self):
+        # All criteria attested-only — coverage gate satisfied (matching scorer).
+        d = _resolve(status=None, coverage={"total": 2, "covered": 0, "attested": 2})
+        assert d.fire
+        assert d.trigger == "coverage_complete"
+
+    def test_mixed_attested_and_covered_fires(self):
+        # Mix of covered + attested satisfies the gate.
+        d = _resolve(status=None, coverage={"total": 3, "covered": 1, "attested": 2})
+        assert d.fire
+        assert d.trigger == "coverage_complete"
+
+    def test_attested_not_enough_when_uncovered_remains(self):
+        # Even with some attested, uncovered criteria still block.
+        d = _resolve(
+            status=None,
+            coverage={"total": 2, "covered": 0, "attested": 1},
+        )
+        assert not d.fire
+        assert d.reason == "coverage_incomplete"
+        assert "0/2" in d.blocking[0]
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +319,18 @@ class TestT4BlockersCleared:
         assert not d.fire
         assert d.reason == "findings_unresolved"
 
+    def test_not_promoted_uncorroborated_attestation_blocked_from_t4(self):
+        """T4 must not fire when blocker is uncorroborated_attestation with no
+        machine evidence — prevents infinite re-qualification loops."""
+        d = _resolve(
+            status="not_promoted",
+            blocker="uncorroborated_attestation",
+            requalification_ready=True,
+            coverage={"total": 2, "covered": 0, "attested": 2},
+        )
+        assert not d.fire
+        assert d.reason == "not_applicable"
+
 
 # ---------------------------------------------------------------------------
 # Not-applicable fallback
@@ -360,7 +394,7 @@ class TestExplainQualificationTrigger:
             status=None,
             error_code=None,
             qualification_attempts=0,
-            coverage={"total": 1, "covered": 1},
+            coverage={"total": 1, "covered": 1, "attested": 0},
             requalification_ready=None,
             candidate_sha=None,
             automain_sha=None,

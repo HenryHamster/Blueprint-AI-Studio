@@ -2444,6 +2444,12 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the merged diffs 'misses' the version goal per the blind merge-grade "
         "and the merge_grade_block_threshold is armed"
     ),
+    "uncorroborated_attestation": (
+        "all acceptance criteria rely solely on operator attestation — zero "
+        "machine-verified evidence; promotion is blocked until at least one "
+        "criterion carries machine-verified evidence (named_test, "
+        "reachability, or verified task_merge)"
+    ),
 }
 
 

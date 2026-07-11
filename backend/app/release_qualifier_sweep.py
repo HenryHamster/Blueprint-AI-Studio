@@ -1213,6 +1213,7 @@ async def _run_auto_qualification_trigger_for_version(
         coverage = {
             "total": int(coverage_raw.get("total") or 0),
             "covered": int(coverage_raw.get("covered") or 0),
+            "attested": int(coverage_raw.get("attested") or 0),
         }
     except Exception:
         logger.warning(

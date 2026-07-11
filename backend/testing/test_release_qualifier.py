@@ -32110,16 +32110,16 @@ class TestBlindMergeGradeBlock:
 
     # --- Attestation tier: penalize instead of hard-block ------------------
 
-    def test_compute_composite_attested_only_does_not_block_but_penalizes(self):
-        """An attestation-covered criterion clears the blocker but reduces confidence.
+    def test_compute_composite_attested_only_hard_blocks_and_zeroes_confidence(self):
+        """Zero-machine-evidence attestation-only coverage now hard-blocks.
 
         With perfect sub-scores (existing_confidence == 1.0), one fully-attested
         criterion, and NO machine-verified evidence (covered=0, attested=1), the
-        penalty is ATTESTATION_PENALTY_WEIGHT * (1/1) * UNCORROBORATED_PENALTY_MULTIPLIER
-        = 0.30 (doubled because the attestation is completely uncorroborated), so the
-        composite is 0.70 — non-zero (deadlock-breaker preserved) but substantially
-        below a machine-verified 1.0 and below the promotion threshold when the
-        version relied entirely on an operator waiver with zero machine corroboration.
+        uncorroborated_attestation blocker fires and forces confidence to 0.0 —
+        promotion is impossible on attestations alone without at least one
+        criterion carrying machine-verified evidence.
+        The uncorroborated_attested sub-score and attested_count remain recorded
+        for observability even under the blocker.
         """
         result = rq.compute_composite(
             ci_green=True,
@@ -32135,12 +32135,65 @@ class TestBlindMergeGradeBlock:
                 "uncovered": 0,
             },
         )
-        assert result["blocker"] is None
-        # 1.0 * (1 - 0.15 * 2.0) == 0.70
-        assert result["confidence"] == 0.70
-        assert result["promote"] is False  # 0.70 < threshold 0.75
+        assert result["blocker"] == "uncorroborated_attestation"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
         assert result["sub_scores"]["attested_count"] == 1
         assert result["sub_scores"].get("uncorroborated_attested") is True
+
+    def test_attestation_only_zero_machine_coverage_cannot_promote(self):
+        """Zero machine-verified evidence across ALL criteria hard-blocks promotion.
+
+        When every acceptance criterion is covered only by operator attestation
+        (covered=0 across all criteria), the uncorroborated_attestation blocker
+        fires regardless of how high other sub-scores are.  This is the named
+        acceptance evidence for the uncorroborated-attestation-hard-block feature.
+        """
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 3,
+                "covered": 0,
+                "attested": 3,
+                "partial": 0,
+                "uncovered": 0,
+            },
+        )
+        assert result["blocker"] == "uncorroborated_attestation"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+
+    def test_attested_criterion_still_penalizes_when_machine_evidence_exists(self):
+        """Mixed coverage (covered>0, attested>0) gets the penalty but no blocker.
+
+        When at least one criterion carries machine-verified evidence, the
+        uncorroborated_attestation blocker does NOT fire.  The proportional
+        attestation penalty (0.15 * 1/2 = 0.075 → confidence = 0.925) still
+        applies so an attestation-augmented version scores visibly below a
+        fully machine-verified one, but promotion is not hard-blocked.
+        """
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 2,
+                "covered": 1,
+                "attested": 1,
+                "partial": 0,
+                "uncovered": 0,
+            },
+        )
+        assert result["blocker"] is None
+        # penalty = 0.15 * (1/2) = 0.075 → 1.0 * 0.925 == 0.925
+        assert result["confidence"] == 0.925
+        assert result["sub_scores"]["attested_count"] == 1
 
     def test_compute_composite_attested_penalty_is_proportional(self):
         """The penalty scales with the attested fraction of total criteria."""

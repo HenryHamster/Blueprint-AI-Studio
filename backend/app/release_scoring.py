@@ -470,6 +470,13 @@ def compute_composite(
         Versions with no criteria, or callers that pass ``None`` for backward
         compatibility, skip this gate.  ``sub_scores["attested_count"]`` records
         the attested surface for observability whenever a summary is supplied.
+      * ``criterion_coverage`` reports ALL acceptance criteria covered only
+        by operator attestation with zero machine-verified evidence —
+        ``covered == 0 and attested > 0`` (``"uncorroborated_attestation"``).
+        Hard-blocks because an entirely uncorroborated version (no criterion
+        carries machine-verified evidence) must not be promotable, even when
+        other sub-scores are high.  ``sub_scores["uncorroborated_attested"]``
+        records the condition for observability alongside the blocker.
       * ``capability_proof_blocked`` is True — the capability proof gate is in
         ``"enforce"`` mode and at least one ``working`` capability lacks
         ``proven`` evidence (``"capability_proof_gate_blocked"``).  Governs the
@@ -595,6 +602,17 @@ def compute_composite(
         # clear the blocker but incur the confidence penalty applied below
         # (the attestation/backfill tier).
         blocker = "criterion_coverage_incomplete"
+    elif (
+        criterion_coverage is not None
+        and int(criterion_coverage.get("total") or 0) > 0
+        and int(criterion_coverage.get("covered") or 0) == 0
+        and int(criterion_coverage.get("attested") or 0) > 0
+    ):
+        # ALL acceptance criteria rely solely on operator attestation — zero
+        # machine-verified evidence (covered == 0).  Hard-block promotion so
+        # an entirely uncorroborated version cannot promote on attestations
+        # alone, regardless of other sub-scores.
+        blocker = "uncorroborated_attestation"
     elif capability_proof_blocked:
         # The capability proof gate is in ENFORCE mode and there are working
         # capabilities whose proof status is not ``proven`` — the gate would
@@ -634,12 +652,19 @@ def compute_composite(
     attested_count = 0
     backfilled_count = 0
     total_criteria = 0
+    covered_count = 0
     if criterion_coverage is not None:
         attested_count = int(criterion_coverage.get("attested") or 0)
         backfilled_count = int(criterion_coverage.get("backfilled") or 0)
         total_criteria = int(criterion_coverage.get("total") or 0)
+        covered_count = int(criterion_coverage.get("covered") or 0)
         sub_scores["attested_count"] = attested_count
         sub_scores["backfilled_count"] = backfilled_count
+        # Record whether attestations are completely uncorroborated (covered==0)
+        # for observability — this flag is set before the blocker early-return
+        # so operators can see it alongside the uncorroborated_attestation blocker.
+        if covered_count == 0 and attested_count > 0 and total_criteria > 0:
+            sub_scores["uncorroborated_attested"] = True
 
     if blocker is not None:
         return {
