@@ -59,6 +59,9 @@ from app.greenlet_fidelity import (
     KNOWN_UNFAITHFUL_ALLOWLIST as _KNOWN_UNFAITHFUL_ALLOWLIST,
     KNOWN_UNFAITHFUL_ALLOWLIST_CEILING as _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING,
     allowlist_within_ceiling as _allowlist_within_ceiling,
+    ROLLBACK_FLOW_ALLOWLIST as _ROLLBACK_FLOW_ALLOWLIST,
+    ROLLBACK_FLOW_ALLOWLIST_CEILING as _ROLLBACK_FLOW_ALLOWLIST_CEILING,
+    rollback_flow_allowlist_within_ceiling as _rollback_flow_allowlist_within_ceiling,
 )
 
 # ---------------------------------------------------------------------------
@@ -669,16 +672,15 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
         if arg_names & _FIDELITY_FIXTURE_NAMES:
             continue
 
-        # --- fidelity checks 4–7: body AST patterns ---
+        # --- fidelity checks 4-7: body AST patterns ---
         faithful_body = False
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
                 func = child.func
-                if isinstance(func, ast.Attribute):
-                    # session.expunge_all() only — expire_all() is a no-op on SQLite
-                    if func.attr in ("expunge_all",):
-                        faithful_body = True
-                        break
+                # session.expunge_all() only — expire_all() is a no-op on SQLite
+                if isinstance(func, ast.Attribute) and func.attr in ("expunge_all",):
+                    faithful_body = True
+                    break
                 # raiseload=True keyword arg
                 if any(kw.arg == "raiseload" for kw in child.keywords):
                     faithful_body = True
@@ -904,11 +906,12 @@ class TestMissingGreenletTestsFaithful:
             "The testing directory is missing or the glob is broken."
         )
 
-        violations: list[str] = []
-        for path in all_test_files:
-            for v in _unfaithful_greenlet_tests(path):
-                if v not in _KNOWN_UNFAITHFUL_ALLOWLIST:
-                    violations.append(v)
+        violations: list[str] = [
+            v
+            for path in all_test_files
+            for v in _unfaithful_greenlet_tests(path)
+            if v not in _KNOWN_UNFAITHFUL_ALLOWLIST
+        ]
 
         assert not violations, (
             "The following tests mention MissingGreenlet in their docstring but "
@@ -1011,48 +1014,6 @@ class TestStandaloneRosterIncludesGuardModule:
 #    production code after session.rollback() calls
 # ---------------------------------------------------------------------------
 
-# Recognised safe-read patterns that a function containing session.rollback()
-# must use in its body to safely avoid MissingGreenlet on asyncpg.
-# Mirrors backend/app/database.py::ROLLBACK_SAFE_PATTERNS (the canonical
-# source) and is kept in sync by test_rollback_safe_patterns_defined_in_database.
-_ROLLBACK_SAFE_PATTERNS: frozenset[str] = frozenset({
-    "session.refresh",
-    "db_session.refresh",
-    "session.get",
-    "db.get",
-    "session.execute",
-    "db_session.execute",
-    "expunge_all",
-    "expire_all",
-    "__dict__",
-    "return",
-    "raise",
-    "continue",
-    "break",
-    "logger.exception",
-    "logger.warning",
-    "expired",
-    "unloaded",
-})
-
-# Functions in backend/app/ that call session.rollback() but whose safety
-# cannot be verified by the static AST scanner.  Each entry documents why
-# the function is safe despite the scanner's inability to prove it.
-_ROLLBACK_ALLOWLIST: frozenset[str] = frozenset({
-    # try/except handler: rollback in the except block followed by
-    # logger.warning then natural function end — no ORM reads after
-    # the rollback, but the scanner cannot statically prove "falls
-    # through with no further reads" when there's no explicit return.
-    "admin_agent_ops.py::_backfill_direction_merge_evidence_after_mapping",
-    # Utility helper whose sole purpose is a safe best-effort rollback.
-    # The function contains NO ORM reads at all — just rollback + logger.
-    "reaper_infra_recovery.py::_safe_rollback",
-})
-
-# Monotonic ceiling: the allowlist can only shrink.  Bump when adding
-# an entry (deliberate, visible action alongside the new entry).
-_ROLLBACK_ALLOWLIST_CEILING: int = 2
-
 # Directory for scanning production code — with CI Docker fallback.
 _PRODUCTION_APP_DIR: Path = (
     _BACKEND_ROOT / "app" if (_BACKEND_ROOT / "app").is_dir()
@@ -1101,10 +1062,29 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
         "session.execute", "db_session.execute", "expunge_all", "expire_all",
     })
     _SAFE_NAMES: frozenset[str] = frozenset({
-        'session', 'db_session', 'db', 'logger', 'logging',
-        'os', 'sys', 're', 'json', 'datetime', 'contextlib',
-        'asyncio', 'uuid', 'time', 'math', 'traceback',
-        'exc', 'e', 'error', 'ex', 'err', '_exc', 'self', 'cls',
+        # Session / DB handles
+        'session', 'db_session', 'db',
+        # Stdlib / logging / util
+        'logger', 'logging', 'os', 'sys', 're', 'json', 'datetime',
+        'contextlib', 'asyncio', 'uuid', 'time', 'math', 'traceback',
+        # Common exception variable names
+        'exc', 'e', 'error', 'ex', 'err', '_exc',
+        # OOP patterns
+        'self', 'cls',
+        # Module-level observability / config singletons (never ORM objects)
+        '_OBSERVABILITY', '_ws_manager', '_runtime_config', '_reaper_halt_state',
+        '_dispatch_prep_contention_streak', '_warm_ctx', '_shared_state',
+        # WakeDeliveryResult dataclass (reaper wakes, not an ORM model)
+        '_wake_result',
+        # Pre-captured string sentinels (avoid MissingGreenlet in f-strings)
+        '_task_id_str', '_task_project_id_str', '_task_type_str',
+        # Bool sentinel for deferred refresh pattern
+        '_attrs_may_be_expired',
+        # Module-level loop-state counters / dicts
+        'ci_loop',
+        # Enum / Pydantic / plain-dict / local-accumulator variable names
+        'severity', 'body', 'payload', 'container', 'alert_session', 'doc',
+        'runtime_selection', 'results',
     })
 
     def _classify_stmt(suc: ast.stmt) -> int:
@@ -1188,80 +1168,6 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
     return violations
 
 
-def _unsafe_rollback_functions(filepath: Path) -> list[str]:
-    """Return ``module_name::function_name`` for every function in *filepath*
-    that calls ``session.rollback()`` but uses no recognised safe-read pattern
-    (refresh, re-fetch, ``__dict__`` bypass, immediate return/raise, etc.).
-
-    The scanner walks every ``FunctionDef`` and ``AsyncFunctionDef`` in the
-    AST, looking for ``.rollback()`` call targets.  For each matching
-    function it then checks the entire body for at least one pattern in
-    ``_ROLLBACK_SAFE_PATTERNS``.  A pattern anywhere in the same function is
-    sufficient — block-level adjacency is NOT required because the common
-    pattern is "try: ... commit() except: rollback() + return/raise", where
-    the safe pattern is on a different branch from the rollback, and the
-    scanner would miss it with adjacency analysis.
-
-    Functions listed in ``_ROLLBACK_ALLOWLIST`` are skipped after scanning.
-    """
-    source = filepath.read_text(encoding="utf-8")
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    # Safe-read patterns that are *statements* rather than expressions:
-    # Return, Raise, Break, Continue, and Pass are control-flow statements
-    # that prevent the function from reading expired ORM attributes after
-    # the rollback call.
-    _CONTROL_FLOW_STATEMENTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
-
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
-            continue
-
-        # Pre-filter: does this function mention rollback at all?
-        body_text = ast.unparse(node)
-        if "rollback" not in body_text:
-            continue
-
-        # Check for an actual .rollback() call
-        has_rollback_call = False
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                func_name = ast.unparse(child.func)
-                if "rollback" in func_name:
-                    has_rollback_call = True
-                    break
-        if not has_rollback_call:
-            continue
-
-        # Check for safe-read patterns in the function body.
-        # Patterns are checked as:
-        #   1. Call expressions (session.refresh, logger.exception, etc.)
-        #   2. Attribute access (__dict__, expired, unloaded)
-        #   3. Control-flow statements (return, raise, break, continue)
-        safe = False
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                call_text = ast.unparse(child)
-                if any(pat in call_text for pat in _ROLLBACK_SAFE_PATTERNS):
-                    safe = True
-                    break
-            if isinstance(child, ast.Attribute) and child.attr in ("__dict__", "_dict", "expired", "unloaded"):
-                safe = True
-                break
-            if isinstance(child, _CONTROL_FLOW_STATEMENTS):
-                safe = True
-                break
-        if safe:
-            continue
-
-        violations.append(f"{filepath.name}::{node.name}")
-    return violations
-
-
 class TestRollbackSafetyRegressionCheck:
     """Every coroutine or function in ``backend/app/`` that calls
     ``session.rollback()`` must use at least one recognised safe-read pattern
@@ -1286,41 +1192,44 @@ class TestRollbackSafetyRegressionCheck:
     """
 
     def test_rollback_safe_patterns_defined_in_database(self):
-        """The ROLLBACK_SAFE_PATTERNS constant in backend/app/database.py
-        must match the scanner's pattern set in this module.
+        """The ROLLBACK_SAFE_PATTERNS and ROLLBACK_SAFE_REFETCH_PATTERNS constants
+        in backend/app/database.py must be present.
 
-        Exercises production code: imports from ``app.database`` to verify
-        the constant is present and synced.
+        Exercises production code: reads database.py to verify both constants
+        are defined.  ROLLBACK_SAFE_PATTERNS is the canonical list of all
+        recognised safe patterns; ROLLBACK_SAFE_REFETCH_PATTERNS is the subset
+        that unconditionally re-loads ORM state regardless of position (as
+        opposed to control-flow tokens that are only safe in-block).
         """
         database_path = _BACKEND_ROOT / "app" / "database.py"
         assert database_path.exists(), (
             f"backend/app/database.py not found at {database_path}. "
-            "The rollback safety pattern constant cannot be verified."
+            "The rollback safety pattern constants cannot be verified."
         )
         content = database_path.read_text()
         assert "ROLLBACK_SAFE_PATTERNS" in content, (
             "backend/app/database.py must define ROLLBACK_SAFE_PATTERNS — "
             "the canonical list of recognised safe-read patterns after "
-            "session.rollback().  Add it back or update _ROLLBACK_SAFE_PATTERNS "
-            "in this file to match."
+            "session.rollback().  Restore it or update this test to match."
         )
-        # Verify every pattern in our test set is documented in the
-        # production constant (at least string-wise).
-        for pattern in _ROLLBACK_SAFE_PATTERNS:
-            assert pattern in content, (
-                f"Pattern '{pattern}' is recognised by the test scanner but "
-                f"is not listed in backend/app/database.py::ROLLBACK_SAFE_PATTERNS. "
-                f"Keep the two in sync."
-            )
+        assert "ROLLBACK_SAFE_REFETCH_PATTERNS" in content, (
+            "backend/app/database.py must define ROLLBACK_SAFE_REFETCH_PATTERNS — "
+            "the subset of ROLLBACK_SAFE_PATTERNS that are unconditionally safe "
+            "(refetch operations) regardless of position relative to the rollback. "
+            "The flow-aware scanner uses this to distinguish refetch patterns from "
+            "control-flow tokens that are only safe in the same block."
+        )
 
     def test_rollback_missing_greenlet_regression_check(self):
-        """Scan all ``backend/app/*.py`` files and fail if any function calls
-        ``session.rollback()`` without a recognised safe-read pattern.
+        """Scan all ``backend/app/*.py`` files using the flow-aware scanner and
+        fail if any function calls ``session.rollback()`` with an unsafe
+        post-rollback ORM attribute read on the reachable path.
 
-        Functions in ``_ROLLBACK_ALLOWLIST`` are acknowledged technical
-        debt — the scanner cannot statically prove their safety, but each
-        has been manually verified as safe.  The allowlist can only shrink
-        (enforced by the monotonic ceiling).
+        Functions in ``_ROLLBACK_FLOW_ALLOWLIST`` (imported from
+        ``app.greenlet_fidelity``) are acknowledged cases the scanner cannot
+        statically verify — each entry has been manually triaged and confirmed
+        safe.  The allowlist can only shrink (enforced by the monotonic ceiling
+        in ``test_rollback_flow_allowlist_cannot_grow_beyond_ceiling``).
         """
         if not _PRODUCTION_APP_DIR.is_dir():
             pytest.skip(
@@ -1338,116 +1247,40 @@ class TestRollbackSafetyRegressionCheck:
         violations: list[str] = [
             v
             for path in all_prod_files
-            for v in _unsafe_rollback_functions(path)
-            if v not in _ROLLBACK_ALLOWLIST
+            for v in _unsafe_rollback_functions_flow_aware(path)
+            if v not in _ROLLBACK_FLOW_ALLOWLIST
         ]
 
         assert not violations, (
             "The following functions in backend/app/ call session.rollback() "
-            "but use no recognised safe-read pattern (see class docstring and "
-            "_ROLLBACK_SAFE_PATTERNS for the full list). Each such function "
-            "must either include a refresh/re-fetch/__dict__ bypass or a "
-            "return/raise/continue/break immediately after the rollback to "
-            "avoid MissingGreenlet on asyncpg:\n"
+            "with a reachable post-rollback ORM attribute read not covered by "
+            "a safe terminator or refetch.  Each such function must either: "
+            "use session.refresh/session.get/__dict__ after rollback, add an "
+            "explicit return/raise/continue immediately after rollback in the "
+            "same block, or snapshot ORM values before rollback.  "
+            "To acknowledge cases the static scanner cannot verify, add an "
+            "entry to ROLLBACK_FLOW_ALLOWLIST in backend/app/greenlet_fidelity.py "
+            "with a comment explaining why the function is safe:\n"
             + "\n".join(f"  - {v}" for v in sorted(violations))
-            + "\n\nTo acknowledge existing patterns the scanner cannot verify, "
-            "add to _ROLLBACK_ALLOWLIST with a comment explaining why the "
-            "function is safe despite the static analysis gap."
         )
 
-    def test_rollback_allowlist_cannot_grow_beyond_ceiling(self):
-        """The rollback allowlist must never exceed its monotonic ceiling.
+    def test_rollback_flow_allowlist_cannot_grow_beyond_ceiling(self):
+        """The rollback-flow allowlist must never exceed its monotonic ceiling.
 
-        This is a growth ratchet: adding an entry requires bumping the
-        ceiling constant, which is a deliberate, visible diff action.
-        Burn-down is tracked by lowering the ceiling as entries are
-        migrated to scanner-verifiable patterns.
+        This is a growth ratchet: adding an entry to ROLLBACK_FLOW_ALLOWLIST
+        requires bumping ROLLBACK_FLOW_ALLOWLIST_CEILING in
+        backend/app/greenlet_fidelity.py — a deliberate, visible diff action.
+        Burn-down is tracked by lowering the ceiling as entries are fixed in
+        the production code.
         """
-        assert len(_ROLLBACK_ALLOWLIST) <= _ROLLBACK_ALLOWLIST_CEILING, (
-            f"_ROLLBACK_ALLOWLIST has {len(_ROLLBACK_ALLOWLIST)} entries "
-            f"(ceiling: {_ROLLBACK_ALLOWLIST_CEILING}). Either make the "
-            "entries verifiable by the static scanner (see _unsafe_rollback_functions "
-            "for recognised patterns) and remove from the allowlist, or — "
-            "after exhausting verifiable options — deliberately bump "
-            "_ROLLBACK_ALLOWLIST_CEILING."
-        )
-
-    def test_rollback_safe_pattern_accepts_return_after_rollback(self, tmp_path):
-        """A function that returns immediately after session.rollback() must
-        NOT be flagged by the scanner.
-
-        Regression guard: the scanner relies on ``"return"`` being present
-        in the ``_ROLLBACK_SAFE_PATTERNS`` set and matched via AST unparse
-        anywhere in the function body.
-        """
-        test_file = tmp_path / "test_rollback_return.py"
-        test_file.write_text(textwrap.dedent("""\
-            async def test_rollback_then_return(session):
-                \"\"\"Rollback and return — safe pattern.\"\"\"
-                await session.rollback()
-                return None
-        """))
-        violations = _unsafe_rollback_functions(test_file)
-        assert not any("test_rollback_then_return" in v for v in violations), (
-            "A function that calls session.rollback() and then returns was "
-            "incorrectly flagged.  'return' is a recognised safe-read pattern "
-            "because exiting the function avoids any expired-attribute read."
-        )
-
-    def test_rollback_safe_pattern_accepts_refresh_after_rollback(self, tmp_path):
-        """A function that refreshes ORM objects after session.rollback() must
-        NOT be flagged by the scanner.
-        """
-        test_file = tmp_path / "test_rollback_refresh.py"
-        test_file.write_text(textwrap.dedent("""\
-            async def test_rollback_then_refresh(session):
-                \"\"\"Rollback and refresh — safe pattern.\"\"\"
-                await session.rollback()
-                await session.refresh(obj)
-        """))
-        violations = _unsafe_rollback_functions(test_file)
-        assert not any("test_rollback_then_refresh" in v for v in violations), (
-            "A function that calls session.rollback() and then session.refresh() "
-            "was incorrectly flagged.  'session.refresh' is a recognised safe-read "
-            "pattern because it explicitly re-loads the object from the DB."
-        )
-
-    def test_rollback_safe_pattern_accepts_dict_bypass(self, tmp_path):
-        """A function that uses ``__dict__`` to bypass expiry after
-        session.rollback() must NOT be flagged by the scanner.
-        """
-        test_file = tmp_path / "test_rollback_dict.py"
-        test_file.write_text(textwrap.dedent("""\
-            async def test_rollback_then_dict(session):
-                \"\"\"Rollback and read via __dict__ — safe pattern.\"\"\"
-                await session.rollback()
-                status = obj.__dict__.get("status")
-        """))
-        violations = _unsafe_rollback_functions(test_file)
-        assert not any("test_rollback_then_dict" in v for v in violations), (
-            "A function that calls session.rollback() and then reads via "
-            "__dict__ was incorrectly flagged.  '__dict__' is a recognised "
-            "safe-read pattern because it bypasses expired-attribute lazy loading."
-        )
-
-    def test_rollback_safe_pattern_flags_bare_rollback(self, tmp_path):
-        """A function that calls session.rollback() followed by an ORM attribute
-        read without any safe pattern MUST be flagged by the scanner.
-
-        This is the pattern that crashes with MissingGreenlet on asyncpg.
-        """
-        test_file = tmp_path / "test_rollback_bare.py"
-        test_file.write_text(textwrap.dedent("""\
-            async def test_rollback_then_read(session):
-                \"\"\"Rollback and read attribute — UNSAFE pattern.\"\"\"
-                await session.rollback()
-                print(task.status)
-        """))
-        violations = _unsafe_rollback_functions(test_file)
-        assert any("test_rollback_then_read" in v for v in violations), (
-            "A function that calls session.rollback() and then reads an ORM "
-            "attribute without any safe-read pattern was NOT flagged.  This "
-            "pattern raises MissingGreenlet on asyncpg and must be detected."
+        assert _rollback_flow_allowlist_within_ceiling(), (
+            f"ROLLBACK_FLOW_ALLOWLIST has {len(_ROLLBACK_FLOW_ALLOWLIST)} entries "
+            f"(ceiling: {_ROLLBACK_FLOW_ALLOWLIST_CEILING}). Either fix the "
+            "production function so the flow-aware scanner can verify it "
+            "(use session.refresh/session.get after rollback, or snapshot ORM "
+            "values before rollback) and remove from the allowlist, or — after "
+            "exhausting verifiable options — deliberately bump "
+            "ROLLBACK_FLOW_ALLOWLIST_CEILING in backend/app/greenlet_fidelity.py."
         )
 
     def test_rollback_scanner_flags_read_after_rollback_despite_unrelated_safe_token(

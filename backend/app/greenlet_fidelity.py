@@ -73,3 +73,65 @@ def allowlist_within_ceiling() -> bool:
     ``KNOWN_UNFAITHFUL_ALLOWLIST_CEILING`` makes this return ``False``.
     """
     return len(KNOWN_UNFAITHFUL_ALLOWLIST) <= KNOWN_UNFAITHFUL_ALLOWLIST_CEILING
+
+
+# ---------------------------------------------------------------------------
+# Rollback-flow allowlist — functions that call session.rollback() and have
+# post-rollback ORM attribute accesses that the flow-aware scanner flags but
+# that are genuinely safe for reasons the static scanner cannot verify (e.g.
+# a re-fetch via a helper function, a separate session scope, a Pydantic model
+# mistaken for an ORM object, or a guarded deferred-refresh pattern).
+#
+# Each entry is ``module_filename::function_name`` and must carry an inline
+# comment explaining why the function is safe despite the scanner's flag.
+# ---------------------------------------------------------------------------
+ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
+    # analytics rollbacks inside contextlib.suppress() between L1924-L2018;
+    # each suppress block catches the rollback exception and the ORM attribute
+    # task.context at L2061 is read on the previously-committed task instance
+    # which is not owned by the rolling-back analytics sub-session.
+    "agent.py::claim_task",
+    # three rollback sites all guarded: L3446 (task.context written after
+    # rollback inside suppress, not a lazy-load read); L1878 (rollback inside
+    # suppress, task.context at L2634 is an ORM write `task.context = _ctx`,
+    # not a read that triggers lazy-load); L3586 scanner flags payload.status
+    # but payload is a Pydantic model, not an ORM object.
+    "agent_status.py::update_agent_status",
+    # r.flagged at L469 where r is a CheckResult dataclass (@dataclass frozen=True),
+    # not an ORM-mapped model; scanner cannot distinguish dataclass fields from
+    # mapped ORM columns.
+    "metrics_integrity_sweep.py::run_metrics_integrity_sweep",
+    # _crashed_task.status at L3957 is on an instance freshly loaded via
+    # _lock_dispatchable_task_for_mutation(session, _qt_id) after the rollback
+    # at L3815; scanner cannot see the re-fetch because it's wrapped in a helper.
+    "orchestrator.py::orchestrator_worker",
+    # ci_task.status at L2884 is on an instance freshly re-fetched via
+    # _lock_task_for_mutation(session, ci_task_id, ...) at L2873 immediately
+    # after the rollback at L2867; scanner cannot trace through the helper.
+    "orchestrator_ci_monitor.py::_monitor_evaluating_tasks",
+    # version.id at L1364 is accessed after rollback of fire_session (a scoped
+    # sub-session); version is bound to the outer session's identity map so
+    # fire_session.rollback() does not expire it.
+    "release_qualifier_sweep.py::_run_auto_qualification_trigger_for_version",
+    # existing.id at L1219 is read after IntegrityError rollback at L1213;
+    # existing is immediately re-fetched via _get_active_pipeline_task_by_key
+    # (which issues session.execute internally) before the .id read; scanner
+    # cannot trace the re-fetch through the helper call.
+    "review_pipeline.py::_spawn_verify_tests_task",
+})
+
+# Monotonic ceiling for the rollback-flow allowlist: can only shrink as entries
+# are fixed at the production code level. Bump when adding a new entry.
+ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 7
+
+
+def rollback_flow_allowlist_within_ceiling() -> bool:
+    """Return ``True`` when the rollback-flow allowlist has not grown past its
+    monotonic ceiling.
+
+    This is the growth ratchet: adding an entry to ``ROLLBACK_FLOW_ALLOWLIST``
+    without also raising ``ROLLBACK_FLOW_ALLOWLIST_CEILING`` makes this return
+    ``False``, causing ``test_rollback_flow_allowlist_cannot_grow_beyond_ceiling``
+    to fail.
+    """
+    return len(ROLLBACK_FLOW_ALLOWLIST) <= ROLLBACK_FLOW_ALLOWLIST_CEILING
