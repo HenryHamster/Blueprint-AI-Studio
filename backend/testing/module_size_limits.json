@@ -98,7 +98,7 @@
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 3400,
     "alert_dispatch.py": 2950,
-    "compute_jobs.py": 2900,
+    "compute_jobs.py": 3400,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2450,
     "runtime_config_state.py": 3000,

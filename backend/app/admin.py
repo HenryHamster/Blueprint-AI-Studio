@@ -2187,6 +2187,10 @@ class ComputeExperimentTaskPayload(BaseModel):
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+    # When False, suppresses the reason-and-ship follow-on at completion.
+    # Operator-authored tasks (created_by="USER") default to suppressed; pass
+    # spawn_followup=True to opt in. Engine-authored tasks default to spawning.
+    spawn_followup: bool | None = None
 
     @model_validator(mode="after")
     def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
@@ -3149,6 +3153,7 @@ async def create_compute_experiment_task(
             if payload.require_durable_artifact
             else {}
         ),
+        **({"spawn_followup": payload.spawn_followup} if payload.spawn_followup is not None else {}),
     }
     try:
         task_payload = validate_task_payload(task_payload_raw)

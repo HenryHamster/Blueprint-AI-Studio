@@ -13633,3 +13633,203 @@ async def test_retry_provisioning_timeout_already_terminal(db_session):
         session_factory, job.id, _utcnow()
     )
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# spawn_followup gate tests
+# ---------------------------------------------------------------------------
+
+async def _setup_parked_succeeded_job(db_session, *, created_by="USER", payload_extra=None):
+    """Helper: create a project/task/job in PARKED state with a fired SUCCEEDED wake."""
+    from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.task_lifecycle import fire_task_wakes, park_task
+
+    project = Project(name=f"SpawnFollowup {uuid.uuid4().hex[:6]}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = {"type": "compute_experiment", "base_branch": "main"}
+    if payload_extra:
+        payload.update(payload_extra)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment: spawn_followup gate",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
+        created_by=created_by,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.final_cost_usd = 0.10
+    job.accrued_cost_usd = 0.10
+    db_session.add(job)
+    await fire_task_wakes(
+        db_session,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+    )
+    await db_session.commit()
+
+    await park_task(
+        db_session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=_utcnow() + timedelta(hours=1),
+        reason=f"parked on compute job {job.id}",
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task, job
+
+
+@pytest.mark.asyncio
+async def test_spawn_followup_suppressed_for_operator_authored_task(db_session, monkeypatch):
+    """Operator-authored tasks (created_by='USER') do NOT spawn a reason-and-ship
+    follow-on unless spawn_followup=True is explicitly set in the payload."""
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+
+    spawn_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr("app.task_completion._spawn_act_on_verdict_followon", spawn_mock)
+    monkeypatch.setattr("app.task_completion.broadcast_to_project", AsyncMock())
+    monkeypatch.setattr(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=(None, "precondition-not-met")),
+    )
+
+    task, _job = await _setup_parked_succeeded_job(db_session, created_by="USER")
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    # Operator smoke: task completes without spawning a follow-on.
+    assert task.status == TaskStatus.COMPLETED
+    spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_spawn_followup_opt_in_for_operator_authored_task(db_session, monkeypatch):
+    """When spawn_followup=True is explicitly set, operator-authored tasks DO spawn
+    a follow-on (the operator opted in)."""
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+
+    fake_child = Task(
+        project_id=None,
+        title="follow-on",
+        status=TaskStatus.QUEUED,
+    )
+    spawn_mock = AsyncMock(return_value=fake_child)
+    monkeypatch.setattr("app.task_completion._spawn_act_on_verdict_followon", spawn_mock)
+    monkeypatch.setattr("app.task_completion.broadcast_to_project", AsyncMock())
+    monkeypatch.setattr(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=(None, "precondition-not-met")),
+    )
+
+    task, _job = await _setup_parked_succeeded_job(
+        db_session, created_by="USER", payload_extra={"spawn_followup": True}
+    )
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    # Opted-in: follow-on was spawned, task should be EVALUATING.
+    assert task.status == TaskStatus.EVALUATING
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_spawn_followup_spawns_for_engine_authored_task(db_session, monkeypatch):
+    """Engine-authored tasks (created_by='ORCHESTRATOR') spawn the reason-and-ship
+    follow-on by default (no explicit spawn_followup needed)."""
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+
+    fake_child = Task(
+        project_id=None,
+        title="follow-on",
+        status=TaskStatus.QUEUED,
+    )
+    spawn_mock = AsyncMock(return_value=fake_child)
+    monkeypatch.setattr("app.task_completion._spawn_act_on_verdict_followon", spawn_mock)
+    monkeypatch.setattr("app.task_completion.broadcast_to_project", AsyncMock())
+    monkeypatch.setattr(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=(None, "precondition-not-met")),
+    )
+
+    task, _job = await _setup_parked_succeeded_job(db_session, created_by="ORCHESTRATOR")
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    # Engine-authored: follow-on spawned by default → EVALUATING.
+    assert task.status == TaskStatus.EVALUATING
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_session, monkeypatch):
+    """Engine-authored tasks with spawn_followup=False do NOT spawn a follow-on."""
+    from app.reaper_sweeps import sweep_deliver_task_wakes
+
+    spawn_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr("app.task_completion._spawn_act_on_verdict_followon", spawn_mock)
+    monkeypatch.setattr("app.task_completion.broadcast_to_project", AsyncMock())
+    monkeypatch.setattr(
+        "app.knowledge_completion.persist_compute_experiment_knowledge",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.knowledge_completion._analyze_compute_experiment_with_llm",
+        AsyncMock(return_value=(None, "precondition-not-met")),
+    )
+
+    task, _job = await _setup_parked_succeeded_job(
+        db_session, created_by="ORCHESTRATOR", payload_extra={"spawn_followup": False}
+    )
+
+    delivered = await sweep_deliver_task_wakes(db_session, _utcnow())
+    assert delivered == 1
+
+    db_session.expire_all()
+    await db_session.refresh(task)
+    # Explicitly suppressed: task completes without follow-on.
+    assert task.status == TaskStatus.COMPLETED
+    spawn_mock.assert_not_called()

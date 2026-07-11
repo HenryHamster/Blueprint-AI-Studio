@@ -3774,9 +3774,21 @@ async def _handle_compute_experiment_completion(
     # intended terminal outcomes whose experiment never produced a result to
     # reason over, so there is nothing to dispose — exactly as the failure
     # branches above exclude them. They complete clean with full capture.
+    #
+    # spawn_followup gate: operator-authored tasks (created_by="USER") suppress
+    # the follow-on by default (opt-in via spawn_followup=True in the payload).
+    # Engine-authored tasks (ORCHESTRATOR / STRATEGIC_AGENT) spawn by default
+    # unless spawn_followup=False is explicitly set. This prevents validation
+    # smokes from burning agent budget on throwaway metrics.
+    _payload_spawn_followup = (task.first_payload or {}).get("spawn_followup")
+    _should_spawn_followup = (
+        _payload_spawn_followup is True
+        if task.created_by == "USER"
+        else _payload_spawn_followup is not False
+    )
     final_status = TaskStatus.COMPLETED
     result_outcome = (plan_output.get("compute_result") or {}).get("outcome")
-    if result_outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES:
+    if result_outcome not in _COMPUTE_INTENTIONAL_KILL_OUTCOMES and _should_spawn_followup:
         if sweep_id:
             child = await _maybe_spawn_sweep_aggregate_followon(
                 session, task, sweep_id, plan_output.get("compute_result") or {}, logs

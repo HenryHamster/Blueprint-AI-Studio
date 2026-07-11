@@ -85,6 +85,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "setup_step",
         "container_image",
         "container_registry_auth",
+        "spawn_followup",
     ):
         val = _pick(opt_key)
         if val is not None:
