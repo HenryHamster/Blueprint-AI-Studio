@@ -1278,6 +1278,11 @@ export interface KnowledgeDocument {
   /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
    *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
   criterion_met?: boolean | null;
+  /** Proof-strength tier for compute_experiment documents: 'covered' (local hw execution),
+   *  'attested' (cloud execution), 'backfilled' (metrics without direct run evidence),
+   *  'partial' (attempted but incomplete), 'uncovered' (no execution evidence). Null for
+   *  non-compute documents and older docs persisted before the field existed. */
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
   /** Lifecycle tracking for the strategist follow-up workflow. */
   lifecycle_status?: 'pending' | 'consumed' | 'dismissed' | string;
   consumed_at?: string | null;

@@ -1283,3 +1283,126 @@ describe('KnowledgeBrowser — live proof release evidence', () => {
     expect((host as HTMLDivElement).textContent).toContain('GPU no-proof benchmark');
   });
 });
+
+describe('KnowledgeBrowser — compute run provenance detail', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  async function renderAndOpenDoc(doc: typeof computeDoc & { forward_quality_verdict?: unknown }) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [doc] as never, total: 1, limit: 50, offset: 0 });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({ ...doc, body: '# Body' } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(doc.title),
+    );
+    if (!docButton) throw new Error('expected document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+  }
+
+  test('renders run provenance with operator-hardware label and truncated runner id for local-subprocess', async () => {
+    const docWithProvenance = {
+      ...computeDoc,
+      id: 'doc-provenance-1',
+      title: 'GPU benchmark with provenance',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'local-subprocess',
+          runner_target_id: 'abc12345xyz99999',
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithProvenance);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Machine-verified');
+    expect(text).toContain('Operator hardware');
+    expect(text).toContain('abc12345');
+    expect(text).not.toContain('abc12345xyz');
+  });
+
+  test('renders GPU label for local-gpu backend', async () => {
+    const docWithGpu = {
+      ...computeDoc,
+      id: 'doc-provenance-gpu',
+      title: 'GPU experiment with gpu backend',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'local-gpu',
+          runner_target_id: 'gpu-runner-0001',
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithGpu);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Operator hardware · GPU');
+    expect(text).toContain('gpu-runn');
+  });
+
+  test('renders GCP label for gcp backend', async () => {
+    const docWithGcp = {
+      ...computeDoc,
+      id: 'doc-provenance-gcp',
+      title: 'Cloud experiment with gcp backend',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'gcp',
+          runner_target_id: null,
+        },
+      },
+    };
+    await renderAndOpenDoc(docWithGcp);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('GCP cloud');
+  });
+
+  test('renders no run provenance panel when terminal_diagnostics is absent', async () => {
+    const docWithoutProvenance = {
+      ...computeDoc,
+      id: 'doc-no-provenance',
+      title: 'GPU benchmark without provenance',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        // no terminal_diagnostics
+      },
+    };
+    await renderAndOpenDoc(docWithoutProvenance);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).not.toContain('Run provenance');
+  });
+
+  test('renders no run provenance panel when forward_quality_verdict is null', async () => {
+    const docNullVerdict = {
+      ...computeDoc,
+      id: 'doc-null-verdict',
+      title: 'GPU benchmark null verdict',
+      forward_quality_verdict: null,
+    };
+    await renderAndOpenDoc(docNullVerdict as never);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).not.toContain('Run provenance');
+  });
+});

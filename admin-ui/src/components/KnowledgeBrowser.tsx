@@ -5,6 +5,8 @@ import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { CriterionVerdictBadge } from './CriterionVerdictBadge';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
+import { computeJobExecutionLocation } from './ComputeJobsPanel.utils';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
@@ -13,7 +15,6 @@ import {
   type KnowledgeForwardQualityVerdict,
 } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { computeJobExecutionLocation } from './ComputeJobsPanel.utils';
 
 interface KnowledgeBrowserProps {
   selectedProjectId: string | null;
@@ -587,6 +588,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <SourceKindBadge kind={selected.source_kind} />
                 <CriterionVerdictBadge doc={selected} />
                 <AcceptanceGradeBadge doc={selected} />
+                <EvidenceTierBadge tier={selected.evidence_tier} />
                 <OriginBadge doc={selected} />
                 <LifecycleBadge status={selected.lifecycle_status} />
                 {selected.authoring_branch && selected.head_sha && (
@@ -871,6 +873,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     <SourceKindBadge kind={doc.source_kind} />
                     <CriterionVerdictBadge doc={doc} />
                     <AcceptanceGradeBadge doc={doc} />
+                    <EvidenceTierBadge tier={doc.evidence_tier} />
                     <OriginBadge doc={doc} />
                     <LifecycleBadge status={doc.lifecycle_status} />
                     {doc.direction_id && (

@@ -305,4 +305,59 @@ describe('KnowledgeBrowser — viewport regression', () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     expect((host as HTMLDivElement).textContent).toContain('feature/knowledge-provenance@abc1234');
   });
+
+  test('compute_experiment detail view with execution provenance renders without overflow at 800px', async () => {
+    const computeDocWithProvenance = {
+      id: 'doc-compute-provenance-vp',
+      title: 'GPU benchmark with execution provenance',
+      summary: 'Measured TFLOPS with runner metadata.',
+      topic: 'compute-performance',
+      direction_id: 'd-compute-1',
+      tags: ['gpu', 'benchmark'],
+      source_citations: [],
+      source_task_id: 'task-ce-vp',
+      authoring_branch: null,
+      head_sha: null,
+      source_kind: 'compute_experiment',
+      created_at: '2026-06-01T00:00:00Z',
+      updated_at: '2026-06-01T00:00:00Z',
+      knowledge_acceptance_evidence: true,
+      compute_acceptance_grade: 'acceptance',
+      compute_acceptance_reason: 'llm_artifact_cited',
+      criterion_met: true,
+      forward_quality_verdict: {
+        passed: true,
+        reason: 'Artifact-cited analysis passed.',
+        strategy: 'forward-quality',
+        terminal_diagnostics: {
+          executing_backend: 'local-subprocess',
+          runner_target_id: 'dd59526e-1234-5678-abcd-ef0123456789',
+        },
+      },
+    };
+    const { fetchKnowledgeDocuments: fkd, fetchKnowledgeDocument: fkdoc } = await import('../api');
+    vi.mocked(fkd).mockResolvedValueOnce({ documents: [computeDocWithProvenance] as never, total: 1, limit: 50, offset: 0 });
+    vi.mocked(fkdoc).mockResolvedValueOnce({ ...computeDocWithProvenance, body: '# GPU Results\n\nThroughput: 312 TFLOPS.' } as never);
+
+    await expectNoOverflowAt(800, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} onNavigateToTask={() => {}} />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+      const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+        b => b.textContent?.includes('GPU benchmark with execution provenance'),
+      );
+      if (docButton) {
+        await act(async () => { (docButton as HTMLElement).click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+      }
+    });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Operator hardware');
+    expect(text).toContain('dd59526e');
+  });
 });

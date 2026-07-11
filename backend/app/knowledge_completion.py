@@ -1284,6 +1284,27 @@ def _evaluate_criterion_per_arm(
     return per_arm if per_arm else None
 
 
+def _compute_evidence_tier(
+    job: Any | None,
+    result_metrics: dict[str, Any] | None,
+) -> str:
+    """Compute the evidence tier for a compute-experiment knowledge document.
+
+    Uses the ComputeJob's backend attribute as the primary signal so that
+    both successful and failed runs are classified correctly.
+    """
+    if job is None:
+        return "backfilled" if result_metrics else "uncovered"
+    backend = getattr(job, "backend", None) or ""
+    if backend.startswith("local-"):
+        return "covered"
+    if backend:
+        return "attested"
+    if result_metrics:
+        return "backfilled"
+    return "partial"
+
+
 def _build_compute_experiment_document(
     task: Task,
     *,
@@ -1294,6 +1315,7 @@ def _build_compute_experiment_document(
     terminal_diagnostics: dict[str, Any] | None = None,
     result_metrics: dict[str, Any] | None = None,
     arms: Any | None = None,
+    evidence_tier: str | None = None,
 ) -> dict[str, Any]:
     """Build the DETERMINISTIC compute-experiment knowledge document.
 
@@ -1543,6 +1565,8 @@ def _build_compute_experiment_document(
         "criterion": criterion,
         "criterion_met": crit_met,
     }
+    if evidence_tier is not None:
+        verdict_record["evidence_tier"] = evidence_tier
     if terminal_diagnostics:
         verdict_record["terminal_diagnostics"] = terminal_diagnostics
     # Faithful, queryable home for the real numbers and any A/B arms so future
@@ -2423,6 +2447,7 @@ async def _prepare_deterministic_compute_document(
     terminal_diagnostics = _extract_job_terminal_diagnostics(job)
     result_metrics = _extract_faithful_result_metrics(job)
     arms = _extract_experiment_arms(result_metrics)
+    evidence_tier = _compute_evidence_tier(job, result_metrics)
     document = _build_compute_experiment_document(
         task,
         outcome=outcome,
@@ -2432,6 +2457,7 @@ async def _prepare_deterministic_compute_document(
         terminal_diagnostics=terminal_diagnostics,
         result_metrics=result_metrics,
         arms=arms,
+        evidence_tier=evidence_tier,
     )
     try:
         grounding_stamp = await _compute_citation_grounding_stamp(
