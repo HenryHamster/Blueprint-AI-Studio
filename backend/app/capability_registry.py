@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
-from app.evidence_primitive import classify_evidence
+from app.evidence_primitive import classify_evidence, classify_evidence_tiered
 
 if TYPE_CHECKING:
     from app.evidence_primitive import EvidenceStatus
@@ -297,11 +297,22 @@ def working_capability_proof_status(
     The proof-aware companion to :func:`working_capability_names`: it selects the
     exact same set of names (only ``working`` capabilities, alias-aware over each
     entry's ``absorbs`` list) but pairs each name with the :data:`EvidenceStatus`
-    that :func:`classify_evidence` derives from the capability's
+    that :func:`classify_evidence_tiered` derives from the capability's
     ``evidence_refs`` — ``proven`` / ``partial`` / ``unproven`` / ``unverified``.
     A ``working`` capability with an empty or missing ``evidence_refs`` classifies
     as ``unproven`` (the "declared working with zero proof" case this gate exists
-    to surface); one carrying a ``proven=True`` ref classifies as ``proven``.
+    to surface); one carrying a machine-verified ``proven=True`` ref classifies as
+    ``proven``.
+
+    Because this map feeds the enforce-gate path, it uses the *tier-aware*
+    classifier: a capability whose ONLY ``proven=True`` ref is a
+    ``backing_path`` (declared files merely exist at HEAD — the same self-report
+    vector the gate exists to close) classifies as ``partial``, not ``proven``,
+    and therefore does NOT clear the enforce gate on its own. A ``backing_path``
+    proof corroborated by a machine-verified ``named_test`` still reads
+    ``proven``. The badge/display path
+    (:func:`annotate_capability_proof_status`) deliberately keeps the plain
+    :func:`classify_evidence` so existing evidence still surfaces on the UI.
 
     When ``evidence_refs`` is empty or missing but the capability declares a
     non-empty ``backing_paths`` list, the status is upgraded to ``partial`` —
@@ -327,7 +338,12 @@ def working_capability_proof_status(
         # that simply omits the field classifies as ``unproven`` (definite absence
         # of proof), matching the pydantic ``Capability`` default of ``[]``.
         refs = evidence_refs if isinstance(evidence_refs, list) else []
-        proof_status = classify_evidence(refs)
+        # Tier-aware classification for the ENFORCE-gate path: a proven set whose
+        # only proof is ``backing_path`` (declared files exist at HEAD, nothing
+        # machine-verified) is demoted to ``partial`` so it does NOT clear the
+        # gate as strongly as a machine-verified ``named_test``. The badge/display
+        # path (annotate_capability_proof_status) keeps the plain classifier.
+        proof_status = classify_evidence_tiered(refs)
         # When evidence_refs is empty/missing but the capability declares
         # backing_paths, upgrade to ``partial`` — the claim has structural
         # evidence (it declares where its code lives) even if no formal

@@ -8,11 +8,13 @@ The module is IO-free, so these are plain synchronous unit tests.
 from typing import get_args
 
 from app.evidence_primitive import (
+    BACKING_ONLY_KINDS,
     PATH_BACKED_KINDS,
     EvidenceStatus,
     ProofKind,
     claim_contradicts_evidence,
     classify_evidence,
+    classify_evidence_tiered,
 )
 
 
@@ -48,6 +50,14 @@ def test_path_backed_kinds_are_file_pathish():
     assert set(PATH_BACKED_KINDS) == {"named_test", "backing_path"}
     # Every path-backed kind is a real ProofKind.
     assert set(get_args(ProofKind)) >= PATH_BACKED_KINDS
+
+
+def test_backing_only_kinds_is_backing_path():
+    # Only structural-only (file-existence) kinds belong here; a backing_path
+    # proof alone is not machine-verified corroboration.
+    assert set(BACKING_ONLY_KINDS) == {"backing_path"}
+    # Every backing-only kind is a real ProofKind.
+    assert set(get_args(ProofKind)) >= BACKING_ONLY_KINDS
 
 
 # --- classify_evidence -------------------------------------------------------
@@ -94,6 +104,83 @@ def test_classify_treats_only_true_as_proven():
     # A truthy-but-not-True proven flag is not machine-checked proof.
     refs = [{"kind": "named_test", "ref": "a/b.py", "proven": 1}]
     assert classify_evidence(refs) == "partial"
+
+
+# --- classify_evidence_tiered ------------------------------------------------
+
+
+def test_tiered_backing_path_only_returns_partial():
+    # A proven set whose ONLY proof is backing_path is demoted from proven to
+    # partial — files exist at HEAD, but nothing was machine-verified.
+    refs = [{"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True}]
+    assert classify_evidence_tiered(refs) == "partial"
+    # The plain classifier still reads this as proven (behavior unchanged).
+    assert classify_evidence(refs) == "proven"
+
+
+def test_tiered_multiple_backing_path_only_returns_partial():
+    # Even several backing_path proofs together are structural-only → partial.
+    refs = [
+        {"kind": "backing_path", "ref": "backend/app/a.py", "proven": True},
+        {"kind": "backing_path", "ref": "backend/app/b.py", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "partial"
+
+
+def test_tiered_mixed_backing_and_named_test_returns_proven():
+    # A backing_path proof corroborated by a machine-verified named_test reads
+    # proven — the mixed case is NOT demoted.
+    refs = [
+        {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True},
+        {"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "proven"
+
+
+def test_tiered_named_test_only_returns_proven():
+    # A lone machine-verified named_test is proven, exactly like the plain path.
+    refs = [{"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True}]
+    assert classify_evidence_tiered(refs) == "proven"
+
+
+def test_tiered_proven_ref_with_missing_kind_returns_proven():
+    # An unlabeled proven ref counts as non-backing → stays proven (conservative:
+    # never silently demote a proof whose kind we cannot read).
+    refs = [{"ref": "something", "proven": True}]
+    assert classify_evidence_tiered(refs) == "proven"
+
+
+def test_tiered_no_refs_returns_unproven():
+    assert classify_evidence_tiered([]) == "unproven"
+
+
+def test_tiered_partial_unchanged():
+    # Refs present but none proven → partial, identical to classify_evidence.
+    refs = [
+        {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": False},
+        {"kind": "named_test", "ref": "test_foo.py", "proven": False},
+    ]
+    assert classify_evidence_tiered(refs) == "partial"
+    assert classify_evidence(refs) == "partial"
+
+
+def test_tiered_unverified_parity_with_classify_evidence():
+    # Structurally uncheckable inputs classify identically to the plain path.
+    assert classify_evidence_tiered(None) == "unverified"
+    assert classify_evidence_tiered("nope") == "unverified"
+    assert classify_evidence_tiered(["not-a-dict", 42]) == "unverified"
+
+
+def test_tiered_backing_path_truthy_not_true_is_partial():
+    # A truthy-but-not-True proven flag is not proof at all → partial (no proven
+    # ref exists), matching classify_evidence.
+    refs = [{"kind": "backing_path", "ref": "backend/app/foo.py", "proven": 1}]
+    assert classify_evidence_tiered(refs) == "partial"
+
+
+def test_tiered_never_returns_contradicted():
+    refs = [{"kind": "backing_path", "ref": "a/b.py", "proven": True}]
+    assert classify_evidence_tiered(refs) != "contradicted"
 
 
 # --- claim_contradicts_evidence ----------------------------------------------

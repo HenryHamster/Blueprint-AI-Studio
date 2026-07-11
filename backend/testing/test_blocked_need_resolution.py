@@ -586,6 +586,48 @@ def test_working_capability_proof_status_backing_paths_are_partial():
     )
 
 
+def test_working_capability_proof_status_backing_path_evidence_ref_is_partial():
+    """A working cap whose ONLY evidence_ref is a proven ``backing_path`` reads
+    ``partial`` (not ``proven``): a file-existence proof is not machine-verified
+    corroboration, so it must NOT clear the enforce gate on its own."""
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Backing only",
+                status="working",
+                evidence_refs=[
+                    {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True}
+                ],
+            ),
+            # A named_test proven ref alongside corroborates → proven.
+            Capability(
+                name="Corroborated",
+                status="working",
+                evidence_refs=[
+                    {"kind": "backing_path", "ref": "backend/app/bar.py", "proven": True},
+                    _proven_ref(),
+                ],
+            ),
+        ]
+    )
+    proof = working_capability_proof_status(model)
+    assert proof["backing-only"] == "partial"
+    assert proof["corroborated"] == "proven"
+
+    # Enforce mode: the backing-only cap stays gated; the corroborated one clears.
+    assert capability_need_blocked_by_proof_gate(
+        {"kind": "capability", "ref": "backing-only"}, proof, mode="enforce"
+    ) is True
+    assert capability_need_blocked_by_proof_gate(
+        {"kind": "capability", "ref": "corroborated"}, proof, mode="enforce"
+    ) is False
+
+
 def test_working_capability_proof_status_backing_paths_dict_form():
     """Dict-form payloads also respect backing_paths → partial upgrade."""
     from app.capability_registry import working_capability_proof_status

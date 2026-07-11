@@ -31,7 +31,12 @@ from app.capability_proof import (
     record_gap_evidence,
     should_record_capability_proof,
 )
-from app.capability_registry import registry_capability_evidence_refs_map
+from app.capability_registry import (
+    capability_need_blocked_by_proof_gate,
+    registry_capability_evidence_refs_map,
+    working_capability_proof_status,
+)
+from app.evidence_primitive import classify_evidence_tiered
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
@@ -1456,3 +1461,127 @@ class TestCommissionProofEarnLoop:
             )
         assert result["total_demanded_unproven"] == 1
         assert result["earned"] == 1
+
+
+# ── backing_path proof tiering: enforce-gate clearance ────────────────────────
+
+
+def _backing_path_ref(ref: str = "backend/app/foo.py") -> dict:
+    """A proven backing_path evidence ref — files exist at HEAD, nothing ran."""
+    return {"kind": "backing_path", "ref": ref, "proven": True}
+
+
+def _named_test_ref(ref: str = "testing/test_foo.py::test_bar") -> dict:
+    """A proven, machine-verified named_test evidence ref."""
+    return {"kind": "named_test", "ref": ref, "proven": True}
+
+
+class TestBackingPathTieringInEnforceGate:
+    """A backing_path-only proof must be tiered below machine-verified proof.
+
+    ``classify_evidence_tiered`` demotes a proven set whose ONLY proof is
+    ``backing_path`` to ``partial``, so ``working_capability_proof_status`` reads
+    ``partial`` for such a capability and ``capability_need_blocked_by_proof_gate``
+    keeps the dependent BLOCKED under enforce mode — the exact self-report vector
+    the gate exists to close.
+    """
+
+    def test_classify_evidence_tiered_backing_path_only_returns_partial(self):
+        assert classify_evidence_tiered([_backing_path_ref()]) == "partial"
+
+    def test_classify_evidence_tiered_mixed_returns_proven(self):
+        assert (
+            classify_evidence_tiered([_backing_path_ref(), _named_test_ref()])
+            == "proven"
+        )
+
+    def test_classify_evidence_tiered_no_refs_returns_unproven(self):
+        assert classify_evidence_tiered([]) == "unproven"
+
+    def test_classify_evidence_tiered_partial_unchanged(self):
+        # No proven entries → partial (unchanged from classify_evidence).
+        refs = [{"kind": "backing_path", "ref": "backend/app/foo.py", "proven": False}]
+        assert classify_evidence_tiered(refs) == "partial"
+
+    def test_backing_path_only_does_not_clear_enforce_gate(self):
+        """ACCEPTANCE EVIDENCE. A working capability whose ONLY evidence is a
+        proven ``backing_path`` maps to ``partial`` in
+        ``working_capability_proof_status`` and stays BLOCKED under enforce."""
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "backing-only-cap",
+                    "status": "working",
+                    "evidence_refs": [_backing_path_ref()],
+                },
+            ]
+        }
+        proof = working_capability_proof_status(problem_model)
+        # The backing-only proof is tiered down to partial (NOT proven).
+        assert proof["backing-only-cap"] == "partial"
+
+        need = {"kind": "capability", "ref": "backing-only-cap"}
+        # Enforce mode: partial does NOT clear the gate → blocked.
+        assert (
+            capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
+        )
+        # Off/observe modes never gate (behavior preserved).
+        assert (
+            capability_need_blocked_by_proof_gate(need, proof, mode="off") is False
+        )
+        assert (
+            capability_need_blocked_by_proof_gate(need, proof, mode="observe") is False
+        )
+
+    def test_backing_path_plus_named_test_clears_enforce_gate(self):
+        """A working capability with BOTH a proven backing_path AND a proven
+        named_test maps to ``proven`` and clears the enforce gate."""
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "corroborated-cap",
+                    "status": "working",
+                    "evidence_refs": [_backing_path_ref(), _named_test_ref()],
+                },
+            ]
+        }
+        proof = working_capability_proof_status(problem_model)
+        assert proof["corroborated-cap"] == "proven"
+
+        need = {"kind": "capability", "ref": "corroborated-cap"}
+        assert (
+            capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is False
+        )
+
+    def test_named_test_only_still_clears_enforce_gate(self):
+        """A lone machine-verified named_test proof is unaffected — still proven."""
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "verified-cap",
+                    "status": "working",
+                    "evidence_refs": [_named_test_ref()],
+                },
+            ]
+        }
+        proof = working_capability_proof_status(problem_model)
+        assert proof["verified-cap"] == "proven"
+        need = {"kind": "capability", "ref": "verified-cap"}
+        assert (
+            capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is False
+        )
+
+    def test_backing_paths_field_upgrade_still_partial(self):
+        """The separate ``backing_paths`` field → partial upgrade is preserved:
+        no evidence_refs but a declared backing_paths list still reads partial."""
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "paths-field-cap",
+                    "status": "working",
+                    "backing_paths": ["backend/app/foo.py"],
+                },
+            ]
+        }
+        proof = working_capability_proof_status(problem_model)
+        assert proof["paths-field-cap"] == "partial"

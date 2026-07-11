@@ -67,6 +67,15 @@ ProofKind = Literal[
 #: logical ids (criterion keys, artifact ids) that a path check cannot resolve.
 PATH_BACKED_KINDS: frozenset[str] = frozenset({"named_test", "backing_path"})
 
+#: Proof kinds that are *structural-only* — they prove the declared files exist
+#: at HEAD but NOT that anything was machine-verified to work. A ``backing_path``
+#: proof only asserts "the code that backs this claim is in the repo"; it is not
+#: the same corroboration bar as a ``named_test`` that actually ran green. When a
+#: proven-evidence set consists SOLELY of these kinds, the tier-aware classifier
+#: (:func:`classify_evidence_tiered`) demotes it from ``proven`` to ``partial`` so
+#: an enforce-mode gate is not cleared by a self-reported file-existence proof.
+BACKING_ONLY_KINDS: frozenset[str] = frozenset({"backing_path"})
+
 #: Claimed statuses that assert a gap's work is done/settled. A done-type claim
 #: whose evidence does not back it up is the "working/closed but unproven/absent"
 #: contradiction. ``active``/``blocked`` are in-progress and never contradict.
@@ -127,6 +136,46 @@ def classify_evidence(refs: Any) -> EvidenceStatus:
     if any(r.get("proven") is True for r in checkable):
         return "proven"
     return "partial"
+
+
+def classify_evidence_tiered(refs: Any) -> EvidenceStatus:
+    """Classify evidence refs, tiering structural-only proofs below machine-verified.
+
+    Identical to :func:`classify_evidence` in every case EXCEPT the ``proven``
+    one: when the ONLY ``proven=True`` refs are all of a
+    :data:`BACKING_ONLY_KINDS` kind (currently just ``backing_path``), this
+    returns ``"partial"`` instead of ``"proven"``. A ``backing_path`` proof only
+    asserts that the declared files exist at HEAD — it is a self-report that code
+    is present, not machine-verified corroboration that it works. So a capability
+    whose sole proof is ``backing_path`` must not clear an enforce-mode gate as
+    strongly as a ``named_test`` that actually ran green.
+
+    The mixed case is preserved as ``proven``: when at least one
+    non-``backing_path`` ``proven=True`` ref exists alongside a ``backing_path``
+    one, the structural proof is corroborated by machine-verified evidence and the
+    set reads ``proven``. A ``proven=True`` ref whose ``kind`` is missing/blank is
+    treated as NON-backing (so it still reads ``proven``), staying conservative —
+    an unlabeled proof is never silently demoted.
+
+    ``partial`` / ``unproven`` / ``unverified`` are returned identically to
+    :func:`classify_evidence`; ``contradicted`` is never returned here.
+    """
+    if not isinstance(refs, list):
+        return "unverified"
+    if not refs:
+        return "unproven"
+    checkable = [r for r in refs if isinstance(r, dict)]
+    if not checkable:
+        return "unverified"
+    proven = [r for r in checkable if r.get("proven") is True]
+    if not proven:
+        return "partial"
+    # At least one proven ref. If EVERY proven ref is a structural-only kind
+    # (backing_path), demote to partial — no machine-verified proof corroborates
+    # it. A missing/blank ``kind`` counts as non-backing, so it keeps ``proven``.
+    if all(r.get("kind") in BACKING_ONLY_KINDS for r in proven):
+        return "partial"
+    return "proven"
 
 
 def claim_contradicts_evidence(
