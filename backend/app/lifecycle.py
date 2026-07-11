@@ -402,6 +402,117 @@ async def _seed_routing_verdict_from_snapshot():
         )
 
 
+async def _seed_deploy_project_futility_verdicts() -> None:
+    """Seed futility verdicts for context-injection blocks on the deploy project.
+
+    Global capability trials on Blueprint self-repo (evaluated 2026-07-11) reached
+    futility_bound_reached for five context-injection blocks with large n and lift
+    far below the 0.05 adopt threshold. This function records ``"no_effect"``
+    verdicts (``evidence_source="strategic_review"``) on the deploy project so
+    ``get_effective_holdback_fraction()`` maps them to holdback=1.0 — always
+    suppress. The operator can reverse any verdict via
+    ``PATCH /api/admin/agent/projects/{id}/declare-capability-verdict``.
+
+    Best-effort and idempotent: a seed failure must never abort startup, and
+    repeated restarts never overwrite existing verdicts.
+    """
+    try:
+        from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
+        from app.capability_trial_verdict import record_trial_verdict
+
+        identity = _deploy_repo_identity()
+        if identity is None:
+            logger.info(
+                "[STARTUP] deploy_repo_identity is UNRESOLVED — skipping futility "
+                "verdict seed (no deploy project to seed)"
+            )
+            return
+
+        futility_cap_names = [
+            "repo_map",
+            "module_interfaces",
+            "related_tests",
+            "affected_consumers",
+            "diagnostics_after_edit",
+        ]
+        _RATIONALE = (
+            "Global capability trial on Blueprint self-repo (evaluated 2026-07-11) "
+            "reached futility_bound_reached with large n and lift far below 0.05 "
+            "adopt threshold. Seeded as strategic_review to suppress this "
+            "context-injection block for the deploy project."
+        )
+
+        async with AsyncSessionLocal() as seed_session:
+            owner, repo = identity
+            deploy_project = (
+                (
+                    await seed_session.execute(
+                        select(Project).where(
+                            _func.lower(Project.github_owner) == owner,
+                            _func.lower(Project.github_repo) == repo,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+
+            if deploy_project is None:
+                logger.info(
+                    "[STARTUP] Deploy project %s/%s not found in database — "
+                    "skipping futility verdict seed",
+                    owner,
+                    repo,
+                )
+                return
+
+            existing_verdicts = deploy_project.capability_adoption_verdicts or {}
+            seeded = 0
+            skipped = 0
+
+            for cap_name in futility_cap_names:
+                if cap_name in existing_verdicts:
+                    skipped += 1
+                    continue
+
+                entry = {
+                    "verdict": "no_effect",
+                    "verdict_reason": "futility_bound_reached",
+                    "evidence_source": "strategic_review",
+                    "lift": None,
+                    "n_with": 0,
+                    "n_without": 0,
+                    "rationale": _RATIONALE,
+                }
+                record_trial_verdict(deploy_project, cap_name, entry)
+                seeded += 1
+
+            await seed_session.commit()
+
+            if seeded:
+                logger.info(
+                    "[STARTUP] Seeded %d futility verdict(s) on deploy project "
+                    "%s/%s (skipped %d already present)",
+                    seeded,
+                    owner,
+                    repo,
+                    skipped,
+                )
+            else:
+                logger.info(
+                    "[STARTUP] All %d futility verdicts already present on deploy "
+                    "project %s/%s",
+                    len(futility_cap_names),
+                    owner,
+                    repo,
+                )
+    except Exception:
+        logger.warning(
+            "[STARTUP] Deploy project futility-verdict seed failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _leader_lock_keepalive_tick(leader_conn) -> str:
     """Run one leader-lock keepalive iteration and report the outcome.
 
@@ -664,6 +775,11 @@ async def lifespan(app):
     # operators know to set runtime_config['deploy_repo_identity'] via
     # PATCH /api/admin/settings.
     _log_startup_deploy_identity()
+
+    # Seed futility verdicts on the deploy project for five context-injection
+    # blocks that reached futility_bound_reached (global trial, 2026-07-11).
+    # Best-effort; a seed failure must never abort startup.
+    await _seed_deploy_project_futility_verdicts()
 
     # --- Leader election via pg_try_advisory_lock (session-scoped) ---
     # Only one Cloud Run instance should run the leader-only background services.

@@ -11,8 +11,10 @@ Covers:
   - get_trial_verdicts: returns empty dict when column is absent/None
 """
 
+import contextlib
+from typing import ClassVar
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.capability_trial_verdict import (
     LANE_PILOT_ASSIGNMENT_KEY,
@@ -29,6 +31,7 @@ from app.capability_trial_verdict import (
     is_lane_pilot_arm_member,
     record_trial_verdict,
 )
+from app.lifecycle import _seed_deploy_project_futility_verdicts
 
 
 # ── evaluate_trial_verdict ────────────────────────────────────────────────────
@@ -4902,3 +4905,176 @@ class TestPersistTrialVerdictsRowLock:
         assert mock_project.capability_adoption_verdicts.get("repo_map", {}).get(
             "verdict"
         ) == "adopt"
+
+
+# ── _seed_deploy_project_futility_verdicts (lifecycle) ─────────────────────
+
+
+class TestSeedDeployProjectFutilityVerdicts:
+    """Tests for lifecycle._seed_deploy_project_futility_verdicts().
+
+    Exercises the startup seed that records ``no_effect`` / ``futility_bound_reached``
+    verdicts for the five context-injection blocks on the deploy project.
+    """
+
+    FUTILITY_CAPS: ClassVar[list[str]] = [
+        "repo_map",
+        "module_interfaces",
+        "related_tests",
+        "affected_consumers",
+        "diagnostics_after_edit",
+    ]
+    DEPLOY_IDENTITY = ("blueprint", "blueprint")
+
+    @pytest.fixture
+    def mock_project(self):
+        p = MagicMock()
+        p.github_owner = "Blueprint"
+        p.github_repo = "Blueprint"
+        p.capability_adoption_verdicts = {}
+        return p
+
+    @pytest.fixture
+    def mock_session(self, mock_project):
+        s = AsyncMock(spec=["execute", "commit", "rollback"])
+        result = MagicMock()
+        result.scalars.return_value.first.return_value = mock_project
+        s.execute = AsyncMock(return_value=result)
+        s.commit = AsyncMock()
+        s.rollback = AsyncMock()
+        return s
+
+    @pytest.fixture
+    def mock_cm(self, mock_session):
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_session)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        return cm
+
+    def _patch(self, mock_cm):
+        return (
+            patch("app.lifecycle.AsyncSessionLocal", return_value=mock_cm),
+            patch(
+                "app.deploy_identity.deploy_repo_identity",
+                return_value=self.DEPLOY_IDENTITY,
+            ),
+            patch("app.capability_trial_verdict.flag_modified"),
+        )
+
+    async def test_seeds_verdicts_on_deploy_project(self, mock_project, mock_cm):
+        """All five futility caps receive no_effect/futility_bound_reached."""
+        with contextlib.ExitStack() as stack:
+            for p in self._patch(mock_cm):
+                stack.enter_context(p)
+            await _seed_deploy_project_futility_verdicts()
+
+        for cap in self.FUTILITY_CAPS:
+            assert cap in mock_project.capability_adoption_verdicts, (
+                f"{cap} not seeded"
+            )
+            entry = mock_project.capability_adoption_verdicts[cap]
+            assert entry["verdict"] == "no_effect"
+            assert entry["verdict_reason"] == "futility_bound_reached"
+            assert entry["evidence_source"] == "strategic_review"
+            assert "rationale" in entry
+            assert "futility_bound_reached" in entry["rationale"]
+
+    async def test_idempotent_skips_existing_verdicts(self, mock_project, mock_cm):
+        """Calling twice does not overwrite existing verdicts."""
+        with contextlib.ExitStack() as stack:
+            for p in self._patch(mock_cm):
+                stack.enter_context(p)
+            await _seed_deploy_project_futility_verdicts()
+
+        # Verify first call seeded all
+        first_entry = mock_project.capability_adoption_verdicts["repo_map"]
+        first_rationale = first_entry["rationale"]
+
+        # Second call
+        with contextlib.ExitStack() as stack:
+            for p in self._patch(mock_cm):
+                stack.enter_context(p)
+            await _seed_deploy_project_futility_verdicts()
+
+        # Verdicts unchanged
+        assert mock_project.capability_adoption_verdicts["repo_map"] is first_entry
+        assert (
+            mock_project.capability_adoption_verdicts["repo_map"]["rationale"]
+            == first_rationale
+        )
+
+    async def test_skips_when_no_deploy_identity(self, mock_cm):
+        """No verdicts seeded when deploy_repo_identity() returns None."""
+        with (
+            patch("app.lifecycle.AsyncSessionLocal", return_value=mock_cm),
+            patch(
+                "app.deploy_identity.deploy_repo_identity",
+                return_value=None,
+            ),
+            patch("app.capability_trial_verdict.flag_modified") as mock_flag,
+        ):
+            await _seed_deploy_project_futility_verdicts()
+
+        mock_flag.assert_not_called()
+
+    async def test_skips_when_deploy_project_not_found(self, mock_cm):
+        """No verdicts seeded when no project matches the deploy identity."""
+        mock_session = AsyncMock(spec=["execute"])
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.first.return_value = None
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+
+        with (
+            patch("app.lifecycle.AsyncSessionLocal", return_value=mock_cm),
+            patch(
+                "app.deploy_identity.deploy_repo_identity",
+                return_value=self.DEPLOY_IDENTITY,
+            ),
+            patch("app.capability_trial_verdict.flag_modified") as mock_flag,
+        ):
+            await _seed_deploy_project_futility_verdicts()
+
+        mock_flag.assert_not_called()
+
+    async def test_get_effective_holdback_is_one_after_seeding(
+        self, mock_project, mock_cm
+    ):
+        """After seeding, get_effective_holdback_fraction returns 1.0 for each cap."""
+        with contextlib.ExitStack() as stack:
+            for p in self._patch(mock_cm):
+                stack.enter_context(p)
+            await _seed_deploy_project_futility_verdicts()
+
+        for cap in self.FUTILITY_CAPS:
+            frac = get_effective_holdback_fraction(
+                mock_project.capability_adoption_verdicts, cap, 0.1
+            )
+            assert frac == 1.0, (
+                f"{cap} holdback should be 1.0 after no_effect verdict, got {frac}"
+            )
+
+    async def test_non_deploy_project_unaffected(self, mock_cm):
+        """A non-deploy project must NOT have verdicts seeded."""
+        other_project = MagicMock()
+        other_project.capability_adoption_verdicts = {}
+
+        mock_session = AsyncMock(spec=["execute", "commit"])
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.first.return_value = None
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.commit = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+
+        with (
+            patch("app.lifecycle.AsyncSessionLocal", return_value=mock_cm),
+            patch(
+                "app.deploy_identity.deploy_repo_identity",
+                return_value=self.DEPLOY_IDENTITY,
+            ),
+            patch("app.capability_trial_verdict.flag_modified") as mock_flag,
+        ):
+            await _seed_deploy_project_futility_verdicts()
+
+        mock_flag.assert_not_called()
+        assert other_project.capability_adoption_verdicts == {}

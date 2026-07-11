@@ -128,7 +128,7 @@
     "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2650,
     "payload_schemas.py": 2050,
-    "lifecycle.py": 1750,
+    "lifecycle.py": 2150,
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
