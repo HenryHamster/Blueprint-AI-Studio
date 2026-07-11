@@ -72,6 +72,8 @@ vi.mock('../processTracking.js', () => ({
 vi.mock('../prompt.js', () => ({
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
+  writeSkillHelpers: vi.fn(),
+  formatSkills: vi.fn(() => ''),
   SHARED_LIFECYCLE_REMAINDER: '',
 }));
 

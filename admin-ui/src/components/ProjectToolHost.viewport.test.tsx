@@ -11,10 +11,12 @@ vi.mock('../api/projectTools', async () => {
   return {
     ...actual,
     fetchProjectTools: vi.fn(),
+    fetchProjectToolManifest: vi.fn(),
+    fetchAssetToken: vi.fn(),
   };
 });
 
-import { fetchProjectTools } from '../api/projectTools';
+import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken } from '../api/projectTools';
 
 const SAMPLE_TOOLS = [
   {
@@ -67,6 +69,13 @@ beforeAll(() => {
 describe('ProjectToolHost — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    // Default mocks: empty manifest + resolved asset token so existing tests
+    // that don't exercise the manifest path still behave predictably.
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], error: null });
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 'mock-token', expires_at: '2026-07-11T12:00:00Z' });
+  });
 
   afterEach(() => {
     if (root) act(() => { root?.unmount(); });
@@ -171,5 +180,108 @@ describe('ProjectToolHost — viewport regression', () => {
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Loading tools');
     resolveTools(SAMPLE_TOOLS);
+  });
+
+  test('renders manifest-declared tool in iframe alongside registered tools', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'custom-viewer',
+        title: 'Custom Viewer',
+        description: 'A project-declared viewer tool',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      error: null,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    // Registered tool renders
+    expect(host.textContent).toContain('Mock Widget');
+    // Manifest tool renders
+    expect(host.textContent).toContain('Custom Viewer');
+    // Project-declared badge is visible
+    expect(host.textContent).toContain('Project-declared');
+  });
+
+  test('shows manifest warning without crashing registered tools', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [],
+      error: 'Manifest validation errors: tools[0]: title must be a non-empty string',
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    // Warning text is shown
+    expect(host.textContent).toContain('Manifest warning');
+    // Registered tools still render
+    expect(host.textContent).toContain('Mock Widget');
+  });
+
+  test('renders manifest tools when no registered tools exist', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue([]);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'standalone-tool',
+        title: 'Standalone Tool',
+        description: 'Only manifest tool',
+        placement: 'project_section',
+        entry: 'dist/app.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      error: null,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-standalone" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Standalone Tool');
+    expect(host.textContent).toContain('Project-declared');
+    expect(host.textContent).not.toContain('No tools registered');
+  });
+
+  test('renders manifest and registered tools without overflow at 1440px', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'big-viewer',
+        title: 'Big Data Viewer with Long Title That Tests Layout',
+        description: 'A project-declared data viewer',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      error: null,
+    });
+    await expectNoOverflowAt(1440, async () => {
+      host = document.createElement('div');
+      host.style.width = '1440px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+      await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    });
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).toContain('Big Data Viewer');
+    expect(host.textContent).toContain('Project-declared');
   });
 });

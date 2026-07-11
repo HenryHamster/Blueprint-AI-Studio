@@ -43,6 +43,7 @@ import {
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
   formatProvenanceWarnings, formatAcceptanceEvidence,
+  formatSkills, writeSkillHelpers, type TaskSkill,
 } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
@@ -364,6 +365,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  const skillsSection = formatSkills(task.skills as TaskSkill[] | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
@@ -408,11 +410,12 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
   const isRetry = !!retryContext;
-  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks(isRetry) + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + skillsSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks(isRetry) + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   if (isBlueprintSelfRepo(owner, repo)) {
     writeViewportSnapshotHelper(taskId);
     writeViewportLiveHelper(taskId);

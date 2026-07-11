@@ -28,6 +28,8 @@ vi.mock('../prompt.js', () => ({
   configureResidentAgentPermissions: vi.fn(() => []),
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
+  writeSkillHelpers: vi.fn(),
+  formatSkills: vi.fn(),
   SHARED_LIFECYCLE_REMAINDER: '',
 }));
 vi.mock('./strategic-helpers.js', () => ({ writeStrategicHelpers: vi.fn() }));

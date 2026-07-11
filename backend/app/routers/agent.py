@@ -3848,6 +3848,35 @@ async def claim_task(
                 "[AGENT] Failed to inject rejection_patterns (non-critical)"
             )
 
+    # Inject project-declared skills from .blueprint/tools.json manifest.
+    # Skills are shell-command procedures the project's agent can invoke.
+    # Fetched for the same task types that receive playbook entries.
+    _SKILLS_TASK_TYPES = {
+        "create",
+        "fix",
+        "refactor",
+        "review",
+        "qa",
+        "smoketest",
+        "deps",
+        "migrate",
+        "debug",
+        "docs",
+        "strategic_review",
+    }
+    if project_for_playbook and task_type in _SKILLS_TASK_TYPES:
+        try:
+            from app.routers.admin_project_tools import _discover_manifest_tools as _discover_skills_manifest
+
+            _skills_manifest = await _discover_skills_manifest(project_for_playbook)
+            _skills = _skills_manifest.get("skills", [])
+            if _skills:
+                response["skills"] = _skills
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject project skills (non-critical)"
+            )
+
     # Inject strategic intent so tactical agents understand the "why" behind
     # their work. Useful for every task type. Prefer the LIVE, operator-editable
     # problem model (onboarding + Problem Model editor write here) so current

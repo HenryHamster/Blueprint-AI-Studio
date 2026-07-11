@@ -1,16 +1,19 @@
-import { type ReactNode, useEffect, useState } from 'react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
 import {
   fetchProjectTools,
   createProjectTool,
   deleteProjectTool as deleteProjectToolApi,
   updateProjectTool as updateProjectToolApi,
   fetchToolKinds,
+  fetchProjectToolManifest,
   seedProjectTools as seedProjectToolsApi,
   type ProjectTool,
+  type ProjectToolManifestEntry,
   type ToolKindConfig,
 } from '../api/projectTools';
 import { getToolComponent } from '../toolRegistry';
 import { WorkbenchPanel } from './WorkbenchLayout';
+import { ProjectToolIframe } from './ProjectToolIframe';
 
 interface Props {
   projectId: string;
@@ -21,11 +24,18 @@ type FetchState =
   | { status: 'error'; projectId: string; message: string }
   | { status: 'ok'; projectId: string; tools: ProjectTool[] };
 
+type ManifestState =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ok'; tools: ProjectToolManifestEntry[]; warning?: string };
+
 const actionBtn =
   'inline-flex min-h-11 items-center gap-1.5 rounded-md border px-3 text-xs font-semibold transition-colors';
 
 export function ProjectToolHost({ projectId }: Props) {
   const [state, setState] = useState<FetchState>({ status: 'loading', projectId });
+  const [manifestState, setManifestState] = useState<ManifestState>({ status: 'loading' });
+  const abortRef = useRef<AbortController | null>(null);
 
   // Management UI state
   const [showAddForm, setShowAddForm] = useState(false);
@@ -38,7 +48,7 @@ export function ProjectToolHost({ projectId }: Props) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
 
-  // Fetch tools on mount / projectId change
+  // Fetch registered tools on mount / projectId change
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -55,6 +65,37 @@ export function ProjectToolHost({ projectId }: Props) {
     }
     void load();
     return () => { cancelled = true; };
+  }, [projectId]);
+
+  // Fetch manifest-declared tools (project-declared from .blueprint/tools.json)
+  useEffect(() => {
+    // Abort any previous in-flight manifest fetch when projectId changes.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    async function loadManifest() {
+      try {
+        const data = await fetchProjectToolManifest(projectId, controller.signal);
+        if (controller.signal.aborted) return;
+        if (data.error) {
+          // Partial success: some tools loaded, but there's a validation warning.
+          setManifestState({ status: 'ok', tools: data.tools, warning: data.error });
+        } else {
+          setManifestState({ status: 'ok', tools: data.tools });
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        // Manifest failures are non-fatal — registered tools still render.
+        setManifestState({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Failed to load manifest',
+        });
+      }
+    }
+
+    void loadManifest();
+    return () => { controller.abort(); };
   }, [projectId]);
 
   async function refresh() {
@@ -249,8 +290,10 @@ export function ProjectToolHost({ projectId }: Props) {
     if (effective.status !== 'ok') return null;
     const enabledTools = effective.tools.filter(t => t.enabled);
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
+    const manifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
+    const hasAnyTool = registeredTools.length > 0 || manifestTools.length > 0;
 
-    if (registeredTools.length === 0) {
+    if (!hasAnyTool) {
       return (
         <>
           <p className="text-sm text-neutral-500">No tools registered for this project.</p>
@@ -260,6 +303,7 @@ export function ProjectToolHost({ projectId }: Props) {
 
     return (
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {/* Registered (DB-backed) tools with management controls */}
         {registeredTools.map(tool => {
           const ToolComponent = getToolComponent(tool.kind);
           if (!ToolComponent) return null;
@@ -291,6 +335,29 @@ export function ProjectToolHost({ projectId }: Props) {
             </div>
           );
         })}
+
+        {/* Manifest-declared (project-repo) tools — read-only, rendered via iframe */}
+        {manifestTools.map(tool => (
+          <div key={`manifest:${tool.slug}`} className="min-w-0 space-y-1.5">
+            <WorkbenchPanel
+              title={tool.title}
+              meta={
+                <span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">
+                  Project-declared
+                </span>
+              }
+            >
+              <ProjectToolIframe projectId={projectId} tool={tool} />
+            </WorkbenchPanel>
+          </div>
+        ))}
+
+        {/* Manifest warning (non-fatal validation error) */}
+        {manifestState.status === 'ok' && manifestState.warning && (
+          <div className="col-span-full rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
+            Manifest warning: {manifestState.warning}
+          </div>
+        )}
       </div>
     );
   }

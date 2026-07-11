@@ -1519,3 +1519,28 @@ async def agent_fetch_ui_load_timing(
             {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
         )
     return {"status": "success", "data": {"surfaces": surfaces}}
+
+
+@router.get("/projects/{project_id}/skills")
+@limiter.limit("60/minute")
+async def agent_fetch_project_skills(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Fetch skills declared in the project's ``.blueprint/tools.json`` manifest.
+
+    Returns ``{"skills": [...]}`` where each skill entry has ``slug``,
+    ``title``, ``command``, and optionally ``description``.  An empty array
+    means no skills are declared.  Authenticated via agent JWT; cross-project
+    access returns 404.
+
+    This endpoint is the backend for the strategic resident's ``./fetch skills``
+    verb.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.routers.admin_project_tools import _discover_manifest_tools  # noqa: PLC0415
+
+    manifest = await _discover_manifest_tools(project)
+    return {"skills": manifest.get("skills", [])}

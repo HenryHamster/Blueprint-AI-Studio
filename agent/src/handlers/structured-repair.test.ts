@@ -14,6 +14,8 @@ vi.mock('../telemetry.js', () => ({
 vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
   SHARED_LIFECYCLE_REMAINDER: '',
+  formatSkills: vi.fn(() => ''),
+  writeSkillHelpers: vi.fn(),
 }));
 
 import { attemptStructuredRepair } from './structured-repair.js';

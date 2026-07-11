@@ -956,6 +956,65 @@ async def get_file_text_at_ref(
         return None
 
 
+async def get_file_bytes_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> bytes | None:
+    """Fetch the raw BYTES of *path* at ``owner/repo@ref``.
+
+    Binary-safe sibling of :func:`get_file_text_at_ref`. Returns the decoded
+    base64 content for any file (text or binary) so that image and other binary
+    asset types can be served without corruption. Goes through
+    :func:`_github_request`, so it is quota-accounted and rate-limit-aware.
+
+    Returns the raw bytes on HTTP 200, or ``None`` for any non-retrievable
+    outcome (404, non-200, non-file payload, undecodable body, or transport
+    error).
+    """
+    import base64
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code != 200:
+            if response.status_code != 404:
+                logger.warning(
+                    "[GITHUB] bytes fetch for %s on %s/%s@%s: HTTP %s",
+                    path, owner, repo, ref, response.status_code,
+                )
+            return None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return None
+        return base64.b64decode(content_b64)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[GITHUB] Failed bytes fetch for %s on %s/%s@%s: %s",
+            path, owner, repo, ref, e,
+        )
+        return None
+
+
 async def list_repo_tree_paths_at_ref(
     token: str,
     owner: str,

@@ -89,6 +89,9 @@ import {
   SELF_REVIEW_PROMPT_VERSION,
   SHARED_LIFECYCLE_REMAINDER,
   assembleFailureGuidanceBlocks,
+  formatSkills,
+  writeSkillHelpers,
+  type TaskSkill,
   type FixAttempt,
 } from './prompt.js';
 import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
@@ -5534,5 +5537,206 @@ describe('thinker prompt contains criterion-coverage retirement warning', () => 
     expect(prompt).toContain('direction_owns_uncovered_criterion');
     expect(prompt).toContain('retract via Section 8');
     expect(prompt).toContain('Do NOT retire criterion-carrying without addressing the criterion first');
+  });
+});
+
+// ── formatSkills ─────────────────────────────────────────────────────────────
+describe('formatSkills', () => {
+  it('returns empty string for undefined', () => {
+    expect(formatSkills(undefined)).toBe('');
+  });
+
+  it('returns empty string for empty array', () => {
+    expect(formatSkills([])).toBe('');
+  });
+
+  it('renders a single skill with all fields', () => {
+    const skills = [
+      { slug: 'deploy', title: 'Deploy', command: 'bash deploy.sh', description: 'Deploy to staging' },
+    ];
+    const result = formatSkills(skills);
+    expect(result).toContain('## Project Skills');
+    expect(result).toContain('### Deploy');
+    expect(result).toContain('Deploy to staging');
+    expect(result).toContain('- Run: `skill-deploy` (or directly: `bash deploy.sh`)');
+  });
+
+  it('renders multiple skills each with their own section', () => {
+    const skills = [
+      { slug: 'lint', title: 'Lint', command: 'npm run lint', description: 'Run linter' },
+      { slug: 'test', title: 'Test', command: 'npm test', description: 'Run tests' },
+    ];
+    const result = formatSkills(skills);
+    expect(result).toContain('### Lint');
+    expect(result).toContain('### Test');
+    expect(result).toContain('skill-lint');
+    expect(result).toContain('skill-test');
+  });
+
+  it('falls back to slug when title is missing', () => {
+    const skills = [{ slug: 'deploy', command: 'bash deploy.sh' }] as unknown as TaskSkill[];
+    const result = formatSkills(skills);
+    expect(result).toContain('### deploy');
+  });
+
+  it('handles missing description gracefully', () => {
+    const skills = [{ slug: 'deploy', title: 'Deploy', command: 'bash deploy.sh' }];
+    const result = formatSkills(skills);
+    // No description paragraph — just the title header + Run line
+    expect(result).not.toContain('undefined');
+    expect(result).toContain('### Deploy');
+    expect(result).toContain('- Run: `skill-deploy`');
+  });
+
+  it('handles missing slug gracefully (empty string)', () => {
+    const skills = [{ title: 'No slug', command: 'echo hi' }] as unknown as TaskSkill[];
+    const result = formatSkills(skills);
+    expect(result).toContain('### No slug');
+    expect(result).toContain('- Run: `skill-`');
+  });
+
+  it('handles non-string slug gracefully', () => {
+    const skills = [{ slug: 123, title: 'Bad slug', command: 'echo hi' }] as unknown as TaskSkill[];
+    const result = formatSkills(skills);
+    // typeof check returns '' for non-string, so slug is empty
+    expect(result).toContain('### Bad slug');
+    expect(result).toContain('- Run: `skill-`');
+  });
+});
+
+// ── writeSkillHelpers ────────────────────────────────────────────────────────
+describe('writeSkillHelpers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('does nothing for undefined', () => {
+    writeSkillHelpers(undefined);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+    expect(vi.mocked(fs.appendFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('does nothing for empty array', () => {
+    writeSkillHelpers([]);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+    expect(vi.mocked(fs.appendFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('writes an executable script for a valid skill', () => {
+    const skills = [{ slug: 'deploy', title: 'Deploy', command: 'bash deploy.sh' }];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledTimes(1);
+    const [path, content, opts] = vi.mocked(fs.writeFileSync).mock.calls[0];
+    expect(path).toBe('/tmp/workspace/skill-deploy');
+    expect(content).toContain('#!/bin/bash');
+    expect(content).toContain('# Project skill: Deploy');
+    expect(content).toContain('set -e');
+    expect(content).toContain('bash deploy.sh');
+    expect(opts).toEqual({ mode: 0o755 });
+  });
+
+  it('writes multiple skills', () => {
+    const skills = [
+      { slug: 'lint', title: 'Lint', command: 'npm run lint' },
+      { slug: 'test', title: 'Test', command: 'npm test' },
+    ];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledTimes(2);
+    const paths = vi.mocked(fs.writeFileSync).mock.calls.map((c) => c[0]);
+    expect(paths).toContain('/tmp/workspace/skill-lint');
+    expect(paths).toContain('/tmp/workspace/skill-test');
+  });
+
+  it('skips skill with invalid slug (uppercase)', () => {
+    const skills = [
+      { slug: 'DEPLOY', command: 'bash deploy.sh' },
+      { slug: 'valid', command: 'echo ok' },
+    ];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fs.writeFileSync).mock.calls[0][0]).toBe('/tmp/workspace/skill-valid');
+  });
+
+  it('skips skill with leading-hyphen slug', () => {
+    const skills = [{ slug: '-deploy', command: 'bash deploy.sh' }];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('skips skill with empty slug', () => {
+    const skills = [{ slug: '', command: 'echo hi' }];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('skips skill with missing command', () => {
+    const skills = [{ slug: 'deploy', title: 'Deploy' }];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('skips skill with non-string slug', () => {
+    const skills = [
+      { slug: null, command: 'echo hi' },
+      { slug: 42, command: 'echo hi' },
+    ];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('writes to .git/info/exclude to prevent git tracking', () => {
+    const skills = [{ slug: 'deploy', command: 'bash deploy.sh' }];
+    writeSkillHelpers(skills);
+    // Should append /skill-* glob and /skill-deploy to exclude file
+    expect(vi.mocked(fs.appendFileSync)).toHaveBeenCalled();
+    const excludeCalls = vi.mocked(fs.appendFileSync).mock.calls.filter(
+      (c) => String(c[0]).endsWith('.git/info/exclude'),
+    );
+    expect(excludeCalls.length).toBeGreaterThanOrEqual(1);
+    const written = excludeCalls.map((c) => String(c[1]));
+    const allText = written.join('');
+    expect(allText).toContain('/skill-*');
+    expect(allText).toContain('/skill-deploy');
+  });
+
+  it('does not add duplicate /skill-* glob when already excluded', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('/skill-*\n');
+    const skills = [{ slug: 'deploy', command: 'bash deploy.sh' }];
+    writeSkillHelpers(skills);
+    // The /skill-* glob is already present; it should not be added again.
+    const excludeCalls = vi.mocked(fs.appendFileSync).mock.calls.filter(
+      (c) => String(c[0]).endsWith('.git/info/exclude'),
+    );
+    expect(excludeCalls.length).toBe(1);
+    expect(String(excludeCalls[0][1])).not.toContain('/skill-*');
+    expect(String(excludeCalls[0][1])).toContain('/skill-deploy');
+  });
+
+  it('skips .git/info/exclude management when no scripts were written', () => {
+    // All skills skipped → addedPatterns empty → no exclude management
+    const skills = [{ slug: '', command: 'echo hi' }];
+    writeSkillHelpers(skills);
+    expect(vi.mocked(fs.appendFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('uses provided workspace path', () => {
+    const skills = [{ slug: 'deploy', command: 'bash deploy.sh' }];
+    writeSkillHelpers(skills, '/custom/path');
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/custom/path/skill-deploy',
+      expect.stringContaining('bash deploy.sh'),
+      { mode: 0o755 },
+    );
+    const excludeCalls = vi.mocked(fs.appendFileSync).mock.calls.filter(
+      (c) => String(c[0]) === '/custom/path/.git/info/exclude',
+    );
+    expect(excludeCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('handles fs write error gracefully', () => {
+    vi.mocked(fs.writeFileSync).mockImplementationOnce(() => { throw new Error('ENOSPC'); });
+    const skills = [{ slug: 'deploy', command: 'bash deploy.sh' }];
+    expect(() => { writeSkillHelpers(skills); }).not.toThrow();
   });
 });

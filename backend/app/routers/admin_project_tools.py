@@ -14,27 +14,40 @@ Endpoints (all under ``/api/admin``):
   GET    /projects/{project_id}/tools/{tool_id}/content    fetch content (member+)
   PUT    /projects/{project_id}/tools/{tool_id}/content    save content (member+)
   POST   /projects/{project_id}/tools/seed                 seed defaults (owner)
+  GET    /projects/{project_id}/tools/manifest             discover project-declared tools (member+)
+  POST   /projects/{project_id}/tools/{tool_slug}/asset-token  mint capability JWT (member+)
+  GET    /projects/{project_id}/tools/{tool_slug}/assets/{path:path}  serve tool assets (JWT auth)
 
 The content-save path uses ``lock_project_or_429`` to serialise writes and an
 optimistic ``base_revision``/409 guard that mirrors the design-doc revision
 pattern in ``admin_projects.py``.
+
+The asset serving endpoint uses a separate router WITHOUT the ``get_current_user``
+dependency — it validates a short-lived capability JWT from the query string
+so opaque-origin (``null``) iframes can load tool assets without cookies.
 """
 
+import json as _json
 import logging
+import mimetypes
 import re
+import time as _time
 import uuid
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import ProjectTool, _utcnow
-from app.auth import get_current_user
-from app.admin import _get_user_project_with_role
+from app.models import Project, ProjectTool, _utcnow
+from app.auth import get_current_user, AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
@@ -74,6 +87,340 @@ _SEED_TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+
+# ── Public asset router (NO get_current_user — iframe auth via JWT) ──────────
+
+asset_router = APIRouter(
+    prefix="/api/admin",
+    tags=["admin-project-tool-assets"],
+)
+
+
+# ── Manifest discovery cache ─────────────────────────────────────────────────
+#
+# Project-declared tools live in ``.blueprint/tools.json`` in the project's
+# connected GitHub repo.  We cache parse results in-memory with a short TTL so
+# repeated requests don't hammer the GitHub API.  Cache failures (missing file,
+# malformed JSON) too — they get a shorter 60s TTL to avoid re-fetching on
+# every request while still picking up fixes quickly.
+
+_MANIFEST_CACHE_TTL_OK = 300       # 5 minutes for a successful parse
+_MANIFEST_CACHE_TTL_FAIL = 60      # 1 minute for a failure (missing/malformed)
+_MANIFEST_CACHE_MAX = 500          # entries
+_manifest_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _prune_manifest_cache() -> None:
+    """Evict expired entries so the cache doesn't grow unbounded."""
+    now = _time.monotonic()
+    stale = [k for k, (exp, _result) in _manifest_cache.items() if now >= exp]
+    for k in stale:
+        _manifest_cache.pop(k, None)
+    # If still over the cap after pruning stale, evict oldest by expiry.
+    if len(_manifest_cache) > _MANIFEST_CACHE_MAX:
+        sorted_keys = sorted(_manifest_cache, key=lambda k: _manifest_cache[k][0])
+        for k in sorted_keys[: len(_manifest_cache) - _MANIFEST_CACHE_MAX]:
+            _manifest_cache.pop(k, None)
+
+
+# ── Manifest schema ──────────────────────────────────────────────────────────
+
+# Required fields in each tool entry.
+_MANIFEST_TOOL_REQUIRED = {"slug", "title", "entry"}
+
+# The .blueprint/tools.json keys we accept.  Anything outside this set is
+# silently ignored so the manifest format can grow without breaking readers.
+_MANIFEST_TOOL_KNOWN_KEYS = {
+    "slug", "title", "description", "placement", "entry",
+}
+
+# Valid placements (must match admin-ui rendering buckets).
+_VALID_PLACEMENTS = {"project_section", "toolbar", "sidebar"}
+
+# ── Skill schema (same manifest, parallel array) ─────────────────────────────
+#
+# Skills are declared in the same ``.blueprint/tools.json`` manifest as an
+# optional ``skills`` array alongside the existing ``tools`` array. Each skill
+# entry describes a reusable agent procedure — its slug, title, shell command,
+# and an optional description.
+
+# Required fields in each skill entry.
+_MANIFEST_SKILL_REQUIRED = {"slug", "title", "command"}
+
+# The .blueprint/tools.json skill keys we accept.
+_MANIFEST_SKILL_KNOWN_KEYS = {
+    "slug", "title", "command", "description",
+}
+
+_SLUG_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
+
+
+def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:
+    """Validate a single tool entry from the manifest.  Returns an error
+    message string on failure, or ``None`` on success."""
+    if not isinstance(entry, dict):
+        return f"tools[{index}]: must be an object, got {type(entry).__name__}"
+    missing = _MANIFEST_TOOL_REQUIRED - set(entry.keys())
+    if missing:
+        return f"tools[{index}]: missing required fields: {sorted(missing)}"
+    slug = entry.get("slug")
+    if not isinstance(slug, str) or not _SLUG_VALUE_RE.match(slug):
+        return f"tools[{index}]: slug must match {_SLUG_VALUE_RE.pattern}"
+    title = entry.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return f"tools[{index}]: title must be a non-empty string"
+    entry_path = entry.get("entry")
+    if not isinstance(entry_path, str) or not entry_path.strip():
+        return f"tools[{index}]: entry must be a non-empty path string"
+    # Reject paths containing ".." (traversal) or starting with "/" (absolute).
+    if ".." in entry_path or entry_path.startswith("/"):
+        return f"tools[{index}]: entry path must be relative and must not contain '..'"
+    placement = entry.get("placement", "project_section")
+    if placement not in _VALID_PLACEMENTS:
+        return f"tools[{index}]: placement must be one of {sorted(_VALID_PLACEMENTS)}"
+    # Extra unknown keys: silently ignored.
+    return None
+
+
+def _normalize_manifest_tool(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a validated tool entry into the response shape."""
+    return {
+        "slug": entry["slug"],
+        "title": entry["title"].strip(),
+        "description": (entry.get("description") or "").strip() if isinstance(entry.get("description"), str) else "",
+        "placement": entry.get("placement", "project_section"),
+        "entry": entry["entry"].strip(),
+        "kind": "project",
+        "source": "project",
+    }
+
+
+def _validate_manifest_skill(entry: Dict[str, Any], index: int) -> Optional[str]:
+    """Validate a single skill entry from the manifest.  Returns an error
+    message string on failure, or ``None`` on success."""
+    if not isinstance(entry, dict):
+        return f"skills[{index}]: must be an object, got {type(entry).__name__}"
+    missing = _MANIFEST_SKILL_REQUIRED - set(entry.keys())
+    if missing:
+        return f"skills[{index}]: missing required fields: {sorted(missing)}"
+    slug = entry.get("slug")
+    if not isinstance(slug, str) or not _SLUG_VALUE_RE.match(slug):
+        return f"skills[{index}]: slug must match {_SLUG_VALUE_RE.pattern}"
+    title = entry.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return f"skills[{index}]: title must be a non-empty string"
+    command = entry.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return f"skills[{index}]: command must be a non-empty string"
+    # Extra unknown keys: silently ignored.
+    return None
+
+
+def _normalize_manifest_skill(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a validated skill entry into the response shape."""
+    result: Dict[str, Any] = {
+        "slug": entry["slug"],
+        "title": entry["title"].strip(),
+        "command": entry["command"].strip(),
+    }
+    description = entry.get("description")
+    if isinstance(description, str) and description.strip():
+        result["description"] = description.strip()
+    return result
+
+
+async def _discover_manifest_tools(
+    project: Project,
+) -> Dict[str, Any]:
+    """Fetch and parse ``.blueprint/tools.json`` from the project's connected repo.
+
+    Returns a dict ``{tools: [...], skills: [...], error: str | None}``.
+    ``error`` is set only for a structural problem with the manifest (malformed
+    JSON, schema violation) — a missing repo or missing manifest file returns
+    empty lists with no error.
+    """
+    owner = (project.github_owner or "").strip()
+    repo_name = (project.github_repo or "").strip()
+    project_id_str = str(project.id)
+
+    if not owner or not repo_name:
+        return {"tools": [], "skills": [], "error": None}
+
+    cache_key = f"{owner}/{repo_name}"
+
+    # Check manifest cache.
+    _prune_manifest_cache()
+    cached = _manifest_cache.get(cache_key)
+    if cached is not None and _time.monotonic() < cached[0]:
+        return cached[1]
+
+    try:
+        from app.github_auth import get_repo_installation_read_token
+        from app.github_refs import get_repo_default_branch
+        from app.github import get_file_text_at_ref
+
+        token = await get_repo_installation_read_token(owner, repo_name)
+        if not token:
+            logger.warning(
+                "[project-tools] No read token for %s/%s — cannot fetch manifest",
+                owner, repo_name,
+            )
+            result = {"tools": [], "skills": [], "error": None}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+            return result
+
+        default_branch = await get_repo_default_branch(token, owner, repo_name)
+        manifest_text = await get_file_text_at_ref(
+            ".blueprint/tools.json",
+            token=token,
+            owner=owner,
+            repo=repo_name,
+            ref=default_branch,
+            project_id=project_id_str,
+        )
+
+        if manifest_text is None:
+            # File doesn't exist — not an error, just no project-declared tools.
+            result = {"tools": [], "skills": [], "error": None}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
+            return result
+
+        try:
+            manifest = _json.loads(manifest_text)
+        except _json.JSONDecodeError as e:
+            error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
+            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
+            result = {"tools": [], "skills": [], "error": error_msg}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+            return result
+
+        if not isinstance(manifest, dict):
+            error_msg = ".blueprint/tools.json must be a JSON object with a 'tools' array"
+            result = {"tools": [], "skills": [], "error": error_msg}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+            return result
+
+        raw_tools = manifest.get("tools")
+        if not isinstance(raw_tools, list):
+            error_msg = ".blueprint/tools.json 'tools' field must be an array"
+            result = {"tools": [], "skills": [], "error": error_msg}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+            return result
+
+        tools: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        seen_slugs: set[str] = set()
+        for i, entry in enumerate(raw_tools):
+            err = _validate_manifest_tool(entry, i)
+            if err:
+                errors.append(err)
+                continue
+            slug = entry["slug"]
+            if slug in seen_slugs:
+                errors.append(f"tools[{i}]: duplicate slug '{slug}'")
+                continue
+            seen_slugs.add(slug)
+            tools.append(_normalize_manifest_tool(entry))
+
+        # Parse optional skills array alongside tools.
+        raw_skills = manifest.get("skills")
+        skills: List[Dict[str, Any]] = []
+        if isinstance(raw_skills, list):
+            seen_skill_slugs: set[str] = set()
+            for i, entry in enumerate(raw_skills):
+                err = _validate_manifest_skill(entry, i)
+                if err:
+                    errors.append(err)
+                    continue
+                slug = entry["slug"]
+                if slug in seen_skill_slugs:
+                    errors.append(f"skills[{i}]: duplicate slug '{slug}'")
+                    continue
+                seen_skill_slugs.add(slug)
+                skills.append(_normalize_manifest_skill(entry))
+
+        if errors:
+            error_msg = "Manifest validation errors: " + "; ".join(errors)
+            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
+            result = {"tools": tools, "skills": skills, "error": error_msg}
+            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+            return result
+
+        result = {"tools": tools, "skills": skills, "error": None}
+        _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
+        return result
+
+    except Exception as e:  # noqa: BLE001 — manifest fetch must never crash the endpoint
+        logger.warning(
+            "[project-tools] Manifest fetch error for %s: %s", cache_key, e,
+        )
+        result = {"tools": [], "skills": [], "error": f"Failed to fetch manifest: {e}"}
+        _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
+        return result
+
+
+# ── Content-Type detection ───────────────────────────────────────────────────
+
+# Extension → MIME type mapping for common web asset types.  Falls back to
+# mimetypes.guess_type for anything not in the map, then to octet-stream.
+_ASSET_MIME_MAP: Dict[str, str] = {
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+}
+
+# Extensions that are safe to serve as text (via get_file_text_at_ref) — all
+# others go through the binary-safe get_file_bytes_at_ref.
+_TEXT_EXTENSIONS = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".svg", ".txt", ".md", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+
+
+def _content_type_for_path(path: str) -> str:
+    """Return the Content-Type for *path*, falling back to octet-stream."""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    dotted = f".{ext}" if ext else ""
+    if dotted in _ASSET_MIME_MAP:
+        return _ASSET_MIME_MAP[dotted]
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+# ── Asset token creation ─────────────────────────────────────────────────────
+
+ASSET_TOKEN_TTL_MINUTES = 5
+
+
+def _create_tool_asset_token(project_id: str, tool_slug: str) -> str:
+    """Mint a short-lived capability JWT for tool-asset access.
+
+    The token carries ``scope: "tool-asset"`` as an explicit discriminator so
+    the asset endpoint can reject agent tokens (which lack this scope) and vice
+    versa.  Signed with ``AGENT_JWT_SECRET`` (HS256) — the same key as agent
+    tokens, but the scope claim prevents cross-use.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ASSET_TOKEN_TTL_MINUTES)
+    to_encode = {
+        "scope": "tool-asset",
+        "project_id": project_id,
+        "tool_slug": tool_slug,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+
 
 # ── Tool-kind endpoint (dynamic discovery for the frontend) ───────────────────
 
@@ -485,3 +832,196 @@ async def seed_project_tools(
         await session.commit()
 
     return {"status": "ok", "added": added, "skipped": skipped}
+
+
+# ── Manifest discovery endpoint ──────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/tools/manifest")
+async def discover_project_tool_manifest(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Discover tools declared in the project's ``.blueprint/tools.json``.
+
+    Returns a JSON object with a ``tools`` array and an optional ``error``
+    string.  Each tool entry carries ``slug``, ``title``, ``description``,
+    ``placement``, ``entry``, ``kind`` (always ``"project"``), and ``source``
+    (always ``"project"``).  An empty list means no project-declared tools.
+
+    Graceful handling: no connected repo → empty list; no manifest file →
+    empty list; malformed manifest → structured error in the response body.
+    Requires member role on the project.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    result = await _discover_manifest_tools(project)
+    return result
+
+
+# ── Capability-token minting endpoint ────────────────────────────────────────
+
+
+@router.post("/projects/{project_id}/tools/{tool_slug}/asset-token")
+async def mint_tool_asset_token(
+    project_id: uuid.UUID,
+    tool_slug: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Mint a short-lived capability JWT for accessing a project tool's assets.
+
+    The token carries ``scope: "tool-asset"``, ``project_id``, ``tool_slug``,
+    ``exp`` (5-minute TTL), and ``iat``.  Signed with the same HS256 secret as
+    agent tokens but scoped so it cannot be used as an agent token.
+
+    Returns ``{token, expires_at}`` (ISO timestamp).  Rejects unknown tool
+    slugs with 404 — the slug must be present in the project's
+    ``.blueprint/tools.json`` manifest.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    # Resolve the manifest to verify the slug exists.
+    result = await _discover_manifest_tools(project)
+    if result.get("tools") is None or not any(
+        t.get("slug") == tool_slug for t in result.get("tools", [])
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_slug}' not found in project manifest",
+        )
+    token = _create_tool_asset_token(str(project_id), tool_slug)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ASSET_TOKEN_TTL_MINUTES)
+    return {"token": token, "expires_at": expires_at.isoformat()}
+
+
+# ── Asset serving endpoint (public router — JWT auth, no cookies) ────────────
+
+
+def _verify_tool_asset_token(token: str) -> dict:
+    """Verify a tool-asset capability JWT.
+
+    Returns the decoded payload on success.  Raises HTTPException(401) on
+    invalid/expired tokens.  Also rejects tokens whose ``scope`` is not
+    ``"tool-asset"`` — agent tokens cannot access this endpoint.
+    """
+    try:
+        payload = jwt.decode(token, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Asset token expired") from None
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid asset token") from None
+    if payload.get("scope") != "tool-asset":
+        raise HTTPException(status_code=401, detail="Token scope is not tool-asset")
+    return payload
+
+
+@asset_router.get("/projects/{project_id}/tools/{tool_slug}/assets/{path:path}")
+async def serve_tool_asset(
+    project_id: uuid.UUID,
+    tool_slug: str,
+    path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    token: str = Query(..., description="Capability JWT for tool-asset access"),
+):
+    """Serve a static asset for a project-declared tool.
+
+    Authenticated via a short-lived ``token`` query parameter (not cookies /
+    Firebase — opaque-origin iframes cannot send cookies).  The token must
+    carry ``scope: "tool-asset"``, the correct ``project_id``, and the correct
+    ``tool_slug``.
+
+    Files are read from ``.blueprint/tools/{tool_slug}/{path}`` in the
+    project's connected GitHub repo default branch.  Content-Type is detected
+    from the file extension.  Security: path traversal (``..``) and absolute
+    paths are rejected.
+    """
+    # 1. Validate the capability JWT.
+    payload = _verify_tool_asset_token(token)
+    if payload.get("project_id") != str(project_id):
+        raise HTTPException(status_code=401, detail="Token project_id mismatch")
+    if payload.get("tool_slug") != tool_slug:
+        raise HTTPException(status_code=401, detail="Token tool_slug mismatch")
+
+    # 2. Security: reject path traversal and absolute paths.
+    if ".." in path or path.startswith("/") or path.startswith("\\"):
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+
+    # 3. Look up the project to get GitHub repo info.
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    owner = (project.github_owner or "").strip()
+    repo_name = (project.github_repo or "").strip()
+    if not owner or not repo_name:
+        raise HTTPException(status_code=404, detail="Project has no connected repo")
+
+    # 4. Fetch the file from GitHub.
+    repo_file_path = f".blueprint/tools/{tool_slug}/{path}"
+
+    from app.github_auth import get_repo_installation_read_token
+    from app.github_refs import get_repo_default_branch
+
+    gh_token = await get_repo_installation_read_token(owner, repo_name)
+    if not gh_token:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to obtain GitHub token for repo access",
+        )
+
+    default_branch = await get_repo_default_branch(gh_token, owner, repo_name)
+
+    content_type = _content_type_for_path(path)
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    is_text = f".{ext}" in _TEXT_EXTENSIONS if ext else True
+
+    try:
+        if is_text:
+            from app.github import get_file_text_at_ref
+
+            text = await get_file_text_at_ref(
+                repo_file_path,
+                token=gh_token,
+                owner=owner,
+                repo=repo_name,
+                ref=default_branch,
+                project_id=str(project_id),
+            )
+            if text is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            body: bytes = text.encode("utf-8")
+        else:
+            from app.github import get_file_bytes_at_ref
+
+            raw = await get_file_bytes_at_ref(
+                repo_file_path,
+                token=gh_token,
+                owner=owner,
+                repo=repo_name,
+                ref=default_branch,
+                project_id=str(project_id),
+            )
+            if raw is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            body = raw
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[project-tools] Asset fetch error %s/%s/%s: %s",
+            owner, repo_name, repo_file_path, e,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
+
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=300",
+        },
+    )

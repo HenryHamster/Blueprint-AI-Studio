@@ -54,6 +54,7 @@ from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
 from app.routers.admin_project_tools import router as admin_project_tools_router
+from app.routers.admin_project_tools import asset_router as admin_project_tools_asset_router
 from app.routers.admin_warm_pool import router as admin_warm_pool_router
 from app.routers.admin_runners import router as admin_runners_router
 from app.routers.runner import router as runner_router
@@ -891,6 +892,7 @@ app.include_router(admin_debug_router)
 app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
 app.include_router(admin_project_tools_router)
+app.include_router(admin_project_tools_asset_router)
 app.include_router(admin_warm_pool_router)
 app.include_router(admin_runners_router)
 app.include_router(runner_router)

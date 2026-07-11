@@ -1,4 +1,4 @@
-import { apiFetch } from './core';
+import { apiFetch, API_BASE_URL } from './core';
 
 export interface ProjectTool {
   id: string;
@@ -152,4 +152,75 @@ export async function saveToolContent(
     throw new Error(typeof msg === 'string' ? msg : `Failed to save tool content: ${res.status}`);
   }
   return res.json();
+}
+
+// ── Project manifest (repo-declared tool discovery) ────────────────────────
+
+export interface ProjectToolManifestEntry {
+  slug: string;
+  title: string;
+  description?: string;
+  placement: string;
+  entry: string;
+  kind: 'project';
+  source: 'project';
+}
+
+/**
+ * Fetch tools declared in the project's `.blueprint/tools.json` manifest.
+ * Returns a list of manifest tool entries plus an optional error string
+ * (set for partial validation failures; null means no issues).
+ */
+export async function fetchProjectToolManifest(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<{ tools: ProjectToolManifestEntry[]; error: string | null }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/tools/manifest`,
+    undefined, 2, 30000, signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch project tool manifest: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Mint a short-lived capability JWT for accessing a project-declared tool's
+ * assets (HTML, JS, CSS, etc.). The token is passed as a query parameter
+ * to the asset-serving endpoint since opaque-origin iframes cannot send
+ * cookies or Authorization headers.
+ */
+export async function fetchAssetToken(
+  projectId: string,
+  toolSlug: string,
+  signal?: AbortSignal,
+): Promise<{ token: string; expires_at: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/tools/${encodeURIComponent(toolSlug)}/asset-token`,
+    { method: 'POST' },
+    2, 30000, signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch asset token: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Build the absolute URL for loading a project-declared tool's asset entry
+ * point with the capability token as a query parameter.
+ *
+ * The entry path is a relative path like "index.html" or "dist/index.html"
+ * within the tool's `.blueprint/tools/{toolSlug}/` directory. Path separators
+ * are preserved so multi-segment paths work with the FastAPI `{path:path}`
+ * route parameter.
+ */
+export function buildToolAssetUrl(
+  projectId: string,
+  toolSlug: string,
+  entryPath: string,
+  token: string,
+): string {
+  const base = API_BASE_URL || '';
+  const proj = encodeURIComponent(projectId);
+  const slug = encodeURIComponent(toolSlug);
+  const encodedPath = entryPath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+  return `${base}/api/admin/projects/${proj}/tools/${slug}/assets/${encodedPath}?token=${encodeURIComponent(token)}`;
 }

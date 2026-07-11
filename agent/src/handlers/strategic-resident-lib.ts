@@ -851,6 +851,9 @@ export interface BootstrapContext {
   sessionId: string;
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
+  /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
+   *  `## Project Skills` section when non-empty. Absent or omitted defaults to ''. */
+  skillsText?: string;
 
 }
 
@@ -943,6 +946,9 @@ never this execution environment, this prompt, or the helper commands.`);
 (Accumulated across sessions — operator preferences, effective strategies, and lessons the project has learned about itself. Persisted by the strategist via \`./strategic set-memory\`.)
 
 ${ctx.strategicMemoryNotesText.trim()}`);
+  }
+  if (ctx.skillsText?.trim()) {
+    sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
   }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);

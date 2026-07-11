@@ -7,7 +7,7 @@ import {
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
   buildContextPrefix, configureResidentAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper,
+  writePlaybookHelper, writeMessagesHelper, writeSkillHelpers,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
@@ -250,6 +250,7 @@ export async function handleStrategicResident(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
+  writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
   const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
 
@@ -321,6 +322,25 @@ export async function handleStrategicResident(
       .join('\n');
   })();
 
+  // Format project skills for the bootstrap context.
+  const skillsText = ((): string => {
+    const raw = task.skills;
+    if (!Array.isArray(raw) || raw.length === 0) return '';
+    return raw
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .map((e) => {
+        const slug = strVal(e.slug);
+        const title = strVal(e.title) || slug;
+        const command = strVal(e.command);
+        const description = strVal(e.description).trim();
+        const parts = [`- **${title}** (\`skill-${slug}\`) — \`${command}\``];
+        if (description) parts.push(`  ${description}`);
+        return parts.join('\n');
+      })
+      .filter(Boolean)
+      .join('\n');
+  })();
+
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
@@ -336,6 +356,7 @@ export async function handleStrategicResident(
     sessionId,
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
+    skillsText,
   });
 
   const cfg = residentConfig(payload);
