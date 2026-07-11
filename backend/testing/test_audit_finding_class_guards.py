@@ -618,6 +618,11 @@ _KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
     "test_observability_payload_projection.py::test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load",
 })
 
+# Monotonic ceiling for the allowlist: the list can ONLY shrink. Bump this
+# constant when adding an entry (requires deliberate, visible action in the
+# diff alongside the new entry). Burn-down is tracked by lowering the ceiling.
+_KNOWN_UNFAITHFUL_ALLOWLIST_CEILING: int = 15
+
 
 def _unfaithful_greenlet_tests(path: Path) -> list[str]:
     """Return ``module::test_name`` for every async test function in *path* that
@@ -819,6 +824,23 @@ class TestMissingGreenletTestsFaithful:
             + "\n".join(f"  - {v}" for v in sorted(violations))
             + "\n\nTo acknowledge existing debt, add to _KNOWN_UNFAITHFUL_ALLOWLIST "
             "with a comment explaining why the test cannot be made faithful."
+        )
+
+    def test_unfaithful_allowlist_cannot_grow_beyond_ceiling(self):
+        """The known-unfaithful allowlist must never exceed its monotonic
+        ceiling.
+
+        This is a growth ratchet: adding an entry requires bumping the
+        ceiling constant, which is a deliberate, visible diff action.
+        Burn-down is tracked by lowering the ceiling as entries are
+        migrated to faithful patterns.
+        """
+        assert len(_KNOWN_UNFAITHFUL_ALLOWLIST) <= _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING, (
+            f"_KNOWN_UNFAITHFUL_ALLOWLIST has {len(_KNOWN_UNFAITHFUL_ALLOWLIST)} entries "
+            f"(ceiling: {_KNOWN_UNFAITHFUL_ALLOWLIST_CEILING}). Either migrate entries "
+            "to a faithful pattern (see _unfaithful_greenlet_tests for recognised "
+            "mechanisms) and lower the ceiling, or—after exhausting faithful options—"
+            "deliberately bump _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING."
         )
 
 
