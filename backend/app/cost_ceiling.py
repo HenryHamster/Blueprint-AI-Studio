@@ -189,6 +189,17 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                             Task.id,
                             Task.context,
                             Task.latest_status_message,
+                            # Read below for FAILED rows: `t.last_heartbeat or
+                            # t.started_at` (classify_failure's at_time) and
+                            # classify_failure → _stuck_llm_call_no_progress
+                            # (failure_classification.py) reads api_call_summary;
+                            # the raiseload error is otherwise silently swallowed
+                            # by this block's broad except, dropping the ENTIRE
+                            # BUDGET_EXCEEDED notification (the dispatch below
+                            # never runs), not just the cost breakdown.
+                            Task.last_heartbeat,
+                            Task.started_at,
+                            Task.api_call_summary,
                         raiseload=True,)
                     )
                     .where(

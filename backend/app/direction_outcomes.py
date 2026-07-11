@@ -2794,8 +2794,16 @@ async def discount_stranded_pr_from_direction_credit(
     that re-enter the stranded-PR path are no-ops and cannot over-subtract
     direction credit.
 
-    Best-effort: failures are logged and the session rolled back so the caller's
-    stranding operation (``mark_stranded_non_landing``) is not disrupted.
+    Best-effort: failures are logged and the session rolled back. NB the
+    rollback discards any uncommitted state on that session — including the
+    caller's own ``mark_stranded_non_landing`` context mutation when the
+    caller shares its session — and expires every ORM instance loaded in it
+    (regardless of ``expire_on_commit=False``). Callers that must keep the
+    stranding marker and their loaded instances alive across a discount
+    failure should invoke this on a private short-lived session (see the
+    ``_stranding_queue`` drain in
+    ``strategic_spawning._build_recent_interventions``); there the rollback
+    is contained and genuinely leaves the caller undisturbed.
     """
     import contextlib
     import logging
@@ -2865,7 +2873,13 @@ async def discount_stranded_pr_from_direction_credit(
             # Only written when the discount was actually applied (live entry or evicted aggregate),
             # not when the direction itself was not found.
             task.context = {**ctx, "stranded_discount_applied": True}
-            await session.commit()
+        # Commit even when no discount was applied (direction not found): the
+        # caller ran mark_stranded_non_landing on task.context BEFORE calling
+        # this function, and without a commit here that stranding marker is
+        # discarded on session close — the task then re-strands every cycle
+        # (warning-log churn, repeated ancestry checks). The idempotency stamp
+        # above is still only written when a discount was actually applied.
+        await session.commit()
     except Exception as exc:  # noqa: BLE001 — best-effort; must not undo stranding
         logging.getLogger(__name__).warning(
             "[DIRECTION] stranded-PR credit discount failed for task %s: %r",

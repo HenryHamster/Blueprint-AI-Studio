@@ -12643,6 +12643,163 @@ async def test_verified_not_landed_discount_survives_projection_reload(
 
 
 @pytest.mark.asyncio
+async def test_stranded_discount_failure_does_not_abort_interventions_build(
+    db_session, mocker, real_orm_expiry
+):
+    """One failing stranded-PR discount must not poison the spawn cycle.
+
+    discount_stranded_pr_from_direction_credit's best-effort except path calls
+    session.rollback() on the session it is handed; a rollback expires every
+    loaded instance regardless of expire_on_commit=False. Run inline on the
+    shared session (pre-fix), one failed discount made the next iteration's
+    ``(t.context or {})`` read — and the caller's later ``project`` reads —
+    raise MissingGreenlet and abort the whole spawn cycle. Post-fix each
+    queued mark-stranded + discount pair runs on its OWN fresh session, so a
+    failure is fully contained: the build completes, the remaining pairs still
+    strand + discount, and the shared session's instances stay live.
+
+    Uses the ``real_orm_expiry`` fixture: the suite-wide ``InstanceState._expire``
+    no-op (backend/conftest.py) makes rollback-expiry impossible by default,
+    so without it this test would pass vacuously against the broken code.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    dir_a, dir_b = "dir-strand-fail-a", "dir-strand-fail-b"
+    rt_a, rt_b = str(uuid.uuid4()), str(uuid.uuid4())
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": d_id,
+                "text": f"stranded failure isolation {d_id}",
+                "status": "active",
+                "research_history": [
+                    {"task_id": rt, "prs_merged": 1, "verified_prs_merged": 1}
+                ],
+            }
+            for d_id, rt in ((dir_a, rt_a), (dir_b, rt_b))
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = []
+    for i, (d_id, rt) in enumerate(((dir_a, rt_a), (dir_b, rt_b))):
+        t = Task(
+            project_id=project.id,
+            title=f"Stranded non-landing task {d_id}",
+            description="merge commit NOT an ancestor of integration branch",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={
+                "pr_merged": True,
+                "pr_number": 600 + i,
+                "direction_id": d_id,
+                "research_task_id": rt,
+            },
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.commit()
+    task_id_a, task_id_b = (t.id for t in tasks)
+    for t in tasks:
+        db_session.expunge(t)
+
+    # Self-check that real_orm_expiry actually restored genuine expiry
+    # semantics — otherwise the whole test is vacuous (the suite-wide no-op
+    # would make the pre-fix shared-session rollback harmless in tests while
+    # it aborts spawn cycles in production).
+    await db_session.refresh(project)  # ensure an active transaction to roll back
+    await db_session.rollback()
+    assert sa_inspect(project).expired, (
+        "real_orm_expiry fixture did not restore InstanceState._expire — "
+        "rollback-expiry coverage would be vacuous"
+    )
+    await db_session.refresh(project)  # re-load for the build below
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha9", "head": {"sha": "h9"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    # Pair 1's discount dies inside its own try (directions write blows up) →
+    # its best-effort handler logs + rolls back the session it was handed.
+    # Pair 2's discount must still go through the REAL locked write.
+    from app.task_locking import with_directions_locked as _real_wdl
+
+    _wdl_calls = {"n": 0}
+
+    async def _flaky_wdl(session, project_id, mutate_fn, **kwargs):
+        _wdl_calls["n"] += 1
+        if _wdl_calls["n"] == 1:
+            raise RuntimeError("directions write exploded")
+        return await _real_wdl(session, project_id, mutate_fn, **kwargs)
+
+    mocker.patch(
+        "app.direction_outcomes.with_directions_locked", side_effect=_flaky_wdl
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+
+    # The build completed and BOTH directions were fully processed.
+    assert result is not None
+    assert _wdl_calls["n"] >= 2, "second pair's discount never ran"
+    delta_by_id = {e["direction_id"]: e for e in result["per_direction_delta"]}
+    assert set(delta_by_id) >= {dir_a, dir_b}
+    for d_id in (dir_a, dir_b):
+        assert delta_by_id[d_id].get("recent_merged_titles"), (
+            f"direction {d_id} lost its merge data — the loop must survive a "
+            "failed stranded-PR discount"
+        )
+
+    # F2 guard: the caller (_spawn_strategic_review → source_ref_validation)
+    # keeps reading `project` on the shared session after the build. With real
+    # expiry active, a shared-session rollback would have expired it and this
+    # read would raise MissingGreenlet.
+    assert isinstance(project.directions, list)
+
+    from conftest import TestingSessionLocal
+
+    async with TestingSessionLocal() as fresh:
+        # Pair 1 (dir_a): its private session rolled back — nothing persisted;
+        # it re-strands next cycle and the idempotency stamp must be absent.
+        reloaded_a = await fresh.get(Task, task_id_a)
+        ctx_a = reloaded_a.context or {}
+        assert ctx_a.get("stranded_discount_applied") is None
+        assert ctx_a.get("landed_on_integration") is None
+        # Pair 2 (dir_b): fully stranded + discounted in its own session
+        # despite pair 1's failure.
+        reloaded_b = await fresh.get(Task, task_id_b)
+        ctx_b = reloaded_b.context or {}
+        assert ctx_b.get("landed_on_integration") is False
+        assert "pr_merged" not in ctx_b
+        assert ctx_b.get("stranded_discount_applied") is True
+        fresh_project = await fresh.get(Project, project.id)
+        dir_b_entry = next(
+            d for d in fresh_project.directions or [] if d.get("id") == dir_b
+        )
+        hist_b = next(
+            h
+            for h in dir_b_entry.get("research_history", [])
+            if h.get("task_id") == rt_b
+        )
+        assert hist_b.get("stranded_prs_merged") == 1
+
+
+@pytest.mark.asyncio
 async def test_verified_not_landed_stranded_discount_idempotent(db_session, mocker):
     """A task already carrying stranded_discount_applied=True is not double-counted.
 

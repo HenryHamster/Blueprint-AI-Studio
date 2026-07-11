@@ -412,6 +412,156 @@ async def test_claim_high_iter_loadonly_keeps_sr_trend_columns_eager(db_session)
 
 
 @pytest.mark.asyncio
+async def test_refresh_sr_catch_rate_projection_loads_updated_at(
+    client, db_session, mocker
+):
+    """Regression: ``_refresh_sr_catch_rate`` (routers/agent.py) loads its
+    28-day SR rows with ``load_only(..., raiseload=True)``.
+    ``sr_analytics_common._updated_naive`` reads ``task.updated_at`` off those
+    rows via ``getattr(task, "updated_at", None)`` — getattr does NOT suppress
+    the raiseload ``InvalidRequestError`` (it only suppresses AttributeError),
+    so with the column deferred the whole SR catch-rate trend update silently
+    aborted (swallowed by the claim path's broad except). Assert the rows
+    handed to ``compute_sr_catch_rate_trends`` have ``updated_at`` loaded."""
+    from sqlalchemy import inspect as sa_inspect
+
+    import app.shared_state as _shared_state
+    from app.models import TaskStatus
+
+    project = Project(name="CatchRate Projection", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _shared_state.sr_catch_rate_last_refreshed.pop(str(project.id), None)
+
+    # SR-relevant terminal row: matches the _sr_rows query filters
+    # (status, created_at window, context has _self_review_outcome).
+    sr_row = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "description": "landed"}],
+        context={
+            "_self_review_outcome": {
+                "check_results": {"security": {"passed": True}}
+            },
+            "_first_attempt_rejection_categories": {"security": 1},
+        },
+    )
+    claimable = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "description": "test"}],
+        vm_instance_id="projection-vm",
+    )
+    db_session.add(sr_row)
+    db_session.add(claimable)
+    await db_session.commit()
+    await db_session.refresh(claimable)
+
+    from app.auth import create_agent_token
+
+    headers = {"x-agent-token": create_agent_token(str(claimable.id), "projection-vm")}
+
+    mock_fn = AsyncMock(return_value=None)
+    with patch("app.sr_analytics.compute_sr_catch_rate_trends", new=mock_fn):
+        resp = await client.post("/api/agent/claim", headers=headers)
+        assert resp.status_code == 200
+        mock_fn.assert_awaited_once()
+        all_tasks = mock_fn.call_args.kwargs["all_tasks"]
+
+    captured = [t for t in all_tasks if t.id == sr_row.id]
+    assert captured, "seeded SR row must be in the catch-rate window"
+    for t in captured:
+        unloaded = sa_inspect(t).unloaded
+        assert "updated_at" not in unloaded, (
+            "updated_at deferred by the _refresh_sr_catch_rate load_only — "
+            "sr_analytics_common._updated_naive would raise raiseload's "
+            "InvalidRequestError and silently abort the catch-rate update"
+        )
+        _ = getattr(t, "updated_at", None)
+
+
+@pytest.mark.asyncio
+async def test_catch_rate_cycle_projection_loads_updated_at(db_session, mocker):
+    """Regression: cycle-mode catch-rate rows are loaded inside
+    ``compute_sr_catch_rate_trends`` (sr_analytics_catch_rate_impl.py) with
+    ``load_only(..., raiseload=True)`` and flow into
+    ``sr_analytics_common._compute_miss_latency_stats`` → ``_updated_naive``,
+    which reads ``task.updated_at`` (getattr does NOT suppress the raiseload
+    error). Assert the cycle-bucketed rows have ``updated_at`` loaded by
+    capturing them at the ``_stats_for_tasks`` consumer."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.models import StrategicCycle, TaskStatus
+    from app.sr_analytics_catch_rate import compute_sr_catch_rate_trends
+    import app.sr_analytics_catch_rate_impl as _impl
+    from conftest import TestingSessionLocal
+
+    project = Project(name="CatchRate Cycle Projection", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cycles = [
+        StrategicCycle(
+            id=f"cycle-proj-{i}",
+            project_id=project.id,
+            outcome="completed",
+            phase1_started_at=now - timedelta(days=i + 1),
+        )
+        for i in range(2)
+    ]
+    tasks = [
+        Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            strategic_cycle_id=c.id,
+            payloads=[{"type": "create", "description": "x"}],
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"security": {"passed": True}}
+                }
+            },
+        )
+        for c in cycles
+    ]
+    db_session.add_all([*cycles, *tasks])
+    await db_session.commit()
+    seeded_ids = {t.id for t in tasks}
+
+    # Pass-through spy on the first consumer of the cycle-bucketed rows.
+    real_stats = _impl._stats_for_tasks
+    captured: list = []
+
+    def _spy(rows, *args, **kwargs):
+        captured.extend(rows)
+        return real_stats(rows, *args, **kwargs)
+
+    mocker.patch.object(_impl, "_stats_for_tasks", side_effect=_spy)
+
+    # Fresh session: an identity-map hit from db_session would bypass the
+    # projection and mask the regression.
+    async with TestingSessionLocal() as fresh_session:
+        await compute_sr_catch_rate_trends(
+            project_id=project.id, session=fresh_session, all_tasks=[]
+        )
+
+    captured_seeded = [t for t in captured if t.id in seeded_ids]
+    assert captured_seeded, "cycle-bucketed rows must reach _stats_for_tasks"
+    for t in captured_seeded:
+        unloaded = sa_inspect(t).unloaded
+        assert "updated_at" not in unloaded, (
+            "updated_at deferred by the cycle-tasks load_only — "
+            "_compute_miss_latency_stats/_updated_naive would raise raiseload's "
+            "InvalidRequestError on the legacy-timestamp fallback path"
+        )
+        _ = getattr(t, "updated_at", None)
+
+
+@pytest.mark.asyncio
 async def test_sr_trend_cycle_query_narrowed_to_id_rows(db_session):
     """Regression (incident 2026-05-29): the SR-trend cycle query was narrowed
     from ``select(StrategicCycle)`` to ``select(StrategicCycle.id)`` + ``.all()``

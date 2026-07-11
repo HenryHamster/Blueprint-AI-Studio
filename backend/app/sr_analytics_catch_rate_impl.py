@@ -131,6 +131,12 @@ async def _compute_sr_catch_rate_trends_impl(
                             Task.project_id,
                             Task.strategic_cycle_id,
                             Task.payloads,
+                            # Read by sr_analytics_common._updated_naive via
+                            # getattr(task, "updated_at", None) — getattr does NOT
+                            # suppress the raiseload InvalidRequestError (only
+                            # AttributeError), which is otherwise swallowed by the
+                            # caller and silently aborts the catch-rate update.
+                            Task.updated_at,
                         raiseload=True,)
                     )
                     .where(*cycle_where)

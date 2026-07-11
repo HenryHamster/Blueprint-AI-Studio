@@ -140,6 +140,51 @@ async def db_session():
             await conn.run_sync(SQLModel.metadata.drop_all)
 
 
+@pytest.fixture()
+def real_orm_expiry():
+    """Opt-in restoration of REAL SQLAlchemy expiry semantics for one test.
+
+    The root ``backend/conftest.py`` monkeypatches ``InstanceState._expire`` to
+    a no-op SUITE-WIDE (an aiosqlite MissingGreenlet shim), which means
+    rollback/commit expiry literally cannot happen in any backend test by
+    default — a regression test for a rollback-expiry bug would pass
+    vacuously. Request this fixture to get production expiry semantics for the
+    duration of a single test (e.g. ``session.rollback()`` expires every
+    loaded instance and the next attribute access lazy-loads / raises
+    MissingGreenlet under async, exactly like prod). Opt-in only: the no-op is
+    restored on teardown and nothing outside the requesting test is affected.
+
+    Tests using this MUST self-verify it took effect (assert an instance is
+    actually ``.expired`` after a rollback) so a future conftest refactor
+    cannot silently regress them to vacuous again.
+    """
+    from sqlalchemy.orm.state import InstanceState
+
+    noop = InstanceState._expire
+    if getattr(noop, "__name__", "") != "_noop_expire":
+        # The suite-wide no-op is not active in this invocation (e.g. the
+        # root conftest was not collected) — expiry is already real.
+        yield
+        return
+    # backend/conftest.py saved the pristine function as
+    # ``_orig_instance_expire`` right before patching. Its module is NOT
+    # reliably reachable via sys.modules (pytest's conftest import machinery
+    # lets testing/conftest.py own the name "conftest"), but the no-op's own
+    # ``__globals__`` IS that module's namespace — recover the original there.
+    # (Never re-import backend/conftest.py by path: re-running it would save
+    # the already-patched no-op as the "original".)
+    original = noop.__globals__.get("_orig_instance_expire")
+    assert original is not None and original is not noop, (
+        "real_orm_expiry: could not recover the original InstanceState._expire "
+        "from the no-op's __globals__ (_orig_instance_expire)"
+    )
+    InstanceState._expire = original
+    try:
+        yield
+    finally:
+        InstanceState._expire = noop
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _dispose_production_engine_per_test():
     """Dispose the lazy production engine after every test so its pooled

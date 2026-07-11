@@ -1413,6 +1413,63 @@ def _make_cost_task(
 
 
 @pytest.mark.asyncio
+async def test_cost_ceiling_failure_breakdown_classifies_projected_failed_row(
+    cost_db, mocker
+):
+    """Regression: the BUDGET_EXCEEDED cost_by_failure_class aggregation loads
+    sibling cost rows via load_only(..., raiseload=True) (app/cost_ceiling.py)
+    and, for FAILED rows, reads ``t.last_heartbeat or t.started_at`` bare plus
+    classify_failure → _stuck_llm_call_no_progress reads t.api_call_summary.
+    When the projection omitted those columns, the raiseload InvalidRequestError
+    was swallowed by the block's broad except and the ENTIRE BUDGET_EXCEEDED
+    notification was silently dropped (the dispatch never ran) whenever any
+    FAILED task was among the day's rows."""
+    project = await _make_project(cost_db)
+
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+
+    failed = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    failed.status = TaskStatus.FAILED
+    failed.latest_status_message = (
+        "Fatal error: Claude Code exceeded 45-minute time limit"
+    )
+    failed.api_call_summary = {"llm_call_count": 1, "total_output_tokens": 0}
+    failed.last_heartbeat = datetime.now(timezone.utc).replace(tzinfo=None)
+    cost_db.add(failed)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    # Detach the FAILED sibling so the cost_rows query re-loads it through the
+    # production load_only projection — an identity-map hit would bypass
+    # raiseload and mask the regression.
+    cost_db.expunge(failed)
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
+        await _check_daily_cost_ceiling(task, cost_db)
+    # Let the fire-and-forget ensure_future() run to completion.
+    await asyncio.sleep(0)
+
+    assert dispatch_mock.call_count == 1, (
+        "BUDGET_EXCEEDED dispatch never happened — the cost aggregation likely "
+        "died reading unprojected columns off the FAILED sibling row"
+    )
+    payload = dispatch_mock.call_args.args[2]
+    breakdown = payload["cost_by_failure_class"]
+    # The stalled-LLM FAILED row must be classified (RATE_LIMIT via the
+    # 0-output-token reclassification, which needs api_call_summary loaded).
+    assert breakdown.get("RATE_LIMIT", 0) > 0, (
+        f"expected RATE_LIMIT bucket in cost_by_failure_class, got {breakdown!r}"
+    )
+    assert breakdown.get("COMPLETED", 0) > 0
+
+
+@pytest.mark.asyncio
 async def test_cost_ceiling_no_alert_when_disabled(cost_db, mocker):
     """When daily_cost_ceiling_usd == 0 (disabled), no alert should be created."""
     project = await _make_project(cost_db)

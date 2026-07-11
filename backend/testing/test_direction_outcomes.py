@@ -951,6 +951,61 @@ async def test_discount_stranded_pr_best_effort_on_raiseload_projection(
 
 
 @pytest.mark.asyncio
+async def test_discount_stranded_pr_missing_direction_persists_stranding_marker(
+    db_session: AsyncSession,
+):
+    """When the direction is not found, the stranding marker must still persist.
+
+    The caller (cycle-start reconciliation / rollup ancestry check) runs
+    mark_stranded_non_landing on task.context BEFORE calling the discount.
+    Pre-fix, when with_directions_locked found no matching direction the
+    function never committed, so the marker mutation was discarded on session
+    close and the task re-stranded every cycle (warning-log churn, repeated
+    ancestry checks). The idempotency stamp must still be withheld — it is
+    only written when a discount was actually applied.
+    """
+    from conftest import TestingSessionLocal
+
+    from app.direction_outcomes import discount_stranded_pr_from_direction_credit
+    from app.landed_signal import mark_stranded_non_landing
+
+    # Project with NO directions: the discount's mutate_fn finds no match.
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": "d-missing-direction",
+            "research_task_id": str(research_task.id),
+        },
+        title="missing-direction stranding",
+    )
+    task_id = task.id
+    await db_session.commit()
+
+    _had_pr_merged = bool((task.context or {}).get("pr_merged"))
+    mark_stranded_non_landing(task, reason="test_missing_direction")
+    await discount_stranded_pr_from_direction_credit(
+        task, db_session, had_pr_merged=_had_pr_merged
+    )
+
+    # Re-read on a FRESH session: the marker must be durably committed, not
+    # merely dirty in db_session's identity map.
+    async with TestingSessionLocal() as fresh:
+        reloaded = await fresh.get(Task, task_id)
+        ctx = reloaded.context or {}
+        assert ctx.get("landed_on_integration") is False
+        assert ctx.get("rollup_landing_stranded") == "test_missing_direction"
+        assert "pr_merged" not in ctx
+        # No direction matched — the idempotency stamp must NOT be written.
+        assert ctx.get("stranded_discount_applied") is None
+
+
+@pytest.mark.asyncio
 async def test_verify_rollup_merge_landed_stranded_invokes_discount(
     db_session: AsyncSession, mocker
 ):

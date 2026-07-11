@@ -189,6 +189,45 @@ async def test_failure_distribution_uses_classify_failure_categories():
 
 
 @pytest.mark.asyncio
+async def test_failure_distribution_projection_loads_api_call_summary(db_session):
+    """Regression: the health-summary task query loads rows with
+    load_only(..., raiseload=True) (app/pipeline_health.py); classify_failure →
+    _stuck_llm_call_no_progress (failure_classification.py) reads
+    task.api_call_summary inside a broad ``try/except Exception: return False``.
+    When the projection omitted the column, the raiseload InvalidRequestError
+    was silently swallowed and the silent-provider-hang → RATE_LIMIT
+    reclassification was disabled: the stalled task below misclassified as
+    AGENT_TIMEOUT. Uses a REAL DB and a FRESH session (empty identity map) so
+    the projection genuinely applies — the mocked-session tests above bypass it.
+    """
+    from conftest import TestingSessionLocal
+
+    project = make_project(directions=[])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stalled = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=_utcnow() - timedelta(hours=1),
+        latest_status_message="Fatal error: Claude Code exceeded 45-minute time limit",
+        api_call_summary={"llm_call_count": 1, "total_output_tokens": 0},
+    )
+    db_session.add(stalled)
+    await db_session.commit()
+
+    async with TestingSessionLocal() as fresh_session:
+        result = await compute_pipeline_health_summary(fresh_session, project.id)
+
+    assert result["failure_distribution"].get("RATE_LIMIT") == 1, (
+        "stalled-LLM failure must reclassify to RATE_LIMIT — got "
+        f"{result['failure_distribution']!r}; api_call_summary was likely "
+        "unreadable on the projected row"
+    )
+
+
+@pytest.mark.asyncio
 async def test_failure_taxonomy_distribution_mixed():
     """failure_taxonomy bucket counts and percentages sum to ~100%."""
     now = _utcnow()
