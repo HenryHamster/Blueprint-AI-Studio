@@ -897,3 +897,110 @@ async def test_challenge_and_acceptance_window_surface_from_ledger(db_session):
     # Blob-only dimensions are unaffected.
     assert d["criterion_coverage"]["status"] == "passed"
     assert d["goal_alignment"]["status"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# patch_qualification_state_from_dimension_states — read-surface consistency
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_surface_prefers_ledger_over_stale_blob(db_session):
+    """When the ledger has resolved dimension facts for the current candidate_sha
+    and the last_qualification blob carries stale sub_scores (e.g. after an
+    infra-failure overwrite resets the blob while the ledger preserves resolved
+    results), patch_qualification_state_from_dimension_states ensures that the
+    qualification_state sub_scores match the ledger-backed dimension_states scores.
+
+    This exercises the Phase 1b read-cutover seam: one read returns one story.
+    """
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import (
+        resolve_dimension_states_from_ledger,
+        patch_qualification_state_from_dimension_states,
+    )
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    # Blob simulates an infra-failure overwrite: sub_scores are stale/reset
+    # (audit=0.0) while the ledger preserved the successful pass at 0.95.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "infra_failure",
+            "candidate_sha": "sha-stale-blob",
+            "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+            "error": "vm_timeout",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Ledger preserved the resolved facts from before the infra-failure.
+    for dim, status, sub_score in [
+        ("audit", "passed", 0.95),
+        ("test_erosion", "passed", 0.87),
+        ("ci", "passed", None),
+    ]:
+        db_session.add(QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-stale-blob",
+            dimension=dim,
+            status=status,
+            sub_score=sub_score,
+            blocker=None,
+        ))
+    await db_session.flush()
+
+    # Stale blob-derived qualification_state (as returned by summarize_qualification_state).
+    stale_qual_state = {
+        "state": "infra_failure",
+        "summary": "transient infra failure",
+        "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+    }
+
+    # Read the ledger-backed dimension_states.
+    dimension_states = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in dimension_states}
+
+    # Ledger correctly overrides the stale blob for audit and test_erosion.
+    assert d["audit"]["status"] == "passed"
+    assert d["audit"]["score"] == pytest.approx(0.95)
+    assert d["test_erosion"]["status"] == "passed"
+    assert d["test_erosion"]["score"] == pytest.approx(0.87)
+
+    # Patch the stale qualification_state with the ledger-backed scores.
+    patched = patch_qualification_state_from_dimension_states(stale_qual_state, dimension_states)
+
+    # After patching, sub_scores reflect the ledger — not the stale blob.
+    assert patched is not None
+    assert patched["sub_scores"]["audit"] == pytest.approx(0.95), (
+        "qualification_state.sub_scores should prefer ledger over stale blob"
+    )
+    assert patched["sub_scores"]["test_erosion"] == pytest.approx(0.87), (
+        "qualification_state.sub_scores should prefer ledger over stale blob"
+    )
+
+    # Original is not mutated.
+    assert stale_qual_state["sub_scores"]["audit"] == pytest.approx(0.0), (
+        "patch must not mutate the original qualification_state"
+    )
+
+    # Guard: None input returns None.
+    assert patch_qualification_state_from_dimension_states(None, dimension_states) is None
+
+    # Guard: dimensions with no score do not zero out existing sub_scores keys.
+    patched_no_score = patch_qualification_state_from_dimension_states(
+        {"sub_scores": {"audit": 0.9}},
+        [{"key": "audit", "label": "Audit", "status": "passed", "score": None, "reason": None}],
+    )
+    assert patched_no_score is not None
+    assert patched_no_score["sub_scores"]["audit"] == pytest.approx(0.9), (
+        "None score must not overwrite existing sub_scores value"
+    )

@@ -481,6 +481,71 @@ class TestCapabilityProofViews:
         assert enriched["capabilities"][1]["proof_status"] == "unproven"
         assert "proof_records" not in enriched["capabilities"][1]
 
+    def test_enrich_backing_path_only_not_proven(self):
+        """A capability with only backing_path proof records must read 'partial', not 'proven'.
+
+        backing_path proofs assert only that the declared files exist at HEAD —
+        they are self-reported structural evidence, not machine-verified.
+        The enforce gate must not be cleared by backing_path alone.
+        """
+        problem_model = {
+            "revision": 1,
+            "capabilities": [
+                {"name": "cap-backing-only", "status": "working"},
+                {"name": "cap-named-test", "status": "working"},
+                {"name": "cap-mixed", "status": "working"},
+                {"name": "cap-empty", "status": "planned"},
+            ],
+        }
+        proof_records = {
+            "cap-backing-only": [
+                {
+                    "task_id": "task-1",
+                    "proved_at": "2026-07-01T00:00:00Z",
+                    "proof_kind": "backing_path",
+                    "proof_ref": "backend/app/capability_proof.py",
+                    "commit_sha": "abc123",
+                }
+            ],
+            "cap-named-test": [
+                {
+                    "task_id": "task-2",
+                    "proved_at": "2026-07-01T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_enrich_backing_path_only_not_proven",
+                    "commit_sha": "abc123",
+                }
+            ],
+            "cap-mixed": [
+                {
+                    "task_id": "task-3a",
+                    "proved_at": "2026-07-01T00:00:00Z",
+                    "proof_kind": "backing_path",
+                    "proof_ref": "backend/app/capability_proof.py",
+                    "commit_sha": "abc123",
+                },
+                {
+                    "task_id": "task-3b",
+                    "proved_at": "2026-07-01T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "backend/testing/test_capability_proof.py::test_enrich_backing_path_only_not_proven",
+                    "commit_sha": "abc123",
+                },
+            ],
+        }
+
+        enriched = enrich_problem_model_capability_proofs(problem_model, proof_records)
+
+        caps = {c["name"]: c for c in enriched["capabilities"]}
+        # backing_path-only proof is classified as path_proven by classify_evidence_tiered
+        assert caps["cap-backing-only"]["proof_status"] == "path_proven"
+        # named_test proof is fully proven
+        assert caps["cap-named-test"]["proof_status"] == "proven"
+        # mixed (backing_path + named_test) is proven (corroborated)
+        assert caps["cap-mixed"]["proof_status"] == "proven"
+        # no proof records → unproven
+        assert caps["cap-empty"]["proof_status"] == "unproven"
+
 
 class TestCapabilityBadgeReflectsEvidence:
     """annotate_capability_proof_status: evidence_refs_map (tier-1) overrides

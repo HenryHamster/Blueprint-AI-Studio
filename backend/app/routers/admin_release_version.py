@@ -34,6 +34,7 @@ from app.qualification_state_resolver import (
     resolve_promotion_blocking_result,
     resolve_dimension_states,
     resolve_dimension_states_from_ledger,
+    patch_qualification_state_from_dimension_states,
 )
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
@@ -232,6 +233,7 @@ async def _serialize_version_history_entry(
     qualification_state, _ = resolve_effective_qualification_state(
         version, project, serving=(aggregate, artifacts)
     )
+    # Defer dimension_states computation so we can patch qualification_state below.
 
     # Enrich each history entry with the same server-computed highlights and
     # merged counts the per-version summary endpoint produces, bounded by the
@@ -266,6 +268,17 @@ async def _serialize_version_history_entry(
                 "[VERSION_HISTORY] criterion coverage compute failed for version %s",
                 version.id,
             )
+
+    # Compute dimension_states from the ledger when possible, then patch
+    # qualification_state.sub_scores so both surfaces tell one consistent story.
+    _dim_states: list[Any] = (
+        await resolve_dimension_states_from_ledger(session, version)
+        if session is not None
+        else resolve_dimension_states(version.last_qualification)
+    )
+    qualification_state = patch_qualification_state_from_dimension_states(
+        qualification_state, _dim_states
+    )
 
     return {
         "id": str(version.id),
@@ -326,11 +339,7 @@ async def _serialize_version_history_entry(
         # When a DB session is available, prefer the QualificationDimensionResult ledger
         # (which survives re-qualification overwrites); otherwise fall back to the
         # mutable last_qualification blob.
-        "dimension_states": (
-            await resolve_dimension_states_from_ledger(session, version)
-            if session is not None
-            else resolve_dimension_states(version.last_qualification)
-        ),
+        "dimension_states": _dim_states,
     }
 
 
@@ -723,6 +732,12 @@ async def get_version_lifecycle(
                 audit_child=latest_audit,
                 serving=(aggregate_serving, artifact_evidence),
             )
+            # Hoist dimension_states so we can patch qual_state sub_scores from
+            # the ledger before assembling the response — one consistent story.
+            _open_dim_states = await resolve_dimension_states_from_ledger(session, open_row)
+            qual_state = patch_qualification_state_from_dimension_states(
+                qual_state, _open_dim_states
+            )
 
             # Fetch live current_focus from the project's problem_model
             live_current_focus = None
@@ -849,7 +864,9 @@ async def get_version_lifecycle(
                 # has key, label, status, score, reason. Additive — never breaks
                 # older clients that ignore unknown fields.
                 # Prefers the QualificationDimensionResult ledger when populated.
-                "dimension_states": await resolve_dimension_states_from_ledger(session, open_row),
+                # Already resolved above so qualification_state sub_scores could
+                # be patched to match — both surfaces share one source of truth.
+                "dimension_states": _open_dim_states,
             }
 
         history_rows = (

@@ -25,9 +25,9 @@ from app.capability_registry import (
     exempt_capability_names,
     normalize_capability_name,
 )
-from app.evidence_primitive import (  # noqa: F401 — EvidenceRef imported for shape doc
-    EvidenceRef,
-    classify_evidence,
+from app.evidence_primitive import (
+    EvidenceRef,  # noqa: F401 — imported for shape doc
+    classify_evidence_tiered,
 )
 
 # Re-exported for back-compat: the annotation body lives in the IO-free
@@ -201,17 +201,19 @@ def enrich_problem_model_capability_proofs(
             if isinstance(cap_name, str)
             else []
         )
-        # Derive proof_status from evidence_refs (tier-1) when available,
-        # falling back to proof_record kind checking (tier-2).
-        refs = entry2.get("evidence_refs")
-        if isinstance(refs, list):
-            entry2["proof_status"] = classify_evidence(refs)
+        evidence_refs = entry2.get("evidence_refs")
+        if isinstance(evidence_refs, list):
+            # Empty list explicitly signals "cleared" — treat as unproven rather
+            # than falling through to proof_records, which would change semantics.
+            entry2["proof_status"] = classify_evidence_tiered(evidence_refs) if evidence_refs else "unproven"
         elif entries:
-            has_behavioral = any(
-                r.get("proof_kind") != _PROOF_KIND_BACKING_PATH
-                for r in entries
-            )
-            entry2["proof_status"] = "proven" if has_behavioral else "path_proven"
+            # Map proof records to EvidenceRef shape for tiered classification.
+            # All stored proof records represent proven evidence (only recorded
+            # when acceptance evidence is verified), so proven=True is correct.
+            synthetic_refs = [
+                {"kind": e.get("proof_kind"), "proven": True} for e in entries
+            ]
+            entry2["proof_status"] = classify_evidence_tiered(synthetic_refs)
         else:
             entry2["proof_status"] = "unproven"
         if entries:

@@ -578,6 +578,58 @@ async def resolve_dimension_states_from_ledger(
     return result
 
 
+def patch_qualification_state_from_dimension_states(
+    qual_state: "dict[str, Any] | None",
+    dimension_states: "list[dict[str, Any]]",
+) -> "dict[str, Any] | None":
+    """Patch qual_state sub_scores from ledger-backed dimension_states scores.
+
+    Pure (no DB access). Returns a shallow copy of qual_state with the sub_scores
+    dict updated from the scores carried by dimension_states, so that the top-level
+    qualification_state and the per-dimension breakdown tell one consistent story
+    even after the last_qualification blob was overwritten by a re-qualification or
+    infra-failure that the ledger survived.
+
+    Only dimensions whose score is non-None are patched. The key mapping from
+    dimension key to sub_scores key follows the same convention resolve_dimension_states
+    uses when reading from the blob:
+      - audit, test_erosion, smoketest, debt_pressure → same key in sub_scores
+      - acceptance_window → sub_scores["acceptance_window_fraction"]
+
+    Returns None when qual_state is None; returns qual_state unchanged when
+    dimension_states carries no non-None scores for the mapped dimensions.
+    """
+    if qual_state is None:
+        return None
+
+    _DIM_TO_SUB_SCORE: dict[str, str] = {
+        "audit": "audit",
+        "test_erosion": "test_erosion",
+        "smoketest": "smoketest",
+        "debt_pressure": "debt_pressure",
+        "acceptance_window": "acceptance_window_fraction",
+    }
+
+    patches: dict[str, Any] = {}
+    for dim in dimension_states:
+        score = dim.get("score")
+        if score is None:
+            continue
+        dim_key = dim.get("key")
+        if dim_key is None:
+            continue
+        sub_key = _DIM_TO_SUB_SCORE.get(dim_key)
+        if sub_key is not None:
+            patches[sub_key] = score
+
+    if not patches:
+        return qual_state
+
+    result = {**qual_state}
+    result["sub_scores"] = {**(result.get("sub_scores") or {}), **patches}
+    return result
+
+
 async def resolve_open_version_qualification_state(
     session: AsyncSession,
     version: ReleaseVersion,
