@@ -55,6 +55,7 @@ from app.autonomous_spawn_budget import (
     normalize_autonomous_spawn_budget_categories,
     normalize_autonomous_spawn_budget_mode,
 )
+from app.field_encryption import encrypt_field
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
 
@@ -307,6 +308,15 @@ router = APIRouter(
     tags=["admin-settings"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _encrypt_notification_config(config: dict) -> dict:
+    """Return a copy of config with webhook_url encrypted for DB persistence."""
+    if not config:
+        return config
+    url = config.get("webhook_url", "")
+    encrypted_url = encrypt_field(url) if url else url
+    return {**config, "webhook_url": encrypted_url or ""}
 
 
 def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict:
@@ -3468,30 +3478,32 @@ async def _apply_settings(
                             "residual_audit_defer_escalation_threshold", 5
                         )
                     ),
-                    "notification_config": _runtime_config.get(
-                        "notification_config",
-                        {
-                            "webhook_url": "",
-                            "enabled_events": [
-                                "TASK_FAILED",
-                                "APPROVAL_NEEDED",
-                                "DEPLOY_HEALTH_ALERT",
-                                "REMEDIATION_ESCALATED",
-                                "RESIDUAL_FIX_ESCALATED",
-                                "DIRECTION_BURN_PAUSE",
-                                "MERGE_UNVERIFIED",
-                                "SPEND_HOLD_CREATED",
-                                "SPEND_HOLD_EXPIRING",
-                                "RUNNER_DEACTIVATED",
-                                "RUNNER_DEGRADED",
-                                "RUNNER_DEGRADED_ESCALATED",
-                                "RUNNER_FLEET_OFFLINE",
-                                "RUNNER_LOW_DISK",
-                                "RUNNER_OUTAGE_ESCALATED",
-                                "RUNNER_LOCAL_HOLD",
-                            ],
-                            "throttle_seconds": 30,
-                        },
+                    "notification_config": _encrypt_notification_config(
+                        _runtime_config.get(
+                            "notification_config",
+                            {
+                                "webhook_url": "",
+                                "enabled_events": [
+                                    "TASK_FAILED",
+                                    "APPROVAL_NEEDED",
+                                    "DEPLOY_HEALTH_ALERT",
+                                    "REMEDIATION_ESCALATED",
+                                    "RESIDUAL_FIX_ESCALATED",
+                                    "DIRECTION_BURN_PAUSE",
+                                    "MERGE_UNVERIFIED",
+                                    "SPEND_HOLD_CREATED",
+                                    "SPEND_HOLD_EXPIRING",
+                                    "RUNNER_DEACTIVATED",
+                                    "RUNNER_DEGRADED",
+                                    "RUNNER_DEGRADED_ESCALATED",
+                                    "RUNNER_FLEET_OFFLINE",
+                                    "RUNNER_LOW_DISK",
+                                    "RUNNER_OUTAGE_ESCALATED",
+                                    "RUNNER_LOCAL_HOLD",
+                                ],
+                                "throttle_seconds": 30,
+                            },
+                        )
                     ),
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)

@@ -10422,6 +10422,91 @@ class TestNotificationConfigStartupRestore:
             await _engine.dispose()
 
     @pytest.mark.asyncio
+    async def test_notification_config_webhook_url_encrypted_in_db_and_decrypted_on_restore(
+        self, mocker
+    ):
+        """When GITHUB_PAT_ENCRYPTION_KEY is set, the webhook_url stored in
+        runtime_config_json is encrypted (ciphertext at rest) and transparently
+        decrypted when loaded back into shared_state.runtime_config on restart."""
+        from cryptography.fernet import Fernet
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from app import shared_state
+        from app.models import DeploymentState
+        from app.main import _init_deployment_state
+        from app.field_encryption import decrypt_field
+        from app.routers.admin_settings import _encrypt_notification_config
+
+        key = Fernet.generate_key().decode()
+        mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+        plaintext_url = "https://hooks.example.com/secret-bearer-token-abc123"
+        encrypted_nc = _encrypt_notification_config(
+            {
+                "webhook_url": plaintext_url,
+                "enabled_events": ["TASK_FAILED"],
+                "throttle_seconds": 60,
+            }
+        )
+
+        # Encrypted value must differ from plaintext and must be Fernet ciphertext
+        assert encrypted_nc["webhook_url"] != plaintext_url
+        assert decrypt_field(encrypted_nc["webhook_url"]) == plaintext_url
+
+        # Seed DeploymentState with the encrypted notification_config
+        async with _Session() as session:
+            state = DeploymentState(
+                id=1,
+                current_revision="r1",
+                current_sha="abc123",
+                runtime_config_json={"notification_config": encrypted_nc},
+            )
+            session.add(state)
+            await session.commit()
+
+        # Simulate restart: clear in-memory state, restore from DB
+        saved = shared_state.runtime_config.pop("notification_config", None)
+        try:
+            await _init_deployment_state()
+            restored = shared_state.runtime_config.get("notification_config")
+            assert restored is not None, (
+                "notification_config must be restored from runtime_config_json"
+            )
+            # After decryption, the webhook_url must be the original plaintext
+            assert restored["webhook_url"] == plaintext_url, (
+                f"Expected decrypted URL {plaintext_url!r}, got {restored['webhook_url']!r}"
+            )
+            assert restored["enabled_events"] == ["TASK_FAILED"]
+            assert restored["throttle_seconds"] == 60
+        finally:
+            if saved is not None:
+                shared_state.runtime_config["notification_config"] = saved
+            else:
+                shared_state.runtime_config.pop("notification_config", None)
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()
+
+    @pytest.mark.asyncio
     async def test_init_deployment_state_degrades_on_commit_lock_timeout(self, mocker):
         """A contended DeploymentState write during deploy-detection must NOT crash
         startup. Boot used to die ("Application startup failed. Exiting.") when this

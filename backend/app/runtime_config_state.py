@@ -1859,11 +1859,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "task_type_provider_overrides",
                     "autonomous_periodic_tasks",
                     "health_check_urls",
-                    "notification_config",
                     "deploy_repo_identity",
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
+                if "notification_config" in config_json:
+                    nc = config_json["notification_config"]
+                    if isinstance(nc, dict) and nc.get("webhook_url"):
+                        from app.field_encryption import decrypt_field
+                        nc = {**nc, "webhook_url": decrypt_field(nc["webhook_url"]) or ""}
+                    _set("notification_config", nc)
                 if "autonomous_spawn_budget_mode" in config_json:
                     raw_mode = (
                         str(config_json["autonomous_spawn_budget_mode"] or "")
