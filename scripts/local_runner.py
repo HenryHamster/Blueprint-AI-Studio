@@ -966,12 +966,41 @@ class _BoundedDedupLog:
 
 # ── GPU detection ────────────────────────────────────────────────────────────
 
+def _detect_gpu_compute_capabilities() -> list:
+    """Query CUDA compute capability for each GPU via nvidia-smi.
+
+    Returns a list of floats (e.g. [8.9] for an NVIDIA L40S, [7.0] for V100).
+    Returns an empty list on any error so the caller can proceed without it.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        caps = []
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    caps.append(float(line))
+                except ValueError:
+                    pass
+        return caps
+    except Exception:
+        return []
+
+
 def _detect_gpu() -> dict:
     """Detect GPU hardware by probing nvidia-smi.
 
-    Returns a dict with has_gpu, gpu_count, and gpu_names.  Any error
-    (binary absent, timeout, non-zero exit) is treated as no GPU present so
-    detection is always non-fatal.
+    Returns a dict with has_gpu, gpu_count, gpu_names, and
+    gpu_compute_capabilities (list of float CUDA compute capability per GPU,
+    e.g. [8.9] for an L40S).  Any error (binary absent, timeout, non-zero
+    exit) is treated as no GPU present so detection is always non-fatal.
     """
     try:
         result = subprocess.run(
@@ -981,14 +1010,15 @@ def _detect_gpu() -> dict:
             timeout=5,
         )
         if result.returncode != 0:
-            return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+            return {"has_gpu": False, "gpu_count": 0, "gpu_names": [], "gpu_compute_capabilities": []}
         import re
         gpu_names = re.findall(r"^GPU \d+:\s*(.+?)(?:\s*\(UUID:.+)?\s*$", result.stdout, re.MULTILINE)
         if gpu_names:
-            return {"has_gpu": True, "gpu_count": len(gpu_names), "gpu_names": gpu_names}
-        return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+            compute_caps = _detect_gpu_compute_capabilities()
+            return {"has_gpu": True, "gpu_count": len(gpu_names), "gpu_names": gpu_names, "gpu_compute_capabilities": compute_caps}
+        return {"has_gpu": False, "gpu_count": 0, "gpu_names": [], "gpu_compute_capabilities": []}
     except Exception:
-        return {"has_gpu": False, "gpu_count": 0, "gpu_names": []}
+        return {"has_gpu": False, "gpu_count": 0, "gpu_names": [], "gpu_compute_capabilities": []}
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
