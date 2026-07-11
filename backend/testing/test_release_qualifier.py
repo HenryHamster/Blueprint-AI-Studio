@@ -18907,6 +18907,145 @@ async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
 
 
 @pytest.mark.asyncio
+async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
+    db_session, mocker,
+):
+    """On an infra_failure re-drive at the SAME candidate_sha, already-resolved
+    dimensions from the per-dimension ledger are carried forward and their child
+    tasks are NOT re-spawned — only the still-unresolved dimensions' children
+    are spawned.  This is the piece that flattens the "attempt 12→13" re-audit
+    cost when a single gate (e.g. merge-grade) hit a transient infra failure.
+
+    Acceptance evidence: the sweep re-driver consults the ledger before spawning,
+    so a re-drive that only needs to re-run merge-grade skips the ~15min audit
+    and the smoketest — verified by asserting the spawn mocks are NOT called for
+    resolved dimensions and the resolved facts are carried forward in the pending
+    record.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "f00dcafe" * 5
+
+    # Seed dimension rows: most dimensions are already resolved from a prior
+    # finalize at this candidate_sha.  Only merge_grade was left 'unavailable'
+    # by a transient infra failure on that gate.
+    await _seed_dimension_row(
+        db_session, project, version, "audit",
+        status="passed", sub_score=0.85, candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "test_erosion",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "smoketest",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "ci",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_identity",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_apply",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "challenge",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "merge_grade",
+        status="unavailable", candidate_sha=sha,
+    )
+    await db_session.commit()
+
+    # Set version in infra_failure at the SAME candidate_sha — the merge-grade
+    # gate hit a transient unparseable-report failure while every other gate
+    # already resolved (passed).
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha,
+        "error": "merge_grade_report_unparseable",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version.qualification_attempts = 1
+    # The merge-grade spawn requires a non-empty, non-contentless goal.
+    version.goal = "Deliver the per-dimension ledger reuse on qualifier re-drive"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Mock spawn functions to track which are called.
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    merge_grade_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_merge_grade_task",
+        new=AsyncMock(),
+    )
+    smoketest_spawn = mocker.patch(
+        "app.release_qualifier._spawn_qualifier_smoketest_task",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-f00d",
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The re-drive should have fired (returned True — a spawn happened).
+    assert result is True
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # The version transitioned from infra_failure to pending.
+    assert qual["status"] == "pending"
+
+    # --- Core assertions: resolved-dimension children were NOT re-spawned ---
+    # audit child was NOT spawned (audit+test_erosion already resolved).
+    audit_spawn.assert_not_called()
+    # smoketest child was NOT spawned (smoketest already resolved).
+    smoketest_spawn.assert_not_called()
+    # merge_grade child WAS spawned (merge_grade was still 'unavailable').
+    merge_grade_spawn.assert_awaited_once()
+
+    # --- Resolved dimensions are carried forward in the pending record ---
+    resolved = qual.get("resolved_dimensions") or {}
+    assert isinstance(resolved, dict)
+    assert "audit" in resolved
+    assert resolved["audit"]["status"] == "passed"
+    assert resolved["audit"]["sub_score"] == 0.85
+    assert "test_erosion" in resolved
+    assert resolved["test_erosion"]["status"] == "passed"
+    assert "smoketest" in resolved
+    assert resolved["smoketest"]["status"] == "passed"
+    # merge_grade was NOT resolved (status=unavailable), so not in resolved_dims.
+    assert "merge_grade" not in resolved
+
+    # --- Task ID fields reflect which children were spawned ---
+    assert qual["audit_task_id"] is None
+    assert qual["smoketest_task_id"] is None
+    assert qual["merge_grade_task_id"] is not None
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA

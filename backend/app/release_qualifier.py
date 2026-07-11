@@ -2177,18 +2177,60 @@ async def run_qualification(
     # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
     _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
-    try:
-        audit_task = await _spawn_release_audit_task(
-            session,
-            project_id,
-            version_id=version.id,
-            base_branch=promotion_target,
-            diff_range=diff_range,
-            candidate_sha=candidate_sha,
-            version_goal=version.goal,
+    # Consult the per-dimension fact ledger before spawning children (Phase 1
+    # ledger reuse).  On a re-drive at the same candidate_sha, dimensions that
+    # already resolved (passed/failed/blocked) in a prior finalize are carried
+    # forward from the ledger — their child tasks are NOT re-spawned, and only
+    # the dimensions still unavailable/pending are re-run.  This is the piece
+    # that flattens the "attempt 12→13" re-audit cost when a single gate
+    # (e.g. merge-grade) hit a transient infra failure.
+    prior_dim_results = await _load_prior_dimension_results(
+        session, version, candidate_sha
+    )
+    resolved_dims: dict[str, dict[str, Any]] = {}
+    for dim, row in prior_dim_results.items():
+        if row.status in _LEDGER_RESOLVED_STATUSES:
+            resolved_dims[dim] = {
+                "status": row.status,
+                "sub_score": row.sub_score,
+                "blocker": row.blocker,
+                "detail": row.detail,
+            }
+    # A child task is needed only when NOT ALL of its produced dimensions are
+    # already resolved.  audit task → {audit, test_erosion}; smoketest task →
+    # {smoketest}; merge_grade task → {merge_grade}.
+    _audit_needed = not (
+        "audit" in resolved_dims and "test_erosion" in resolved_dims
+    )
+    _smoketest_needed = smoketest_enabled and "smoketest" not in resolved_dims
+    _merge_grade_needed = (
+        _merge_grade_goal_usable and "merge_grade" not in resolved_dims
+    )
+    if resolved_dims:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s has %d "
+            "already-resolved dimension(s) from a prior finalize — "
+            "audit_needed=%s smoketest_needed=%s merge_grade_needed=%s",
+            version.version_number,
+            candidate_sha[:8],
+            len(resolved_dims),
+            _audit_needed,
+            _smoketest_needed,
+            _merge_grade_needed,
         )
-        audit_task_id = str(audit_task.id)
-        if _merge_grade_goal_usable:
+    try:
+        if _audit_needed:
+            audit_task = await _spawn_release_audit_task(
+                session,
+                project_id,
+                version_id=version.id,
+                base_branch=promotion_target,
+                diff_range=diff_range,
+                candidate_sha=candidate_sha,
+                version_goal=version.goal,
+            )
+            audit_task_id = str(audit_task.id)
+        if _merge_grade_needed:
             merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
             merge_grade_task = await _spawn_release_merge_grade_task(
                 session,
@@ -2201,7 +2243,7 @@ async def run_qualification(
                 merged_pr_numbers=merged_pr_numbers,
             )
             merge_grade_task_id = str(merge_grade_task.id)
-        if smoketest_enabled:
+        if _smoketest_needed:
             smoketest_task = await _spawn_qualifier_smoketest_task(
                 session,
                 project_id,
@@ -2236,6 +2278,8 @@ async def run_qualification(
         session.add(version)
         return {"status": "spawn_failed"}
 
+    audit_challenge_spawn_pending = _audit_needed
+
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
@@ -2265,6 +2309,11 @@ async def run_qualification(
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
+        # Dimensions already resolved (passed/failed/blocked) for this
+        # candidate_sha from a prior finalize — carried forward from the
+        # per-dimension ledger so _finalize_qualification can compose from
+        # them without re-running their gates.
+        "resolved_dimensions": resolved_dims if resolved_dims else None,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -3645,6 +3694,12 @@ async def _finalize_qualification(
     # must match the children that actually ran.  Legacy records that predate
     # the flag default to True (the old always-spawn behaviour).
     smoketest_enabled = bool(qual.get("smoketest_enabled", True))
+    # Dimensions already resolved (passed/failed/blocked) for this candidate_sha
+    # from a prior finalize, carried forward by run_qualification from the
+    # per-dimension ledger.  When a dimension is present here its gate evaluation
+    # is composed from the ledger rather than re-run, and its child task may not
+    # have been spawned (the spawn coordinator skipped it).
+    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
 
     # Re-resolve CI for the candidate commit NOW rather than reusing the
     # boolean frozen at spawn — a candidate whose checks were merely pending
@@ -3889,109 +3944,135 @@ async def _finalize_qualification(
             )
 
     # --- Read the release_audit report -------------------------------------
-    audit_report: dict[str, Any] | None = None
-    if audit_task_id:
-        try:
-            audit_report = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(audit_task_id)),
-                ArtifactType.RELEASE_AUDIT_REPORT,
-            )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
-                audit_task_id,
-                version.version_number,
-            )
-    # Defense-in-depth: a COMPLETED audit task whose RELEASE_AUDIT_REPORT
-    # artifact is absent or unparseable is an infrastructure failure — the
-    # agent ran but produced no usable output.  Route to _handle_infra_failure
-    # so the operator notification is "release_infra_failure" (not
-    # "release_blocked / audit_missing"), and no QualificationVerdict row is
-    # written.
-    if (
-        audit_report is None
-        and audit_task_id
-        and _audit_task_obj is not None
-        and _audit_task_obj.status == TaskStatus.COMPLETED
-    ):
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_missing"
-        )
-
-    audit_score, test_erosion_score = _score_audit(audit_report)
-    # Carry the findings (not just the score) into last_qualification so the
-    # strategic agent can target them — otherwise the audit sub-score, usually
-    # the binding constraint, is opaque to the loop.
-    audit_findings = _extract_audit_findings(audit_report)
-    # Carry the higher-severity findings the verification gate EXCLUDED from
-    # scoring — for display only, marked unverified — so an audit whose
-    # sub-score was inflated by dropped findings is rendered honestly instead of
-    # reading as clean. Never confirmed blockers.  Use original report (the
-    # unverified-primary gap is independent of the challenge reconciliation).
-    excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
-    # Carry the specific test-erosion detail (deleted files / negative deltas)
-    # so the agent can target it when test-erosion is the binding constraint,
-    # the same way it sees audit_findings.
-    test_erosion_detail = _extract_test_erosion_detail(audit_report)
-    audit_missing_reason = _audit_missing_reason(audit_report)
-    if audit_missing_reason == "parseable_but_unscoreable":
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_parseable_but_unscoreable"
-        )
-    # An empty artifact dict has no scoring signal at all — _score_audit()
-    # returns a silent clean 1.0 because no deductions ever apply.
-    if isinstance(audit_report, dict) and not audit_report:
-        return await _handle_infra_failure(
-            session, version, qual, "audit_report_empty_dict"
-        )
-    # A "findings" key whose value is not a list is a malformed artifact shape.
-    # _score_audit() falls through to the "issues" fallback; if that is also
-    # absent or not a list, derived=1.0 with no deductions — treat as infra_failure.
-    if isinstance(audit_report, dict):
-        _findings_raw = audit_report.get("findings")
+    # When both audit and test_erosion dimensions are already resolved from a
+    # prior finalize at this candidate_sha (carried forward from the ledger),
+    # compose from the durable facts rather than reading artifacts — the audit
+    # child was not re-spawned for this re-drive.
+    _audit_and_erosion_resolved = (
+        "audit" in resolved_dims and "test_erosion" in resolved_dims
+    )
+    if _audit_and_erosion_resolved:
+        audit_report = None
+        audit_score = resolved_dims["audit"].get("sub_score")
+        test_erosion_score = resolved_dims["test_erosion"].get("sub_score")
+        if test_erosion_score is None:
+            test_erosion_score = 1.0
+        audit_findings: list[dict[str, Any]] = []
+        excluded_audit_findings: list[dict[str, Any]] = []
+        test_erosion_detail: dict[str, Any] = {}
+        audit_missing_reason: str | None = None
+    else:
+        audit_report: dict[str, Any] | None = None
+        if audit_task_id:
+            try:
+                audit_report = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(audit_task_id)),
+                    ArtifactType.RELEASE_AUDIT_REPORT,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
+                    audit_task_id,
+                    version.version_number,
+                )
+        # Defense-in-depth: a COMPLETED audit task whose RELEASE_AUDIT_REPORT
+        # artifact is absent or unparseable is an infrastructure failure — the
+        # agent ran but produced no usable output.  Route to _handle_infra_failure
+        # so the operator notification is "release_infra_failure" (not
+        # "release_blocked / audit_missing"), and no QualificationVerdict row is
+        # written.
         if (
-            _findings_raw is not None
-            and not isinstance(_findings_raw, list)
-            and not isinstance(audit_report.get("issues"), list)
+            audit_report is None
+            and audit_task_id
+            and _audit_task_obj is not None
+            and _audit_task_obj.status == TaskStatus.COMPLETED
         ):
             return await _handle_infra_failure(
-                session, version, qual, "audit_report_findings_wrong_type"
+                session, version, qual, "audit_report_missing"
             )
+
+        audit_score, test_erosion_score = _score_audit(audit_report)
+        # Carry the findings (not just the score) into last_qualification so the
+        # strategic agent can target them — otherwise the audit sub-score, usually
+        # the binding constraint, is opaque to the loop.
+        audit_findings = _extract_audit_findings(audit_report)
+        # Carry the higher-severity findings the verification gate EXCLUDED from
+        # scoring — for display only, marked unverified — so an audit whose
+        # sub-score was inflated by dropped findings is rendered honestly instead of
+        # reading as clean. Never confirmed blockers.  Use original report (the
+        # unverified-primary gap is independent of the challenge reconciliation).
+        excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
+        # Carry the specific test-erosion detail (deleted files / negative deltas)
+        # so the agent can target it when test-erosion is the binding constraint,
+        # the same way it sees audit_findings.
+        test_erosion_detail = _extract_test_erosion_detail(audit_report)
+        audit_missing_reason = _audit_missing_reason(audit_report)
+        if audit_missing_reason == "parseable_but_unscoreable":
+            return await _handle_infra_failure(
+                session, version, qual, "audit_report_parseable_but_unscoreable"
+            )
+        # An empty artifact dict has no scoring signal at all — _score_audit()
+        # returns a silent clean 1.0 because no deductions ever apply.
+        if isinstance(audit_report, dict) and not audit_report:
+            return await _handle_infra_failure(
+                session, version, qual, "audit_report_empty_dict"
+            )
+        # A "findings" key whose value is not a list is a malformed artifact shape.
+        # _score_audit() falls through to the "issues" fallback; if that is also
+        # absent or not a list, derived=1.0 with no deductions — treat as infra_failure.
+        if isinstance(audit_report, dict):
+            _findings_raw = audit_report.get("findings")
+            if (
+                _findings_raw is not None
+                and not isinstance(_findings_raw, list)
+                and not isinstance(audit_report.get("issues"), list)
+            ):
+                return await _handle_infra_failure(
+                    session, version, qual, "audit_report_findings_wrong_type"
+                )
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
     # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
     # read and smoketest_score stays None (compute_composite drops the
-    # dimension rather than hard-blocking on it).
-    smoketest_result: dict[str, Any] | None = None
-    if smoketest_enabled and smoketest_task_id:
-        try:
-            smoketest_result = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(smoketest_task_id)),
-                ArtifactType.SMOKETEST_RESULT,
+    # dimension rather than hard-blocking on it).  When the smoketest dimension
+    # is already resolved from a prior finalize at this candidate_sha, compose
+    # from the ledger (the smoketest child was not re-spawned).
+    if "smoketest" in resolved_dims:
+        smoketest_result = None
+        _smoke_score = resolved_dims["smoketest"].get("sub_score")
+        smoketest_score = _smoke_score if _smoke_score is not None else 1.0
+        smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
+    else:
+        smoketest_result: dict[str, Any] | None = None
+        if smoketest_enabled and smoketest_task_id:
+            try:
+                smoketest_result = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(smoketest_task_id)),
+                    ArtifactType.SMOKETEST_RESULT,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
+                    smoketest_task_id,
+                    version.version_number,
+                )
+        if (
+            smoketest_enabled
+            and smoketest_task_id
+            and _smoke_task_obj is not None
+            and _smoke_task_obj.status == TaskStatus.COMPLETED
+            and smoketest_result is None
+        ):
+            return await _handle_infra_failure(
+                session, version, qual, "smoketest_report_missing"
             )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
-                smoketest_task_id,
-                version.version_number,
-            )
-    if (
-        smoketest_enabled
-        and smoketest_task_id
-        and _smoke_task_obj is not None
-        and _smoke_task_obj.status == TaskStatus.COMPLETED
-        and smoketest_result is None
-    ):
-        return await _handle_infra_failure(
-            session, version, qual, "smoketest_report_missing"
-        )
-    smoketest_score = _score_smoketest(smoketest_result)
-    # Carry the specific smoketest-failure detail (failed suite / named tests)
-    # so the agent can target it when smoketest is the binding constraint.
-    smoketest_detail = _extract_smoketest_detail(smoketest_result)
+        smoketest_score = _score_smoketest(smoketest_result)
+        # Carry the specific smoketest-failure detail (failed suite / named tests)
+        # so the agent can target it when smoketest is the binding constraint.
+        smoketest_detail = _extract_smoketest_detail(smoketest_result)
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
     # If the qualifying run intentionally deferred the challenge spawn, do the
@@ -3999,10 +4080,10 @@ async def _finalize_qualification(
     # where the initial release_audit_challenge finally has the audit findings
     # needed to copy primary summaries verbatim into the prompt.
     if (
-        bool(qual.get("audit_challenge_spawn_pending"))
-        and not challenge_task_id
-        and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
-    ):
+            bool(qual.get("audit_challenge_spawn_pending"))
+            and not challenge_task_id
+            and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
+        ):
         audit_payload = (
             _audit_task_obj.first_payload if _audit_task_obj is not None else {}
         )
@@ -4475,72 +4556,90 @@ async def _finalize_qualification(
                 )
             return await _handle_infra_failure(session, version, qual, _challenge_hold)
 
-    # Score using the reconciled report (refuted findings removed when challenge ran).
-    audit_score, test_erosion_score = _score_audit(_audit_report_scored)
-    # Carry the confirmed (actionable) findings into last_qualification so the
-    # strategic agent can target them.  Use reconciled report when available so
-    # refuted findings are not surfaced as actionable blockers.
-    audit_findings = _extract_audit_findings(_audit_report_scored)
-    # Pre-cap totals + truncation flags for both carried lists. Verified meta is
-    # computed on the reconciled report (matches audit_findings just above);
-    # excluded meta on the original report (matches excluded_audit_findings,
-    # which is derived from audit_report — the unverified-primary gap is
-    # independent of challenge reconciliation).
-    _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
-    _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
-    # Build the reconciliation record on the RECONCILED report so
-    # findings_derived_score agrees with the applied audit_score.  The challenge
-    # synthesis is derived from the binding verdict artifact (new gate) — kept
-    # separate from excluded_findings_count (verification-gate drops) so they
-    # are never double-counted.
-    audit_reconciliation = {
-        **_compute_audit_reconciliation(_audit_report_scored),
-        "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
-            audit_report,
-            challenge_verdicts,
+    # Score using the reconciled report (refuted findings removed when challenge
+    # ran).  When audit+test_erosion are already resolved from a prior finalize
+    # at this candidate_sha, skip re-scoring — the carried-forward scores and
+    # empty findings lists from the ledger are authoritative, and re-scoring
+    # against a None report would overwrite them with a default 1.0.
+    if not _audit_and_erosion_resolved:
+        audit_score, test_erosion_score = _score_audit(_audit_report_scored)
+        # Carry the confirmed (actionable) findings into last_qualification so the
+        # strategic agent can target them.  Use reconciled report when available so
+        # refuted findings are not surfaced as actionable blockers.
+        audit_findings = _extract_audit_findings(_audit_report_scored)
+        # Pre-cap totals + truncation flags for both carried lists. Verified meta is
+        # computed on the reconciled report (matches audit_findings just above);
+        # excluded meta on the original report (matches excluded_audit_findings,
+        # which is derived from audit_report — the unverified-primary gap is
+        # independent of challenge reconciliation).
+        _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
+        _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
+        # Build the reconciliation record on the RECONCILED report so
+        # findings_derived_score agrees with the applied audit_score.  The challenge
+        # synthesis is derived from the binding verdict artifact (new gate) — kept
+        # separate from excluded_findings_count (verification-gate drops) so they
+        # are never double-counted.
+        audit_reconciliation = {
+            **_compute_audit_reconciliation(_audit_report_scored),
+            "audit_challenge": _compute_challenge_synthesis_from_binding_verdicts(
+                audit_report,
+                challenge_verdicts,
+                candidate_sha=candidate_sha,
+                challenge_reason=None,
+            ),
+            "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
+            "challenge_binding_record": _challenge_binding_record,
+        }
+        audit_challenge = audit_reconciliation.get("audit_challenge")
+        audit_task_candidate_sha = None
+        if _audit_task_obj is not None:
+            audit_task_candidate_sha = (
+                str(
+                    (_audit_task_obj.context or {}).get("candidate_sha")
+                    or (_audit_task_obj.first_payload or {}).get("candidate_sha")
+                    or ""
+                ).strip()
+                or None
+            )
+        audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
             candidate_sha=candidate_sha,
-            challenge_reason=None,
-        ),
-        "challenge_excluded_findings_count": len(challenger_refuted_audit_findings),
-        "challenge_binding_record": _challenge_binding_record,
-    }
-    audit_challenge = audit_reconciliation.get("audit_challenge")
-    audit_task_candidate_sha = None
-    if _audit_task_obj is not None:
-        audit_task_candidate_sha = (
-            str(
-                (_audit_task_obj.context or {}).get("candidate_sha")
-                or (_audit_task_obj.first_payload or {}).get("candidate_sha")
-                or ""
-            ).strip()
-            or None
+            audit_task_id=str(audit_task_id) if audit_task_id else None,
+            audit_task_candidate_sha=audit_task_candidate_sha,
+            challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
+            challenged_candidate_sha=(
+                str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            binding_expected_count=len(primary_findings),
+            binding_record_count=len(_challenge_binding_record),
+            reconciliation_status=(
+                str(audit_challenge.get("status") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            reconciliation_reason=(
+                str(audit_challenge.get("reason") or "").strip() or None
+                if isinstance(audit_challenge, dict)
+                else None
+            ),
+            legacy_advisory_only=bool(audit_challenge_task_id)
+            and not bool(challenge_task_id),
         )
-    audit_reconciliation["audit_leg_proof"] = _build_audit_leg_proof(
-        candidate_sha=candidate_sha,
-        audit_task_id=str(audit_task_id) if audit_task_id else None,
-        audit_task_candidate_sha=audit_task_candidate_sha,
-        challenge_task_id=str(challenge_task_id) if challenge_task_id else None,
-        challenged_candidate_sha=(
-            str(audit_challenge.get("challenged_candidate_sha") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        binding_expected_count=len(primary_findings),
-        binding_record_count=len(_challenge_binding_record),
-        reconciliation_status=(
-            str(audit_challenge.get("status") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        reconciliation_reason=(
-            str(audit_challenge.get("reason") or "").strip() or None
-            if isinstance(audit_challenge, dict)
-            else None
-        ),
-        legacy_advisory_only=bool(audit_challenge_task_id)
-        and not bool(challenge_task_id),
-    )
-
+    else:
+        # audit+test_erosion resolved from ledger — reconciliation fields are
+        # not meaningful (no challenge ran, no audit report exists).
+        _verified_findings_meta = {
+            "audit_findings_total": 0,
+            "audit_findings_truncated": False,
+        }
+        _excluded_findings_meta = {
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        }
+        audit_reconciliation: dict[str, Any] = {}
+        challenger_refuted_audit_findings = []
+        _challenge_binding_record = []
     # --- Deterministic Alembic revision-identity safety gate ----------------
     # A revision-identity collision between the candidate and the deployed
     # promotion target (the back-merge renumber class, prod incident
@@ -4611,15 +4710,33 @@ async def _finalize_qualification(
     #     against); no child was spawned, merge_grade_task_id is None.
     #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
     #     (infra_failure): required artifacts cannot be skipped or waved through.
-    merge_grade_cert: dict[str, Any] = {
-        "status": "not_applicable",
-        "covers_goal": None,
-        "coverage": None,
-        "biggest_gap": None,
-        "blocked": False,
-        "detail": None,
-    }
-    if merge_grade_task_id:
+    #   * merge_grade dimension already resolved from a prior finalize at this
+    #     candidate_sha → compose from the ledger (the child was not re-spawned).
+    if "merge_grade" in resolved_dims:
+        _mg_resolved = resolved_dims["merge_grade"]
+        _mg_status = _mg_resolved["status"]
+        merge_grade_cert = {
+            "status": (
+                "pass" if _mg_status == "passed" else (
+                    "fail" if _mg_status == "failed" else _mg_status
+                )
+            ),
+            "covers_goal": None,
+            "coverage": _mg_resolved.get("sub_score"),
+            "biggest_gap": None,
+            "blocked": _mg_status == "failed",
+            "detail": None,
+        }
+    else:
+        merge_grade_cert: dict[str, Any] = {
+            "status": "not_applicable",
+            "covers_goal": None,
+            "coverage": None,
+            "biggest_gap": None,
+            "blocked": False,
+            "detail": None,
+        }
+    if merge_grade_task_id and "merge_grade" not in resolved_dims:
         merge_grade_artifact: dict[str, Any] | None = None
         try:
             merge_grade_artifact = await _latest_artifact_logs(
@@ -5190,8 +5307,22 @@ async def _required_children_terminal(
     default to "required".  Returns False (not ready) when a required child id
     is missing/unparseable, the row is not yet persisted, or any required child
     is still non-terminal — i.e. a conservative "not ready to finalize" answer.
+
+    When one or more dimensions are already resolved via the per-dimension
+    ledger (``resolved_dimensions``), their corresponding child task was not
+    spawned — the function skips the terminal check for those dimensions since
+    the ledger carries the durable fact forward from the prior finalize.
     """
     qual = version.last_qualification or {}
+
+    # Dimensions already resolved via the per-dimension ledger, carried forward
+    # from a prior finalize at this candidate_sha.  When present, the
+    # corresponding child task was NOT re-spawned, so skip requiring it.
+    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
+    audit_resolved = "audit" in resolved_dims and "test_erosion" in resolved_dims
+    smoketest_resolved = "smoketest" in resolved_dims
+    merge_grade_resolved = "merge_grade" in resolved_dims
+
     smoketest_required = bool(qual.get("smoketest_enabled", True))
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
@@ -5201,20 +5332,34 @@ async def _required_children_terminal(
     merge_grade_task_id_raw = qual.get("merge_grade_task_id")
     merge_grade_required = bool(merge_grade_task_id_raw)
 
-    if not audit_task_id_raw or (smoketest_required and not smoketest_task_id_raw):
+    # When a dimension is already resolved via the ledger, its child task id
+    # is legitimately None (the spawn coordinator skipped it).  Skip requiring
+    # it rather than returning False for a "missing" task id.
+    if (not audit_task_id_raw and not audit_resolved) or (
+        smoketest_required
+        and not smoketest_task_id_raw
+        and not smoketest_resolved
+    ):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
             "qualification but missing required child task ids "
-            "(audit=%r smoke=%r smoketest_required=%s) — not ready",
+            "(audit=%r smoke=%r smoketest_required=%s audit_resolved=%s "
+            "smoketest_resolved=%s) — not ready",
             version.version_number,
             audit_task_id_raw,
             smoketest_task_id_raw,
             smoketest_required,
+            audit_resolved,
+            smoketest_resolved,
         )
         return False
 
     try:
-        audit_task_id = uuid.UUID(str(audit_task_id_raw))
+        audit_task_id = (
+            uuid.UUID(str(audit_task_id_raw))
+            if audit_task_id_raw is not None
+            else None
+        )
         smoketest_task_id = (
             uuid.UUID(str(smoketest_task_id_raw))
             if smoketest_required and smoketest_task_id_raw
@@ -5239,7 +5384,11 @@ async def _required_children_terminal(
         )
         return False
 
-    audit_task: Task | None = await session.get(Task, audit_task_id)
+    audit_task: Task | None = (
+        await session.get(Task, audit_task_id)
+        if audit_task_id is not None
+        else None
+    )
     smoketest_task: Task | None = (
         await session.get(Task, smoketest_task_id)
         if smoketest_task_id is not None
@@ -5257,10 +5406,10 @@ async def _required_children_terminal(
     )
 
     if (
-        audit_task is None
-        or (smoketest_required and smoketest_task is None)
+        (not audit_resolved and audit_task is None)
+        or (smoketest_required and not smoketest_resolved and smoketest_task is None)
         or (challenge_required and challenge_task is None)
-        or (merge_grade_required and merge_grade_task is None)
+        or (merge_grade_required and not merge_grade_resolved and merge_grade_task is None)
     ):
         logger.debug(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d required child "
@@ -5270,9 +5419,10 @@ async def _required_children_terminal(
         return False
 
     if (
-        audit_task.status not in _TERMINAL_STATUSES
+        (not audit_resolved and audit_task is not None and audit_task.status not in _TERMINAL_STATUSES)
         or (
             smoketest_required
+            and not smoketest_resolved
             and smoketest_task is not None
             and smoketest_task.status not in _TERMINAL_STATUSES
         )
@@ -5283,6 +5433,7 @@ async def _required_children_terminal(
         )
         or (
             merge_grade_required
+            and not merge_grade_resolved
             and merge_grade_task is not None
             and merge_grade_task.status not in _TERMINAL_STATUSES
         )
@@ -5294,8 +5445,8 @@ async def _required_children_terminal(
         "[RELEASE_QUALIFIER] finalize-gate: required children terminal for "
         "version v%d (audit=%s/%s smoke=%s challenge=%s)",
         version.version_number,
-        audit_task.id,
-        audit_task.status,
+        audit_task.id if audit_task is not None else "resolved",
+        audit_task.status if audit_task is not None else "N/A",
         f"{smoketest_task.id}/{smoketest_task.status}"
         if smoketest_task is not None
         else "disabled",
