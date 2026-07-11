@@ -13,7 +13,7 @@ vi.mock('../api/projectTools', async () => {
   };
 });
 
-import { fetchToolContent, saveToolContent } from '../api/projectTools';
+import { fetchToolContent, saveToolContent, ConflictError } from '../api/projectTools';
 import WhiteboardTool from './WhiteboardTool';
 
 const SAMPLE_STROKES = [
@@ -178,6 +178,40 @@ describe('WhiteboardTool — viewport regression', () => {
   // -----------------------------------------------------------------------
   // Touch target at 1280px (primary acceptance width)
   // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
+  // Conflict recovery
+  // -----------------------------------------------------------------------
+
+  test('recovers from 409 save conflict by reloading content from server', async () => {
+    vi.mocked(fetchToolContent)
+      .mockResolvedValueOnce({
+        content: { strokes: SAMPLE_STROKES },
+        content_revision: 3,
+      })
+      .mockResolvedValueOnce({
+        content: { strokes: SAMPLE_STROKES },
+        content_revision: 5,
+      });
+
+    vi.mocked(saveToolContent).mockRejectedValueOnce(new ConflictError());
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
+
+    if (!host) throw new Error('host not mounted');
+    expect(host.querySelector('canvas')).toBeTruthy();
+
+    // Wait for auto-save debounce (1500ms) + conflict reload
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
+
+    // fetchToolContent: 1st call (initial load) + 2nd call (conflict reload)
+    expect(fetchToolContent).toHaveBeenCalledTimes(2);
+  });
 
   test('controls meet minimum touch target at 1280px', async () => {
     vi.mocked(fetchToolContent).mockResolvedValue({

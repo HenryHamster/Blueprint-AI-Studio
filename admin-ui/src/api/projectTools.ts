@@ -20,12 +20,12 @@ export interface ToolKindConfig {
 
 export interface CreateProjectToolPayload {
   kind: string;
-  label: string;
+  title: string;
   config?: Record<string, unknown>;
 }
 
 export interface UpdateProjectToolPayload {
-  label?: string;
+  title?: string;
   config?: Record<string, unknown>;
   enabled?: boolean;
 }
@@ -85,6 +85,18 @@ export async function deleteProjectTool(projectId: string, toolId: string): Prom
   }
 }
 
+export async function seedProjectTools(projectId: string): Promise<{ status: string; added: string[]; skipped: string[] }> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/tools/seed`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to seed project tools: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to seed project tools: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchToolKinds(): Promise<ToolKindConfig[]> {
   const res = await apiFetch('/api/admin/tool-kinds');
   if (!res.ok) throw new Error(`Failed to fetch tool kinds: ${res.status}`);
@@ -111,6 +123,13 @@ export async function fetchToolContent<T = Record<string, unknown>>(
   return res.json();
 }
 
+export class ConflictError extends Error {
+  constructor() {
+    super('Save conflict — content was modified by another writer.');
+    this.name = 'ConflictError';
+  }
+}
+
 export async function saveToolContent(
   projectId: string,
   toolId: string,
@@ -125,6 +144,9 @@ export async function saveToolContent(
     },
   );
   if (!res.ok) {
+    if (res.status === 409) {
+      throw new ConflictError();
+    }
     const data = await res.json().catch(() => ({}));
     const msg = data?.detail || `Failed to save tool content: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to save tool content: ${res.status}`);

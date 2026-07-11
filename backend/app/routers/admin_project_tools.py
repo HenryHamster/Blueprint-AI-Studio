@@ -59,6 +59,8 @@ TOOL_KINDS: Dict[str, Dict[str, Any]] = {
         "config_schema": {},
         "default_title": "Whiteboard",
         "default_placement": "project_section",
+        "label": "Whiteboard",
+        "description": "A collaborative canvas for sketching diagrams and ideas.",
     },
 }
 
@@ -72,6 +74,30 @@ _SEED_TOOLS: Dict[str, Dict[str, Any]] = {
 }
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+
+# ── Tool-kind endpoint (dynamic discovery for the frontend) ───────────────────
+
+@router.get("/tool-kinds")
+async def list_tool_kinds():
+    """List available tool kinds with metadata for dynamic UI rendering.
+
+    Returns a bare array matching the TypeScript ``ToolKindConfig`` interface so
+    that ``fetchToolKinds`` in the admin-ui can populate registration forms and
+    tool-host configuration panels without hardcoding kind metadata on the client.
+    """
+    result: List[Dict[str, Any]] = []
+    for kind, spec in sorted(TOOL_KINDS.items()):
+        entry: Dict[str, Any] = {
+            "kind": kind,
+            "label": spec.get("label", spec.get("default_title", kind)),
+            "description": spec.get("description", ""),
+        }
+        icon = spec.get("icon")
+        if icon is not None:
+            entry["icon"] = icon
+        entry["config_schema"] = spec.get("config_schema", {})
+        result.append(entry)
+    return result
 
 
 # ── Pydantic request/response models ──────────────────────────────────────────
@@ -119,6 +145,54 @@ def _tool_summary(tool: ProjectTool) -> Dict[str, Any]:
         "placement": tool.placement,
         "content_revision": tool.content_revision,
     }
+
+
+def _validate_config(kind: str, config: Dict[str, Any], spec: Dict[str, Any]) -> None:
+    """Validate tool config against the kind's ``config_schema``.
+
+    Raises HTTPException(400) if validation fails.  An empty schema ``{}``
+    (the default for kinds without constraints) accepts any config, so this
+    is a no-op until a future kind declares a real schema.
+
+    The subset of JSON Schema handled here covers the common patterns for
+    tool-kind config: ``required`` field names and per-field ``type``
+    constraints on top-level properties.  Complex combinators (``oneOf``,
+    ``allOf``) and nested property schemas are not supported — if a future
+    kind needs them, migrate to a real JSON Schema library.
+    """
+    schema = spec.get("config_schema", {})
+    if not schema:
+        return
+
+    errors: List[str] = []
+
+    # Check required top-level fields.
+    for field in schema.get("required", []):
+        if field not in config:
+            errors.append(f"'{field}' is required")
+
+    # Check type constraints on top-level properties.
+    for field, prop_schema in schema.get("properties", {}).items():
+        if field not in config:
+            continue
+        expected = prop_schema.get("type")
+        if not expected:
+            continue
+        val = config[field]
+        if expected == "string" and not isinstance(val, str):
+            errors.append(f"'{field}' must be a string")
+        elif expected == "integer" and not isinstance(val, int):
+            errors.append(f"'{field}' must be an integer")
+        elif expected == "boolean" and not isinstance(val, bool):
+            errors.append(f"'{field}' must be a boolean")
+        elif expected == "array" and not isinstance(val, list):
+            errors.append(f"'{field}' must be an array")
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid config for tool kind '{kind}': {'; '.join(errors)}",
+        )
 
 
 async def _get_project_tool(
@@ -200,6 +274,7 @@ async def register_project_tool(
     if not placement:
         placement = spec["default_placement"]
     config = payload.config if isinstance(payload.config, dict) else {}
+    _validate_config(kind, config, spec)
 
     # Enforce unique (project_id, slug) with a friendly 409 before hitting the
     # DB constraint, which would otherwise surface as a 500.
@@ -261,6 +336,7 @@ async def update_project_tool(
     if payload.config is not None:
         if not isinstance(payload.config, dict):
             raise HTTPException(status_code=400, detail="config must be an object")
+        _validate_config(tool.kind, payload.config, TOOL_KINDS.get(tool.kind, {}))
         tool.config = payload.config
         flag_modified(tool, "config")
 

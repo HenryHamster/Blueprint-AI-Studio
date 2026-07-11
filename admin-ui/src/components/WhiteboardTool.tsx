@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ToolComponentProps } from '../toolRegistry';
-import { fetchToolContent, saveToolContent, type ToolContent } from '../api/projectTools';
+import { fetchToolContent, saveToolContent, ConflictError, type ToolContent } from '../api/projectTools';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -240,7 +240,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       const msg = err instanceof Error ? err.message : 'Save failed';
       setSaveError(msg);
       // Reload on conflict to get the latest revision.
-      if (msg.includes('409') || msg.includes('base_revision') || msg.includes('modified by another')) {
+      if (err instanceof ConflictError) {
         try {
           const data: ToolContent<WhiteboardContent> = await fetchToolContent<WhiteboardContent>(projectId, tool.id);
           strokesRef.current = data.content?.strokes ?? [];

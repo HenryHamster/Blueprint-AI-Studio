@@ -27,6 +27,11 @@ const ORPHAN_ALLOWLIST = new Set<string>([
   // the dashboard wiring, which requires a parallel useProjectMetrics hook
   // update.
   'FleetHealthCard.tsx',
+  // Whiteboard tool — reachable from main.tsx via import './appTools'
+  // (side-effect import) then registerToolKind, but the import-graph walker's
+  // regex only tracks `from` and `import()` patterns, not bare side-effect
+  // imports. The component is not dead; it is registered dynamically.
+  'WhiteboardTool.tsx',
 ]);
 
 // ---------------------------------------------------------------------------

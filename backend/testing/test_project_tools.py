@@ -86,10 +86,69 @@ def test_tool_kinds_entries_wellformed():
     from app.routers.admin_project_tools import TOOL_KINDS
 
     for kind, spec in TOOL_KINDS.items():
-        assert set(spec) >= {"config_schema", "default_title", "default_placement"}, kind
+        assert set(spec) >= {
+            "config_schema", "default_title", "default_placement",
+            "label", "description",
+        }, kind
         assert isinstance(spec["config_schema"], dict), kind
         assert isinstance(spec["default_title"], str) and spec["default_title"], kind
         assert isinstance(spec["default_placement"], str) and spec["default_placement"], kind
+        assert isinstance(spec["label"], str) and spec["label"], kind
+        assert isinstance(spec["description"], str) and spec["description"], kind
+
+
+# ---------------------------------------------------------------------------
+# GET /tool-kinds (dynamic kind discovery — no DB needed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_tool_kinds_endpoint(client: AsyncClient, db_session):
+    """The /tool-kinds endpoint returns a bare array of kind configs."""
+    resp = await client.get(f"{_BASE}/tool-kinds")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list), "must return a bare array, not a wrapped object"
+    assert len(body) >= 1
+
+
+@pytest.mark.asyncio
+async def test_list_tool_kinds_response_matches_ts_interface(
+    client: AsyncClient, db_session
+):
+    """Response shape must match the TypeScript ToolKindConfig interface:
+    kind, label, description, icon?, config_schema?."""
+    resp = await client.get(f"{_BASE}/tool-kinds")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert len(body) >= 1
+
+    for entry in body:
+        required = {"kind", "label", "description"}
+        missing = required - set(entry.keys())
+        assert not missing, f"entry missing fields: {sorted(missing)} in {entry['kind']}"
+
+        assert isinstance(entry["kind"], str) and entry["kind"], entry
+        assert isinstance(entry["label"], str) and entry["label"], entry
+        assert isinstance(entry["description"], str), entry
+        # icon is optional; config_schema is optional but should be dict when present
+        if "icon" in entry:
+            assert isinstance(entry["icon"], str), entry
+        if "config_schema" in entry:
+            assert isinstance(entry["config_schema"], dict), entry
+
+
+@pytest.mark.asyncio
+async def test_list_tool_kinds_whiteboard_known(client: AsyncClient, db_session):
+    """The whiteboard kind is always present with known metadata."""
+    resp = await client.get(f"{_BASE}/tool-kinds")
+    assert resp.status_code == 200
+    kinds = {e["kind"]: e for e in resp.json()}
+    assert "whiteboard" in kinds
+    wb = kinds["whiteboard"]
+    assert wb["label"] == "Whiteboard"
+    assert isinstance(wb["description"], str) and wb["description"]
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +459,136 @@ async def test_list_tools_response_shape_matches_client_contract(
     assert isinstance(tool["slug"], str) and tool["slug"]
     assert isinstance(tool["enabled"], bool)
     assert isinstance(tool["content_revision"], int)
+
+
+# ---------------------------------------------------------------------------
+# Config validation against kind config_schema
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_tool_with_config(client: AsyncClient, db_session):
+    """Whiteboard has an empty config_schema so any dict config is accepted."""
+    project = await _make_project_member(db_session)
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "config": {"theme": "dark", "grid": True}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["kind"] == "whiteboard"
+
+
+@pytest.mark.asyncio
+async def test_register_tool_config_rejected_by_schema(
+    client: AsyncClient, db_session
+):
+    """With a patched schema that requires an api_key, missing it is rejected."""
+    from unittest.mock import patch
+    from app.routers.admin_project_tools import TOOL_KINDS
+
+    project = await _make_project_member(db_session)
+    patched_kinds = {
+        **TOOL_KINDS,
+        "test-kind": {
+            "config_schema": {
+                "type": "object",
+                "required": ["api_key"],
+                "properties": {"api_key": {"type": "string"}},
+            },
+            "default_title": "Test",
+            "default_placement": "project_section",
+        },
+    }
+    with patch("app.routers.admin_project_tools.TOOL_KINDS", patched_kinds):
+        resp = await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "test-kind", "config": {"not_api_key": 123}},
+        )
+    assert resp.status_code == 400
+    assert "Invalid config" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_register_tool_valid_config_passes_schema(
+    client: AsyncClient, db_session
+):
+    """With a patched schema, config that satisfies constraints is accepted."""
+    from unittest.mock import patch
+    from app.routers.admin_project_tools import TOOL_KINDS
+
+    project = await _make_project_member(db_session)
+    patched_kinds = {
+        **TOOL_KINDS,
+        "test-kind": {
+            "config_schema": {
+                "type": "object",
+                "required": ["api_key"],
+                "properties": {"api_key": {"type": "string"}},
+            },
+            "default_title": "Test",
+            "default_placement": "project_section",
+        },
+    }
+    with patch("app.routers.admin_project_tools.TOOL_KINDS", patched_kinds):
+        resp = await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "test-kind", "config": {"api_key": "sk-abc"}},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["kind"] == "test-kind"
+
+
+@pytest.mark.asyncio
+async def test_update_tool_config(client: AsyncClient, db_session):
+    """PATCH with a config dict is accepted (whiteboard schema is empty)."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "cfg-upd"},
+        )
+    ).json()
+    tool_id = created["id"]
+
+    resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"config": {"theme": "dark"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_update_tool_config_rejected_by_schema(
+    client: AsyncClient, db_session
+):
+    """PATCH with config violating the kind's config_schema is rejected."""
+    from unittest.mock import patch
+    from app.routers.admin_project_tools import TOOL_KINDS
+
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "cfg-rej"},
+        )
+    ).json()
+    tool_id = created["id"]
+
+    patched_kinds = {
+        **TOOL_KINDS,
+        "whiteboard": {
+            **TOOL_KINDS["whiteboard"],
+            "config_schema": {
+                "type": "object",
+                "required": ["api_key"],
+                "properties": {"api_key": {"type": "string"}},
+            },
+        },
+    }
+    with patch("app.routers.admin_project_tools.TOOL_KINDS", patched_kinds):
+        resp = await client.patch(
+            f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+            json={"config": {"not_api_key": True}},
+        )
+    assert resp.status_code == 400
+    assert "Invalid config" in resp.json()["error"]["message"]
