@@ -368,6 +368,12 @@ async def attest_criterion(
             detail=f"Criterion '{criterion_key}' is {row.status} and cannot be attested",
         )
 
+    # Capture primitive values before the try/except so that a rollback (which
+    # expires the ORM instance on asyncpg) cannot trigger a sync lazy-load on
+    # row.id or row.text — those reads would raise MissingGreenlet in production.
+    criterion_id: uuid.UUID = row.id
+    criterion_text: str = row.text
+
     attested_at = _utcnow().isoformat()
     detail = {"reason": body.reason, "attested_at": attested_at}
 
@@ -378,7 +384,7 @@ async def attest_criterion(
     # restarts.  This is the operator re-attest / renew path — the waiver is
     # renewable before it expires, rather than a silent no-op.
     evidence = CriterionEvidence(
-        criterion_id=row.id,
+        criterion_id=criterion_id,
         project_id=project_id,
         source_kind="operator_attestation",
         source_id=current_user["user_id"],
@@ -395,7 +401,7 @@ async def attest_criterion(
         await session.execute(
             sa_update(CriterionEvidence)
             .where(
-                CriterionEvidence.criterion_id == row.id,
+                CriterionEvidence.criterion_id == criterion_id,
                 CriterionEvidence.source_kind == "operator_attestation",
                 CriterionEvidence.source_id == current_user["user_id"],
             )
@@ -415,7 +421,7 @@ async def attest_criterion(
         # Best-effort: spawn a fresh corroboration task on re-attestation so the
         # system keeps trying to earn real coverage, not just extending the waiver.
         await ac.spawn_corroboration_task(
-            session, project_id, criterion_key, row.text, body.reason
+            session, project_id, criterion_key, criterion_text, body.reason
         )
 
         return {"status": "ok", "criterion_key": criterion_key, "coverage": "attested"}
@@ -425,7 +431,7 @@ async def attest_criterion(
     # 'attested' to 'covered') rather than relying solely on the time-bounded
     # waiver. Failure here never blocks the attestation itself.
     await ac.spawn_corroboration_task(
-        session, project_id, criterion_key, row.text, body.reason
+        session, project_id, criterion_key, criterion_text, body.reason
     )
 
     logger.info(

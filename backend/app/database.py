@@ -673,7 +673,12 @@ ROLLBACK_SAFE_PATTERNS: frozenset[str] = frozenset({
 
 # Subset of ROLLBACK_SAFE_PATTERNS that are unconditionally safe regardless of
 # where they appear relative to the rollback call.  A session.refresh() or
-# session.execute() anywhere after rollback genuinely re-loads ORM state.
+# session.execute() anywhere after rollback genuinely re-loads ORM state —
+# BUT ONLY for the object actually passed to refresh(), or the rows returned
+# by execute().  A co-located refetch does NOT make a same-expression ORM
+# attribute read safe when that attribute belongs to a DIFFERENT, unrelated
+# object that the refetch does not reload (e.g. reading ``row.id`` as an
+# argument to ``session.execute(sa_update(...).where(... == row.id))``).
 # Control-flow tokens (return/raise/break/continue) are only safe when they
 # appear IN THE SAME BLOCK as the rollback, after it — a return at function
 # level after an ORM attribute read does NOT make the read safe.  The flow-aware

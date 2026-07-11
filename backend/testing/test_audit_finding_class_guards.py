@@ -1044,11 +1044,11 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
     does NOT make a rollback inside an except handler safe when the except
     handler falls through to statements that read expired ORM attributes.
 
-    This stricter analysis is used to validate that specific patterns are safe.
     The production regression check (``test_rollback_missing_greenlet_regression_check``)
-    uses the older ``_unsafe_rollback_functions`` because many large production
-    functions rely on best-effort rollbacks inside complex control flow that is
-    safe in practice but cannot yet be statically verified without type info.
+    uses this flow-aware scanner against all of ``backend/app/``.  Functions the
+    scanner cannot statically verify as safe (due to re-fetch through a helper,
+    cross-session reads, or other patterns beyond the scanner's AST model) are
+    acknowledged in ``ROLLBACK_FLOW_ALLOWLIST`` in ``backend/app/greenlet_fidelity.py``.
     """
     source = filepath.read_text(encoding="utf-8")
     try:
@@ -1087,8 +1087,34 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
         'runtime_selection', 'results',
     })
 
+    # Compound AST statement types whose sub-statements are sequenced internally:
+    # a refetch at the start of the block makes later attribute reads in the same
+    # block safe.  The tightened refetch-vs-orm-read check only applies to SIMPLE
+    # (non-compound) statements where both appear in the same flat expression.
+    # FunctionDef / AsyncFunctionDef are treated as compound so that a nested
+    # function definition containing a refetch does not mask ORM reads elsewhere
+    # in its body when the definition itself is a successor of the rollback.
+    _COMPOUND_STMT_TYPES = (
+        ast.If, ast.Try, ast.For, ast.While, ast.With,
+        ast.AsyncFor, ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef,
+    )
+
     def _classify_stmt(suc: ast.stmt) -> int:
-        """Return 1 (safe-terminator), -1 (bare ORM read), or 0 (neutral)."""
+        """Return 1 (safe-terminator), -1 (bare ORM read), or 0 (neutral).
+
+        A *refetch* (``session.execute/refresh/get``, ``expire_all``, etc.)
+        makes the statement safe only when the same simple expression contains
+        no ORM attribute reads on an *unrelated* object that the refetch does
+        not reload.  For compound blocks (``if``/``try``/nested function defs)
+        the original behaviour is preserved: a refetch anywhere in the block
+        marks the block as safe, because the block internally sequences the
+        fetch before any attribute reads on the returned object.
+
+        Attributes whose name starts with an uppercase letter (e.g.
+        ``module.ClassName``) are excluded from the ORM-read check — SQLAlchemy
+        column names are always snake_case, so an uppercase attr is a class or
+        type reference, never a mapped column access.
+        """
         if isinstance(suc, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
             return 1
         method_funcs = {
@@ -1108,9 +1134,16 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
                       and isinstance(n.value, ast.Name)
                       and n.value.id not in _SAFE_NAMES
                       and not n.value.id[0].isupper()
-                      and not n.attr.startswith('__')):
+                      and not n.attr.startswith('__')
+                      and not n.attr[0].isupper()):
                     has_orm_read = True
-        if has_refetch:
+        # For compound blocks a refetch anywhere in the block marks it safe
+        # (the block sequences fetch before read).  For simple expressions a
+        # refetch is only safe when no unrelated expired ORM attribute appears
+        # in the same expression — a co-located refetch does NOT re-load a
+        # different expired object passed as an argument to the refetch call.
+        is_compound = isinstance(suc, _COMPOUND_STMT_TYPES)
+        if has_refetch and (is_compound or not has_orm_read):
             return 1
         if has_orm_read:
             return -1
@@ -1329,4 +1362,76 @@ class TestRollbackSafetyRegressionCheck:
             "scanner, even though the post-rollback path reaches the read before any "
             "safe terminator.  The flow-aware scanner must check terminator position "
             "relative to the rollback, not just presence anywhere in the function body."
+        )
+
+    def test_rollback_scanner_flags_unrelated_expired_read_beside_refetch(
+        self, tmp_path
+    ):
+        """A post-rollback ``session.execute`` does NOT make the same statement
+        safe when it also reads an expired ORM attribute on a *different* object
+        that the execute does not reload.
+
+        Pattern caught: ``attest_criterion`` (pre-fix) called
+        ``session.execute(sa_update(X).where(X.criterion_id == row.id))``
+        after rollback.  The execute is an UPDATE — it does not re-load ``row``.
+        ``row`` is expired; ``row.id`` in the WHERE clause raises
+        ``MissingGreenlet`` on asyncpg before the execute even runs.
+
+        The old whole-statement check returned 1 (safe) whenever a refetch
+        pattern appeared anywhere in the statement, even as a sibling expression
+        to an unrelated expired attribute read.  The flow-aware scanner must
+        return -1 (unsafe) for this shape.
+
+        Exercises ``_classify_stmt`` inside ``_unsafe_rollback_functions_flow_aware``
+        and the ``ROLLBACK_SAFE_REFETCH_PATTERNS`` constant in
+        ``backend/app/database.py`` (which documents that a refetch is only safe
+        when it actually re-loads the object whose attributes are subsequently
+        read).
+        """
+        database_path = _BACKEND_ROOT / "app" / "database.py"
+        assert database_path.exists(), "backend/app/database.py not found"
+        db_content = database_path.read_text()
+        assert "ROLLBACK_SAFE_REFETCH_PATTERNS" in db_content, (
+            "backend/app/database.py must define ROLLBACK_SAFE_REFETCH_PATTERNS — "
+            "the subset of safe patterns that are unconditionally safe (refetch "
+            "operations) as opposed to control-flow tokens whose safety depends "
+            "on their position relative to the rollback call."
+        )
+
+        test_file = tmp_path / "test_refetch_beside_expired_read.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def unsafe_execute_with_unrelated_expired_read(
+                session, row, CriterionEvidence, sa_update
+            ):
+                \"\"\"session.execute(UPDATE ... WHERE x == row.id) after rollback.
+
+                row is expired; row.id in the WHERE clause raises MissingGreenlet
+                on asyncpg before the execute runs.  The refetch (session.execute)
+                does NOT re-load row — it performs an UPDATE, so it is NOT a safe
+                refetch for row.  This must be flagged as unsafe.
+                \"\"\"
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                # UNSAFE: row is expired; row.id is read as an argument to
+                # session.execute, which does not re-load row.
+                await session.execute(
+                    sa_update(CriterionEvidence).where(
+                        CriterionEvidence.criterion_id == row.id
+                    )
+                )
+        """))
+        violations = _unsafe_rollback_functions_flow_aware(test_file)
+        assert any(
+            "unsafe_execute_with_unrelated_expired_read" in v for v in violations
+        ), (
+            "A function that calls session.execute(UPDATE ... WHERE obj.id) after "
+            "rollback was NOT flagged by the flow-aware scanner, even though 'obj' "
+            "is expired and 'obj.id' is read as an argument to the execute call "
+            "before the execute can re-load any state.  A co-located "
+            "session.execute does NOT make a same-expression ORM attribute read "
+            "safe when it does not re-load the attribute's object.  The scanner "
+            "must treat a refetch-plus-unrelated-orm-read in the same simple "
+            "statement as unsafe (return -1, not 1)."
         )

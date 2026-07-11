@@ -7383,3 +7383,72 @@ async def test_corroboration_child_inherits_criterion_ids_and_upgrades_attested_
         f"Expected 'covered' after successful corroboration, "
         f"got {crit2['coverage']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MissingGreenlet fidelity: attest / re-attest with real ORM expiry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attest_criterion_reattest_no_missing_greenlet(
+    client: AsyncClient, db_session, expire_fidelity
+):
+    """Re-attestation must not raise MissingGreenlet when ORM expiry is active.
+
+    On the asyncpg backend, session.rollback() expires all ORM objects.
+    The attest endpoint's IntegrityError path previously read row.id and
+    row.text after the rollback, which triggered a sync lazy-load with no
+    greenlet context and raised MissingGreenlet.  The fix captures criterion_id
+    and criterion_text as plain Python values before entering the try/except,
+    so the post-rollback code never touches the expired ORM instance.
+
+    This test uses the expire_fidelity fixture to restore real SQLAlchemy expiry
+    (InstanceState._expire) on the SQLite backend, reproducing the asyncpg
+    failure mode cheaply.  Without the production fix, the second POST fails
+    with DetachedInstanceError or MissingGreenlet; with the fix it returns 200.
+    """
+    project = await _make_project_with_member(db_session, name="ReAttest-NoGreenlet")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion for greenlet fidelity test"
+    )
+
+    url = (
+        f"/api/admin/projects/{project.id}"
+        f"/acceptance-criteria/{criterion.criterion_key}/attest"
+    )
+
+    # First attestation — succeeds on the INSERT path, no rollback involved.
+    resp1 = await client.post(url, json={"reason": "First attest"})
+    assert resp1.status_code == 200, resp1.text
+    data1 = resp1.json()
+    assert data1["status"] == "ok"
+    assert data1["coverage"] == "attested"
+
+    # Second attestation — triggers IntegrityError → rollback → UPDATE path.
+    # With expire_fidelity active, rollback expires row; accessing row.id or
+    # row.text after rollback would raise MissingGreenlet without the fix.
+    resp2 = await client.post(url, json={"reason": "Re-attest renewal"})
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert data2["status"] == "ok", (
+        f"Re-attestation must succeed even with real ORM expiry; got: {data2}"
+    )
+    assert data2["coverage"] == "attested"
+
+    # Verify the evidence row was updated (not duplicated) — dedup constraint held.
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    attest_rows = [e for e in evidence if e.source_kind == "operator_attestation"]
+    assert len(attest_rows) == 1, (
+        f"Re-attestation must UPSERT, not insert a duplicate row; "
+        f"found {len(attest_rows)} operator_attestation rows"
+    )
+    assert attest_rows[0].detail["reason"] == "Re-attest renewal", (
+        f"Evidence detail must reflect the refreshed reason; "
+        f"got {attest_rows[0].detail!r}"
+    )
