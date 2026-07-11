@@ -854,7 +854,8 @@ async def claim_task(
 
     Status codes:
         200: Task claimed successfully
-        404: The JWT's task is not claimable on this VM
+        409: The JWT's task exists but is no longer claimable (terminal/reaped/doomed)
+        404: The JWT's task is not found or not pinned to this VM
         429: Task locked by another process (retry recommended)
         403: Token is not task-scoped
         401: Invalid or expired token
@@ -933,6 +934,24 @@ async def claim_task(
         )
         task = (await session.execute(replay_stmt)).scalars().first()
         if not task:
+            # Distinguish "task gone / not pinned here" (404) from "task exists
+            # but is terminal / reaped / doomed" (409). A 409 tells the agent to
+            # stop retrying; a 404 may indicate a routing error.
+            terminal_check = await session.execute(
+                select(Task.status).where(
+                    Task.id == token_task_uuid,
+                    Task.vm_instance_id == vm_id,
+                )
+            )
+            existing_status = terminal_check.scalars().first()
+            if existing_status is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task {token_task_id} is no longer claimable "
+                        f"(status: {existing_status})."
+                    ),
+                )
             raise HTTPException(
                 status_code=404,
                 detail=(

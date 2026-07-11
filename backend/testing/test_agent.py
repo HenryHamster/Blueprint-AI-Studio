@@ -560,6 +560,78 @@ async def test_agent_claim_scoped_to_token_sub_prevents_cross_claim(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_returns_409_when_jwt_task_is_terminal(
+    client: AsyncClient, db_session
+):
+    """When the JWT's task exists but is terminal (cancelled/reaped/doomed),
+    claim must return 409 — not 404 and not a different task.
+
+    Regression: before the scoping fix, claim returned a DIFFERENT task (the
+    oldest pinned sibling). After the scoping fix, it now correctly checks only
+    the JWT's task; when that task is no longer claimable the response should be
+    409 so the agent knows to stop retrying rather than treating it as a routing
+    error.
+    """
+    project = Project(name="Claim Terminal 409", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shared_vm = "runner:term-409-test"
+
+    # Older task pinned to the same runner — still claimable.
+    task_old = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "old"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_old)
+    await db_session.commit()
+    await db_session.refresh(task_old)
+
+    # Newer task pinned to the same runner — starts PROVISIONING, then goes terminal.
+    task_new = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "new"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_new)
+    await db_session.commit()
+    await db_session.refresh(task_new)
+
+    # JWT is scoped to the newer task.
+    token = create_agent_token(str(task_new.id), shared_vm)
+    headers = {"x-agent-token": token}
+
+    # Sanity: before the task moves off PROVISIONING, claim succeeds and returns the newer task.
+    resp = await client.post("/api/agent/claim", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["task_id"] == str(task_new.id)
+
+    # Now move the newer task to EVALUATING (non-terminal, so verify_agent_token
+    # passes, but no longer QUEUED/PROVISIONING and outside the IN_PROGRESS
+    # idempotency window — simulates a task that was claimed and then handed to
+    # evaluation, after which the agent's retry must not grab the older sibling).
+    task_new.status = TaskStatus.EVALUATING
+    # Clear the heartbeat so the IN_PROGRESS idempotency replay window doesn't fire.
+    task_new.last_heartbeat = _utcnow() - timedelta(minutes=10)
+    db_session.add(task_new)
+    await db_session.commit()
+
+    # The JWT still has the newer task's sub. Claim must return 409, not 404
+    # (task exists but not claimable) and not 200 (must not return the older task).
+    resp2 = await client.post("/api/agent/claim", headers=headers)
+    assert resp2.status_code == 409, (
+        f"Expected 409 for non-claimable task but got {resp2.status_code}: {resp2.text}"
+    )
+    # The older pinned task must remain untouched.
+    await db_session.refresh(task_old)
+    assert task_old.status == TaskStatus.PROVISIONING
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_ancestor_chain_fetched_in_single_query(
     client: AsyncClient, db_session
 ):
@@ -1455,9 +1527,10 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
 @pytest.mark.asyncio
 async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_session):
     """
-    Idempotent replay only fires within ~3 min of the original claim. Beyond
-    that window a stray claim from the same VM is a real anomaly and should
-    404, not silently re-serve a task whose agent may have long since died.
+    Idempotent replay only fires within 5 min of the original claim. Beyond
+    that window a stray claim from the same VM is a real anomaly. The task
+    exists (IN_PROGRESS) but is no longer claimable — this returns 409 (task
+    exists but not claimable), not 404 (task not found / not pinned here).
     """
     project = Project(name="Claim Replay Expiry", user_id="test-user-123")
     db_session.add(project)
@@ -1479,7 +1552,7 @@ async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_ses
     token = create_agent_token(str(task.id), "agent-vm-stale-replay")
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 404
+    assert resp.status_code == 409
 
 
 @pytest.mark.asyncio
