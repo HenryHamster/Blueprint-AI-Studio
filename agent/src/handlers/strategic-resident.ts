@@ -36,9 +36,11 @@ import {
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
   decisionsRegisterText, DECISIONS_REGISTER_CAP,
   serializeDecisionsReg, restoreDecisionsReg,
+  formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
+  type CheckpointGrounding, type CheckpointStateResponse,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -308,21 +310,9 @@ export async function handleStrategicResident(
 
   // Format strategic memory notes for the bootstrap prompt. Each entry is
   // {note, set_at}; render as "- [set_at] note" so the timestamp provides
-  // ordering context. Absent or non-array degrades to empty string.
-  const strategicMemoryNotesText = ((): string => {
-    const raw = payload.strategic_memory_notes;
-    if (!Array.isArray(raw) || raw.length === 0) return '';
-    return raw
-      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
-      .map((e) => {
-        const note = typeof e.note === 'string' ? e.note.trim() : '';
-        const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
-        if (!note) return '';
-        return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
-      })
-      .filter(Boolean)
-      .join('\n');
-  })();
+  // ordering context. Absent or non-array degrades to empty string. Shared with
+  // the compaction-refresh path so both format identically.
+  const strategicMemoryNotesText = formatStrategicMemoryNotes(payload.strategic_memory_notes);
 
   // Format project skills for the bootstrap context.
   const skillsText = ((): string => {
@@ -413,6 +403,14 @@ export async function handleStrategicResident(
   // uses this so it shows live directions rather than session-start snapshots.
   let refreshedDirectionGrounding: Array<{id: string; text: string; status: string}> | null = null;
 
+  // Refreshable self-model grounding (problem model, vision, memory notes,
+  // running update) fetched from the checkpoint-state endpoint at compaction
+  // time. Initialized null (degrading to the session-start snapshots) and set
+  // just before a compaction checkpoint is built so the checkpoint carries
+  // current state rather than stale bootstrap data. Mirrors the direction
+  // refresh above. See maybeCompact / buildCheckpointContext.
+  let refreshedGrounding: CheckpointGrounding | null = null;
+
   /** Build the compaction checkpoint context from current handler state. */
   const buildCheckpointContext = (): CompactionCheckpointContext => {
     const roleIdentity = [
@@ -443,19 +441,31 @@ export async function handleStrategicResident(
 
     // Durable self-model grounding — carried from the bootstrap across compaction
     // so the resumed session does NOT re-derive settled facts, re-read settled
-    // directions, or re-propose corrections the operator already made.
+    // directions, or re-propose corrections the operator already made. Prefer
+    // grounding refreshed at compaction time (refreshedGrounding, fetched from
+    // the checkpoint-state endpoint) over the session-start snapshot.
+    const grounding = resolveCheckpointGrounding(
+      {
+        problemModelJson,
+        visionJson,
+        strategicMemoryNotesText,
+        runningUpdate: strVal(payload.running_update),
+      },
+      refreshedGrounding,
+    );
     return {
       roleIdentity, examLedgerJson, recentInteractions, autonomousState,
-      problemModelJson: problemModelJson || undefined,
-      visionJson: visionJson || undefined,
-      strategicMemoryNotesText: strategicMemoryNotesText || undefined,
+      problemModelJson: grounding.problemModelJson,
+      visionJson: grounding.visionJson,
+      strategicMemoryNotesText: grounding.strategicMemoryNotesText,
       openMessagesText: buildOpenMessagesText(openMessages) || undefined,
       priorSessionContextText: priorSessionContextText || undefined,
       directionsText: refreshedDirectionGrounding
         ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
         : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
-      runningUpdate: strVal(payload.running_update) || undefined,
+      runningUpdate: grounding.runningUpdate,
       decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
+      groundingRefreshed: refreshedGrounding !== null,
     };
   };
   // An operator turn just completed → run an autonomous turn to act on it.
@@ -600,6 +610,24 @@ export async function handleStrategicResident(
     }
     sendLog(ws, `[resident] context-window pressure detected (${r.inputTokens} input tokens >= ${threshold} threshold) — compacting session\n`);
     streamer.status('session compacting — context reset to preserve signal');
+
+    // Refresh the self-model grounding from CURRENT project state before building
+    // the checkpoint, so a session that compacts after mid-session mutations
+    // (set-problem-model, set-memory, set-running-update) carries fresh data
+    // rather than the stale session-start snapshot. NON-FATAL: any failure
+    // degrades to the snapshot so compaction still proceeds — same degrade
+    // pattern as the heartbeat/poll paths.
+    try {
+      const state = await apiGet(
+        `/api/agent/projects/${projectId}/strategic-session/checkpoint-state`,
+      ) as CheckpointStateResponse | null;
+      if (state) {
+        refreshedGrounding = formatCheckpointState(state);
+        sendLog(ws, '[resident] compaction grounding refreshed from checkpoint-state endpoint\n');
+      }
+    } catch (e) {
+      sendLog(ws, `[resident] checkpoint-state refresh failed (non-fatal, using session-start snapshot): ${String(e)}\n`);
+    }
 
     // Build the checkpoint prompt from current handler state.
     const checkpoint = buildCompactionCheckpoint(buildCheckpointContext());

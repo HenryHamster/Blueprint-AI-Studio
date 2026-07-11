@@ -16,6 +16,8 @@ import {
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
+  formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
+  type CheckpointGrounding, type CheckpointStateResponse,
   decisionsRegisterText, serializeDecisionsReg, restoreDecisionsReg,
   DECISIONS_REGISTER_CAP, DECISIONS_REG_MAX_BYTES,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
@@ -1851,6 +1853,169 @@ describe('buildCompactionCheckpoint', () => {
     });
     expect(result).not.toContain('## Self-model grounding');
     expect(result).not.toContain('### Problem model');
+  });
+});
+
+describe('formatStrategicMemoryNotes', () => {
+  it('renders "- [set_at] note" per well-formed entry', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: 'prefer concrete action', set_at: '2026-07-01T00:00:00Z' },
+      { note: 'verify before escalating', set_at: '2026-07-02T00:00:00Z' },
+    ]);
+    expect(out).toBe(
+      '- [2026-07-01T00:00:00Z] prefer concrete action\n' +
+      '- [2026-07-02T00:00:00Z] verify before escalating',
+    );
+  });
+
+  it('omits the timestamp when set_at is absent', () => {
+    expect(formatStrategicMemoryNotes([{ note: 'no timestamp' }])).toBe('- no timestamp');
+  });
+
+  it('skips entries with a missing/blank note and drops non-object entries', () => {
+    const out = formatStrategicMemoryNotes([
+      { note: '   ' },
+      { set_at: '2026-07-01T00:00:00Z' },
+      'garbage',
+      null,
+      { note: 'kept' },
+    ]);
+    expect(out).toBe('- kept');
+  });
+
+  it('degrades to empty string for empty / non-array input', () => {
+    expect(formatStrategicMemoryNotes([])).toBe('');
+    expect(formatStrategicMemoryNotes(undefined)).toBe('');
+    expect(formatStrategicMemoryNotes('nope')).toBe('');
+  });
+});
+
+describe('formatCheckpointState', () => {
+  it('maps a populated response into pretty-printed JSON + formatted notes + string', () => {
+    const resp: CheckpointStateResponse = {
+      problem_model: { goals: ['ship refresh'] },
+      vision: { future: 'coherent strategist' },
+      strategic_memory_notes: [{ note: 'do not re-derive', set_at: '2026-07-01T00:00:00Z' }],
+      running_update: 'refresh landed',
+    };
+    const g = formatCheckpointState(resp);
+    expect(g.problemModelJson).toBe(JSON.stringify({ goals: ['ship refresh'] }, null, 2));
+    expect(g.visionJson).toBe(JSON.stringify({ future: 'coherent strategist' }, null, 2));
+    expect(g.strategicMemoryNotesText).toBe('- [2026-07-01T00:00:00Z] do not re-derive');
+    expect(g.runningUpdate).toBe('refresh landed');
+  });
+
+  it('coerces empty {} / missing / mistyped fields to empty strings (no throw)', () => {
+    const g = formatCheckpointState({
+      problem_model: {},
+      vision: undefined,
+      strategic_memory_notes: 'not-an-array',
+      running_update: 42,
+    });
+    expect(g.problemModelJson).toBe('');
+    expect(g.visionJson).toBe('');
+    expect(g.strategicMemoryNotesText).toBe('');
+    expect(g.runningUpdate).toBe('');
+    // A fully empty response object must not throw.
+    expect(() => formatCheckpointState({})).not.toThrow();
+  });
+});
+
+describe('resolveCheckpointGrounding', () => {
+  const snapshot: CheckpointGrounding = {
+    problemModelJson: JSON.stringify({ goals: ['STALE goal'] }, null, 2),
+    visionJson: JSON.stringify({ future: 'STALE vision' }, null, 2),
+    strategicMemoryNotesText: '- STALE lesson',
+    runningUpdate: 'STALE running update',
+  };
+
+  it('refreshed checkpoint state overrides session-start snapshot', () => {
+    // The refreshed grounding is derived from a checkpoint-state response the
+    // operator updated mid-session; every field must win over the snapshot.
+    const refreshed = formatCheckpointState({
+      problem_model: { goals: ['FRESH goal'] },
+      vision: { future: 'FRESH vision' },
+      strategic_memory_notes: [{ note: 'FRESH lesson', set_at: '2026-07-11T00:00:00Z' }],
+      running_update: 'FRESH running update',
+    });
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.problemModelJson).toContain('FRESH goal');
+    expect(resolved.problemModelJson).not.toContain('STALE');
+    expect(resolved.visionJson).toContain('FRESH vision');
+    expect(resolved.visionJson).not.toContain('STALE');
+    expect(resolved.strategicMemoryNotesText).toBe('- [2026-07-11T00:00:00Z] FRESH lesson');
+    expect(resolved.runningUpdate).toBe('FRESH running update');
+
+    // And end-to-end: the rendered checkpoint carries the fresh values, marked
+    // as refreshed rather than a session-start snapshot.
+    const checkpoint = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      ...resolved,
+      groundingRefreshed: true,
+    });
+    expect(checkpoint).toContain('FRESH goal');
+    expect(checkpoint).not.toContain('STALE');
+    expect(checkpoint).toContain('## Self-model grounding (refreshed at compaction)');
+    expect(checkpoint).not.toContain('(session-start snapshot)');
+  });
+
+  it('falls back to the snapshot when no refresh occurred (refreshed null/undefined)', () => {
+    expect(resolveCheckpointGrounding(snapshot, null)).toEqual({
+      problemModelJson: snapshot.problemModelJson,
+      visionJson: snapshot.visionJson,
+      strategicMemoryNotesText: snapshot.strategicMemoryNotesText,
+      runningUpdate: snapshot.runningUpdate,
+    });
+    expect(resolveCheckpointGrounding(snapshot, undefined).problemModelJson)
+      .toContain('STALE goal');
+  });
+
+  it('a refreshed field that was cleared mid-session collapses to undefined (not the stale value)', () => {
+    // Operator wiped the running update; the refreshed empty must win so the
+    // checkpoint drops the section rather than re-showing the stale text.
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: JSON.stringify({ goals: ['FRESH goal'] }, null, 2),
+      visionJson: '',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.problemModelJson).toContain('FRESH goal');
+    expect(resolved.visionJson).toBeUndefined();
+    expect(resolved.strategicMemoryNotesText).toBeUndefined();
+    expect(resolved.runningUpdate).toBeUndefined();
+  });
+});
+
+describe('buildCompactionCheckpoint groundingRefreshed note', () => {
+  it('uses the refreshed-at-compaction note when groundingRefreshed is true', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      problemModelJson: JSON.stringify({ goals: ['g'] }),
+      groundingRefreshed: true,
+    });
+    expect(result).toContain('## Self-model grounding (refreshed at compaction)');
+    expect(result).toContain('Refreshed note');
+    expect(result).not.toContain('(session-start snapshot)');
+    expect(result).not.toContain('Snapshot note');
+  });
+
+  it('defaults to the session-start snapshot note when groundingRefreshed is falsy', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      problemModelJson: JSON.stringify({ goals: ['g'] }),
+    });
+    expect(result).toContain('## Self-model grounding (session-start snapshot)');
+    expect(result).not.toContain('(refreshed at compaction)');
   });
 });
 

@@ -369,6 +369,98 @@ export function formatDirectionGroundingText(
   return `(refreshed from heartbeat)\n${entries.join('\n')}`;
 }
 
+/**
+ * Format strategic memory notes for the bootstrap / checkpoint prompt. Each
+ * entry is `{note, set_at}`; render as `- [set_at] note` so the timestamp
+ * provides ordering context. Absent, non-array, or empty degrades to an empty
+ * string. Shared by the session-start bootstrap and the compaction refresh so
+ * both paths format identically. Pure — safe to unit-test.
+ */
+export function formatStrategicMemoryNotes(raw: unknown): string {
+  if (!Array.isArray(raw) || raw.length === 0) return '';
+  return raw
+    .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+    .map((e) => {
+      const note = typeof e.note === 'string' ? e.note.trim() : '';
+      const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
+      if (!note) return '';
+      return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Pretty-print a record-shaped value as 2-space JSON, or '' when absent/empty. */
+function formatRecordJson(value: unknown): string {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length > 0
+    ? JSON.stringify(value, null, 2)
+    : '';
+}
+
+/**
+ * The 4-field response of GET
+ * `/api/agent/projects/{id}/strategic-session/checkpoint-state`. Read-only
+ * mirror of the backend contract — do NOT extend without changing the endpoint.
+ */
+export interface CheckpointStateResponse {
+  problem_model?: unknown;
+  strategic_memory_notes?: unknown;
+  running_update?: unknown;
+  vision?: unknown;
+}
+
+/** The four self-model grounding fields the compaction checkpoint carries. */
+export interface CheckpointGrounding {
+  problemModelJson: string;
+  visionJson: string;
+  strategicMemoryNotesText: string;
+  runningUpdate: string;
+}
+
+/**
+ * Map a checkpoint-state endpoint response into the refreshed grounding fields,
+ * formatted identically to the session-start bootstrap (problem_model / vision
+ * → pretty JSON, notes → shared formatter, running_update → string). Tolerant
+ * of missing / mistyped keys so a partial response never throws.
+ */
+export function formatCheckpointState(resp: CheckpointStateResponse): CheckpointGrounding {
+  return {
+    problemModelJson: formatRecordJson(resp.problem_model),
+    visionJson: formatRecordJson(resp.vision),
+    strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
+    runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
+  };
+}
+
+/**
+ * Resolve the four grounding sub-fields for the compaction checkpoint,
+ * preferring grounding refreshed at compaction time over the session-start
+ * snapshot. When `refreshed` is present (the checkpoint-state fetch succeeded)
+ * its values win entirely — even an empty field, so a mid-session clear (e.g.
+ * the operator wipes the running update) is reflected rather than reverting to
+ * the stale snapshot. When absent (fetch failed or never ran) the snapshot is
+ * used. Empty strings collapse to `undefined` so the checkpoint omits that
+ * sub-section, matching the existing `refreshedDirectionGrounding` fallback.
+ */
+export function resolveCheckpointGrounding(
+  snapshot: CheckpointGrounding,
+  refreshed: CheckpointGrounding | null | undefined,
+): {
+  problemModelJson?: string;
+  visionJson?: string;
+  strategicMemoryNotesText?: string;
+  runningUpdate?: string;
+} {
+  const src = refreshed ?? snapshot;
+  return {
+    problemModelJson: src.problemModelJson || undefined,
+    visionJson: src.visionJson || undefined,
+    strategicMemoryNotesText: src.strategicMemoryNotesText || undefined,
+    runningUpdate: src.runningUpdate || undefined,
+  };
+}
+
 export interface CompactionCheckpointContext {
   /** Condensed role identity section (from the original bootstrap). */
   roleIdentity: string;
@@ -398,6 +490,12 @@ export interface CompactionCheckpointContext {
   runningUpdate?: string;
   /** Formatted decisions register text (durable cross-tick decision memory). */
   decisionsRegisterText?: string;
+  /**
+   * True when the self-model grounding was re-fetched from the checkpoint-state
+   * endpoint at compaction time (so it reflects current, not session-start,
+   * state). Softens the "session-start snapshot" note. Defaults to false.
+   */
+  groundingRefreshed?: boolean;
 }
 
 /**
@@ -470,11 +568,18 @@ ${ctx.autonomousState.trim()}`);
     grounding.push(`### Running update\n${ctx.runningUpdate.trim()}`);
   }
   if (grounding.length > 0) {
-    const note = `> **Snapshot note:** The data below was captured when the session started
+    if (ctx.groundingRefreshed) {
+      const note = `> **Refreshed note:** The data below was re-fetched from current project
+> state at compaction time. If in doubt you can still confirm via
+> \`./fetch problem-model\`, \`./fetch direction <id>\`, and \`./fetch message\`.`;
+      sections.push(`## Self-model grounding (refreshed at compaction)\n${note}\n\n${grounding.join('\n\n')}`);
+    } else {
+      const note = `> **Snapshot note:** The data below was captured when the session started
 > and may not reflect current project state. Use \`./fetch problem-model\`,
 > \`./fetch direction <id>\`, and \`./fetch message\` to retrieve
 > the latest state.`;
-    sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
+      sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
+    }
   }
 
   // (vi) Durable decisions register — preserved across restarts.
