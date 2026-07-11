@@ -741,6 +741,19 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
         if contract:
             data["launch_contract"] = contract
 
+    # Promote exit_code and command_log as first-class fields so callers do not
+    # need to reach into the opaque polling_metadata bag to surface them.
+    # command_log is already redacted in-place above; read from metadata so the
+    # promoted copy is consistent with the in-bag copy.
+    if isinstance(metadata, dict):
+        exit_code = metadata.get("exit_code")
+        data["exit_code"] = exit_code if isinstance(exit_code, int) else None
+        command_log = metadata.get("command_log")
+        data["command_log"] = command_log if isinstance(command_log, dict) else None
+    else:
+        data["exit_code"] = None
+        data["command_log"] = None
+
     return data
 
 

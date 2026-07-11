@@ -1750,12 +1750,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   ) : (
                     <span className="break-words">{job.terminal_reason ?? '—'}</span>
                   )}
-                  {!active && typeof (job.polling_metadata?.exit_code) === 'number' && (
+                  {!active && typeof job.exit_code === 'number' && (
                     <span
                       className="shrink-0 rounded border border-neutral-700 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-400"
                       data-testid="compute-exit-code"
                     >
-                      exit {job.polling_metadata.exit_code as number}
+                      exit {job.exit_code}
                     </span>
                   )}
                 </div>
@@ -2358,7 +2358,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {(() => {
                 if (active) return null;
-                const cl = job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null;
+                const cl = job.command_log ?? (job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null);
                 if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;
                 const lines = cl.text.split('\n');
                 const clipped = lines.length > 30;

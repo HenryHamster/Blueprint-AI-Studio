@@ -775,6 +775,10 @@ export interface ComputeJob {
     provisioning_model?: string | null;
   } | null;
   polling_metadata?: Record<string, unknown>;
+  // First-class exit_code and command_log promoted from polling_metadata.
+  // Null when not yet available or not applicable.
+  exit_code?: number | null;
+  command_log?: ComputeJobCommandLog | null;
   // Bounded RPC failure diagnostic; null/absent when no backend RPC has failed
   // (or once it resolves). Older responses may carry it under polling_metadata.
   compute_rpc_diagnostic?: ComputeRpcDiagnostic | null;

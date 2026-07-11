@@ -2588,3 +2588,76 @@ async def test_awaiting_local_runner_viewer_ok_non_member_404(
     )
     assert resp.status_code == 200
     assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_job_response_has_first_class_exit_code_and_command_log(
+    client: AsyncClient, db_session
+):
+    """exit_code and command_log must appear as first-class top-level fields on the
+    admin compute-job response, not only inside the opaque polling_metadata bag.
+
+    A terminal job whose polling_metadata carries exit_code (int) and command_log
+    (dict) must expose them both as first-class keys at the root of the serialized
+    job response, with the command_log already credential-redacted.  A job that
+    carries no exit_code/command_log must still expose the keys (as null) so
+    callers can rely on them being present without guarding for key absence.
+    """
+    project = await _make_project(db_session, name="First-Class Fields")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Seed a failed job with exit_code and command_log in polling_metadata.
+    _task, failed_job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {
+            "exit_code": 1,
+            "command_log": {
+                "text": "running experiment\nANTHROPIC_API_KEY=sk-ant-api03-SECRET\nexit 1",
+                "truncated": False,
+                "byte_count": 70,
+            },
+            "result_metrics": {"accuracy": 0.42},
+        },
+    )
+    failed_job.status = ComputeJobStatus.FAILED
+    db_session.add(failed_job)
+    await db_session.commit()
+
+    # Seed a second job with no exit_code / command_log to confirm null promotion.
+    _task2, empty_job = await _make_job_with_polling_metadata(
+        db_session,
+        project,
+        {"result_metrics": {"accuracy": 0.9}},
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs_by_id = {j["id"]: j for j in resp.json()["compute_jobs"]}
+
+    # --- failed job ---
+    failed = jobs_by_id[str(failed_job.id)]
+
+    # exit_code must be a first-class integer field, not buried in polling_metadata.
+    assert "exit_code" in failed, "exit_code must be a top-level field"
+    assert failed["exit_code"] == 1
+
+    # command_log must be a first-class dict field.
+    assert "command_log" in failed, "command_log must be a top-level field"
+    assert isinstance(failed["command_log"], dict)
+    assert failed["command_log"]["truncated"] is False
+    assert failed["command_log"]["byte_count"] == 70
+
+    # The command_log text must have the credential redacted.
+    log_text = failed["command_log"]["text"]
+    assert "sk-ant-api03-SECRET" not in log_text, (
+        "command_log text must be credential-redacted before promotion"
+    )
+    assert "running experiment" in log_text
+
+    # --- job with no exit_code / command_log ---
+    empty = jobs_by_id[str(empty_job.id)]
+    assert "exit_code" in empty, "exit_code must always be present (null when absent)"
+    assert empty["exit_code"] is None
+    assert "command_log" in empty, "command_log must always be present (null when absent)"
+    assert empty["command_log"] is None

@@ -688,14 +688,14 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-live-output')).toBeNull();
   });
 
-  test('terminal job with exit_code in polling_metadata shows exit code chip', async () => {
+  test('terminal job with exit_code shows exit code chip', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'FAILED',
         outcome: 'FAILURE',
         final_cost_usd: 0.5,
         terminal_reason: 'command failed',
-        polling_metadata: { exit_code: 1 },
+        exit_code: 1,
       }),
     ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
@@ -705,7 +705,7 @@ describe('ComputeJobsPanel render + kill', () => {
 
   test('active job does not show exit code chip even if present', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ polling_metadata: { exit_code: 0 } }),
+      makeJob({ exit_code: 0 }),
     ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
