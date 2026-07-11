@@ -1629,6 +1629,7 @@ export interface FleetRunner {
       bwrap_ok?: boolean;
       userns_ok?: boolean;
       docker_usable?: boolean;
+      docker_cdi_gpu?: boolean;
       podman_usable?: boolean;
       apptainer_ok?: boolean;
       enroot_ok?: boolean;
