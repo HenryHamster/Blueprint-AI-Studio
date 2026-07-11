@@ -2766,18 +2766,32 @@ async def orchestrator_worker():
                         if task.requires_approval:
                             await session.rollback()
                             continue
-                        # Snapshot vm_instance_id BEFORE the strategic local runner
-                        # path, which can commit or rollback and expire the ORM
-                        # object. Accessing task.vm_instance_id after that would
-                        # fire a sync lazy-load from async context → MissingGreenlet.
-                        _task_vm_id_str = str(task.vm_instance_id or "")
+                        # vm_instance_id read via __dict__ after the strategic
+                        # path call. _hold_strategic_local_runner_task's
+                        # no-change branch calls session.rollback(), which
+                        # expires ALL session-bound ORM instances even under
+                        # expire_on_commit=False. Under asyncpg reading the
+                        # expired descriptor triggers a sync lazy-load →
+                        # MissingGreenlet (the same hazard documented in the
+                        # dispatch-prep handler comments above). Reading via
+                        # __dict__ avoids the descriptor's lazy-load trap.
                         if await _try_strategic_local_required_runner_path(
                             session,
                             task,
                             _active_runners_cache,
                             _runner_pins_this_cycle,
                         ):
-                            if _task_vm_id_str.startswith("runner:"):
+                            # expire_on_commit=False preserves in-memory values
+                            # through a commit, so the runner-dispatch path has
+                            # vm_instance_id="runner:{id}" accessible. Only the
+                            # rollback path expires the instance, and that path
+                            # never writes "runner:" — so reading through __dict__
+                            # (which returns None for expired/missing keys) is
+                            # safe and avoids the lazy-load → MissingGreenlet.
+                            if str(
+                                task.__dict__.get("vm_instance_id")
+                                or ""
+                            ).startswith("runner:"):
                                 _cycle_dispatched += 1
                             continue
                         resource_defer_msg = (

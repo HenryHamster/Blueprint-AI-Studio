@@ -10216,3 +10216,69 @@ async def test_held_require_local_compute_alerts_before_timeout(db_session, mock
         await db_session.execute(select(Alert).where(Alert.task_id == task_id))
     ).scalars().all()
     assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+# ---------------------------------------------------------------------------
+# MissingGreenlet hardening: strategic local-runner dispatch-prep path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_dispatch_prep_vm_id_via_dict_after_hold_rollback(
+    db_session, expire_fidelity
+):
+    """After _hold_strategic_local_runner_task rolls back (no-change path),
+    reading task.vm_instance_id via the ORM descriptor triggers a sync
+    lazy-load that raises MissingGreenlet under asyncpg. The fix reads via
+    __dict__ which avoids the descriptor entirely — reproducing the same
+    pattern the dispatch loop uses at orchestrator.py:2776.
+
+    expire_fidelity restores real SQLAlchemy expiry so the rollback truly
+    clears the instance dict, matching what asyncpg does in production.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _hold_strategic_local_runner_task,
+    )
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    )
+
+    project = make_project(name="strategic-mg-test")
+    db_session.add(project)
+    await db_session.commit()
+
+    _hold_reason = (
+        "Strategic workbench is in continuous local mode; waiting for a live "
+        "Strategic-capable local runner instead of dispatching to cloud."
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        vm_instance_id=None,
+        payloads=[{"type": "strategic_review"}],
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: "2020-01-01T00:00:00",
+        },
+        latest_status_message=_hold_reason,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The hold function detects nothing changed → rolls back (expires task).
+    result = await _hold_strategic_local_runner_task(db_session, task)
+    assert result is True
+
+    # With expire_fidelity the rollback truly expired the instance dict.
+    # Reading via __dict__ avoids the descriptor's lazy-load → MissingGreenlet.
+    vm_id = task.__dict__.get("vm_instance_id")
+    # vm_instance_id was cleared by the rollback, so .get() returns None.
+    # This is the exact same str(__dict__.get(...) or "") pattern the
+    # dispatch loop fix uses to decide whether to increment _cycle_dispatched.
+    assert not str(vm_id or "").startswith("runner:")
+    assert vm_id is None, (
+        "vm_instance_id should not be in __dict__ after rollback; "
+        f"got {vm_id!r}"
+    )
