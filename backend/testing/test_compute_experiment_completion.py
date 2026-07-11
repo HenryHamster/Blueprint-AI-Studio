@@ -6013,6 +6013,68 @@ def test_runtime_phase_terminal_diagnostics_no_provisioning_fields():
     )
 
 
+def test_compute_terminal_diagnostics_surface_executing_backend_and_runner():
+    """_extract_job_terminal_diagnostics must surface 'executing_backend' from
+    job.backend and 'runner_target_id' from polling_metadata, so a compute
+    experiment proves which backend/runner executed the job."""
+    # Runtime-phase job with a runner target
+    job = MagicMock()
+    job.terminal_reason = "compute job finished"
+    job.started_at = _utcnow()
+    job.accelerator_type = "nvidia-tesla-t4"
+    job.machine_type = "n1-standard-4"
+    job.backend = "runner-subprocess"
+    job.polling_metadata = {
+        "runner_target_id": "runner-abc-123",
+    }
+
+    diag = _extract_job_terminal_diagnostics(job)
+
+    assert diag is not None
+    assert diag["executing_backend"] == "runner-subprocess"
+    assert diag["runner_target_id"] == "runner-abc-123"
+
+    # Cloud job with no runner_target_id should not carry runner_target_id
+    cloud_job = MagicMock()
+    cloud_job.terminal_reason = "compute job finished"
+    cloud_job.started_at = _utcnow()
+    cloud_job.accelerator_type = None
+    cloud_job.machine_type = None
+    cloud_job.backend = "gcp"
+    cloud_job.polling_metadata = {}
+
+    diag_cloud = _extract_job_terminal_diagnostics(cloud_job)
+
+    assert diag_cloud is not None
+    assert diag_cloud["executing_backend"] == "gcp"
+    assert "runner_target_id" not in diag_cloud
+
+    # Knowledge document body must surface both fields
+    task = MagicMock()
+    task.first_payload = {"experiment": "GPU throughput test", "tags": []}
+
+    doc = _build_compute_experiment_document(
+        task,
+        outcome="SUCCESS",
+        cost=0.37,
+        criterion=None,
+        result_reference=None,
+        terminal_diagnostics=diag,
+    )
+
+    body = doc["body"]
+    assert "Executing backend:" in body
+    assert "runner-subprocess" in body
+    assert "Runner target:" in body
+    assert "runner-abc-123" in body
+    assert "Backend:" in body
+
+    # verdict_record must carry both fields
+    td = doc["verdict_record"].get("terminal_diagnostics", {})
+    assert td["executing_backend"] == "runner-subprocess"
+    assert td["runner_target_id"] == "runner-abc-123"
+
+
 # ── E2E local-backend smoke ──────────────────────────────────────────────────
 
 

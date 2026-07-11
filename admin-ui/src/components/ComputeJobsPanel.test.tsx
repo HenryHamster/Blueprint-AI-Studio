@@ -2803,6 +2803,60 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(failChip?.className).toContain('red');
   });
 
+  test('arms comparison section shows N-of-M arms met criterion rollup count', async () => {
+    const job1 = makeJob({
+      id: 'arms-rollup-1',
+      task_title: 'arms rollup run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'arms-rollup-test',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.92,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-alpha': 0.95, 'arm-beta': 0.82, 'arm-gamma': 0.93 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          accuracy: 0.92,
+          arms: {
+            'arm-alpha': { accuracy: 0.95 },
+            'arm-beta': { accuracy: 0.82 },
+            'arm-gamma': { accuracy: 0.93 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'arms-rollup-2',
+      task_title: 'other run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'arms-rollup-test',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const rollup = await findByTestId('arms-met-count');
+    expect(rollup.textContent).toBe('2/3 arms met');
+    // arm-beta failed (0.82 < 0.9), so exactly 2 out of 3 met
+    expect(rollup.textContent).not.toContain('3/3');
+  });
+
   test('per-arm pass/fail chip handles != operator correctly', async () => {
     // arm-neq-pass has value 0.5 which != 0.9 (should pass); arm-neq-fail has value 0.9 which == 0.9 (should fail)
     const job = makeJob({

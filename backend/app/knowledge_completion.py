@@ -1382,6 +1382,12 @@ def _build_compute_experiment_document(
                 contract_parts.append(f"model={td_contract['provisioning_model']}")
             if contract_parts:
                 summary_parts.append(f"Launch contract: {', '.join(contract_parts)}.")
+        td_backend = terminal_diagnostics.get("executing_backend")
+        if td_backend:
+            summary_parts.append(f"Backend: {td_backend}.")
+        td_runner = terminal_diagnostics.get("runner_target_id")
+        if td_runner:
+            summary_parts.append(f"Runner target: {td_runner}.")
     summary = " ".join(summary_parts)
 
     body_lines = [
@@ -1408,6 +1414,8 @@ def _build_compute_experiment_document(
         td_phase = terminal_diagnostics.get("vm_phase")
         td_accel = terminal_diagnostics.get("accelerator_type")
         td_machine = terminal_diagnostics.get("machine_type")
+        td_backend = terminal_diagnostics.get("executing_backend")
+        td_runner = terminal_diagnostics.get("runner_target_id")
         td_cause = terminal_diagnostics.get("provisioning_cause")
         td_contract = terminal_diagnostics.get("launch_contract")
         if td_reason:
@@ -1418,6 +1426,10 @@ def _build_compute_experiment_document(
             body_lines.append(f"- **Accelerator type:** {td_accel}")
         if td_machine:
             body_lines.append(f"- **Machine type:** {td_machine}")
+        if td_backend:
+            body_lines.append(f"- **Executing backend:** {td_backend}")
+        if td_runner:
+            body_lines.append(f"- **Runner target:** {td_runner}")
         if td_cause:
             if td_cause.get("error_type"):
                 body_lines.append(
@@ -2315,6 +2327,16 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
     machine = getattr(job, "machine_type", None)
     if machine:
         diag["machine_type"] = machine
+    backend = getattr(job, "backend", None)
+    if backend:
+        diag["executing_backend"] = backend
+    try:
+        meta = getattr(job, "polling_metadata", None) or {}
+        runner_target_id = meta.get("runner_target_id")
+        if runner_target_id:
+            diag["runner_target_id"] = str(runner_target_id)
+    except Exception:
+        pass
     if vm_phase == "provisioning":
         try:
             meta = getattr(job, "polling_metadata", None) or {}

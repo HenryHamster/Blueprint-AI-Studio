@@ -268,10 +268,25 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
               const perArm = job.criterion_verdict?.per_arm;
               const cvOperator = job.criterion_verdict?.operator;
               const cvThreshold = job.criterion_verdict?.threshold;
+              const hasArmsVerdict = perArm != null && Object.keys(perArm).length > 0;
+              let armsMetCount = 0;
+              if (hasArmsVerdict && cvOperator && cvThreshold != null) {
+                for (const arm of arms) {
+                  const pav = perArm[arm.name];
+                  if (pav != null && criterionMet(pav, cvOperator, cvThreshold)) {
+                    armsMetCount++;
+                  }
+                }
+              }
               return (
                 <div key={job.id} className="mb-1.5">
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
                     {(job.task_title ?? job.id).slice(0, 24)}
+                    {hasArmsVerdict && (
+                      <span className="text-ui-xs text-neutral-500 font-normal ml-2" data-testid="arms-met-count">
+                        {armsMetCount}/{arms.length} arms met
+                      </span>
+                    )}
                   </div>
                   {arms.map((arm) => {
                     const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
