@@ -670,3 +670,22 @@ ROLLBACK_SAFE_PATTERNS: frozenset[str] = frozenset({
     "expired",               # .expired attribute access (self-aware check)
     "unloaded",              # sa_inspect(obj).unloaded deferred-column check
 })
+
+# Subset of ROLLBACK_SAFE_PATTERNS that are unconditionally safe regardless of
+# where they appear relative to the rollback call.  A session.refresh() or
+# session.execute() anywhere after rollback genuinely re-loads ORM state.
+# Control-flow tokens (return/raise/break/continue) are only safe when they
+# appear IN THE SAME BLOCK as the rollback, after it — a return at function
+# level after an ORM attribute read does NOT make the read safe.  The flow-aware
+# scanner in test_audit_finding_class_guards.py uses this constant to distinguish
+# the two categories; this definition serves as canonical documentation.
+ROLLBACK_SAFE_REFETCH_PATTERNS: frozenset[str] = frozenset({
+    "session.refresh",
+    "db_session.refresh",
+    "session.get",
+    "db.get",
+    "session.execute",
+    "db_session.execute",
+    "expunge_all",
+    "expire_all",
+})

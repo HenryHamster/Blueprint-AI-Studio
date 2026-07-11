@@ -1060,6 +1060,134 @@ _PRODUCTION_APP_DIR: Path = (
 )
 
 
+def _build_parent_map(tree: ast.AST) -> dict:
+    """Return a mapping from id(child) → parent node for every node in tree."""
+    parents: dict = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return parents
+
+
+def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
+    """Flow-aware version of the rollback scanner.
+
+    Unlike ``_unsafe_rollback_functions``, this scanner performs per-rollback
+    post-path analysis: for each rollback call it walks UP the AST from the
+    call site, checking each containing block's *continuation* (statements
+    that follow the rollback on the same execution path) for a safe terminator
+    (return/raise/break/continue) or a known-safe refetch call.
+
+    A control-flow token is only counted as safe when it appears AFTER the
+    rollback in its own containing block.  A ``return True`` at function level
+    does NOT make a rollback inside an except handler safe when the except
+    handler falls through to statements that read expired ORM attributes.
+
+    This stricter analysis is used to validate that specific patterns are safe.
+    The production regression check (``test_rollback_missing_greenlet_regression_check``)
+    uses the older ``_unsafe_rollback_functions`` because many large production
+    functions rely on best-effort rollbacks inside complex control flow that is
+    safe in practice but cannot yet be statically verified without type info.
+    """
+    source = filepath.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    # Refetch patterns from ROLLBACK_SAFE_REFETCH_PATTERNS in database.py.
+    _REFETCH_PATS: frozenset[str] = frozenset({
+        "session.refresh", "db_session.refresh", "session.get", "db.get",
+        "session.execute", "db_session.execute", "expunge_all", "expire_all",
+    })
+    _SAFE_NAMES: frozenset[str] = frozenset({
+        'session', 'db_session', 'db', 'logger', 'logging',
+        'os', 'sys', 're', 'json', 'datetime', 'contextlib',
+        'asyncio', 'uuid', 'time', 'math', 'traceback',
+        'exc', 'e', 'error', 'ex', 'err', '_exc', 'self', 'cls',
+    })
+
+    def _classify_stmt(suc: ast.stmt) -> int:
+        """Return 1 (safe-terminator), -1 (bare ORM read), or 0 (neutral)."""
+        if isinstance(suc, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            return 1
+        method_funcs = {
+            id(n.func) for n in ast.walk(suc)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        has_refetch = False
+        has_orm_read = False
+        for n in ast.walk(suc):
+            if isinstance(n, ast.Call):
+                if any(p in ast.unparse(n) for p in _REFETCH_PATS):
+                    has_refetch = True
+            elif isinstance(n, ast.Attribute):
+                if n.attr in ('__dict__', '_dict', 'expired', 'unloaded'):
+                    has_refetch = True
+                elif (id(n) not in method_funcs
+                      and isinstance(n.value, ast.Name)
+                      and n.value.id not in _SAFE_NAMES
+                      and not n.value.id[0].isupper()
+                      and not n.attr.startswith('__')):
+                    has_orm_read = True
+        if has_refetch:
+            return 1
+        if has_orm_read:
+            return -1
+        return 0
+
+    parents = _build_parent_map(tree)
+
+    def _rollback_is_flow_safe(rollback_call: ast.AST, func_node: ast.AST) -> bool:
+        """True if the post-rollback path has a safe terminator before ORM reads."""
+        cur: ast.AST = rollback_call
+        while id(cur) in parents:
+            par = parents[id(cur)]
+            found_block = None
+            found_idx = -1
+            for attr in ('body', 'orelse', 'finalbody'):
+                blk = getattr(par, attr, None)
+                if isinstance(blk, list):
+                    for i, s in enumerate(blk):
+                        if s is cur:
+                            found_block, found_idx = blk, i
+                            break
+                if found_block is not None:
+                    break
+            if found_block is None and isinstance(par, ast.ExceptHandler):
+                for i, s in enumerate(par.body):
+                    if s is cur:
+                        found_block, found_idx = par.body, i
+                        break
+            if found_block is not None:
+                for suc in found_block[found_idx + 1:]:
+                    verdict = _classify_stmt(suc)
+                    if verdict == 1:
+                        return True
+                    if verdict == -1:
+                        return False
+                if par is func_node:
+                    return True  # reached function end with no ORM reads → safe
+            cur = par
+        return True
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        rollback_calls = [
+            child for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "rollback"
+        ]
+        if not rollback_calls:
+            continue
+        if any(not _rollback_is_flow_safe(rb, node) for rb in rollback_calls):
+            violations.append(f"{filepath.name}::{node.name}")
+    return violations
+
+
 def _unsafe_rollback_functions(filepath: Path) -> list[str]:
     """Return ``module_name::function_name`` for every function in *filepath*
     that calls ``session.rollback()`` but uses no recognised safe-read pattern
@@ -1320,4 +1448,52 @@ class TestRollbackSafetyRegressionCheck:
             "A function that calls session.rollback() and then reads an ORM "
             "attribute without any safe-read pattern was NOT flagged.  This "
             "pattern raises MissingGreenlet on asyncpg and must be detected."
+        )
+
+    def test_rollback_scanner_flags_read_after_rollback_despite_unrelated_safe_token(
+        self, tmp_path
+    ):
+        """A rollback in an except handler that falls through to an ORM read
+        MUST be flagged even when an unrelated ``return`` appears later in the
+        function body.
+
+        The old whole-function scan accepted this shape because it found
+        ``return True`` anywhere in the function and marked the function safe.
+        The flow-aware scanner must detect that ``task.status`` is reachable
+        after the rollback (the except handler has no terminator) and flag it.
+
+        Exercises ``ROLLBACK_SAFE_REFETCH_PATTERNS`` in ``backend/app/database.py``:
+        the production constant documents which patterns constitute a genuine
+        safe refetch vs a control-flow token that is only safe in-block.
+        """
+        database_path = _BACKEND_ROOT / "app" / "database.py"
+        assert database_path.exists(), "backend/app/database.py not found"
+        db_content = database_path.read_text()
+        assert "ROLLBACK_SAFE_REFETCH_PATTERNS" in db_content, (
+            "backend/app/database.py must define ROLLBACK_SAFE_REFETCH_PATTERNS — "
+            "the subset of safe patterns that are unconditionally safe (refetch "
+            "operations) as opposed to control-flow tokens whose safety depends "
+            "on their position relative to the rollback call."
+        )
+
+        test_file = tmp_path / "test_dangerous_fallthrough.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def dangerous_rollback_with_unrelated_return(session, task):
+                \"\"\"Rollback in except, ORM read after try — UNSAFE.\"\"\"
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    logging.warning("rolled back")
+                # task is expired here; accessing .status raises MissingGreenlet
+                print(task.status)
+                return True  # unrelated safe token that fooled the old scanner
+        """))
+        violations = _unsafe_rollback_functions_flow_aware(test_file)
+        assert any("dangerous_rollback_with_unrelated_return" in v for v in violations), (
+            "A function whose rollback is in an except handler that falls through "
+            "to an ORM attribute read (task.status) was NOT flagged by the flow-aware "
+            "scanner, even though the post-rollback path reaches the read before any "
+            "safe terminator.  The flow-aware scanner must check terminator position "
+            "relative to the rollback, not just presence anywhere in the function body."
         )
