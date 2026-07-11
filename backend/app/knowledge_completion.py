@@ -1387,7 +1387,9 @@ def _build_compute_experiment_document(
             summary_parts.append(f"Backend: {td_backend}.")
         td_runner = terminal_diagnostics.get("runner_target_id")
         if td_runner:
-            summary_parts.append(f"Runner target: {td_runner}.")
+            td_runner_name = terminal_diagnostics.get("runner_hostname")
+            label = f"{td_runner_name} ({td_runner})" if td_runner_name else td_runner
+            summary_parts.append(f"Runner: {label}.")
     summary = " ".join(summary_parts)
 
     body_lines = [
@@ -1416,6 +1418,7 @@ def _build_compute_experiment_document(
         td_machine = terminal_diagnostics.get("machine_type")
         td_backend = terminal_diagnostics.get("executing_backend")
         td_runner = terminal_diagnostics.get("runner_target_id")
+        td_runner_hostname = terminal_diagnostics.get("runner_hostname")
         td_cause = terminal_diagnostics.get("provisioning_cause")
         td_contract = terminal_diagnostics.get("launch_contract")
         if td_reason:
@@ -1429,7 +1432,8 @@ def _build_compute_experiment_document(
         if td_backend:
             body_lines.append(f"- **Executing backend:** {td_backend}")
         if td_runner:
-            body_lines.append(f"- **Runner target:** {td_runner}")
+            runner_label = f"{td_runner_hostname} (`{td_runner}`)" if td_runner_hostname else td_runner
+            body_lines.append(f"- **Runner:** {runner_label}")
         if td_cause:
             if td_cause.get("error_type"):
                 body_lines.append(
@@ -2335,6 +2339,9 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
         runner_target_id = meta.get("runner_target_id")
         if runner_target_id:
             diag["runner_target_id"] = str(runner_target_id)
+        runner_hostname = meta.get("runner_hostname")
+        if runner_hostname:
+            diag["runner_hostname"] = str(runner_hostname)
     except Exception:
         pass
     if vm_phase == "provisioning":

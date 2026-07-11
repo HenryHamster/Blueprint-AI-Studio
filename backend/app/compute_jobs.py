@@ -353,6 +353,7 @@ async def create_compute_job(
     # (the runner's GPU capability gate in _try_runner_dispatch already validated
     # that the runner can handle any GPU accelerator declared in the payload).
     runner_target_id: str | None = (locked_task.context or {}).get("runner_target_id") or None
+    runner_hostname: str | None = (locked_task.context or {}).get("runner_hostname") or None
     if runner_target_id is not None:
         normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
     # Enforce-local policy: when a project requires its compute_experiment work to run
@@ -526,6 +527,8 @@ async def create_compute_job(
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     if runner_target_id is not None:
         polling_metadata["runner_target_id"] = runner_target_id
+    if runner_hostname is not None:
+        polling_metadata["runner_hostname"] = runner_hostname
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,

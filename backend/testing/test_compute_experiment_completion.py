@@ -6026,6 +6026,7 @@ def test_compute_terminal_diagnostics_surface_executing_backend_and_runner():
     job.backend = "runner-subprocess"
     job.polling_metadata = {
         "runner_target_id": "runner-abc-123",
+        "runner_hostname": "worker-host",
     }
 
     diag = _extract_job_terminal_diagnostics(job)
@@ -6033,6 +6034,7 @@ def test_compute_terminal_diagnostics_surface_executing_backend_and_runner():
     assert diag is not None
     assert diag["executing_backend"] == "runner-subprocess"
     assert diag["runner_target_id"] == "runner-abc-123"
+    assert diag["runner_hostname"] == "worker-host"
 
     # Cloud job with no runner_target_id should not carry runner_target_id
     cloud_job = MagicMock()
@@ -6065,14 +6067,15 @@ def test_compute_terminal_diagnostics_surface_executing_backend_and_runner():
     body = doc["body"]
     assert "Executing backend:" in body
     assert "runner-subprocess" in body
-    assert "Runner target:" in body
+    assert "Runner:" in body
     assert "runner-abc-123" in body
-    assert "Backend:" in body
+    assert "worker-host" in body
 
     # verdict_record must carry both fields
     td = doc["verdict_record"].get("terminal_diagnostics", {})
     assert td["executing_backend"] == "runner-subprocess"
     assert td["runner_target_id"] == "runner-abc-123"
+    assert td["runner_hostname"] == "worker-host"
 
 
 # ── E2E local-backend smoke ──────────────────────────────────────────────────

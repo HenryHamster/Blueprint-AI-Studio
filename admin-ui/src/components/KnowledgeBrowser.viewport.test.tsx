@@ -58,6 +58,34 @@ const sampleDocs = [
     updated_at: '2026-05-30T00:00:00Z',
     forward_quality_verdict: { passed: false, reason: 'Insufficient citations.', strategy: 'forward_quality' },
   },
+  {
+    id: 'doc-8888-9999-aaaa-bbbb',
+    title: 'CUDA driver smoke test on L40S GPU',
+    summary: 'Raw CUDA driver validation: cuInit, device enumeration, 128MB alloc, DtoH with integrity check.',
+    topic: 'gpu-validation',
+    direction_id: 'd-compute-1',
+    tags: ['compute', 'gpu', 'cuda'],
+    source_citations: ['gs://bucket/results/cuda-smoke-result.json'],
+    source_task_id: 'task-compute-8888',
+    authoring_branch: null,
+    head_sha: null,
+    source_kind: 'compute_experiment',
+    created_at: '2026-07-01T00:00:00Z',
+    updated_at: '2026-07-01T00:00:00Z',
+    compute_acceptance_grade: 'acceptance',
+    criterion_met: true,
+    forward_quality_verdict: {
+      passed: true,
+      strategy: 'metric',
+      outcome: 'success',
+      terminal_diagnostics: {
+        executing_backend: 'local-gpu',
+        runner_target_id: 'aaaabbbb-cccc-dddd-eeee-ffff00001111',
+        terminal_reason: 'compute job finished',
+        vm_phase: 'runtime',
+      },
+    },
+  },
 ];
 
 vi.mock('../api', () => ({
@@ -72,9 +100,10 @@ vi.mock('../api', () => ({
     }
     return Promise.resolve({ documents: sampleDocs, total: sampleDocs.length, limit: 50, offset: 0 });
   }),
-  fetchKnowledgeDocument: vi.fn(() =>
-    Promise.resolve({ ...sampleDocs[0], body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' }),
-  ),
+  fetchKnowledgeDocument: vi.fn((_projectId: string, docId: string) => {
+    const doc = sampleDocs.find(d => d.id === docId) ?? sampleDocs[0];
+    return Promise.resolve({ ...doc, body: '# Heading\n\nA paragraph of markdown body text with a [link](https://example.com) and a list:\n\n- one\n- two\n' });
+  }),
   resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-0000-1111-2222-3333')),
 }));
 
@@ -247,6 +276,22 @@ describe('KnowledgeBrowser — viewport regression', () => {
     // The finding-origin block and its second-opinion record rendered in the detail view.
     expect((host as HTMLDivElement).textContent).toContain('Finding origin');
     expect((host as HTMLDivElement).textContent).toContain('Second opinion');
+  });
+
+  test('compute_experiment detail view renders run provenance with execution location', async () => {
+    await renderList();
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('CUDA driver smoke test'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected compute doc button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Machine-verified');
+    expect(text).toContain('Operator hardware');
+    expect(text).toContain('aaaabbbb');
   });
 
   test('detail view renders provenance branch and sha when present', async () => {

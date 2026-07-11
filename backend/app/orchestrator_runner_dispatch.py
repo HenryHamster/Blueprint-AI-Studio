@@ -90,6 +90,7 @@ class RunnerDispatchSnapshot(NamedTuple):
     project_id: uuid.UUID
     capabilities: dict
     consecutive_job_failures: int = 0
+    hostname: str | None = None
 
 
 def _runner_handles_task_type(
@@ -228,6 +229,7 @@ async def _load_active_runners_cache(
                     LocalRunner.project_id,
                     LocalRunner.capabilities,
                     LocalRunner.consecutive_job_failures,
+                    LocalRunner.hostname,
                 ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
@@ -239,10 +241,10 @@ async def _load_active_runners_cache(
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
-        session, [runner_id for runner_id, _project_id, _capabilities, _failures in rows]
+        session, [runner_id for runner_id, _project_id, _capabilities, _failures, _hostname in rows]
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
-    for runner_id, project_id, capabilities, consecutive_job_failures in rows:
+    for runner_id, project_id, capabilities, consecutive_job_failures, hostname in rows:
         caps = dict(capabilities or {})
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
@@ -261,6 +263,7 @@ async def _load_active_runners_cache(
             project_id=project_id,
             capabilities=caps,
             consecutive_job_failures=consecutive_job_failures or 0,
+            hostname=hostname,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
@@ -370,6 +373,7 @@ async def _try_runner_dispatch(
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
+    new_ctx["runner_hostname"] = runner.hostname
     # A task that was held (enforce-local) and is now pinned must not carry the
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
@@ -852,6 +856,7 @@ async def _dispatch_compute_experiment_directly(
     if runner is not None:
         ctx = dict(task.context or {})
         ctx["runner_target_id"] = str(runner.id)
+        ctx["runner_hostname"] = runner.hostname
         ctx.pop("awaiting_local_runner_since", None)
         task.context = ctx
         session.add(task)

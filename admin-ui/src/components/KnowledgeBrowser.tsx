@@ -13,6 +13,7 @@ import {
   type KnowledgeForwardQualityVerdict,
 } from '../api';
 import { parseTimestamp } from '../utils/time';
+import { computeJobExecutionLocation } from './ComputeJobsPanel.utils';
 
 interface KnowledgeBrowserProps {
   selectedProjectId: string | null;
@@ -349,6 +350,49 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
   );
 }
 
+/**
+ * Execution provenance panel for compute_experiment knowledge documents.
+ * Reads terminal_diagnostics from the forward_quality_verdict (stored by the
+ * backend when the compute job has a terminal_reason) and surfaces where the
+ * run executed and the evidence tier (always machine-verified for compute).
+ */
+function ComputeRunProvenanceDetail({
+  doc,
+}: {
+  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict'>;
+}) {
+  if (doc.source_kind !== 'compute_experiment') return null;
+  const v = doc.forward_quality_verdict;
+  const tdRaw = v && typeof v.terminal_diagnostics === 'object' && v.terminal_diagnostics !== null
+    ? v.terminal_diagnostics as Record<string, unknown>
+    : null;
+  const backend = typeof tdRaw?.executing_backend === 'string' ? tdRaw.executing_backend : null;
+  const runnerId = typeof tdRaw?.runner_target_id === 'string' ? tdRaw.runner_target_id : null;
+  if (!backend && !runnerId) return null;
+  const location = backend ? computeJobExecutionLocation(backend) : null;
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Run provenance</div>
+        <span className="bg-emerald-500/10 border-emerald-500/20 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 text-emerald-300">
+          <CheckCircle className="w-2.5 h-2.5 shrink-0" /> Machine-verified
+        </span>
+      </div>
+      {location && (
+        <div className="flex items-center gap-1.5">
+          <Cpu className="w-3 h-3 shrink-0 text-neutral-400" />
+          <span className={location.isOperatorHardware ? 'text-amber-300' : 'text-sky-300'}>{location.label}</span>
+        </div>
+      )}
+      {runnerId && (
+        <div className="text-neutral-400 text-ui-sm font-mono">
+          <span className="text-neutral-500">runner: </span>{runnerId.slice(0, 8)}…
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CopyableId({ id }: { id: string }) {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(() => {
@@ -598,6 +642,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <ReleaseEvidencePanel evidence={selected.release_evidence} />
             )}
 
+            <ComputeRunProvenanceDetail doc={selected} />
             <VerdictBadge verdict={selected.forward_quality_verdict} />
             <ProbeDetail verdict={selected.forward_quality_verdict} />
             <OriginProvenanceDetail doc={selected} onNavigateToTask={onNavigateToTask} />
