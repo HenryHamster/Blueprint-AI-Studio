@@ -81,7 +81,16 @@ async def test_get_provider_catalog_route_returns_provider_schema(client):
     assert body["providers"]["anthropic"]["settings_schema"]["type"] == "object"
 
 
-def test_migrate_legacy_provider_config_confines_zai_to_strategic_defaults():
+def test_migrate_legacy_provider_config_backfills_without_rewriting_routes():
+    """Backfill seeds MISSING routing keys but never rewrites explicit routes.
+
+    Regression for the routing-persistence bug: _migrate_legacy_provider_config
+    (and its _backfill_provider_runtime_defaults step) runs on EVERY persisted-
+    config sync and again at dispatch-time resolution, so any forced reordering
+    here silently reverted a successful operator settings PATCH on the next
+    sync cycle (observed live: Strategic routing snapped back to
+    zai → anthropic → deepseek after being explicitly changed).
+    """
     from app.runtime_config_state import _migrate_legacy_provider_config
 
     config = {
@@ -114,15 +123,19 @@ def test_migrate_legacy_provider_config_confines_zai_to_strategic_defaults():
         "design_doc_update",
     ]
     assert migrated["task_type_categories"]["initiative"] == ["research", "plan"]
+    # Explicit nonempty routes are operator-owned: preserved byte-for-byte.
     assert migrated["category_routing"]["_default"]["providers"] == [
-        "deepseek",
         "anthropic",
         "openai",
         "gemini",
     ]
-    assert migrated["category_routing"]["ops"]["providers"][0] == "deepseek"
-    assert "zai" not in migrated["category_routing"]["ops"]["providers"]
+    assert migrated["category_routing"]["ops"]["providers"] == [
+        "anthropic",
+        "openai",
+    ]
+    # Missing categories are still seeded from the current defaults.
     assert migrated["category_routing"]["strategic"]["providers"][0] == "zai"
+    assert migrated["category_routing"]["build"]["providers"][0] == "deepseek"
     assert migrated["provider_selection_mode"] == "preferred"
     assert migrated["provider_tier_model_map"]["deepseek"]["haiku"] == (
         "deepseek-v4-flash"
@@ -131,6 +144,44 @@ def test_migrate_legacy_provider_config_confines_zai_to_strategic_defaults():
         "deepseek-v4-flash"
     )
     assert migrated["provider_settings_defaults"]["deepseek"] == {}
+
+
+def test_migrate_legacy_provider_config_is_stable_across_repeated_syncs():
+    """An explicit operator routing survives repeated reload/dispatch cycles.
+
+    Mirrors production traffic: sync_runtime_config_from_state re-migrates the
+    persisted JSON every cycle, and dispatch-time resolution migrates again.
+    The PATCHed routing must be identical after every pass — including a
+    single-provider route and a reordered multi-provider route.
+    """
+    import copy
+
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    operator_routing = {
+        # Multi-provider route deliberately ordered anthropic-first with
+        # deepseek removed — the exact shape the old backfill clobbered.
+        "strategic": {"providers": ["anthropic", "zai"], "effort": "max"},
+        # Single-provider route (the documented workaround shape).
+        "review": {"providers": ["anthropic"], "effort": "high"},
+        "_default": {"providers": ["deepseek", "anthropic"], "effort": "medium"},
+    }
+    config = {
+        "category_routing": copy.deepcopy(operator_routing),
+        "provider_selection_mode": "exclusive",
+        "provider_settings_by_effort": {},
+    }
+
+    migrated = _migrate_legacy_provider_config(dict(config))
+    for _ in range(3):
+        migrated = _migrate_legacy_provider_config(copy.deepcopy(migrated))
+
+    for category, route in operator_routing.items():
+        assert migrated["category_routing"][category]["providers"] == (
+            route["providers"]
+        ), f"category_routing.{category} was rewritten by backfill"
+        assert migrated["category_routing"][category]["effort"] == route["effort"]
+    assert migrated["provider_selection_mode"] == "exclusive"
 
 
 async def test_patch_settings_accepts_routing_and_matrix(client):

@@ -257,6 +257,7 @@ async def _spawn_release_audit_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    audit_base_sha: str | None = None,
     version_goal: str | None = None,
 ) -> Task:
     """Create + queue a ``release_audit`` task for the qualifier."""
@@ -272,6 +273,10 @@ async def _spawn_release_audit_task(
     }
     if version_goal:
         payload["version_goal"] = version_goal
+    if audit_base_sha:
+        # A hint, not an assertion: the agent verifies ancestry/range
+        # resolvability and falls back to base_branch...candidate_sha if stale.
+        payload["audit_base_sha"] = audit_base_sha
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         "release_audit"
     )
@@ -315,6 +320,7 @@ async def _spawn_release_audit_task(
                 "spawned_by": "RELEASE_QUALIFIER",
                 "task_type": "release_audit",
                 "diff_range": diff_range,
+                "audit_base_sha": audit_base_sha,
                 "release_version_id": str(version_id),
             },
         )

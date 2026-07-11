@@ -169,31 +169,28 @@ async def trigger_self_audit(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     ]
-    active_tasks = (
-        (
-            await session.execute(
-                select(Task)
-                .options(load_only(Task.id, Task.status, Task.payloads, raiseload=True))
-                .where(
-                    Task.project_id == project.id,
-                    Task.status.in_(active_statuses),
-                )
-                .limit(1000)
+    # The task type is stored in the first payload element. Push that exact
+    # predicate into PostgreSQL and fetch only the row needed for the 409.
+    active_audit = (
+        await session.execute(
+            select(Task.id, Task.status)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+                Task.payloads[0]["type"].as_string() == "self_audit",
             )
+            .limit(1)
         )
-        .scalars()
-        .all()
-    )
-    for audit_task in active_tasks:
-        if (audit_task.first_payload or {}).get("type") == "self_audit":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Self-audit is already in progress for this project "
-                    f"(task {str(audit_task.id)[:8]}, status {audit_task.status}). "
-                    f"Wait for it to complete before starting another."
-                ),
-            )
+    ).first()
+    if active_audit is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Self-audit is already in progress for this project "
+                f"(task {str(active_audit.id)[:8]}, status {active_audit.status}). "
+                f"Wait for it to complete before starting another."
+            ),
+        )
 
     # Use idempotency_key to prevent concurrent duplicates. The key is project-scoped
     # so concurrent triggers on the same project use the same key; the database

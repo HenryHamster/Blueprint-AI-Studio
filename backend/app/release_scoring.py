@@ -1499,6 +1499,14 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
             item: dict[str, str] = {"severity": sev, "summary": summary}
             if file_path:
                 item["file"] = file_path[:_DETAIL_NAME_MAX]
+            blob_sha = (
+                str(f.get("blob_sha") or "").strip() if isinstance(f, dict) else ""
+            )
+            if blob_sha:
+                item["blob_sha"] = blob_sha[:64]
+                item["surface_key"] = hashlib.sha256(
+                    f"{file_path.lower()}|{blob_sha}".encode()
+                ).hexdigest()[:16]
             # Deterministic content key so the same finding is stably
             # identifiable across re-extractions (resolution-ledger keying).
             item["key"] = _audit_finding_key(summary, item.get("file"))

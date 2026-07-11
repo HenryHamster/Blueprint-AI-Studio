@@ -165,7 +165,7 @@ describe('scheduleProactiveTokenRefresh / stopProactiveTokenRefresh lifecycle', 
 
 describe('scheduleGithubTokenRefresh / stopGithubTokenRefresh lifecycle', () => {
   // These tests verify the timer start/stop contract without actually firing the
-  // 45-min timer. We use vitest fake timers to stay fast and deterministic.
+  // 8-min timer. We use vitest fake timers to stay fast and deterministic.
   beforeEach(() => {
     vi.useFakeTimers();
     // initTokenModule must be called before schedule* functions.
@@ -222,7 +222,7 @@ describe('scheduleGithubTokenRefresh / stopGithubTokenRefresh lifecycle', () => 
 // keeps the origin URL clean and delegates auth to the credential helper.
 describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)', () => {
   // The local const in agent-token.ts (not exported); mirrored here.
-  const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
+  const GITHUB_TOKEN_REFRESH_MS = 8 * 60 * 1000;
   const FRESH_TOKEN = 'ghs_fresh_write_token';
 
   beforeEach(() => {
