@@ -2800,20 +2800,25 @@ def _preflight(
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 
-    # Provider credential check. When agent work is claimable this is a HARD
-    # requirement: --check exits non-zero (setup_ok=False) so the operator
-    # catches the misconfiguration at enrollment time instead of discovering
-    # every agent task fails at PRE_CLAIM_FAILED at runtime.
+    # Provider credential check. Host env credentials are a FALLBACK only: the
+    # orchestrator ships per-task pool credentials via the /next-task claim path,
+    # so a pool-covered runner can claim and run agent work even with no host env
+    # creds. We downgrade this to a WARNING so --check passes green for pool-covered
+    # runners. Hard-fail is reserved for when we can positively confirm the
+    # orchestrator has no pool accounts at all (not implemented yet — that would
+    # require an extra API call; omitted until the pool-empty signal is available).
     provider_creds = _check_provider_credentials()
     agent_claimable = claimable[iso.CLASS_AGENT]
     if provider_creds:
         _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
     elif agent_claimable:
         print(
-            "  provider creds  : FAIL — no LLM provider credential found.\n"
-            "                    Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,\n"
-            "                    OPENAI_API_KEY, GEMINI_API_KEY, or similar in\n"
-            "                    the environment before claiming agent work.",
+            "  provider creds  : WARNING — no host LLM credential found.\n"
+            "                    Pool dispatch covers claims (per-task creds via\n"
+            "                    /next-task); host env is fallback only if the pool\n"
+            "                    is unconfigured or exhausted. Set ANTHROPIC_API_KEY,\n"
+            "                    CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, or similar\n"
+            "                    to enable the host-credential fallback path.",
             flush=True,
         )
     else:
@@ -2861,7 +2866,6 @@ def _preflight(
         (token_valid or token_401)
         and ws_writable
         and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
-        and (bool(provider_creds) or not agent_claimable)
     )
     return {
         "orchestrator_ok": orchestrator_ok,

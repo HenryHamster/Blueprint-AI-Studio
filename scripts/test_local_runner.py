@@ -4654,7 +4654,11 @@ class TestProviderCredentialCheck(unittest.TestCase):
             self.assertFalse(br._check_provider_credentials())
 
     def test_warning_printed_in_preflight_when_no_credentials(self):
-        """main() prints a WARNING when no provider credential is set (acceptance)."""
+        """main() prints a WARNING when no provider credential is set (acceptance).
+
+        Pool dispatch ships per-task credentials via /next-task so host env creds
+        are fallback-only. Missing host creds → WARNING only, not a hard fail.
+        """
         output_lines = []
 
         def capture_print(*args, **kwargs):
@@ -4672,7 +4676,7 @@ class TestProviderCredentialCheck(unittest.TestCase):
              patch("builtins.print", side_effect=capture_print), \
              patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "run_local_runner", return_value=1):
+             patch.object(br, "run_local_runner", return_value=0):
             rc = br.main(["check"])
 
         warning_lines = [line for line in output_lines if "WARNING" in line and "credential" in line.lower()]
@@ -4681,10 +4685,9 @@ class TestProviderCredentialCheck(unittest.TestCase):
             f"Expected WARNING about missing credentials in output. Got: {output_lines}",
         )
         self.assertIn("ANTHROPIC_API_KEY", warning_lines[0])
-        # Missing provider creds must make --check exit non-zero so the operator
-        # catches the misconfiguration at enrollment time instead of discovering
-        # every agent task fails at runtime.
-        self.assertEqual(rc, 1, "Missing provider creds must make blueprint-runner check exit non-zero")
+        # Missing host creds is now a warning only — pool-covered runners pass --check
+        # green. rc=0 because run_local_runner returns 0 for a pool-covered runner.
+        self.assertEqual(rc, 0, "Missing host creds is a warning only; --check should pass green")
 
 
 class TestStatusJson(unittest.TestCase):
@@ -5022,10 +5025,11 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("FAIL", output)
+        # Provider creds absent → WARNING (not FAIL), pool dispatch covers claims.
+        self.assertIn("WARNING", output)
         self.assertIn("provider creds", output)
-        # Failure is when agent tasks are claimable but no provider creds are set.
-        self.assertFalse(result["setup_ok"])
+        # setup_ok must be True: pool-covered runners have no host creds by design.
+        self.assertTrue(result["setup_ok"])
 
     def test_preflight_with_provider_credentials_does_not_warn(self):
         """Preflight does NOT warn when provider credentials are set."""
