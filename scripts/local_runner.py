@@ -246,7 +246,7 @@ def _save_runner_token(token: str) -> None:
         finally:
             os.close(fd)
         os.chmod(tmp_path, 0o600)
-        os.rename(tmp_path, path)
+        os.replace(tmp_path, path)
     except Exception as exc:
         print(
             f"[runner] WARNING: could not persist runner token to {path}: {exc}",
@@ -317,7 +317,7 @@ def _write_status_json(
         finally:
             os.close(fd)
         os.chmod(tmp_path, 0o644)
-        os.rename(tmp_path, path)
+        os.replace(tmp_path, path)
     except Exception as exc:
         print(
             f"[runner] WARNING: could not write status.json to {path}: {exc}",

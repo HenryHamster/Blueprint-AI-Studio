@@ -4679,6 +4679,35 @@ class TestStatusJson(unittest.TestCase):
         tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
         self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
 
+    def test_overwrite_existing_file_succeeds(self):
+        """Writing status.json twice must succeed: the second write replaces the first.
+        os.replace (not os.rename) is used so this works on Windows too, where
+        os.rename raises FileExistsError when the destination already exists."""
+        local_runner._write_status_json(
+            runner_id="first-box",
+            last_heartbeat_status="initial",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        self.assertTrue(os.path.exists(path))
+
+        local_runner._write_status_json(
+            runner_id="second-box",
+            last_heartbeat_status="updated",
+            active_task_ids=["new-task"],
+            active_compute_job_ids=[],
+        )
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            data = json.loads(f.read())
+        self.assertEqual(data["runner_id"], "second-box")
+        self.assertEqual(data["last_heartbeat_status"], "updated")
+        self.assertEqual(data["active_task_ids"], ["new-task"])
+
+        tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
+        self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
+
     def test_permissions_are_0644(self):
         """status.json must be world-readable (0644), not 0600 like the token."""
         local_runner._write_status_json(
