@@ -7,6 +7,7 @@ from app.qualification_state_resolver import resolve_dimension_states
 _ALL_KEYS = {
     "audit", "test_erosion", "smoketest", "ci",
     "migration_identity", "migration_apply", "merge_grade",
+    "challenge", "acceptance_window",
     "criterion_coverage", "debt_pressure", "goal_alignment",
     "capability_proof",
 }
@@ -18,7 +19,7 @@ def _by_key(states):
 
 def test_none_last_qualification_returns_all_pending():
     result = resolve_dimension_states(None)
-    assert len(result) == 11
+    assert len(result) == 13
     d = _by_key(result)
     for key in _ALL_KEYS:
         assert d[key]["status"] == "pending", key
@@ -298,9 +299,9 @@ def test_debt_pressure_when_present():
     assert d["debt_pressure"]["score"] == pytest.approx(0.7)
 
 
-def test_returns_all_11_dimensions():
+def test_returns_all_13_dimensions():
     result = resolve_dimension_states(None)
-    assert len(result) == 11
+    assert len(result) == 13
     keys = {s["key"] for s in result}
     assert keys == _ALL_KEYS
 
@@ -362,7 +363,7 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     db_session.add(version)
     await db_session.flush()
 
-    # Add ledger rows for all 8 overlapping dimensions.  Use a variety of
+    # Add ledger rows for all 10 overlapping dimensions.  Use a variety of
     # statuses and scores that DIFFER from the blob to prove the ledger is read.
     ledger_dims = [
         ("ci", "blocked", None, "ci_not_green"),
@@ -373,6 +374,8 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
         ("migration_apply", "passed", None, None),
         ("merge_grade", "failed", 0.5, "merge_grade_misses"),
         ("debt_pressure", "passed", 0.7, None),
+        ("challenge", "passed", None, None),
+        ("acceptance_window", "passed", 0.8, None),
     ]
     for dim, status, sub_score, blocker in ledger_dims:
         db_session.add(QualificationDimensionResult(
@@ -387,10 +390,10 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 11
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
-    # 8 ledger-backed dimensions use ledger values (with status mapping).
+    # 10 ledger-backed dimensions use ledger values (with status mapping).
     assert d["ci"]["status"] == "failed", "blocked → failed mapping"
     assert d["ci"]["reason"] == "ci_not_green"
     assert d["audit"]["status"] == "passed"
@@ -405,6 +408,9 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     assert d["merge_grade"]["score"] == pytest.approx(0.5)
     assert d["debt_pressure"]["status"] == "passed"
     assert d["debt_pressure"]["score"] == pytest.approx(0.7)
+    assert d["challenge"]["status"] == "passed"
+    assert d["acceptance_window"]["status"] == "passed"
+    assert d["acceptance_window"]["score"] == pytest.approx(0.8)
 
     # 2 blob-only dimensions preserved from last_qualification.
     assert d["criterion_coverage"]["status"] == "passed"
@@ -449,7 +455,7 @@ async def test_ledger_empty_falls_back_to_blob(db_session):
     # Deliberately NO ledger rows.
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 11
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
     # All derived from blob — same as calling resolve_dimension_states directly.
@@ -507,7 +513,7 @@ async def test_ledger_different_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 11
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
 
     # CI is "passed" from blob (ci_resolution.state=green), NOT "failed" from ledger.
@@ -535,7 +541,7 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 11
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
     assert d["ci"]["status"] == "pending"
 
@@ -674,7 +680,7 @@ async def test_proof_gate_ledger_backed_path_works(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 11
+    assert len(result) == 13
     d = {s["key"]: s for s in result}
     assert d["capability_proof"]["status"] == "passed"
 
@@ -725,3 +731,169 @@ async def test_proof_gate_ledger_unavailable_when_not_enforce(db_session):
     result = await resolve_dimension_states_from_ledger(db_session, version)
     d = {s["key"]: s for s in result}
     assert d["capability_proof"]["status"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# challenge + acceptance_window — blob-derived and ledger-backed
+# ---------------------------------------------------------------------------
+
+
+def test_challenge_blob_passed_when_verdicts_present():
+    """challenge dimension is 'passed' when challenge_verdicts is a non-empty dict."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "challenge_verdicts": {"verdict": "pass", "some_key": True},
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["challenge"]["status"] == "passed"
+    assert d["challenge"]["score"] is None
+    assert d["challenge"]["reason"] is None
+
+
+def test_challenge_blob_unavailable_when_no_verdicts():
+    """challenge dimension is 'unavailable' when challenge_verdicts is absent."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        # challenge_verdicts intentionally absent
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["challenge"]["status"] == "unavailable"
+
+
+def test_acceptance_window_blob_passed_with_fraction():
+    """acceptance_window dimension is 'passed' with score when sub_scores contains acceptance_window_fraction."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "acceptance_window_fraction": 0.75,
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["acceptance_window"]["status"] == "passed"
+    assert d["acceptance_window"]["score"] == pytest.approx(0.75)
+
+
+def test_acceptance_window_blob_unavailable_when_absent():
+    """acceptance_window dimension is 'unavailable' when acceptance_window_fraction is absent."""
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        # acceptance_window_fraction intentionally absent from sub_scores
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["acceptance_window"]["status"] == "unavailable"
+    assert d["acceptance_window"]["score"] is None
+
+
+@pytest.mark.asyncio
+async def test_challenge_and_acceptance_window_surface_from_ledger(db_session):
+    """challenge and acceptance_window ledger rows are read back by
+    resolve_dimension_states_from_ledger and override the blob-derived state."""
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    # Blob has no challenge_verdicts (→ unavailable) and no acceptance_window_fraction
+    # (→ unavailable) — the ledger rows below must override both.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-ledger-test",
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "criterion_coverage": {"total": 2, "covered": 2},
+            "blocker": None,
+            "smoketest_enabled": True,
+            # challenge_verdicts absent → blob would produce "unavailable"
+            # sub_scores.acceptance_window_fraction absent → blob would produce "unavailable"
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Ledger says both challenge and acceptance_window are "passed", which
+    # contradicts the blob-derived "unavailable" — proves the ledger wins.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-ledger-test",
+        dimension="challenge",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+    ))
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-ledger-test",
+        dimension="acceptance_window",
+        status="passed",
+        sub_score=0.88,
+        blocker=None,
+    ))
+    # Also add a CI row so the query returns rows for this candidate_sha,
+    # triggering the ledger overlay path (not the fall-back-to-blob path).
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-ledger-test",
+        dimension="ci",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    assert len(result) == 13
+    d = {s["key"]: s for s in result}
+
+    # Blob would have returned "unavailable" for both; ledger overrides to "passed".
+    assert d["challenge"]["status"] == "passed", (
+        "challenge ledger row should override blob-derived unavailable"
+    )
+    assert d["acceptance_window"]["status"] == "passed", (
+        "acceptance_window ledger row should override blob-derived unavailable"
+    )
+    assert d["acceptance_window"]["score"] == pytest.approx(0.88)
+
+    # Blob-only dimensions are unaffected.
+    assert d["criterion_coverage"]["status"] == "passed"
+    assert d["goal_alignment"]["status"] == "unavailable"
