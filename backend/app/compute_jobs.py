@@ -294,6 +294,7 @@ async def create_compute_job(
     setup_step: str | None = None,
     container_image: str | None = None,
     container_registry_auth: dict | None = None,
+    allow_host_fallback: bool = False,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -529,6 +530,8 @@ async def create_compute_job(
         polling_metadata["runner_target_id"] = runner_target_id
     if runner_hostname is not None:
         polling_metadata["runner_hostname"] = runner_hostname
+    if allow_host_fallback:
+        polling_metadata["allow_host_fallback"] = True
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,

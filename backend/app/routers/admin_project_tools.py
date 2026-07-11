@@ -167,38 +167,42 @@ _MANIFEST_SKILL_KNOWN_KEYS = {
 
 _SLUG_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
 
-# ── Compute section schema (same manifest, optional key) ──────────────────────
+# ── Compute image schema ─────────────────────────────────────────────────────
+#
+# A ``compute`` section in ``.blueprint/tools.json`` declares the baked
+# container image to use for compute experiments in this project.  Example:
+#
+#   {
+#     "compute": {
+#       "image": { "name": "ghcr.io/org/my-project:v1.2@sha256:abc..." }
+#     }
+#   }
+#
+# The ``name`` field is the only required key; it is the OCI image reference
+# (registry/repo:tag or :tag@digest).
 
-# The .blueprint/tools.json compute keys we accept.
-_MANIFEST_COMPUTE_KNOWN_KEYS = {
-    "image",
-}
+_MANIFEST_COMPUTE_IMAGE_REQUIRED = {"name"}
 
 
-def _validate_manifest_compute_entry(compute: Dict[str, Any]) -> Optional[str]:
-    """Validate the optional ``compute`` section from the manifest.
+def _validate_manifest_compute_image(spec: Any) -> str | None:
+    """Validate the ``compute.image`` object from the manifest.
 
     Returns an error message string on failure, or ``None`` on success.
     """
-    if not isinstance(compute, dict):
-        return "compute: must be an object"
-    unknown = set(compute.keys()) - _MANIFEST_COMPUTE_KNOWN_KEYS
-    if unknown:
-        return f"compute: unknown keys: {sorted(unknown)}"
-    image = compute.get("image")
-    if image is not None:
-        if not isinstance(image, str) or not image.strip():
-            return "compute.image: must be a non-empty string"
+    if not isinstance(spec, dict):
+        return f"compute.image: must be an object, got {type(spec).__name__}"
+    missing = _MANIFEST_COMPUTE_IMAGE_REQUIRED - set(spec.keys())
+    if missing:
+        return f"compute.image: missing required fields: {sorted(missing)}"
+    name = spec.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "compute.image: name must be a non-empty string"
     return None
 
 
-def _normalize_manifest_compute(compute: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a validated compute section into the canonical shape."""
-    result: Dict[str, Any] = {}
-    image = compute.get("image")
-    if isinstance(image, str) and image.strip():
-        result["image"] = image.strip()
-    return result
+def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a validated ``compute.image`` entry into the response shape."""
+    return {"name": spec["name"].strip()}
 
 
 def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:
@@ -291,7 +295,7 @@ async def _discover_manifest_tools(
     project_id_str = str(project.id)
 
     if not owner or not repo_name:
-        return {"tools": [], "skills": [], "error": None}
+        return {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
 
     cache_key = f"{owner}/{repo_name}"
 
@@ -312,7 +316,7 @@ async def _discover_manifest_tools(
                 "[project-tools] No read token for %s/%s — cannot fetch manifest",
                 owner, repo_name,
             )
-            result = {"tools": [], "skills": [], "compute": None, "error": None}
+            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
@@ -328,7 +332,7 @@ async def _discover_manifest_tools(
 
         if manifest_text is None:
             # File doesn't exist — not an error, just no project-declared tools.
-            result = {"tools": [], "skills": [], "compute": None, "error": None}
+            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
             return result
 
@@ -337,20 +341,22 @@ async def _discover_manifest_tools(
         except _json.JSONDecodeError as e:
             error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
             logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
         if not isinstance(manifest, dict):
             error_msg = ".blueprint/tools.json must be a JSON object with a 'tools' array"
-            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
         raw_tools = manifest.get("tools")
-        if not isinstance(raw_tools, list):
+        if raw_tools is None:
+            raw_tools = []
+        elif not isinstance(raw_tools, list):
             error_msg = ".blueprint/tools.json 'tools' field must be an array"
-            result = {"tools": [], "skills": [], "compute": None, "error": error_msg}
+            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
@@ -369,18 +375,6 @@ async def _discover_manifest_tools(
             seen_slugs.add(slug)
             tools.append(_normalize_manifest_tool(entry))
 
-        # Parse optional compute section alongside tools/skills.
-        raw_compute = manifest.get("compute")
-        compute: Optional[Dict[str, Any]] = None
-        if raw_compute is not None:
-            err = _validate_manifest_compute_entry(raw_compute)
-            if err:
-                errors.append(err)
-            else:
-                normalized = _normalize_manifest_compute(raw_compute)
-                if normalized:
-                    compute = normalized
-
         # Parse optional skills array alongside tools.
         raw_skills = manifest.get("skills")
         skills: List[Dict[str, Any]] = []
@@ -398,14 +392,26 @@ async def _discover_manifest_tools(
                 seen_skill_slugs.add(slug)
                 skills.append(_normalize_manifest_skill(entry))
 
+        # Parse optional compute section alongside tools and skills.
+        compute_image: Dict[str, Any] | None = None
+        raw_compute = manifest.get("compute")
+        if isinstance(raw_compute, dict):
+            raw_compute_image = raw_compute.get("image")
+            if raw_compute_image is not None:
+                err = _validate_manifest_compute_image(raw_compute_image)
+                if err:
+                    errors.append(err)
+                else:
+                    compute_image = _normalize_manifest_compute_image(raw_compute_image)
+
         if errors:
             error_msg = "Manifest validation errors: " + "; ".join(errors)
             logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": tools, "skills": skills, "compute": compute, "error": error_msg}
+            result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": error_msg}
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
-        result = {"tools": tools, "skills": skills, "compute": compute, "error": None}
+        result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": None}
         _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
         return result
 
@@ -413,7 +419,7 @@ async def _discover_manifest_tools(
         logger.warning(
             "[project-tools] Manifest fetch error for %s: %s", cache_key, e,
         )
-        result = {"tools": [], "skills": [], "compute": None, "error": f"Failed to fetch manifest: {e}"}
+        result = {"tools": [], "skills": [], "compute": {"image": None}, "error": f"Failed to fetch manifest: {e}"}
         _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
         return result
 

@@ -10552,3 +10552,141 @@ async def test_strategic_dispatch_prep_vm_id_via_dict_after_hold_rollback(
         "vm_instance_id should not be in __dict__ after rollback; "
         f"got {vm_id!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Container-image dispatch eligibility gate
+# ---------------------------------------------------------------------------
+
+
+def test_image_job_requires_container_capable_runner():
+    """_select_eligible_runner excludes runners without docker_usable when
+    container_image is declared; includes them when no image is required.
+
+    This is the primary acceptance-criterion test: a container_image-declaring
+    job must not land on a runner that explicitly declares docker_usable=False,
+    and must select a runner that declares docker_usable=True.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    incapable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+
+    cache = {project_id: [incapable, capable]}
+
+    # With container_image declared: only the capable runner is selected.
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="registry.example.com/myproject:sha256-abc123",
+    )
+    assert selected is not None, "expected a container-capable runner to be selected"
+    assert selected.id == capable.id, (
+        "runner without docker_usable must not be selected for a container_image job"
+    )
+
+    # Without container_image: the incapable runner is still eligible (least loaded).
+    selected_no_image = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,
+    )
+    assert selected_no_image is not None
+    # Both are eligible when no image is required; the test just confirms selection
+    # returns something (no exclusion applied).
+
+
+
+@pytest.mark.asyncio
+async def test_dispatch_holds_when_container_image_declared_but_no_capable_runner(
+    db_session, mocker
+):
+    """_dispatch_compute_experiment_directly returns 'held' and stamps
+    awaiting_container_runner_since when a container_image is declared but
+    all registered runners lack docker_usable capability.
+
+    No ComputeJob must be created and the task must remain QUEUED.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ContainerImageHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "echo hello",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # One runner registered for the project, but it cannot run containers.
+    incapable_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+    active_runners_cache = {project.id: [incapable_runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED, (
+        "task must remain QUEUED when held for container runner"
+    )
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "awaiting_container_runner_since must be stamped in context on hold"
+    )
+    assert "docker_usable" in (refreshed.latest_status_message or ""), (
+        "status message must explain the docker_usable requirement"
+    )

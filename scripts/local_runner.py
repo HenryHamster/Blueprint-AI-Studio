@@ -1983,6 +1983,7 @@ def _run_compute_job(
     repo_clone = job_body.get("repo_clone") or None
     repo_token = job_body.get("repo_token") or None
     accelerator_type = job_body.get("accelerator_type") or None
+    allow_host_fallback = bool(job_body.get("allow_host_fallback", False))
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
@@ -2001,8 +2002,8 @@ def _run_compute_job(
     outcome: str | None = None
     try:
         # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
-        if iso.decide_compute_backend(caps, has_image) == iso.DECLINE:
-            reason = iso.compute_decline_reason(caps, has_image) or "no isolation boundary"
+        if iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback) == iso.DECLINE:
+            reason = iso.compute_decline_reason(caps, has_image, allow_host_fallback=allow_host_fallback) or "no isolation boundary"
             print(f"[compute] DECLINED job {job_id} (fail-closed): {reason}", flush=True)
             outcome = "failure"
             _report_compute_job(
@@ -2054,7 +2055,7 @@ def _run_compute_job(
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
 
         # Registry auth for docker/podman backends only (trusted host `docker login`).
-        backend_pre = iso.decide_compute_backend(caps, has_image)
+        backend_pre = iso.decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
         if (
             backend_pre in (iso.BACKEND_DOCKER, iso.BACKEND_PODMAN)
             and container_registry_auth.get("password")
@@ -2097,6 +2098,7 @@ def _run_compute_job(
             ),
             cpu_limit=cpu_limit,
             mem_limit=mem_limit,
+            allow_host_fallback=allow_host_fallback,
         )
         if plan.declined:
             print(f"[compute] DECLINED job {job_id} (fail-closed): {plan.decline_reason}", flush=True)

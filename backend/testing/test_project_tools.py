@@ -2311,6 +2311,208 @@ async def test_claim_omits_skills_when_no_manifest(client, db_session):
             )
 
 
+# ===========================================================================
+# Compute image: manifest compute.image section parsing
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Compute image validation helpers (unit tests — no DB / no HTTP)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_manifest_compute_image_wellformed():
+    """A well-formed compute.image entry passes validation."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image({"name": "ghcr.io/org/my-project:v1.2"})
+    assert err is None
+
+
+def test_validate_manifest_compute_image_missing_name():
+    """Missing name field returns an error."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image({})
+    assert err is not None
+    assert "missing required fields" in err
+    assert "name" in err
+
+
+def test_validate_manifest_compute_image_empty_name():
+    """A blank name is rejected."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image({"name": "   "})
+    assert err is not None
+    assert "name" in err
+
+    err2 = _validate_manifest_compute_image({"name": ""})
+    assert err2 is not None
+    assert "name" in err2
+
+
+def test_validate_manifest_compute_image_not_a_dict():
+    """A non-dict compute.image is rejected."""
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image("ghcr.io/org/img:v1")
+    assert err is not None
+    assert "object" in err
+
+    err2 = _validate_manifest_compute_image(["ghcr.io/org/img:v1"])
+    assert err2 is not None
+
+
+def test_normalize_manifest_compute_image_shape():
+    """_normalize_manifest_compute_image strips whitespace and returns name."""
+    from app.routers.admin_project_tools import _normalize_manifest_compute_image
+
+    result = _normalize_manifest_compute_image({"name": "  ghcr.io/org/img:latest  "})
+    assert result == {"name": "ghcr.io/org/img:latest"}
+
+
+# ---------------------------------------------------------------------------
+# Manifest compute.image endpoint tests (integration — mocked GitHub)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_manifest_compute_section_parsed(client: AsyncClient, db_session):
+    """Acceptance test: compute.image section in .blueprint/tools.json is parsed and
+    returned in the manifest response under compute.image.name."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [],
+        "compute": {
+            "image": {"name": "ghcr.io/test-org/my-project:v1.0@sha256:deadbeef"}
+        },
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is None, f"unexpected error: {body.get('error')}"
+        # The compute section must be present and parsed.
+        assert "compute" in body, f"response missing 'compute' key; keys={sorted(body)}"
+        compute = body["compute"]
+        assert isinstance(compute, dict), f"compute must be a dict, got {type(compute)}"
+        assert "image" in compute, f"compute missing 'image' key; keys={sorted(compute)}"
+        image = compute["image"]
+        assert image is not None, "compute.image must not be None when declared in manifest"
+        assert image["name"] == "ghcr.io/test-org/my-project:v1.0@sha256:deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_manifest_compute_section_absent(client: AsyncClient, db_session):
+    """When compute section is absent, compute.image is null in the response."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [
+            {"slug": "my-viewer", "title": "My Viewer", "entry": "index.html"},
+        ],
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is None
+        assert "compute" in body
+        assert body["compute"]["image"] is None
+
+
+@pytest.mark.asyncio
+async def test_manifest_compute_section_invalid_image(client: AsyncClient, db_session):
+    """A malformed compute.image (missing name) surfaces in the error field."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    manifest_json = json.dumps({
+        "tools": [],
+        "compute": {
+            "image": {"not_name": "oops"}
+        },
+    })
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value=manifest_json),
+        ),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is not None
+        assert "compute.image" in body["error"] or "name" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_manifest_compute_no_connected_repo_has_compute_key(
+    client: AsyncClient, db_session
+):
+    """Even with no connected repo, the compute key is present in the response."""
+    project = await _make_project_member(db_session)
+    # No github_owner/github_repo set.
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "compute" in body
+    assert body["compute"]["image"] is None
+
+
 @pytest.mark.asyncio
 async def test_research_claim_includes_project_skills(client, db_session):
     """Research and plan task types receive project skills just like create/fix tasks."""

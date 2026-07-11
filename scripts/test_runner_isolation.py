@@ -179,9 +179,27 @@ class TestDecisionTable(unittest.TestCase):
         caps = _caps(apptainer_path="/usr/bin/apptainer")
         self.assertEqual(iso.decide_compute_backend(caps, True), iso.BACKEND_APPTAINER)
 
-    def test_compute_image_no_runtime_downgrades_to_bwrap(self):
+    def test_image_declines_without_runtime_when_fallback_disabled(self):
+        # Default (allow_host_fallback=False): image job with bwrap but no container
+        # runtime is DECLINED — honest refusal, not a silent downgrade.
         caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True)
-        self.assertEqual(iso.decide_compute_backend(caps, has_image=True), iso.BACKEND_BWRAP)
+        self.assertEqual(iso.decide_compute_backend(caps, has_image=True), iso.DECLINE)
+        # Decline reason must mention the flag so operators know how to opt in.
+        reason = iso.compute_decline_reason(caps, has_image=True)
+        self.assertIsNotNone(reason)
+        self.assertIn("allow_host_fallback", reason)
+
+    def test_compute_image_no_runtime_allows_bwrap_with_host_fallback(self):
+        # Explicit opt-in: allow_host_fallback=True permits the imageless bwrap path.
+        caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(
+            iso.decide_compute_backend(caps, has_image=True, allow_host_fallback=True),
+            iso.BACKEND_BWRAP,
+        )
+        # And compute_decline_reason returns None (not declined).
+        self.assertIsNone(
+            iso.compute_decline_reason(caps, has_image=True, allow_host_fallback=True)
+        )
 
     def test_compute_imageless_uses_bwrap_even_with_docker(self):
         caps = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
@@ -223,7 +241,13 @@ class TestDecisionTable(unittest.TestCase):
         # decision table never routes an image job to a denied docker.
         denied = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True)  # docker_usable defaults False
         self.assertFalse(denied.docker_usable)
-        self.assertEqual(iso.decide_compute_backend(denied, has_image=True), iso.BACKEND_BWRAP)
+        # Default: image job with no runtime → DECLINE (not a silent bwrap downgrade).
+        self.assertEqual(iso.decide_compute_backend(denied, has_image=True), iso.DECLINE)
+        # Explicit opt-in: allow_host_fallback=True → bwrap is permitted as fallback.
+        self.assertEqual(
+            iso.decide_compute_backend(denied, has_image=True, allow_host_fallback=True),
+            iso.BACKEND_BWRAP,
+        )
 
     def test_bwrap_first_policy_across_device_shapes(self):
         """Bwrap-first policy: docker chosen only when agent_image explicitly supplied.
@@ -969,6 +993,25 @@ class TestComputePlan(unittest.TestCase):
     def test_decline_when_no_boundary(self):
         plan = self._common(caps=_caps())
         self.assertTrue(plan.declined)
+
+    def test_plan_image_no_runtime_declines_by_default(self):
+        # image declared, bwrap available, no container runtime, no flag → DECLINE.
+        plan = self._common(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+        )
+        self.assertTrue(plan.declined)
+        self.assertIn("allow_host_fallback", plan.decline_reason or "")
+
+    def test_plan_image_no_runtime_bwrap_with_allow_host_fallback(self):
+        # Explicit opt-in: allow_host_fallback=True → imageless bwrap fallback.
+        plan = self._common(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            allow_host_fallback=True,
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
 
 
 # ── CDI GPU probe ──────────────────────────────────────────────────────────────

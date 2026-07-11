@@ -836,6 +836,7 @@ async def next_compute_job(
         "repo_clone": repo_clone,
         "repo_token": repo_token,
         "accelerator_type": job.accelerator_type,
+        "allow_host_fallback": refreshed_meta.get("allow_host_fallback", False),
     }
 
 

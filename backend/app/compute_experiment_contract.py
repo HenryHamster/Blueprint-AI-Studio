@@ -85,6 +85,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "setup_step",
         "container_image",
         "container_registry_auth",
+        "allow_host_fallback",
         "spawn_followup",
     ):
         val = _pick(opt_key)

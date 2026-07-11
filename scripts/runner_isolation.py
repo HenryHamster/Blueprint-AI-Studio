@@ -544,28 +544,40 @@ def agent_decline_reason(caps: Capabilities, agent_binary_present: bool) -> str 
     return None
 
 
-def decide_compute_backend(caps: Capabilities, has_image: bool) -> str:
+def decide_compute_backend(
+    caps: Capabilities, has_image: bool, *, allow_host_fallback: bool = False
+) -> str:
     """Choose a compute backend, fail-closed.
 
-    Table (image? × runtime? × bwrap?):
-      image + container-runtime          → container backend (docker/podman/apptainer/enroot)
-      image + no runtime + bwrap         → bwrap (best-effort on host toolchain; image unfulfillable)
-      no image + bwrap                   → bwrap
-      no image + no bwrap                → DECLINE (a container needs an image; nothing else is sandboxed)
-      image + no runtime + no bwrap      → DECLINE
+    Table (image? × runtime? × bwrap? × allow_host_fallback?):
+      image + container-runtime                        → container backend (docker/podman/apptainer/enroot)
+      image + no runtime + bwrap + allow_host_fallback → bwrap (explicit opt-in; image unfulfillable)
+      image + no runtime + bwrap                       → DECLINE (default; honest refusal)
+      no image + bwrap                                 → bwrap
+      no image + no bwrap                              → DECLINE
+      image + no runtime + no bwrap                    → DECLINE
     """
     if has_image and caps.any_container_runtime():
         return caps.preferred_container() or DECLINE
     if caps.bwrap_ok:
+        if has_image and not allow_host_fallback:
+            return DECLINE
         return BACKEND_BWRAP
     return DECLINE
 
 
-def compute_decline_reason(caps: Capabilities, has_image: bool) -> str | None:
-    backend = decide_compute_backend(caps, has_image)
+def compute_decline_reason(
+    caps: Capabilities, has_image: bool, *, allow_host_fallback: bool = False
+) -> str | None:
+    backend = decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
     if backend != DECLINE:
         return None
     if has_image:
+        if caps.bwrap_ok and not allow_host_fallback:
+            return (
+                "container_image requested but no usable container runtime — runner declined "
+                "(set allow_host_fallback=true in the launch contract to permit imageless bwrap fallback)"
+            )
         return (
             "container_image requested but no usable container runtime AND no bwrap "
             "sandbox (install a container runtime or bubblewrap)"
@@ -1360,17 +1372,23 @@ def plan_compute_execution(
     ldconfig_output: str = "",
     cpu_limit: str | None = None,
     mem_limit: str | None = None,
+    allow_host_fallback: bool = False,
 ) -> ExecutionPlan:
     """Build the sandbox plan for a compute job, or DECLINE (fail-closed).
 
     All ``*_host`` paths are on the runner filesystem; result_file/artifact_dir/
     clone_dir are expected to live UNDER ``workspace_host`` (the per-job tmpdir).
+
+    When ``image`` is set but no container runtime is available, the job is DECLINED
+    by default.  Set ``allow_host_fallback=True`` in the launch contract to permit
+    an explicit imageless bwrap fallback (reproducibility trade-off; operator opt-in).
     """
     has_image = bool(image)
-    backend = decide_compute_backend(caps, has_image)
+    backend = decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
     if backend == DECLINE:
         return ExecutionPlan.decline(
-            compute_decline_reason(caps, has_image) or "no compute sandbox"
+            compute_decline_reason(caps, has_image, allow_host_fallback=allow_host_fallback)
+            or "no compute sandbox"
         )
 
     # ---- container backends (docker / podman) --------------------------------

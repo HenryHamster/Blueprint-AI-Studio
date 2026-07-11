@@ -594,6 +594,7 @@ def _num_or_none(value) -> float | None:
     return f
 
 
+
 def _select_eligible_runner(
     active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     project_id: uuid.UUID,
@@ -725,6 +726,8 @@ def _build_compute_launch_kwargs(
         kwargs["container_image"] = payload["container_image"]
     if isinstance(payload.get("container_registry_auth"), dict):
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
+    if payload.get("allow_host_fallback"):
+        kwargs["allow_host_fallback"] = bool(payload["allow_host_fallback"])
     return kwargs
 
 
@@ -907,12 +910,46 @@ async def _dispatch_compute_experiment_directly(
         )
         return "held"
 
+    # ── Container-image hold: image declared + registered runners but none
+    # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.
+    # Only fires when the project has at least one live runner (runners exist but
+    # lack the runtime); when no runners are registered at all we fall through to
+    # the cloud backend so the job is not silently wedged.
+    if runner is None and container_image:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        if project_runners:
+            hold_msg = (
+                "Waiting for a container-capable runner: job declares "
+                f"container_image={container_image!r} but no live runner "
+                "has docker_usable capability."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get("awaiting_container_runner_since"):
+                ctx["awaiting_container_runner_since"] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image declared "
+                "(%r) but no container-capable runner available",
+                task.id,
+                container_image,
+            )
+            return "held"
+
     # ── Pin to the chosen runner; the job inherits it via task.context ─────────
     if runner is not None:
         ctx = dict(task.context or {})
         ctx["runner_target_id"] = str(runner.id)
         ctx["runner_hostname"] = runner.hostname
         ctx.pop("awaiting_local_runner_since", None)
+        ctx.pop("awaiting_container_runner_since", None)
         task.context = ctx
         session.add(task)
     elif (task.context or {}).get("runner_target_id"):
