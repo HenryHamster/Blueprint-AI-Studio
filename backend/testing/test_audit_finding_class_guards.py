@@ -603,7 +603,7 @@ _FIDELITY_FIXTURE_NAMES: frozenset[str] = frozenset(
 # from application code and every burn-down is a visible production diff. Tests
 # in the allowlist are *context* references — they document the historical hazard
 # but cannot reproduce the asyncpg failure mode on the default SQLite backend
-# (the root conftest globally no-ops ``InstanceState._expire``). Each entry is
+# (the root conftest no-ops ``InstanceState._expire`` on the aiosqlite backend). Each entry is
 # acknowledged technical debt: ideally each test either gets a
 # ``@pytest.mark.skipif(not USE_POSTGRES, ...)`` decorator or uses the
 # ``missing_greenlet_proxy``/``expire_fidelity`` fixtures to inject the fault.
@@ -624,7 +624,7 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
 
     NOTE: ``session.expire(obj)`` and ``session.expire_all()`` alone are NOT
     sufficient fidelity mechanisms.  Both delegate to ``InstanceState._expire``,
-    which the root conftest globally no-ops.  The calls silently do nothing on
+    which the root conftest no-ops on the aiosqlite backend.  The calls silently do nothing on
     the aiosqlite backend.  Tests that use ``session.expire()`` to reproduce the
     asyncpg fault MUST also use the ``expire_fidelity`` fixture (which restores
     real expiry).  Use ``expunge_all()`` — which removes objects from the session
@@ -699,10 +699,10 @@ class TestMissingGreenletTestsFaithful:
     least one recognised fidelity mechanism so it genuinely exercises the
     asyncpg failure mode on SQLite.
 
-    The root conftest globally no-ops ``InstanceState._expire``, which means
-    ``session.rollback()`` does NOT expire ORM objects on aiosqlite — tests that
-    rely on rollback-triggered expiry pass tautologically on the default SQLite
-    CI run even if the production fix were reverted.
+    The root conftest no-ops ``InstanceState._expire`` on the aiosqlite backend,
+    which means ``session.rollback()`` does NOT expire ORM objects on aiosqlite —
+    tests that rely on rollback-triggered expiry pass tautologically on the default
+    SQLite CI run even if the production fix were reverted.
 
     Recognised fidelity mechanisms:
 
@@ -749,7 +749,7 @@ class TestMissingGreenletTestsFaithful:
         NOT a sufficient MissingGreenlet fidelity mechanism.
 
         ``Session.expire()`` delegates to ``InstanceState._expire``, which the
-        root conftest globally no-ops.  A bare ``session.expire(obj)`` call on
+        root conftest no-ops on the aiosqlite backend.  A bare ``session.expire(obj)`` call on
         the aiosqlite backend silently does nothing.  The conftest must carry
         an explicit warning so future readers don't assume expire() restores
         fidelity on its own.
@@ -770,9 +770,9 @@ class TestMissingGreenletTestsFaithful:
 
         Regression: the scanner previously accepted any ``session.expire(obj)``
         call as a faithful MissingGreenlet fidelity mechanism (removed in this
-        commit).  But the root conftest globally no-ops ``InstanceState._expire``
-        — which ``Session.expire()`` delegates to — so bare expire() does nothing
-        on the default SQLite run.  Tests that rely on it pass tautologically.
+        commit).  But the root conftest no-ops ``InstanceState._expire`` on the
+        aiosqlite backend — which ``Session.expire()`` delegates to — so bare
+        expire() does nothing on the default SQLite run.  Tests that rely on it pass tautologically.
 
         Only ``session.expire()`` combined with the ``expire_fidelity`` fixture
         (which restores real ``_InstanceState._expire`` for that test's duration)
@@ -819,8 +819,8 @@ class TestMissingGreenletTestsFaithful:
         ``expire_fidelity`` fixture must be flagged by the fidelity scanner.
 
         ``Session.expire_all()`` calls ``InstanceState._expire`` for each
-        managed instance — the same method globally no-oped by the root conftest.
-        It is therefore a no-op on the aiosqlite backend, making any test that
+        managed instance — the same method no-oped by the root conftest on the
+        aiosqlite backend.  It is therefore a no-op on the aiosqlite backend, making any test that
         relies solely on it pass tautologically on SQLite.
 
         Use ``expunge_all()`` instead — it removes objects from the session
@@ -835,8 +835,8 @@ class TestMissingGreenletTestsFaithful:
         violations = _unfaithful_greenlet_tests(not_faithful)
         assert any("test_bare_expire_all" in v for v in violations), (
             "session.expire_all() without expire_fidelity fixture was NOT flagged.  "
-            "expire_all() on SQLite is a no-op (InstanceState._expire is globally "
-            "patched in conftest.py) and cannot serve as a faithful fidelity "
+            "expire_all() on aiosqlite is a no-op (InstanceState._expire is "
+            "patched in conftest.py on the aiosqlite backend) and cannot serve as a faithful fidelity "
             "mechanism.  Use expunge_all() instead."
         )
 
@@ -1274,7 +1274,7 @@ class TestRollbackSafetyRegressionCheck:
     fires a lazy SELECT from async context — which requires a greenlet
     context that is absent outside the route's own async chain, raising
     ``MissingGreenlet``.  On aiosqlite (the default test backend) this
-    expiry is globally no-oped by the root ``conftest.py``, so rollback-
+    expiry is no-oped by the root ``conftest.py`` on the aiosqlite backend, so rollback-
     after-read patterns pass tautologically on CI's cheap SQLite shard
     even if the real asyncpg deployment would crash.
 
