@@ -180,6 +180,7 @@ class HeartbeatRequest(BaseModel):
     has_gpu: StrictBool | None = None
     gpu_count: int | None = None
     gpu_names: List[str] | None = None
+    gpu_compute_capabilities: List[float] | None = None
     # Trust telemetry (optional; old runners omit these). last_successful_job_at
     # is ISO-8601; consecutive_job_failures/disk_free_bytes/gpu_utilization_pct are
     # ints. These drive the "connected but failing" degraded state so the operator
@@ -536,6 +537,8 @@ async def heartbeat(
         caps["gpu_count"] = payload.gpu_count
     if payload.gpu_names is not None:
         caps["gpu_names"] = payload.gpu_names
+    if payload.gpu_compute_capabilities is not None:
+        caps["gpu_compute_capabilities"] = [max(0.0, float(v)) for v in payload.gpu_compute_capabilities]
     # Trust telemetry. last_successful_job_at / consecutive_job_failures are
     # first-class columns (the degraded-state logic and panel key on them);
     # disk_free_bytes / gpu_utilization_pct are display-only and ride in caps
@@ -589,6 +592,7 @@ async def heartbeat(
         or previous_caps.get("has_gpu") != caps.get("has_gpu")
         or previous_caps.get("gpu_count") != caps.get("gpu_count")
         or previous_caps.get("gpu_names") != caps.get("gpu_names")
+        or previous_caps.get("gpu_compute_capabilities") != caps.get("gpu_compute_capabilities")
         # Trust-telemetry transitions matter (a runner tipping into/out of the
         # "connected but failing" state), so refetch the panel. gpu_utilization_pct
         # and disk_free_bytes are deliberately excluded — they churn every

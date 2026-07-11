@@ -1685,6 +1685,73 @@ class TestGpuDetection(unittest.TestCase):
         self.assertTrue(result["has_gpu"])
         self.assertEqual(result["gpu_count"], 2)
 
+    def test_detect_gpu_compute_capabilities_parses_single(self):
+        """Single compute_cap line → [8.9]."""
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "8.9\n"
+        with patch("subprocess.run", return_value=fake):
+            result = local_runner._detect_gpu_compute_capabilities()
+        self.assertEqual(result, [8.9])
+
+    def test_detect_gpu_compute_capabilities_parses_multi(self):
+        """Multiple compute_cap lines → list of floats, one per GPU."""
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "8.9\n7.0\n"
+        with patch("subprocess.run", return_value=fake):
+            result = local_runner._detect_gpu_compute_capabilities()
+        self.assertEqual(result, [8.9, 7.0])
+
+    def test_detect_gpu_compute_capabilities_error_returns_empty(self):
+        """Any error in compute_cap query → empty list, no crash."""
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = local_runner._detect_gpu_compute_capabilities()
+        self.assertEqual(result, [])
+
+    def test_detect_gpu_includes_compute_capabilities(self):
+        """_detect_gpu populates gpu_compute_capabilities when GPUs present."""
+        list_fake = MagicMock()
+        list_fake.returncode = 0
+        list_fake.stdout = "GPU 0: NVIDIA L40S (UUID: GPU-xyz)\n"
+        cap_fake = MagicMock()
+        cap_fake.returncode = 0
+        cap_fake.stdout = "8.9\n"
+
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            return list_fake if call_count[0] == 1 else cap_fake
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = local_runner._detect_gpu()
+
+        self.assertTrue(result["has_gpu"])
+        self.assertIn("NVIDIA L40S", result["gpu_names"][0])
+        self.assertEqual(result["gpu_compute_capabilities"], [8.9])
+
+    def test_detect_gpu_compute_capabilities_unavailable_returns_empty_list(self):
+        """When compute_cap query fails, gpu_compute_capabilities is [] (not absent)."""
+        list_fake = MagicMock()
+        list_fake.returncode = 0
+        list_fake.stdout = "GPU 0: Tesla T4 (UUID: GPU-abc)\n"
+        cap_fake = MagicMock()
+        cap_fake.returncode = 1
+        cap_fake.stdout = ""
+
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            return list_fake if call_count[0] == 1 else cap_fake
+
+        with patch("subprocess.run", side_effect=side_effect):
+            result = local_runner._detect_gpu()
+
+        self.assertTrue(result["has_gpu"])
+        self.assertEqual(result["gpu_compute_capabilities"], [])
+
     def test_gpu_capabilities_included_in_heartbeat_body(self):
         """Heartbeat body includes GPU fields detected at startup."""
         posted_bodies = []
