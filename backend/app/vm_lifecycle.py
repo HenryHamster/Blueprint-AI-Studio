@@ -216,7 +216,14 @@ async def _ensure_vm_deleted(
 
     # Runner guard: vm_instance_ids prefixed 'runner:' are logical names, not
     # GCE instance names.  There is no VM to delete — skip GCP calls entirely.
+    # Also drop any doomed marker a caller pre-recorded: the runner is a
+    # persistent process that stays alive across task completions, and a
+    # lingering marker makes next_role refuse every warm-claim from it for
+    # _ORCHESTRATOR_DELETE_TTL while dispatch keeps pinning tasks to it —
+    # each pin then heartbeat-reaps at ~380s and requeues to the same runner
+    # (production 2026-07-11 runner:dd59526e, 10 tasks reaped per cycle).
     if vm_id.startswith("runner:"):
+        _orchestrator_deleted_vms.pop(vm_id, None)
         logger.info(
             "[VM CLEANUP] Skipping GCP teardown for runner-pinned task (vm_id=%s, task=%s) "
             "— no GCE instance exists for runner tasks",
@@ -329,6 +336,15 @@ def fire_and_forget_vm_delete(
     else:
         vm_id = task_or_vm_id
     if not vm_id:
+        return
+    # Persistent runner pseudo-VMs ('runner:<id>') are never deleted —
+    # _ensure_vm_deleted no-ops on them — so never record the doomed marker
+    # for one. The marker means "a VM delete is in flight; don't claim into
+    # it", which is never true for a runner, and a stale marker starves the
+    # runner's next-role claims for _ORCHESTRATOR_DELETE_TTL after every
+    # completion while dispatch keeps pinning work to it (dispatch → refused
+    # claim → heartbeat reap → requeue loop, production 2026-07-11).
+    if vm_id.startswith("runner:"):
         return
     # Record marker synchronously before scheduling. _ensure_vm_deleted
     # also writes this on its first non-await line, but writing here too
