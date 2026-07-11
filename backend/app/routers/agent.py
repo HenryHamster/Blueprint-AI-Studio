@@ -854,8 +854,9 @@ async def claim_task(
 
     Status codes:
         200: Task claimed successfully
-        404: No unclaimed task on this VM
+        404: The JWT's task is not claimable on this VM
         429: Task locked by another process (retry recommended)
+        403: Token is not task-scoped
         401: Invalid or expired token
 
     Rate limit: 200 requests/minute.
@@ -867,45 +868,43 @@ async def claim_task(
     # this widens the warm-VM continuity liveness window beyond just the
     # /vm-heartbeat and /next-role endpoints.
     _shared_state.record_vm_heartbeat(vm_id)
-
-    # Parse the token's task sub defensively. When a local runner runs multiple
-    # agent tasks concurrently, all tasks on the same runner share the same
-    # vm_instance_id ("runner:<id>"). Without scoping the claim SELECT to the
-    # token's own task, an agent whose token authorizes Task A can accidentally
-    # claim Task B (same vm_instance_id, QUEUED/PROVISIONING), causing every
-    # subsequent task-scoped call to 403 with "Task ID mismatch" and the agent
-    # self-terminates. verify_agent_token already rejects bare VM-scoped tokens
-    # before reaching /claim so sub should be present and valid, but guard
-    # against malformed JWTs by falling back to vm_instance_id-only behavior.
+    # Scope the claim to the JWT's task, never "any task pinned to this VM".
+    # Persistent runners pin MANY tasks to one shared vm_instance_id
+    # ('runner:<id>'); an unscoped claim let the agent spawned for task A grab
+    # task B, after which every subsequent call 403'd "Task ID mismatch" and
+    # the agent crash-looped (production 2026-07-11 requeue pile-up). Every
+    # claim caller holds a token minted for its specific task (cold manifest,
+    # warm next-role rotation, runner dispatch), so sub is always present here;
+    # a VM-scoped (taskless) token was never a designed /claim flow.
+    token_task_id = token.get("sub")
     try:
-        token_sub = uuid.UUID(token["sub"]) if token.get("sub") else None
+        token_task_uuid = uuid.UUID(str(token_task_id))
     except (ValueError, TypeError):
-        token_sub = None
-
-    # Build the primary claim WHERE clause: vm_instance_id + status, optionally
-    # scoped to the token's own task sub so concurrent runner agents cannot
-    # cross-claim sibling tasks on the same runner.
-    claim_where = [
-        Task.vm_instance_id == vm_id,
-        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
-    ]
-    if token_sub is not None:
-        claim_where.append(Task.id == token_sub)
-    stmt = select(Task).where(*claim_where).with_for_update(skip_locked=True)
+        raise HTTPException(
+            status_code=403, detail="task-scoped token required to claim"
+        )
+    stmt = (
+        select(Task)
+        .where(
+            Task.id == token_task_uuid,
+            Task.vm_instance_id == vm_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+        )
+        .with_for_update(skip_locked=True)
+    )
     result = await session.execute(stmt)
     task = result.scalars().first()
 
     idempotent_replay = False
     if not task:
-        # Distinguish "no task" from "task locked by another process".
-        # Same sub-scoping so we only 429 when OUR task is locked, not a sibling.
-        check_where = [
-            Task.vm_instance_id == vm_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
-        ]
-        if token_sub is not None:
-            check_where.append(Task.id == token_sub)
-        check = await session.execute(select(Task.id).where(*check_where))
+        # Distinguish "no task" from "task locked by another process"
+        check = await session.execute(
+            select(Task.id).where(
+                Task.id == token_task_uuid,
+                Task.vm_instance_id == vm_id,
+                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+            )
+        )
         if check.scalars().first():
             # Use 429 (not 503) so Cloud Run doesn't classify this as ContainerError
             # and quarantine the instance — see commit 88a77903 for the same pattern
@@ -926,18 +925,20 @@ async def claim_task(
         # the same response. Same sub-scoping so a retry replays only the token's
         # own task, not a sibling's.
         replay_cutoff = _utcnow() - timedelta(minutes=5)
-        replay_where = [
+        replay_stmt = select(Task).where(
+            Task.id == token_task_uuid,
             Task.vm_instance_id == vm_id,
             Task.status == TaskStatus.IN_PROGRESS,
             Task.last_heartbeat >= replay_cutoff,
-        ]
-        if token_sub is not None:
-            replay_where.append(Task.id == token_sub)
-        replay_stmt = select(Task).where(*replay_where)
+        )
         task = (await session.execute(replay_stmt)).scalars().first()
         if not task:
             raise HTTPException(
-                status_code=404, detail="No queued task found for this VM instance."
+                status_code=404,
+                detail=(
+                    f"Task {token_task_id} is not claimable on this VM "
+                    "(not pinned here, or no longer QUEUED/PROVISIONING)."
+                ),
             )
         idempotent_replay = True
 
