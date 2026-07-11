@@ -491,9 +491,11 @@ runtime_config: Dict = {
             "haiku": "claude-haiku-4-5-20251001",
         },
         "openai": {
-            "opus": "gpt-5.4",
-            "sonnet": "gpt-5.3-codex",
-            "haiku": "gpt-5.4-mini",
+            # GPT-5.6 picker trio (2026-07): sol=frontier, terra=balanced,
+            # luna=fast/affordable. gpt-5.3-codex left the picker this cycle.
+            "opus": "gpt-5.6-sol",
+            "sonnet": "gpt-5.6-terra",
+            "haiku": "gpt-5.6-luna",
         },
         "gemini": {
             "opus": "gemini-2.5-pro",
@@ -618,22 +620,24 @@ runtime_config: Dict = {
             # strategic (max) gets high because the prose *is* the deliverable
             # (design docs and strategic reviews).
             "low": {
-                "model": "gpt-5.4-mini",
+                "model": "gpt-5.6-luna",
                 "reasoning_effort": "low",
                 "verbosity": "low",
             },
             "medium": {
-                "model": "gpt-5.4-mini",
+                "model": "gpt-5.6-terra",
                 "reasoning_effort": "medium",
                 "verbosity": "low",
             },
             "high": {
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "reasoning_effort": "high",
                 "verbosity": "medium",
             },
+            # xhigh (not the 5.6-only max/ultra levels) so a fallback or an
+            # operator override to an older-gen model keeps a valid level.
             "max": {
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "reasoning_effort": "xhigh",
                 "verbosity": "high",
             },

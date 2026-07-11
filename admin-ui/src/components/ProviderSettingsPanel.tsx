@@ -26,7 +26,14 @@ const GEMINI_PREVIEW_FALLBACK: Record<string, string> = {
 // sync by convention — when the backend gains/loses flex support for a
 // model, update both sides. Unknown model → fail closed (no flex) so an
 // operator doesn't stamp a guaranteed-400 config.
-const OPENAI_FLEX_SUPPORTED: ReadonlySet<string> = new Set(['gpt-5.4', 'gpt-5.4-mini']);
+const OPENAI_FLEX_SUPPORTED: ReadonlySet<string> = new Set([
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+]);
 
 function openaiModelSupportsFlex(model: unknown): boolean {
   if (typeof model !== 'string') return false;
@@ -299,8 +306,8 @@ function crossFieldLock(key: string, bag: ProviderSettingsBag): string | null {
 // drops incompatible values at dispatch; this just keeps the admin from
 // picking something we know will be dropped.
 function crossFieldEnumDisable(key: string, bag: ProviderSettingsBag): Record<string, string> {
-  // OpenAI: service_tier=flex only works on flex-capable models (gpt-5.4,
-  // gpt-5.4-mini). Sending flex to anything else returns a 400
+  // OpenAI: service_tier=flex only works on flex-capable models (see
+  // OPENAI_FLEX_SUPPORTED). Sending flex to anything else returns a 400
   // `Unsupported service_tier: flex` — mirror the backend's
   // _model_supports_flex gate so the picker never offers flex for an
   // incompatible model.

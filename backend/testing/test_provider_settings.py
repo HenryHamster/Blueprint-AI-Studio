@@ -48,7 +48,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
         == "claude-sonnet-4-6"
     )
     assert (
-        body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.4-mini"
+        body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.6-luna"
     )
     assert body["category_routing"]["strategic"]["providers"][0] == "zai"
     assert "zai" not in body["category_routing"]["initiative"]["providers"]
