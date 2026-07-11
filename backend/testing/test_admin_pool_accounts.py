@@ -2394,3 +2394,246 @@ async def test_secret_blob_ref_encrypted_at_rest_on_update(
     assert acct.secret_blob_ref != sm_ref
     # Decrypted value must equal the new SM path.
     assert decrypt_field(acct.secret_blob_ref) == sm_ref
+
+
+# ── per-project cap CRUD + enforcement ───────────────────────────────────
+
+
+async def test_set_per_project_cap_is_enforced(client, db_session, inject_pool):
+    """Setting a per-project cap via PATCH .../per-project-cap persists to DB,
+    syncs to the in-memory pool entry, and is enforced by _project_at_cap."""
+    from app.max_plan_pool import (
+        _account_by_id,
+        _max_plan_pool_lock,
+        _project_at_cap,
+    )
+
+    project = Project(name="pp-cap-enforce", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_id = uuid.uuid4()
+    acct = MaxPlanAccount(
+        id=acct_id,
+        user_id="test-user-123",
+        name="Per-Project Cap Test",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/ppcap/versions/1",
+        secret_blob_ref="projects/test/secrets/ppcap/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    # Seed the in-memory pool with matching cap fields as empty dicts so the
+    # PATCH handler can sync updates onto them.
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(acct_id),
+                "user_id": "test-user-123",
+                "name": "Per-Project Cap Test",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "active_tasks": 0,
+                "daily_task_count": 0,
+                "daily_task_cap": None,
+                "max_concurrent_tasks": None,
+                "project_daily_task_cap": {},
+                "project_max_concurrent_tasks": {},
+                "project_state": {},
+                "runtime_ready": True,
+            }
+        ],
+    )
+
+    pid = str(project.id)
+
+    # ── 1. Set daily cap only ─────────────────────────────────────────────
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct_id}/per-project-cap",
+        json={"project_id": pid, "daily_task_cap": 5},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["project_id"] == pid
+    assert body["project_daily_task_cap"] == {pid: 5}
+
+    await db_session.refresh(acct)
+    assert acct.project_daily_task_cap == {pid: 5}
+    assert acct.project_max_concurrent_tasks is None  # untouched
+
+    async with _max_plan_pool_lock:
+        mem = _account_by_id.get(str(acct_id))
+    assert mem is not None
+    assert mem.get("project_daily_task_cap") == {pid: 5}
+
+    # ── 2. Below daily cap — not blocked ──────────────────────────────────
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)].setdefault("project_state", {})[pid] = {
+            "daily_task_count": 3,
+            "active_tasks": 0,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is None, f"Expected no cap, got: {reason}"
+
+    # ── 3. At daily cap — blocked ─────────────────────────────────────────
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)]["project_state"][pid] = {
+            "daily_task_count": 5,
+            "active_tasks": 0,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is not None
+    assert "project daily cap" in reason.lower()
+    assert "5" in reason
+
+    # ── 4. Add concurrent cap ─────────────────────────────────────────────
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct_id}/per-project-cap",
+        json={"project_id": pid, "max_concurrent_tasks": 2},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    assert acct.project_daily_task_cap == {pid: 5}  # unchanged
+    assert acct.project_max_concurrent_tasks == {pid: 2}
+
+    async with _max_plan_pool_lock:
+        mem = _account_by_id.get(str(acct_id))
+    assert mem.get("project_max_concurrent_tasks") == {pid: 2}
+
+    # ── 5. Below concurrent cap — not blocked ─────────────────────────────
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)]["project_state"][pid] = {
+            "daily_task_count": 1,
+            "active_tasks": 1,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is None
+
+    # ── 6. At concurrent cap — blocked ────────────────────────────────────
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)]["project_state"][pid] = {
+            "daily_task_count": 1,
+            "active_tasks": 2,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is not None
+    assert "project concurrent cap" in reason.lower()
+    assert "2" in reason
+
+    # ── 7. Clear daily cap — concurrent cap still active ──────────────────
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct_id}/per-project-cap",
+        json={"project_id": pid, "daily_task_cap": None},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    assert acct.project_daily_task_cap == {} or acct.project_daily_task_cap is None
+    assert acct.project_max_concurrent_tasks == {pid: 2}
+
+    # With daily cap cleared, at-daily-cap should not block but at-concurrent
+    # should still block.
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)]["project_state"][pid] = {
+            "daily_task_count": 999,
+            "active_tasks": 2,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is not None
+    assert "concurrent" in reason.lower()
+
+    # ── 8. Clear concurrent cap — no more per-project blocking ────────────
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct_id}/per-project-cap",
+        json={"project_id": pid, "max_concurrent_tasks": None},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    assert acct.project_max_concurrent_tasks == {} or acct.project_max_concurrent_tasks is None
+
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)]["project_state"][pid] = {
+            "daily_task_count": 999,
+            "active_tasks": 999,
+        }
+    mem = _account_by_id.get(str(acct_id))
+    reason = _project_at_cap(mem, pid)
+    assert reason is None, f"Expected no cap after clearing both, got: {reason}"
+
+
+async def test_set_per_project_cap_rejects_missing_project_id(client, db_session):
+    """PATCH .../per-project-cap requires a valid project_id."""
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="No PID",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/nopid/versions/1",
+        secret_blob_ref="projects/test/secrets/nopid/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}/per-project-cap",
+        json={},
+    )
+    assert res.status_code == 400
+    assert "project_id" in res.text
+
+
+async def test_set_per_project_cap_rejects_invalid_values(client, db_session):
+    """Negative and zero caps are rejected."""
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Bad Val",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/badval/versions/1",
+        secret_blob_ref="projects/test/secrets/badval/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}/per-project-cap",
+        json={"project_id": str(uuid.uuid4()), "daily_task_cap": 0},
+    )
+    assert res.status_code == 400
+    assert "daily_task_cap" in res.text
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}/per-project-cap",
+        json={"project_id": str(uuid.uuid4()), "max_concurrent_tasks": -1},
+    )
+    assert res.status_code == 400
+    assert "max_concurrent_tasks" in res.text
+
+
+async def test_set_per_project_cap_rejects_other_users_account(client, db_session):
+    """An account owned by another user must return 404."""
+    acct = MaxPlanAccount(
+        user_id="other-user",
+        name="Not Mine",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}/per-project-cap",
+        json={"project_id": str(uuid.uuid4()), "daily_task_cap": 5},
+    )
+    assert res.status_code == 404
