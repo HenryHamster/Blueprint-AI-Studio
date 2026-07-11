@@ -180,9 +180,10 @@ def _names_metrics_integrity_sweep(text: str | None) -> bool:
 #: criterion falls back to its underlying machine-evidence state.  Attestation
 #: is a visibly distinct, time-bounded tier — NOT full parity with the
 #: machine-verified evidence kinds recognised by :func:`_evidence_proves_covered`.
-#: Measured from ``detail["attested_at"]`` (ISO-8601); legacy rows lacking that
-#: key are treated as non-expiring so historical attestations are never silently
-#: dropped.  Module-level so the window is easy to adjust in one place.
+#: Measured from ``detail["attested_at"]`` (ISO-8601); rows lacking that key
+#: fall back to ``recorded_at`` as the reference timestamp — a missing timestamp
+#: cannot grant perpetual trust.  Module-level so the window is easy to adjust
+#: in one place.
 ATTESTATION_WINDOW_DAYS = 7
 
 
@@ -239,12 +240,12 @@ def _evidence_is_attested(e: CriterionEvidence) -> bool:
     ``detail["attested_at"]`` timestamp is within :data:`ATTESTATION_WINDOW_DAYS`
     of now.  Semantics:
 
-      * A legacy attestation with no ``attested_at`` key (pre-tiering rows) is
-        treated as valid (non-expiring) — historical waivers are never silently
-        dropped.
-      * An unparseable ``attested_at`` value fails toward valid for the same
-        reason: the operator did attest; only a *demonstrably* stale timestamp
-        expires the waiver.
+      * An attestation with no ``attested_at`` key falls back to ``recorded_at``
+        as the reference timestamp, so the attestation is still time-bounded —
+        a missing timestamp cannot grant perpetual trust.
+      * An unparseable ``attested_at`` value also falls back to ``recorded_at``
+        as the reference timestamp, so the attestation is still time-bounded —
+        a corrupt timestamp cannot grant perpetual trust.
       * A parseable timestamp older than the window returns ``False`` so the
         criterion falls back to its underlying (partial/uncovered) state until
         the operator re-attests and refreshes the timer.
@@ -254,14 +255,19 @@ def _evidence_is_attested(e: CriterionEvidence) -> bool:
     detail = e.detail if isinstance(e.detail, dict) else {}
     attested_at_raw = detail.get("attested_at")
     if not attested_at_raw:
-        # Legacy attestation (no timestamp) — treat as valid, non-expiring.
-        return True
+        # No attested_at key — fall back to recorded_at so the attestation is
+        # still time-bounded (a missing timestamp cannot grant perpetual trust).
+        return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+            days=ATTESTATION_WINDOW_DAYS
+        )
     try:
         attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
     except (TypeError, ValueError):
-        # Unparseable timestamp — the attestation exists; don't expire it on a
-        # formatting problem.
-        return True
+        # Unparseable timestamp — fall back to recorded_at so the attestation is
+        # still time-bounded even when attested_at is corrupt.
+        return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+            days=ATTESTATION_WINDOW_DAYS
+        )
     return (_utcnow() - attested_at) <= timedelta(days=ATTESTATION_WINDOW_DAYS)
 
 
@@ -558,9 +564,10 @@ def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | 
     """Return the ISO-8601 expiry timestamp of the latest valid attestation, or None.
 
     Iterates evidence in reverse (latest first) and returns the expiry of the
-    first non-expired operator_attestation that carries a parseable ``attested_at``
-    timestamp. Legacy attestations (no ``attested_at``) are non-expiring and return
-    ``None``. Called only when coverage == ``'attested'``.
+    first non-expired operator_attestation.  When ``attested_at`` is absent or
+    unparseable, falls back to ``recorded_at`` as the reference timestamp so the
+    attestation is still time-bounded — a missing or corrupt timestamp cannot
+    grant perpetual trust.  Called only when coverage == ``'attested'``.
     """
     for e in reversed(evidence):
         if not _evidence_is_attested(e):
@@ -568,12 +575,16 @@ def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | 
         detail = e.detail if isinstance(e.detail, dict) else {}
         attested_at_raw = detail.get("attested_at")
         if not attested_at_raw:
-            return None  # legacy non-expiring attestation
+            # No attested_at key — fall back to recorded_at so the attestation is
+            # still time-bounded (a missing timestamp cannot grant perpetual trust).
+            return (_coerce_naive_utc(e.recorded_at) + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
         try:
             attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
             return (attested_at + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
         except (TypeError, ValueError):
-            return None  # unparseable timestamp — treat as non-expiring
+            # Unparseable timestamp — fall back to recorded_at so the attestation is
+            # still time-bounded even when attested_at is corrupt.
+            return (_coerce_naive_utc(e.recorded_at) + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
     return None
 
 

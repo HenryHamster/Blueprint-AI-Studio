@@ -3036,7 +3036,8 @@ def test_operator_attestation_is_attested_tier_not_covered():
     ev_no_detail = _make_evidence("operator_attestation")
     # No longer machine-covered.
     assert ac._evidence_proves_covered(ev_no_detail) is False
-    # But it IS a valid (legacy, timestamp-less) attestation.
+    # A fresh (no attested_at) attestation falls back to recorded_at which is
+    # within the window — it is still a valid attestation.
     assert ac._evidence_is_attested(ev_no_detail) is True
 
     ev_with_detail = _make_evidence("operator_attestation", detail={"reason": "accepted"})
@@ -3082,11 +3083,44 @@ def test_expired_attestation_falls_back_to_partial():
     assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
 
 
-def test_attestation_unparseable_timestamp_stays_valid():
-    """An attestation with an unparseable attested_at is not expired on a format error."""
-    ev = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
-    assert ac._evidence_is_attested(ev) is True
-    assert ac.compute_criterion_coverage([ev]) == "attested"
+def test_attestation_unparseable_timestamp_falls_back_to_recorded_at():
+    """An attestation with an unparseable attested_at falls back to recorded_at for expiry.
+
+    A fresh row (recorded_at defaults to now) stays valid; a stale row (recorded_at
+    older than the window) expires just like a properly-stamped stale attestation.
+    """
+    # Fresh: recorded_at defaults to _utcnow() via the model, so within the window.
+    ev_fresh = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
+
+    # Stale: recorded_at older than the window → expired, falls back to 'partial'.
+    ev_stale = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
+    ev_stale.recorded_at = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    assert ac._evidence_is_attested(ev_stale) is False
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+
+def test_attestation_without_detail_timestamp_expires_from_recorded_at():
+    """An operator_attestation with no attested_at in detail expires via recorded_at.
+
+    A missing attested_at must NOT grant perpetual trust — the attestation falls
+    back to recorded_at as the reference timestamp, so a stale row (recorded_at
+    older than ATTESTATION_WINDOW_DAYS) is treated as expired.
+    """
+    # Stale: no attested_at in detail, recorded_at older than the window.
+    ev_stale = _make_evidence("operator_attestation", detail={"reason": "old waiver"})
+    ev_stale.recorded_at = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    assert ac._evidence_is_attested(ev_stale) is False, (
+        "An attestation with no attested_at but a stale recorded_at must expire, "
+        "not grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+    # Fresh: no attested_at, recorded_at within the window → still valid.
+    ev_fresh = _make_evidence("operator_attestation", detail={"reason": "recent waiver"})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
 
 
 @pytest.mark.asyncio
@@ -3321,8 +3355,9 @@ async def test_coverage_summary_carries_attestation_expiry(db_session):
     per-criterion entry must carry attestation_expires_at as an ISO-8601 string
     whose value is approximately attested_at + ATTESTATION_WINDOW_DAYS.
     Non-attested criteria carry attestation_expires_at=None.
-    Legacy (timestamp-less) attestations carry attestation_expires_at=None
-    (non-expiring — no deadline to surface).
+    Legacy (timestamp-less) attestations carry attestation_expires_at computed
+    from recorded_at (not None) — a missing timestamp cannot grant perpetual
+    trust, so the attestation is still time-bounded via the recorded_at fallback.
     """
     from datetime import datetime as _dt
 
@@ -3344,8 +3379,8 @@ async def test_coverage_summary_carries_attestation_expiry(db_session):
         detail={"reason": "accepted", "attested_at": attested_at.isoformat()},
     )
 
-    # Legacy (timestamp-less) attestation for c_legacy — should be non-expiring.
-    await ac.record_evidence(
+    # Legacy (timestamp-less) attestation for c_legacy — expires via recorded_at fallback.
+    legacy_evidence = await ac.record_evidence(
         db_session,
         criterion_id=c_legacy.id,
         project_id=project.id,
@@ -3369,11 +3404,18 @@ async def test_coverage_summary_carries_attestation_expiry(db_session):
         f"expiry {expiry_dt!r} deviates from expected {expected_expiry!r}"
     )
 
-    # Legacy attestation: non-expiring → attestation_expires_at=None.
+    # Legacy attestation: no attested_at → expires via recorded_at fallback.
     legacy_entry = by_key[c_legacy.criterion_key]
     assert legacy_entry["coverage"] == "attested"
-    assert legacy_entry.get("attestation_expires_at") is None, (
-        "Legacy (timestamp-less) attestation must carry attestation_expires_at=None"
+    legacy_expiry_str = legacy_entry["attestation_expires_at"]
+    assert legacy_expiry_str is not None, (
+        "Legacy (timestamp-less) attestation must carry a non-None attestation_expires_at "
+        "(recorded_at fallback keeps it time-bounded)"
+    )
+    legacy_expiry_dt = _dt.fromisoformat(legacy_expiry_str)
+    expected_legacy_expiry = legacy_evidence.recorded_at + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((legacy_expiry_dt - expected_legacy_expiry).total_seconds()) < 2, (
+        f"legacy expiry {legacy_expiry_dt!r} deviates from expected {expected_legacy_expiry!r}"
     )
 
     # Uncovered criterion: attestation_expires_at must be None (not attested).

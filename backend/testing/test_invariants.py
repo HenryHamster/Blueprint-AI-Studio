@@ -4684,6 +4684,7 @@ def _find_claude_md() -> str:
         os.path.join(
             os.path.dirname(__file__), "..", "..", "CLAUDE.md"
         ),  # repo root (local dev)
+        "/repo/CLAUDE.md",  # Docker agent VM: /tmp/workspace mounted at /repo
     ]
     for path in candidates:
         if os.path.isfile(path):
