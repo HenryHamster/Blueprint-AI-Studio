@@ -444,6 +444,17 @@ const MANAGED_LLM_ENV_KEYS = [
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_ANTHROPIC_BASE_URL',
   'DEEPSEEK_BASE_URL',
+  // Claude Code model-selection env materialized by the DeepSeek secret
+  // material. Only the deepseek branch of buildBaseCliEnv reads these, but
+  // they are provider credentials-adjacent state and must be cleared (and
+  // snapshotted/restored) across warm retargets like every other managed
+  // key — otherwise a deepseek→anthropic retarget leaves stale DeepSeek
+  // model ids in process.env forever.
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
   'OPENAI_API_KEY',
   'CODEX_API_KEY',
   'CODEX_HOME',

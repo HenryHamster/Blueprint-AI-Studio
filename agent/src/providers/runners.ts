@@ -19,6 +19,7 @@ import {
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
 import { normalizeProviderTokenUsage } from './usage.js';
+import { applyDeepSeekModelEnv, pinDeepSeekModel } from './deepseek-env.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai' | 'deepseek';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -627,6 +628,9 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
     }
     const baseUrl = env.DEEPSEEK_ANTHROPIC_BASE_URL || env.DEEPSEEK_BASE_URL || env.ANTHROPIC_BASE_URL || DEEPSEEK_ANTHROPIC_BASE_URL;
     env.ANTHROPIC_BASE_URL = baseUrl.replace(/\/+$/, '');
+    // Documented model-selection env (see deepseek-env.ts for the full
+    // rationale, precedence, and why it is scoped to this branch only).
+    applyDeepSeekModelEnv(env);
   }
   return env;
 }
@@ -770,11 +774,16 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       // ZERO model deltas — still goes stale and fires correctly.
       const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
       let effectiveEffort = effort;
+      let effectiveModel = model;
       if (LLM_CLI_TRANSLATION) {
         args.push(...LLM_CLI_TRANSLATION.args);
         const idx = LLM_CLI_TRANSLATION.args.indexOf('--effort');
         if (idx >= 0 && idx + 1 < LLM_CLI_TRANSLATION.args.length) {
           effectiveEffort = LLM_CLI_TRANSLATION.args[idx + 1];
+        }
+        const modelIdx = LLM_CLI_TRANSLATION.args.indexOf('--model');
+        if (modelIdx >= 0 && modelIdx + 1 < LLM_CLI_TRANSLATION.args.length) {
+          effectiveModel = LLM_CLI_TRANSLATION.args[modelIdx + 1];
         }
       } else {
         if (model) args.push('--model', model);
@@ -786,19 +795,26 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       return {
         command: 'claude',
         args,
-        env: baseEnv,
+        env: pinDeepSeekModel(baseEnv, isDeepSeek, effectiveModel),
         outputMode: 'claude-stream-json',
         timeoutMs: claudeTimeoutForEffort(effectiveEffort),
         promptInput: 'stdin-file',
         displayName: claudeDisplayName,
       };
     },
-    buildValidationCommand: () => ({
-      command: 'claude',
-      args: ['-p', 'respond with OK', '--max-turns', '1', '--output-format', 'stream-json', '--dangerously-skip-permissions'],
-      env: baseEnv,
-      timeoutMs: 30_000,
-    }),
+    buildValidationCommand: (model) => {
+      // Name the pool-selected model: a bare probe proves only that the key
+      // authenticates, so AGENT_AUTH_OK could pass on a broken model (the
+      // DeepSeek Resident failure mode).
+      const args = ['-p', 'respond with OK', '--max-turns', '1', '--output-format', 'stream-json', '--dangerously-skip-permissions'];
+      if (model) args.push('--model', model);
+      return {
+        command: 'claude',
+        args,
+        env: pinDeepSeekModel(baseEnv, isDeepSeek, model),
+        timeoutMs: 30_000,
+      };
+    },
   };
 }
 

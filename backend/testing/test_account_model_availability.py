@@ -157,6 +157,158 @@ class TestOpenAIListAvailableModels:
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek list_available_models — GET /models at the API root (not under the
+# /anthropic compat prefix), OpenAI-style {"data":[{"id": ...}]} response.
+# ---------------------------------------------------------------------------
+
+
+class TestDeepSeekListAvailableModels:
+    @pytest.mark.asyncio
+    async def test_api_key_parses_data_ids_from_api_root(self, mocker):
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        mock_resp = mocker.MagicMock(status_code=200)
+        mock_resp.json = mocker.MagicMock(
+            return_value={
+                "object": "list",
+                "data": [
+                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+                    {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+                    {"no_id": True},  # malformed; skip
+                ],
+            }
+        )
+        mock_resp.raise_for_status = mocker.MagicMock()
+        mock_client = mocker.MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+        models = await provider.list_available_models(
+            "ds-test-key", LLMAuthMode.API_KEY, {}
+        )
+        assert models == ["deepseek-v4-flash", "deepseek-v4-pro"]
+        # The listing endpoint lives at the API root — the /anthropic compat
+        # prefix must be stripped from the default base URL.
+        url = mock_client.get.await_args.args[0]
+        assert url == "https://api.deepseek.com/models"
+        headers = mock_client.get.await_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer ds-test-key"
+
+    @pytest.mark.asyncio
+    async def test_metadata_base_url_override_maps_to_root(self, mocker):
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        mock_resp = mocker.MagicMock(status_code=200)
+        mock_resp.json = mocker.MagicMock(return_value={"data": []})
+        mock_resp.raise_for_status = mocker.MagicMock()
+        mock_client = mocker.MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+        models = await provider.list_available_models(
+            "ds-test-key",
+            LLMAuthMode.API_KEY,
+            {"anthropic_base_url": "https://proxy.example/deepseek/anthropic"},
+        )
+        assert models == []
+        url = mock_client.get.await_args.args[0]
+        assert url == "https://proxy.example/deepseek/models"
+
+    @pytest.mark.asyncio
+    async def test_network_error_returns_none(self, mocker):
+        """Contract: never raise; None = unknown, don't filter against it."""
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        mock_client = mocker.MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(side_effect=RuntimeError("connection refused"))
+        mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+        result = await provider.list_available_models(
+            "ds-test-key", LLMAuthMode.API_KEY, {}
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_secret_returns_none(self):
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        assert await provider.list_available_models("", LLMAuthMode.API_KEY, {}) is None
+        assert (
+            await provider.list_available_models(None, LLMAuthMode.API_KEY, {}) is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_unsupported_auth_mode_returns_none_not_raise(self):
+        """A corrupt/miskeyed account row (oauth on deepseek) must resolve to
+        unknown per the never-raises contract, not blow up the sweeper."""
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        result = await provider.list_available_models(
+            "ds-test-key", LLMAuthMode.OAUTH, {}
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_body_returns_none(self, mocker):
+        """A syntactically valid but non-object body (bare array) is treated
+        as unknown — never raises out of the contract."""
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+        mock_resp = mocker.MagicMock(status_code=200)
+        mock_resp.json = mocker.MagicMock(return_value=[{"id": "deepseek-v4-pro"}])
+        mock_resp.raise_for_status = mocker.MagicMock()
+        mock_client = mocker.MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+        result = await provider.list_available_models(
+            "ds-test-key", LLMAuthMode.API_KEY, {}
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_alien_vocabulary_fails_open_to_none(self, mocker):
+        """Fleet-starvation guard: the sweeper refreshes every account with
+        this result and the pool hard-filters accounts whose list lacks the
+        requested tier-map id. A successful listing containing NONE of the
+        documented ids is far more likely a catalog rename than every key
+        losing access, so it must resolve to unknown (None) — while an EMPTY
+        list is preserved as the legitimate revoked-key signal."""
+        provider = get_provider(LLMProviderName.DEEPSEEK)
+
+        def client_returning(payload):
+            mock_resp = mocker.MagicMock(status_code=200)
+            mock_resp.json = mocker.MagicMock(return_value=payload)
+            mock_resp.raise_for_status = mocker.MagicMock()
+            mock_client = mocker.MagicMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            return mock_client
+
+        mocker.patch(
+            "httpx.AsyncClient",
+            return_value=client_returning(
+                {"data": [{"id": "deepseek-v5-ultra"}, {"id": "deepseek-v5-mini"}]}
+            ),
+        )
+        assert (
+            await provider.list_available_models("ds-test-key", LLMAuthMode.API_KEY, {})
+            is None
+        )
+
+        mocker.patch(
+            "httpx.AsyncClient", return_value=client_returning({"data": []})
+        )
+        assert (
+            await provider.list_available_models("ds-test-key", LLMAuthMode.API_KEY, {})
+            == []
+        )
+
+
+# ---------------------------------------------------------------------------
 # Availability cache helpers — account_has_model / refresh.
 # ---------------------------------------------------------------------------
 

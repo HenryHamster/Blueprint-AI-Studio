@@ -528,15 +528,24 @@ def test_deepseek_preferred_routing_for_low_medium_effort():
     assert any("build" in w for w in bad_warnings)
     # ops is fine (deepseek first), initiative has empty list → skipped
 
-    # ---- 5. _backfill_provider_runtime_defaults repairs ordering ----
-    repair_config: dict = {
+    # ---- 5. _backfill_provider_runtime_defaults preserves operator routes ----
+    # The backfill runs on EVERY persisted-config sync, not just once during
+    # an upgrade, so rewriting an existing provider list would silently undo
+    # a successful settings PATCH on the next sync cycle. Existing routes are
+    # operator-owned and must round-trip byte-for-byte, even when they violate
+    # the DeepSeek-first default ordering.
+    operator_routes: dict = {
+        "build": {"providers": ["openai", "deepseek", "anthropic"], "effort": "medium"},
+        "initiative": {"providers": ["gemini", "deepseek"], "effort": "medium"},
+        "ops": {"providers": ["gemini", "deepseek"], "effort": "low"},
+        "_default": {"providers": ["openai", "gemini"], "effort": "medium"},
+        "strategic": {"providers": ["zai", "anthropic"], "effort": "max"},
+        "review": {"providers": ["anthropic", "openai"], "effort": "high"},
+    }
+    operator_config: dict = {
         "category_routing": {
-            "build": {"providers": ["openai", "deepseek", "anthropic"], "effort": "medium"},
-            "initiative": {"providers": ["gemini", "deepseek"], "effort": "medium"},
-            "ops": {"providers": ["gemini", "deepseek"], "effort": "low"},
-            "_default": {"providers": ["openai", "gemini"], "effort": "medium"},
-            "strategic": {"providers": ["zai", "anthropic"], "effort": "max"},
-            "review": {"providers": ["anthropic", "openai"], "effort": "high"},
+            category: {"providers": list(route["providers"]), "effort": route["effort"]}
+            for category, route in operator_routes.items()
         },
         "provider_settings_by_effort": {
             "deepseek": {
@@ -549,23 +558,38 @@ def test_deepseek_preferred_routing_for_low_medium_effort():
             "zai": {"max": {"model": "glm-5.2"}},
         },
     }
-    _backfill_provider_runtime_defaults(repair_config)
-    repaired = repair_config["category_routing"]
-    for category in deepseek_first:
-        providers = repaired[category]["providers"]
-        assert providers[0] == "deepseek", (
-            f"after backfill, category_routing.{category} must have DeepSeek "
-            f"first; got {providers}"
+    _backfill_provider_runtime_defaults(operator_config)
+    preserved = operator_config["category_routing"]
+    for category, route in operator_routes.items():
+        assert preserved[category]["providers"] == route["providers"], (
+            f"after backfill, category_routing.{category} must be preserved "
+            f"byte-for-byte; got {preserved[category]['providers']}"
         )
-    # strategic and review must retain their leading providers.
-    assert repaired["strategic"]["providers"][0] == "zai"
-    assert repaired["review"]["providers"][0] == "anthropic"
+        assert preserved[category]["effort"] == route["effort"]
 
-    # After repair, validation must produce no warnings.
-    post_warnings = _validate_deepseek_routing_invariant(repair_config)
-    assert post_warnings == [], (
-        f"post-repair config must pass validation; got {post_warnings}"
+    # The validator still SEES the violated ordering — detection is decoupled
+    # from repair, which is now the operator's call.
+    post_warnings = _validate_deepseek_routing_invariant(operator_config)
+    assert post_warnings != [], (
+        "validator must still flag operator routes that violate the "
+        "DeepSeek-first invariant even though backfill no longer rewrites them"
     )
+
+    # ---- 6. Missing categories are still seeded from the current defaults ----
+    sparse_config: dict = {
+        "category_routing": {
+            "build": {"providers": ["openai"], "effort": "medium"},
+        },
+    }
+    _backfill_provider_runtime_defaults(sparse_config)
+    seeded = sparse_config["category_routing"]
+    assert seeded["build"]["providers"] == ["openai"], (
+        "existing sparse route must survive seeding untouched"
+    )
+    for category in ("_default", "strategic", "initiative", "review", "ops"):
+        assert seeded[category]["providers"] == (
+            runtime_config["category_routing"][category]["providers"]
+        ), f"missing category_routing.{category} must be seeded from defaults"
 
 
 # ── Fixture: reset circuit breaker state for a project ───────────────────────

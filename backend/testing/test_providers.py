@@ -155,6 +155,17 @@ def test_deepseek_provider_uses_claude_compat_secret_material():
     assert material.env["ANTHROPIC_API_KEY"] == "deepseek-test-key"
     assert material.env["ANTHROPIC_AUTH_TOKEN"] == "deepseek-test-key"
     assert material.env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    # DeepSeek's documented Claude Code integration selects models via env —
+    # without these the CLI falls back to its claude-* aliases, which the
+    # compat layer silently remaps (unknown/sonnet/haiku ids → v4-flash), so
+    # an intended Pro session can silently downgrade. Plain ids per the docs:
+    # there is no "[1m]" variant (an unknown id would itself hit the flash
+    # fallback).
+    assert material.env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
+    assert material.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "deepseek-v4-pro"
+    assert material.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "deepseek-v4-pro"
+    assert material.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "deepseek-v4-flash"
+    assert material.env["CLAUDE_CODE_SUBAGENT_MODEL"] == "deepseek-v4-flash"
 
 
 def test_deepseek_provider_accepts_base_url_metadata_override():
