@@ -1024,7 +1024,11 @@ async def bulk_action_tasks(
     # once that happens, subsequent iterations must re-fetch fresh or their reads
     # fire a sync lazy-load -> MissingGreenlet (caught, but it cascades every
     # remaining item to a spurious "error"). `_batch_dirty` flips on first rollback.
+    # Populated on first rollback: batch-fetched replacements for the expired
+    # ORM objects, avoiding per-iteration session.get (PERF finding M-P6).
     _batch_dirty = False
+    _stale_task_map: dict[uuid.UUID, Task] = {}
+    _stale_children_map: dict[uuid.UUID, list[Task]] = {}
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -1035,11 +1039,17 @@ async def bulk_action_tasks(
             )
             continue
         if _batch_dirty:
-            # Re-fetch this task fresh (populate_existing overwrites the expired
-            # instance) so the reads/mutations below run inside the async greenlet.
-            task = await session.get(
-                Task, valid_map[raw_id], populate_existing=True
-            )
+            # Batch-fetch all tasks in one query after rollback instead of
+            # N individual session.get(populate_existing=True) calls.
+            _remaining_ids = list(valid_map.values())
+            _fresh_tasks = (
+                await session.execute(
+                    select(Task).where(Task.id.in_(_remaining_ids)),
+                    execution_options={"populate_existing": True},
+                )
+            ).scalars().all()
+            _stale_task_map = {t.id: t for t in _fresh_tasks}
+            task = _stale_task_map.get(valid_map[raw_id])
             if task is None:
                 results.append(
                     {"task_id": raw_id, "status": "error", "error": "Task not found"}
@@ -1139,20 +1149,21 @@ async def bulk_action_tasks(
 
                 # Use pre-fetched children (batch query before loop, no N+1).
                 # If a prior item rolled back, the prefetch is expired — re-fetch
-                # this parent's active children fresh to avoid MissingGreenlet.
+                # fresh children in one batch query instead of per-parent queries.
                 if _batch_dirty:
-                    active_children = list(
-                        (
-                            await session.execute(
-                                select(Task).where(
-                                    Task.parent_task_id == task.id,
-                                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
-                                )
+                    _parent_ids = list(valid_map.values())
+                    _fresh_children = (
+                        await session.execute(
+                            select(Task).where(
+                                Task.parent_task_id.in_(_parent_ids),
+                                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
                             )
                         )
-                        .scalars()
-                        .all()
-                    )
+                    ).scalars().all()
+                    _stale_children_map = _defaultdict(list)
+                    for _child in _fresh_children:
+                        _stale_children_map[_child.parent_task_id].append(_child)
+                    active_children = _stale_children_map.get(task.id, [])
                 else:
                     active_children = _cancel_children_by_parent.get(task.id, [])
 

@@ -53,8 +53,8 @@ export function ProjectToolHost({ projectId }: Props) {
     let cancelled = false;
     async function load() {
       try {
-        const data = await fetchProjectTools(projectId);
-        if (!cancelled) setState({ status: 'ok', projectId, tools: data });
+        const result = await fetchProjectTools(projectId);
+        if (!cancelled) setState({ status: 'ok', projectId, tools: result.tools });
       } catch (err) {
         if (!cancelled) setState({
           status: 'error',
@@ -100,8 +100,8 @@ export function ProjectToolHost({ projectId }: Props) {
 
   async function refresh() {
     try {
-      const data = await fetchProjectTools(projectId);
-      setState({ status: 'ok', projectId, tools: data });
+      const result = await fetchProjectTools(projectId);
+      setState({ status: 'ok', projectId, tools: result.tools });
     } catch (err) {
       setState({
         status: 'error',

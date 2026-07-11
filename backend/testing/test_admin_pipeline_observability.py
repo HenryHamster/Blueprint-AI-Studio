@@ -722,3 +722,78 @@ async def test_ui_load_timing_aggregates_persist_across_process_restart(
     assert "pipeline" in data["surfaces"]
     assert data["surfaces"]["chat"][0]["page_ready_ms"] == 800
     assert data["surfaces"]["pipeline"][0]["page_ready_ms"] == 1500
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_pinned_baseline_survives_sample_cap(
+    client, db_session
+):
+    """A pinned baseline survives after enough new samples evict the originals.
+
+    Records 10 samples, pins a baseline, then records 201 more samples to
+    exceed the 200-per-surface FIFO cap.  The raw samples are trimmed but
+    the baseline (p50/p90/count) remains intact in the GET response.
+    """
+    import app.routers.admin_pipeline_observability as obs_mod
+
+    surface = "test_cap_survive"
+
+    with obs_mod._UI_TIMING_LOCK:
+        obs_mod._UI_TIMING_SAMPLES.clear()
+
+    # Step 1: Record 10 baseline samples.
+    expected_vals = sorted((i + 1) * 100 for i in range(10))  # 100, 200, ..., 1000
+    for ms in expected_vals:
+        resp = await client.post(
+            "/api/admin/ui-load-timing",
+            json={"surface": surface, "page_ready_ms": ms},
+        )
+        assert resp.status_code == 200
+
+    # Step 2: Pin baseline.
+    resp = await client.post(
+        "/api/admin/ui-load-timing/pin-baseline",
+        json={"label": "Before cap test"},
+    )
+    assert resp.status_code == 200
+    pin_data = resp.json()
+    assert pin_data["ok"] is True
+    assert pin_data["surface_count"] >= 1
+    baseline_id = None
+    for b in pin_data["baselines"]:
+        if b["surface"] == surface:
+            baseline_id = b["id"]
+            assert b["count"] == 10
+            assert b["p50"] == 600  # sorted[5]
+            assert b["p90"] == 1000  # sorted[9]
+            assert b["label"] == "Before cap test"
+            break
+    assert baseline_id is not None, "Baseline not found for test surface"
+
+    # Step 3: Record 201 more samples to exceed the 200-per-surface cap.
+    for i in range(201):
+        resp = await client.post(
+            "/api/admin/ui-load-timing",
+            json={"surface": surface, "page_ready_ms": 5000 + i},
+        )
+        assert resp.status_code == 200
+
+    # Step 4: Verify raw samples are capped at 200 and originals evicted.
+    resp = await client.get("/api/admin/ui-load-timing")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert surface in data["surfaces"]
+    assert len(data["surfaces"][surface]) == 200
+    # All surviving samples should be >= 5000 (the eviction batch).
+    assert all(s["page_ready_ms"] >= 5000 for s in data["surfaces"][surface])
+
+    # Step 5: Verify baseline still returns with correct stats.
+    assert len(data["baselines"]) >= 1
+    surviving = [b for b in data["baselines"] if b["surface"] == surface]
+    assert len(surviving) >= 1
+    bl = surviving[0]
+    assert bl["count"] == 10
+    assert bl["p50"] == 600
+    assert bl["p90"] == 1000
+    assert bl["label"] == "Before cap test"
+    assert bl["id"] == baseline_id

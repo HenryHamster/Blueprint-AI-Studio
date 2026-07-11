@@ -39,7 +39,20 @@ const _repoMapCache = new Map<string, RepoMapCacheEntry>();
 /** Clear the repo-map cache so the next buildRepoMap call recomputes. */
 export function clearRepoMapCache(): void { _repoMapCache.clear(); }
 
+// ── Cached file-tree computation ─────────────────────────────────────────────
+// buildFileTree runs 'git log' and iterates results to rank files by activity.
+// The git history is immutable within a single task, so cache the result keyed
+// on WORKSPACE path. Max 5 entries to bound memory across warm VM tasks.
+interface FileTreeCacheEntry { result: string; }
+const _fileTreeCache = new Map<string, FileTreeCacheEntry>();
+const FILE_TREE_CACHE_MAX = 5;
+
+/** Clear the file-tree cache so the next buildFileTree call recomputes. */
+export function clearFileTreeCache(): void { _fileTreeCache.clear(); }
+
 export function buildFileTree(ws: WebSocket | null): string {
+  const cached = _fileTreeCache.get(WORKSPACE);
+  if (cached) return cached.result;
   try {
     // Get files ranked by recent git activity
     let recentFiles: string[] = [];
@@ -65,9 +78,16 @@ export function buildFileTree(ws: WebSocket | null): string {
     const sorted = [...recentFiles.filter(f => allFiles.includes(f)), ...remaining];
     const tree = sorted.slice(0, 150).map(f => './' + f).join('\n');
 
-    return tree
+    const result = tree
       ? `## Repository File Tree (first 150 files, sorted by recent activity)\n\`\`\`\n${tree}\n\`\`\`\n\n`
       : '';
+    // Cache the result (bounded LRU-style eviction)
+    if (_fileTreeCache.size >= FILE_TREE_CACHE_MAX) {
+      const firstKey = _fileTreeCache.keys().next().value;
+      if (firstKey !== undefined) _fileTreeCache.delete(firstKey);
+    }
+    _fileTreeCache.set(WORKSPACE, { result });
+    return result;
   } catch (e) {
     sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
     return '';

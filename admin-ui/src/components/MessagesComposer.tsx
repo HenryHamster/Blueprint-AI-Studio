@@ -1,4 +1,4 @@
-import { useRef, useState, type RefObject } from 'react';
+import { memo, useRef, useState, type RefObject } from 'react';
 import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
@@ -51,7 +51,7 @@ export interface MessagesComposerProps {
  * identical to the previously-inline markup (Enter submits, Shift+Enter inserts
  * a newline, the textarea auto-resizes up to ~3 rows / 96px).
  */
-export function MessagesComposer({
+export const MessagesComposer = memo(function MessagesComposer({
   textareaRef,
   newType,
   newContent,
@@ -337,4 +337,4 @@ export function MessagesComposer({
       )}
     </div>
   );
-}
+});

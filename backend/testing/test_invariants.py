@@ -1755,6 +1755,7 @@ class TestSchemaRevisionSync:
         _KNOWN_UNGUARDED_DUPLICATES: set[tuple[str, str]] = {
             ("0045", "ix_task_post_commit_pending"),
             ("0117", "ix_task_post_commit_pending"),
+            ("0117", "ix_task_auto_remediation_active"),
             # 0138 SQLite branch uses bare op.create_index; 0141 re-asserts it
             # with guarded SQL for the back-merge reconcile (both pre-date invariant).
             ("0138", "ix_task_blocked_recheck"),

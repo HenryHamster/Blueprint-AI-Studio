@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, memo } from 'react';
 import { ChevronDown, ChevronRight, ExternalLink, Hash, BookOpen, CheckCircle, XCircle, HelpCircle } from 'lucide-react';
 import { ResolvedReferenceLink, isSafeUrl, linkifyStatusMessage } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
@@ -62,7 +62,7 @@ interface MetricsSnapshot {
  *  contract (command, spend cap, deadline, success criterion) is shown above
  *  the per-job rows. Intentional kills (budget/deadline/operator) are styled
  *  amber to distinguish them from genuine crashes (red). */
-export function TaskComputeJobsSection({ task }: { task: Task }) {
+export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ task }: { task: Task }) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const projectId = task.project_id;
   const taskId = task.id;
@@ -213,7 +213,7 @@ export function TaskComputeJobsSection({ task }: { task: Task }) {
       })}
     </>
   );
-}
+});
 
 export function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   const ctx = task.context as Record<string, unknown> | undefined;
@@ -411,7 +411,7 @@ export function BlockedNeedSection({ need, tasks, onNavigateToTask }: { need: Re
  *  tags and forward-quality verdict into plan_output.knowledge_document, so the
  *  drawer can link forward to the produced document without a second lookup —
  *  and fetch its full markdown body inline on demand. */
-export function KnowledgeDocumentSection({ task }: { task: Task }) {
+export const KnowledgeDocumentSection = memo(function KnowledgeDocumentSection({ task }: { task: Task }) {
   const doc = (task.plan_output as Record<string, unknown> | undefined)?.knowledge_document as {
     id?: string;
     title?: string;
@@ -538,7 +538,7 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});
 
 export function EvaluationSummarySection({ summary }: { summary: TaskEvaluationSummary }) {
   const evidence = summary.evidence ?? [];
@@ -707,7 +707,7 @@ export function PanelReviewVerdictSection({ verdict }: { verdict: PanelReviewVer
   );
 }
 
-export function AcceptanceEvidenceSection({ task }: { task: Task }) {
+export const AcceptanceEvidenceSection = memo(function AcceptanceEvidenceSection({ task }: { task: Task }) {
   const verdict = task.context?.code_acceptance_verdict;
   const [expanded, setExpanded] = useState(false);
   const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
@@ -811,7 +811,7 @@ export function AcceptanceEvidenceSection({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});
 
 export function SystemMetricsSection({ task }: { task: Task }) {
   const metrics = (task.last_metrics_json ?? task.context?.last_metrics) as {
@@ -1808,38 +1808,45 @@ function ViewportShotPairBlock({
   );
 }
 
-export function ViewportScreenshotsPanel({ task }: { task: Task }) {
+export const ViewportScreenshotsPanel = memo(function ViewportScreenshotsPanel({ task }: { task: Task }) {
   const [expanded, setExpanded] = useState(false);
   const raw = task.context?.viewport_screenshots as ViewportShotEntry[] | undefined;
-  if (!raw || raw.length === 0) return null;
+  const toggleExpanded = useCallback(() => setExpanded(v => !v), []);
 
-  const pairsMap = new Map<string, ViewportShotPair>();
-  for (const entry of raw) {
-    let key: string;
-    let phase: 'before' | 'after' | 'diff' | null = null;
-    if (entry.name.endsWith('-before')) {
-      key = entry.name.slice(0, -'-before'.length);
-      phase = 'before';
-    } else if (entry.name.endsWith('-after')) {
-      key = entry.name.slice(0, -'-after'.length);
-      phase = 'after';
-    } else if (entry.name.endsWith('-diff')) {
-      key = entry.name.slice(0, -'-diff'.length);
-      phase = 'diff';
-    } else {
-      key = entry.name;
+  // Memoize the pairs-construction loop — each render of the parent re-creates
+  // the raw array reference, but the underlying data is stable.
+  const pairs = useMemo(() => {
+    if (!raw || raw.length === 0) return [];
+    const pairsMap = new Map<string, ViewportShotPair>();
+    for (const entry of raw) {
+      let key: string;
+      let phase: 'before' | 'after' | 'diff' | null = null;
+      if (entry.name.endsWith('-before')) {
+        key = entry.name.slice(0, -'-before'.length);
+        phase = 'before';
+      } else if (entry.name.endsWith('-after')) {
+        key = entry.name.slice(0, -'-after'.length);
+        phase = 'after';
+      } else if (entry.name.endsWith('-diff')) {
+        key = entry.name.slice(0, -'-diff'.length);
+        phase = 'diff';
+      } else {
+        key = entry.name;
+      }
+      if (!pairsMap.has(key)) pairsMap.set(key, { key });
+      const pair = pairsMap.get(key) ?? { key };
+      if (phase === 'before') pair.before = entry;
+      else if (phase === 'after') {
+        pair.after = entry;
+        if (entry.magnitude !== undefined) pair.magnitude = entry.magnitude;
+      } else if (phase === 'diff') {
+        pair.diff = entry;
+      }
     }
-    if (!pairsMap.has(key)) pairsMap.set(key, { key });
-    const pair = pairsMap.get(key) ?? { key };
-    if (phase === 'before') pair.before = entry;
-    else if (phase === 'after') {
-      pair.after = entry;
-      if (entry.magnitude !== undefined) pair.magnitude = entry.magnitude;
-    } else if (phase === 'diff') {
-      pair.diff = entry;
-    }
-  }
-  const pairs = Array.from(pairsMap.values());
+    return Array.from(pairsMap.values());
+  }, [raw]);
+
+  if (!raw || raw.length === 0) return null;
 
   return (
     <>
@@ -1848,7 +1855,7 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
         <button
           data-viewport-allow-small-target
           className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
-          onClick={() => setExpanded(v => !v)}
+          onClick={toggleExpanded}
         >
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {expanded ? 'Hide screenshots' : `View ${raw.length} screenshot${raw.length !== 1 ? 's' : ''}`}
@@ -1864,4 +1871,4 @@ export function ViewportScreenshotsPanel({ task }: { task: Task }) {
       </div>
     </>
   );
-}
+});

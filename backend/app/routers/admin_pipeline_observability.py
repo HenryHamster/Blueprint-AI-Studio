@@ -38,6 +38,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    UiLoadTimingBaseline,
     UiLoadTimingSample,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
@@ -1887,15 +1888,86 @@ async def record_ui_load_timing(
     return {"ok": True}
 
 
+@router.post("/ui-load-timing/pin-baseline")
+async def pin_ui_load_timing_baseline(
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Compute and persist an immutable baseline from current samples.
+
+    Reads all existing UiLoadTimingSample rows, computes p50/p90/count per
+    (surface, sample_type), and stores the result as an immutable baseline
+    that survives the 200-sample FIFO cap. The ``label`` field (max 128
+    chars) is a human-readable tag, e.g. "Before lazy-load wave".
+    """
+    label = str(payload.get("label", "") or "")[:128]
+
+    rows = (
+        await session.execute(
+            select(UiLoadTimingSample)
+            .order_by(UiLoadTimingSample.recorded_at.asc())
+        )
+    ).scalars().all()
+
+    groups: Dict[tuple, List[int]] = {}
+    for row in rows:
+        key = (row.surface, row.sample_type)
+        groups.setdefault(key, []).append(row.page_ready_ms)
+
+    baselines = []
+    for (surface, sample_type), vals in groups.items():
+        if not vals:
+            continue
+        sorted_vals = sorted(vals)
+        n = len(sorted_vals)
+        p50 = sorted_vals[min(int(n * 0.50), n - 1)]
+        p90 = sorted_vals[min(int(n * 0.90), n - 1)]
+        bl = UiLoadTimingBaseline(
+            surface=surface,
+            sample_type=sample_type,
+            p50=p50,
+            p90=p90,
+            count=n,
+            label=label,
+        )
+        session.add(bl)
+        baselines.append(bl)
+
+    await session.commit()
+
+    return {
+        "ok": True,
+        "label": label,
+        "surface_count": len(baselines),
+        "baselines": [
+            {
+                "id": str(b.id),
+                "surface": b.surface,
+                "sample_type": b.sample_type,
+                "p50": b.p50,
+                "p90": b.p90,
+                "count": b.count,
+                "label": b.label,
+                "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+            }
+            for b in baselines
+        ],
+    }
+
+
 @router.get("/ui-load-timing")
 async def get_ui_load_timing(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ) -> Dict[str, Any]:
-    """Return recent admin-UI initial-load timing samples grouped by surface.
+    """Return recent admin-UI initial-load timing samples grouped by surface,
+    plus any pinned baselines.
 
     Each surface entry is a list of {ts, page_ready_ms, sample_type} objects
-    ordered oldest-first (up to 200 per surface).  Persisted across restarts.
+    ordered oldest-first (up to 200 per surface).  The ``baselines`` array
+    carries immutable baseline snapshots (p50/p90/count) that survive the
+    per-surface FIFO cap.
     """
     rows = (
         await session.execute(
@@ -1909,4 +1981,25 @@ async def get_ui_load_timing(
         surfaces.setdefault(row.surface, []).append(
             {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
         )
-    return {"surfaces": surfaces}
+
+    baseline_rows = (
+        await session.execute(
+            select(UiLoadTimingBaseline)
+            .order_by(UiLoadTimingBaseline.pinned_at.desc())
+        )
+    ).scalars().all()
+    baselines = [
+        {
+            "id": str(b.id),
+            "surface": b.surface,
+            "sample_type": b.sample_type,
+            "p50": b.p50,
+            "p90": b.p90,
+            "count": b.count,
+            "label": b.label,
+            "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+        }
+        for b in baseline_rows
+    ]
+
+    return {"surfaces": surfaces, "baselines": baselines}

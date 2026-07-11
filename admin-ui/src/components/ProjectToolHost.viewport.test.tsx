@@ -17,36 +17,41 @@ vi.mock('../api/projectTools', async () => {
 });
 
 import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken } from '../api/projectTools';
+import type { FetchProjectToolsResult } from '../api/projectTools';
 
-const SAMPLE_TOOLS = [
-  {
-    id: 'tool-1',
-    kind: 'mock-widget',
-    slug: 'mock-widget',
-    title: 'Mock Widget',
-    enabled: true,
-    placement: 'project_section',
-    content_revision: 0,
-  },
-  {
-    id: 'tool-2',
-    kind: 'mock-chart',
-    slug: 'mock-chart',
-    title: 'Mock Chart with a Longer Title That Tests Truncation Behavior',
-    enabled: true,
-    placement: 'project_section',
-    content_revision: 0,
-  },
-  {
-    id: 'tool-3',
-    kind: 'mock-table',
-    slug: 'mock-table',
-    title: 'Mock Table',
-    enabled: true,
-    placement: 'project_section',
-    content_revision: 0,
-  },
-];
+const TOOLS_RESULT: FetchProjectToolsResult = {
+  tools: [
+    {
+      id: 'tool-1',
+      kind: 'mock-widget',
+      slug: 'mock-widget',
+      title: 'Mock Widget',
+      enabled: true,
+      placement: 'project_section',
+      content_revision: 0,
+    },
+    {
+      id: 'tool-2',
+      kind: 'mock-chart',
+      slug: 'mock-chart',
+      title: 'Mock Chart with a Longer Title That Tests Truncation Behavior',
+      enabled: true,
+      placement: 'project_section',
+      content_revision: 0,
+    },
+    {
+      id: 'tool-3',
+      kind: 'mock-table',
+      slug: 'mock-table',
+      title: 'Mock Table',
+      enabled: true,
+      placement: 'project_section',
+      content_revision: 0,
+    },
+  ],
+  total_count: 3,
+  next_offset: null,
+};
 
 function MockWidget({ tool }: ToolComponentProps) {
   return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} content</div>;
@@ -86,7 +91,7 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('renders tool grid without overflow at 375px', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
+    vi.mocked(fetchProjectTools).mockResolvedValue(TOOLS_RESULT);
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
@@ -104,7 +109,7 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('renders tool grid without overflow at 1280px', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
+    vi.mocked(fetchProjectTools).mockResolvedValue(TOOLS_RESULT);
     await expectNoOverflowAt(1280, async () => {
       host = document.createElement('div');
       host.style.width = '1280px';
@@ -118,7 +123,11 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('shows empty state when project has no tools', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue([]);
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [],
+      total_count: 0,
+      next_offset: null,
+    });
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -130,17 +139,21 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('shows empty state when no returned tools match the registry', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue([
-      {
-        id: 'tool-unknown',
-        kind: 'unregistered-kind',
-        slug: 'unregistered-kind',
-        title: 'Unknown Tool',
-        enabled: true,
-        placement: 'project_section',
-        content_revision: 0,
-      },
-    ]);
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        {
+          id: 'tool-unknown',
+          kind: 'unregistered-kind',
+          slug: 'unregistered-kind',
+          title: 'Unknown Tool',
+          enabled: true,
+          placement: 'project_section',
+          content_revision: 0,
+        },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -152,10 +165,14 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('skips disabled tools without crashing', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue([
-      { ...SAMPLE_TOOLS[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
-      { ...SAMPLE_TOOLS[1], id: 'tool-2', kind: 'mock-chart', enabled: true },
-    ]);
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
+        { ...TOOLS_RESULT.tools[1], id: 'tool-2', kind: 'mock-chart', enabled: true },
+      ],
+      total_count: 2,
+      next_offset: null,
+    });
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -168,7 +185,7 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('shows loading state before fetch resolves', async () => {
-    let resolveTools: (v: typeof SAMPLE_TOOLS) => void = () => {};
+    let resolveTools: (v: FetchProjectToolsResult) => void = () => {};
     vi.mocked(fetchProjectTools).mockReturnValue(
       new Promise(res => { resolveTools = res; }),
     );
@@ -179,8 +196,10 @@ describe('ProjectToolHost — viewport regression', () => {
     await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Loading tools');
-    resolveTools(SAMPLE_TOOLS);
+    resolveTools(TOOLS_RESULT);
   });
+
+const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
 
   test('renders manifest-declared tool in iframe alongside registered tools', async () => {
     vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
@@ -231,7 +250,7 @@ describe('ProjectToolHost — viewport regression', () => {
   });
 
   test('renders manifest tools when no registered tools exist', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue([]);
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({
       tools: [{
         slug: 'standalone-tool',

@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/set-state-in-effect */
-import { type Dispatch, type SetStateAction, type RefObject, useState, useRef, useEffect } from 'react';
+import { memo, type Dispatch, type SetStateAction, type RefObject, useState, useRef, useEffect } from 'react';
 import { X, MessageSquare, AlertTriangle, ChevronUp, Save, SlidersHorizontal } from 'lucide-react';
 import { type EventPref } from './eventPrefs';
 import { type MuteWindow } from './muteWindow';
@@ -83,7 +83,7 @@ export interface MessagesPanelHeaderProps {
  * for ephemeral header chrome: popovers, debounced search input, and compact
  * filter expansion.
  */
-export function MessagesPanelHeader({
+export const MessagesPanelHeader = memo(function MessagesPanelHeader({
   dividerTime,
   totalNewCount,
   newHighSignalCount,
@@ -367,4 +367,4 @@ export function MessagesPanelHeader({
       )}
     </div>
   );
-}
+});

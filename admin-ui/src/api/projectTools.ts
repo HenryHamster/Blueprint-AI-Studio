@@ -30,11 +30,24 @@ export interface UpdateProjectToolPayload {
   enabled?: boolean;
 }
 
-export async function fetchProjectTools(projectId: string): Promise<ProjectTool[]> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/tools`);
+export interface FetchProjectToolsResult {
+  tools: ProjectTool[];
+  total_count: number;
+  next_offset: number | null;
+}
+
+export async function fetchProjectTools(
+  projectId: string,
+  options?: { limit?: number; offset?: number },
+): Promise<FetchProjectToolsResult> {
+  const params = new URLSearchParams();
+  if (options?.limit !== undefined) params.set('limit', String(options.limit));
+  if (options?.offset !== undefined) params.set('offset', String(options.offset));
+  const qs = params.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/tools${qs ? `?${qs}` : ''}`;
+  const res = await apiFetch(url);
   if (!res.ok) throw new Error(`Failed to fetch project tools: ${res.status}`);
-  const data = await res.json();
-  return data.tools;
+  return res.json();
 }
 
 export async function createProjectTool(

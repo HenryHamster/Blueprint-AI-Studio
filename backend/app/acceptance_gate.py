@@ -1161,11 +1161,12 @@ async def backfill_acceptance_verdicts(session) -> int:
         ).is_(None)
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
-    # Collect IDs only — not Task objects — so a mid-loop rollback inside
-    # record_task_merge_evidence (which unconditionally expires ALL session
-    # objects regardless of expire_on_commit) cannot leave the remaining
-    # iterations' task objects stale.  Each iteration re-fetches its task
-    # fresh via session.get() at the top of the loop.
+    # Collect IDs only, then batch-fetch Task objects with a single
+    # SELECT ... WHERE id IN (...) — eliminates up to 200 individual
+    # session.get() calls (PERF finding M-P6). The initial ID-only query
+    # is safe: if a mid-loop rollback inside record_task_merge_evidence
+    # (which unconditionally expires ALL session objects on rollback)
+    # occurs, the batch is re-fetched.
     result = await session.execute(
         select(Task.id).where(
             Task.status == TaskStatus.COMPLETED,
@@ -1176,24 +1177,45 @@ async def backfill_acceptance_verdicts(session) -> int:
     )
     task_ids = list(result.scalars().all())
 
+    # Batch-fetch all task objects before the loop — single
+    # SELECT ... WHERE id IN (...) instead of up to 200 individual
+    # session.get() calls. Pass task_ids directly (they are UUID objects
+    # or strings depending on dialect; in_() handles both).
     # expire_on_commit=False prevents a commit inside record_task_merge_evidence
     # from expiring the freshly-fetched task object before its attributes are
-    # read by that function.  A ROLLBACK still expires all objects, but each
-    # iteration re-fetches its own task so the next iteration is unaffected.
+    # read by that function.  A ROLLBACK still expires all session objects, so
+    # we batch-fetch upfront and fall back to an individual re-fetch if the
+    # cached copy turns out expired (rare).
     _prior_expire = session.sync_session.expire_on_commit
     session.sync_session.expire_on_commit = False
     try:
         upgraded = 0
         marked_ids: list = []
+
+        # Batch-fetch all candidate tasks in one query (eliminates N+1).
+        _batch_result = await session.execute(
+            select(Task).where(Task.id.in_(task_ids))
+        )
+        tasks_by_id: dict = {t.id: t for t in _batch_result.scalars().all()}
+
         for task_id in task_ids:
-            # Re-fetch fresh each iteration: a rollback from record_evidence
-            # (IntegrityError on CriterionEvidence unique constraint) expires
-            # all session objects; re-fetching here avoids MissingGreenlet on
-            # the subsequent attribute access.
-            task = await session.get(Task, task_id)
+            task = tasks_by_id.get(task_id)
             if task is None:
+                marked_ids.append(task_id)
                 continue
-            verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+
+            # If a prior rollback inside record_evidence expired this cached
+            # object, re-fetch individually (rare — IntegrityError on unique
+            # constraint).  Most iterations use the batch-fetched copy.
+            try:
+                verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            except Exception:
+                task = await session.get(Task, task_id)
+                if task is None:
+                    marked_ids.append(task_id)
+                    continue
+                verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+
             if not isinstance(verdict_data, dict):
                 marked_ids.append(task_id)
                 continue
@@ -1234,6 +1256,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                         getattr(task, "id", None),
                         exc_info=True,
                     )
+                    _batch_dirty = True  # rollback expired ORM objects
                 upgraded += 1
             else:
                 # Re-evaluation could not prove — stamp marker so the
@@ -1248,10 +1271,13 @@ async def backfill_acceptance_verdicts(session) -> int:
         # from ever being examined.
         if marked_ids:
             now_ts = datetime.now(timezone.utc).isoformat()
+            # Batch-fetch all marked tasks in one query (eliminates N+1).
+            _marked_result = await session.execute(
+                select(Task).where(Task.id.in_(marked_ids))
+            )
+            marked_by_id: dict = {t.id: t for t in _marked_result.scalars().all()}
             for mid in marked_ids:
-                # Re-fetch so any mid-loop rollback from a prior iteration
-                # does not leave these objects expired at stamping time.
-                t = await session.get(Task, mid)
+                t = marked_by_id.get(mid)
                 if t is None:
                     continue
                 ctx = dict(t.context or {})

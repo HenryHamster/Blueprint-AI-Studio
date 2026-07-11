@@ -1702,6 +1702,7 @@ async def create_direction_research_task(
                     d.get("id")
                     for d in (rp.get("directions") or [])
                     if isinstance(d, dict) and d.get("id")
+
                 ),
                 None,
             )

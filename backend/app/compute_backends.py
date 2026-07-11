@@ -326,7 +326,7 @@ async def run_preflight_smoke(
                 prefix = _build_container_run_prefix(
                     container_image,
                     host_out_dir=tmpdir,  # -> result.json lands at result_path
-                    gpus=detect_local_gpu() is not None,
+                    gpus=await asyncio.to_thread(detect_local_gpu) is not None,
                 )
                 docker_parts: list[str] = []
                 auth = container_registry_auth or {}
@@ -420,7 +420,7 @@ async def run_preflight_smoke(
             ran_containerized=ran_containerized,
         )
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
 @dataclass(slots=True)

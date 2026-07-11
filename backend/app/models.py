@@ -1577,11 +1577,14 @@ class Task(SQLModel, table=True):
         # that breaks SQLite-fixture tests using metadata.create_all.
         # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
         # Partial index for auto_remediation.py queries that filter
-        # Task.auto_remediation.is_(True) — keeps the scan tight to the small
-        # fraction of tasks with auto_remediation enabled.
+        # Task.auto_remediation.is_(True) and
+        # Task.previous_error_fingerprint == fingerprint — the equality filter on
+        # previous_error_fingerprint narrows the result before the created_at range
+        # scan, avoiding a full scan of the auto_remediation rows.
         Index(
             "ix_task_auto_remediation_active",
             "project_id",
+            "previous_error_fingerprint",
             "created_at",
             postgresql_where=text("auto_remediation = true"),
             sqlite_where=text("auto_remediation = 1"),
@@ -1624,6 +1627,22 @@ class Task(SQLModel, table=True):
             "vm_stopped_at",
             postgresql_where=text("vm_stopped_at IS NOT NULL"),
             sqlite_where=text("vm_stopped_at IS NOT NULL"),
+        ),
+        # Partial index on (status, completed_at) for the global acceptance-gate
+        # backfill query (acceptance_gate.py:1170-1175) that scans for the 200
+        # oldest COMPLETED tasks WITHOUT a project_id filter.  The existing
+        # ix_task_project_status_composite has project_id as the leading column,
+        # so it cannot serve a project-less ORDER BY completed_at ASC scan.  This
+        # index covers status=COMPLETED + completed_at ordering directly.
+        # Postgres-only via alembic 0485 CONCURRENTLY DDL; the metadata Index
+        # registers the name + columns for
+        # test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_status_completed_at",
+            "status",
+            "completed_at",
+            postgresql_where=text("status = 'COMPLETED'"),
+            sqlite_where=text("status = 'COMPLETED'"),
         ),
     )
 
@@ -2300,6 +2319,11 @@ class PoolVm(SQLModel, table=True):
         # Reversed composite for per-project-by-state queries (warm_pool.py
         # lines 244-247, 302, 341-344) where state is the leading column.
         Index("ix_poolvm_state_project", "state", "project_id"),
+        # Composite index for the lease hot path: filters on project_id, state,
+        # AND identity columns (account_id, provider, auth_mode, model) so the
+        # query planner can do an index-only scan instead of sequential scan +
+        # in-memory filtering.
+        Index("ix_poolvm_lease_compat", "project_id", "state", "account_id", "provider", "auth_mode", "model"),
     )
 
 
@@ -2377,6 +2401,14 @@ class TaskHistory(SQLModel, table=True):
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
 
     task: Task = Relationship(back_populates="history")
+
+    # Composite index covering the common query pattern:
+    #   WHERE task_id IN (...) ORDER BY timestamp DESC LIMIT N
+    # Without this PostgreSQL sorts all matching rows per task_id before
+    # applying LIMIT; the composite index avoids the sort.
+    __table_args__ = (
+        Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
+    )
 
 
 # Auto-append to status_log whenever latest_status_message is set
@@ -3417,7 +3449,7 @@ class ResidualRemediationCase(SQLModel, table=True):
     # without a Python-side touch.
     last_spawned_task_id: uuid.UUID | None = Field(
         default=None,
-        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
+        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True, index=True),
     )
     last_spawned_pr_number: int | None = Field(default=None)
     last_spawned_at: datetime | None = Field(
@@ -3862,6 +3894,7 @@ class SystemMaturity(SQLModel, table=True):
             GUID(),
             ForeignKey("task.id", ondelete="SET NULL"),
             nullable=True,
+            index=True,
         ),
     )
 
@@ -4703,6 +4736,7 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
             GUID(),
             ForeignKey("evergreenbacklogitem.id", ondelete="SET NULL"),
             nullable=True,
+            index=True,
         ),
     )
     finding_key: str | None = Field(
@@ -4826,6 +4860,30 @@ class UiLoadTimingSample(SQLModel, table=True):
     )
 
 
+class UiLoadTimingBaseline(SQLModel, table=True):
+    """Pinned baseline snapshot of UI load timing per (surface, sample_type).
+
+    Created on-demand via POST /api/admin/ui-load-timing/pin-baseline to
+    capture a before-improvement baseline that survives the 200-sample FIFO
+    cap. Immutable once written; a new pin creates new rows rather than
+    updating existing ones.
+    """
+
+    __tablename__ = "ui_load_timing_baseline"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    surface: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    sample_type: str = Field(sa_column=Column(String(32), nullable=False))
+    p50: int = Field(sa_column=Column(Integer, nullable=False))
+    p90: int = Field(sa_column=Column(Integer, nullable=False))
+    count: int = Field(sa_column=Column(Integer, nullable=False))
+    label: str = Field(default="", sa_column=Column(String(128), nullable=False))
+    pinned_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
 class NotificationDeadLetter(SQLModel, table=True):
     """Durable record of an external notification that failed to deliver.
 
@@ -4862,4 +4920,16 @@ class NotificationDeadLetter(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Composite index covering the common query pattern:
+    #   WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+    # Without this PostgreSQL filters by project_id then sorts all
+    # matching rows in memory; the composite index avoids the sort.
+    __table_args__ = (
+        Index(
+            "ix_notification_dl_project_id_created_at_desc",
+            "project_id",
+            text("created_at desc"),
+        ),
     )

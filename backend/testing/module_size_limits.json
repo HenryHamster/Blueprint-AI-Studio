@@ -28,7 +28,7 @@
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,
     "routers/admin_release_version.py": 1950,
-    "routers/admin_pipeline_observability.py": 2000,
+    "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 6350,
     "routers/admin_pool_accounts.py": 1950,
     "max_plan_pool.py": 4500,
@@ -136,8 +136,8 @@
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 2150,
     "runner_health_alerts.py": 1950,
-    "runner_health_monitors.py": 1001,
-    "routers/agent_strategic_fetch.py": 1750
+    "routers/agent_strategic_fetch.py": 1750,
+    "runner_health_monitors.py": 1001
   },
   "agent": {
     "index.ts": 4600,

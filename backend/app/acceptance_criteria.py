@@ -480,6 +480,30 @@ async def get_evidence_for_criterion(
     return list(result.scalars().all())
 
 
+async def get_evidence_for_criteria_batch(
+    session: AsyncSession,
+    criterion_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[CriterionEvidence]]:
+    """Return all evidence records for multiple criteria, grouped by criterion_id.
+
+    Issues a single batched SELECT ... WHERE criterion_id IN (...) instead of N
+    individual queries.  Results are returned as a dict mapping each criterion_id
+    to its list of evidence records (ordered by recorded_at).  Criteria with no
+    evidence are not present in the dict — callers should use ``.get(cid, [])``.
+    """
+    if not criterion_ids:
+        return {}
+    result = await session.execute(
+        select(CriterionEvidence)
+        .where(CriterionEvidence.criterion_id.in_(criterion_ids))
+        .order_by(CriterionEvidence.recorded_at)
+    )
+    grouped: dict[uuid.UUID, list[CriterionEvidence]] = defaultdict(list)
+    for row in result.scalars().all():
+        grouped[row.criterion_id].append(row)
+    return grouped
+
+
 def criterion_coverage_to_evidence_status(coverage: str) -> str:
     """Map a criterion coverage string to the shared EvidenceStatus axis.
 
@@ -685,8 +709,13 @@ async def direction_owns_uncovered_criterion(
             return False
 
         uncovered_keys: list[str] = []
+        # Batch-load evidence for ALL active criteria in a single query
+        # instead of issuing N individual SELECTs (one per criterion).
+        evidence_map = await get_evidence_for_criteria_batch(
+            session, [c.id for c in active]
+        )
         for criterion in active:
-            evidence = await get_evidence_for_criterion(session, criterion.id)
+            evidence = evidence_map.get(criterion.id, [])
             # Only 'covered' (machine-verified) satisfies direction completion.
             # 'attested' (operator attestation without machine evidence) is a
             # lower-confidence waiver — a direction should not auto-retire as

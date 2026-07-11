@@ -40,6 +40,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -585,19 +586,35 @@ async def list_project_tools(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ):
     """List a project's registered tools (member+). Lean projection, no content."""
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Total count so the frontend can render pagination controls.
+    count_result = await session.execute(
+        select(func.count()).select_from(ProjectTool).where(
+            ProjectTool.project_id == project_id
+        )
+    )
+    total_count = count_result.scalar_one()
     rows = (
         await session.execute(
             select(ProjectTool)
             .where(ProjectTool.project_id == project_id)
             .order_by(ProjectTool.created_at.asc())
+            .limit(limit)
+            .offset(offset)
         )
     ).scalars().all()
-    return {"tools": [_tool_summary(t) for t in rows]}
+    next_offset = offset + len(rows) if offset + len(rows) < total_count else None
+    return {
+        "tools": [_tool_summary(t) for t in rows],
+        "total_count": total_count,
+        "next_offset": next_offset,
+    }
 
 
 @router.post("/projects/{project_id}/tools")

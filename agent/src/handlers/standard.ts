@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 /**
  * Standard task handlers — core code-change operations.
@@ -424,16 +424,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // Build ctags symbol index for language-aware navigation (./symbols helper).
   // Graceful fallback: if ctags is unavailable or indexing fails, agents still
   // work normally and ./symbols reports "index not available".
-  try {
-    try { execFileSync('ctags', ['--version'], { stdio: 'ignore', timeout: 5000 }); } catch {
-      execFileSync('sudo', ['apt-get', 'install', '-y', '-q', 'universal-ctags'], { stdio: 'ignore', timeout: 60000 });
-    }
-    execFileSync('ctags', ['-R', '--output-format=json', '-f', `/tmp/symbols_${taskId}.json`, '.'], {
-      cwd: WORKSPACE,
-      stdio: 'ignore',
-      timeout: 120000,
-    });
-  } catch { /* ctags unavailable or indexing failed — continue without symbol index */ }
+  // Runs asynchronously so the event loop stays free for heartbeats and WS I/O.
+  void (async () => {
+    const spawnWithTimeout = (file: string, args: string[], timeoutMs: number, opts?: { cwd?: string }) =>
+      new Promise<void>((resolve, reject) => {
+        const child = spawn(file, args, { stdio: 'ignore', ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`timed out after ${timeoutMs}ms: ${file} ${args.join(' ')}`)); }, timeoutMs);
+        child.on('exit', (code) => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(`exit ${code}: ${file} ${args.join(' ')}`)); });
+        child.on('error', (err) => { clearTimeout(timer); reject(err); });
+      });
+    try {
+      try {
+        await spawnWithTimeout('ctags', ['--version'], 5000);
+      } catch {
+        await spawnWithTimeout('sudo', ['apt-get', 'install', '-y', '-q', 'universal-ctags'], 60000);
+      }
+      await spawnWithTimeout('ctags', ['-R', '--output-format=json', '-f', `/tmp/symbols_${taskId}.json`, '.'], 120000, { cwd: WORKSPACE });
+    } catch { /* ctags unavailable or indexing failed — continue without symbol index */ }
+  })();
   if (stdProjectId) writeFetchHelper(taskId, stdProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 

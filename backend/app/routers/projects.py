@@ -227,8 +227,24 @@ async def list_projects(
 ):
     """
     List all projects for the authenticated user.
+    Select only lightweight columns — large JSONB columns (directions, vision,
+    design_doc, problem_model, self_reflection_log, strategic_memory_notes) and
+    running_update (Text) are excluded here and available via the single-project
+    GET endpoint.
     """
-    stmt = select(Project).where(
+    stmt = select(
+        Project.id,
+        Project.name,
+        Project.created_at,
+        Project.status,
+        Project.user_id,
+        Project.github_owner,
+        Project.github_repo,
+        Project.is_self_repo,
+        Project.autonomous_enabled,
+        Project.archived,
+        Project.build_config,
+    ).where(
         Project.id.in_(
             select(ProjectMember.project_id).where(
                 ProjectMember.user_id == current_user["user_id"]
@@ -239,7 +255,8 @@ async def list_projects(
         stmt = stmt.where(Project.status == status)
 
     stmt = stmt.order_by(Project.created_at.desc()).offset(offset).limit(limit)
-    projects = (await session.execute(stmt)).scalars().all()
+    rows = (await session.execute(stmt)).all()
+    projects = [row._asdict() for row in rows]
     return {
         "projects": projects,
         "pagination": {"limit": limit, "offset": offset, "count": len(projects)},

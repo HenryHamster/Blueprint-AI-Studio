@@ -2179,9 +2179,12 @@ async def sweep_stuck_qualifications(
     for version in open_versions:
         try:
             async with factory() as alert_session:
-                v = await alert_session.get(release_version.ReleaseVersion, version.id)
-                if v is None:
-                    continue
+                # Merge the already-loaded version into this session to avoid a
+                # separate SELECT per version. load=False is safe because the
+                # version was just loaded in the outer scan (line 1429) and the
+                # DB row cannot change between the two accesses (no concurrent
+                # writers run inside the same sweep cycle).
+                v = await alert_session.merge(version, load=False)
                 alerted = await _check_version_calcification(alert_session, v)
                 alerted = (
                     await _check_version_ci_unresolved_stall(alert_session, v)

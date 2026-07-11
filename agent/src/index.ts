@@ -153,7 +153,7 @@ import {
   rotateOAuthCredentialsIfChanged as _rotateOAuthCredentialsIfChanged,
   ClaudeTimeoutError,
 } from './oauth-rotation.js';
-import { clearTestConventionCache } from './prompts/discovery.js';
+import { clearTestConventionCache, clearFileTreeCache } from './prompts/discovery.js';
 export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
 /** Rotate OAuth credentials if changed, bound to the local apiPost. */
@@ -2117,12 +2117,46 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // Test convention cache in discovery.ts is per-repo; stale entries from a
   // prior task's codebase must not carry into a new role on a warm VM.
   clearTestConventionCache();
+  // File-tree cache in discovery.ts — buildFileTree result is stale when the
+  // workspace changes between roles.
+  clearFileTreeCache();
   // Per-task resident-session turn-latency telemetry.
   resetResidentTurnLatencyTelemetry();
+  // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
+  // df reading rather than reusing the prior task's cached values.
+  _dfCacheTimestamp = 0;
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+// ── Disk-metric cache ──────────────────────────────────────────────────────────
+// collectMetrics calls 'df' every heartbeat (2+ times/min) to surface low-disk
+// warnings. Disk usage is static within a task, so cache it with a 60s TTL to
+// avoid blocking the event loop on a subprocess spawn every 30 seconds.
+let _dfCacheTimestamp = 0;
+let _dfCacheDiskFreeMb: number | undefined;
+let _dfCacheDiskTotalMb: number | undefined;
+const DF_CACHE_TTL_MS = 60_000;
+
+function _readDiskMetrics(): { disk_free_mb?: number; disk_total_mb?: number } {
+  const now = Date.now();
+  if (_dfCacheTimestamp > 0 && now - _dfCacheTimestamp < DF_CACHE_TTL_MS) {
+    return { disk_free_mb: _dfCacheDiskFreeMb, disk_total_mb: _dfCacheDiskTotalMb };
+  }
+  try {
+    const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
+    const line = dfOut.split('\n')[1];
+    if (line) {
+      const parts = line.trim().split(/\s+/);
+      _dfCacheDiskTotalMb = Math.round(parseInt(parts[1], 10) / 1024);
+      _dfCacheDiskFreeMb = Math.round(parseInt(parts[3], 10) / 1024);
+      _dfCacheTimestamp = now;
+      return { disk_free_mb: _dfCacheDiskFreeMb, disk_total_mb: _dfCacheDiskTotalMb };
+    }
+  } catch { /* disk metrics are best-effort */ }
+  return {};
+}
 
 function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
   const mem = process.memoryUsage();
@@ -2139,17 +2173,8 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
     const max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
     if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
   } catch { /* cgroup v2 not available */ }
-  try {
-    const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
-    const line = dfOut.split('\n')[1];
-    if (line) {
-      const parts = line.trim().split(/\s+/);
-      const disk_total_mb = Math.round(parseInt(parts[1], 10) / 1024);
-      const disk_free_mb = Math.round(parseInt(parts[3], 10) / 1024);
-      return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
-    }
-  } catch { /* disk metrics are best-effort */ }
-  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb };
+  const { disk_free_mb, disk_total_mb } = _readDiskMetrics();
+  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
 }
 
 // Mutex to prevent overlapping heartbeat HTTP calls. Without this, a slow
@@ -2913,8 +2938,8 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
   const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
     try {
-      if (attempt > 0 && taskId) sendHeartbeatSync(taskId, `Git clone retry ${attempt + 1}/${CLONE_MAX_RETRIES}...`);
-      execFileSync('git', args, { encoding: 'utf-8', timeout: timeoutMs });
+      if (attempt > 0 && taskId) log(`Git clone retry ${attempt + 1}/${CLONE_MAX_RETRIES}...`);
+      await gitAsync(args, '.', timeoutMs);
       return;
     } catch (e) {
       if (attempt === CLONE_MAX_RETRIES - 1) throw e;

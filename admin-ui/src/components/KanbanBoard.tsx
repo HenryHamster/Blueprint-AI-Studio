@@ -23,6 +23,7 @@ import {
 export type SortBy = TaskSortBy;
 
 const COLLAPSED_COLUMNS_KEY = 'kanban_collapsed_columns';
+const DEFAULT_MAX_VISIBLE = 50;
 
 function loadCollapsedColumns(): Set<string> {
   try {
@@ -132,6 +133,7 @@ export function KanbanBoard({
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
   const [activeColumnId, setActiveColumnId] = useState<string | null>(null);
+  const [mobileShowAll, setMobileShowAll] = useState(false);
 
   // Persist order changes
   useEffect(() => {
@@ -409,7 +411,7 @@ export function KanbanBoard({
           const mobileContent = (
               <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
-                  {columnTasks.map((task, cardIdx) => (
+                  {columnTasks.slice(0, mobileShowAll ? columnTasks.length : DEFAULT_MAX_VISIBLE).map((task, cardIdx) => (
                     <SortableCard
                       key={task.id}
                       task={task}
@@ -442,6 +444,22 @@ export function KanbanBoard({
                     />
                   ))}
                 </SortableContext>
+                {columnTasks.length > DEFAULT_MAX_VISIBLE && !mobileShowAll && (
+                  <button
+                    onClick={() => setMobileShowAll(true)}
+                    className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+                  >
+                    Show {columnTasks.length - DEFAULT_MAX_VISIBLE} more
+                  </button>
+                )}
+                {mobileShowAll && columnTasks.length > DEFAULT_MAX_VISIBLE && (
+                  <button
+                    onClick={() => setMobileShowAll(false)}
+                    className="w-full text-xs text-neutral-500 hover:text-neutral-300 py-2 rounded-lg border border-dashed border-neutral-800 hover:border-neutral-700 transition-colors min-h-[44px]"
+                  >
+                    Show less
+                  </button>
+                )}
                 {columnTasks.length === 0 && !loading && (
                   <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
                     {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}

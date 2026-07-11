@@ -2852,9 +2852,13 @@ describe('stale result retry envelopes', () => {
 
 // ── setupWorkspace: pre-baked git object cache reuse ─────────────────────────
 describe('setupWorkspace reference-cache reuse', () => {
+  const defaultSpawn = vi.mocked(spawn).getMockImplementation();
+
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(fs.existsSync).mockReset();
+    vi.mocked(spawn).mockReset();
+    if (defaultSpawn) vi.mocked(spawn).mockImplementation(defaultSpawn);
   });
 
   afterEach(() => {
@@ -2862,7 +2866,9 @@ describe('setupWorkspace reference-cache reuse', () => {
   });
 
   /** execFileSync stub: ls-remote throws so the stale-branch path is skipped;
-   *  every other git/rm/curl invocation succeeds. */
+   *  every other git/rm/curl invocation succeeds.
+   *  cloneWithRetry now uses gitAsync (spawn-based), so we also stub spawn for
+   *  'git clone' to succeed immediately. */
   function stubExecFileSyncNoStaleBranch(): void {
     vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
       const a = Array.isArray(args) ? (args as string[]) : [];
@@ -2871,10 +2877,28 @@ describe('setupWorkspace reference-cache reuse', () => {
       }
       return '';
     });
+    // Stub spawn so gitAsync (used by cloneWithRetry) resolves immediately.
+    vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+      if (cmd === 'git') {
+        const proc = {
+          pid: 999,
+          stdin: { on: vi.fn(), end: vi.fn() },
+          stdout: { on: vi.fn() },
+          stderr: { on: vi.fn() },
+          on: vi.fn((event: string, cb: (code: number) => void) => {
+            if (event === 'close') void Promise.resolve().then(() => { cb(0); });
+          }),
+          kill: vi.fn(),
+        };
+        return proc as unknown as ReturnType<typeof spawn>;
+      }
+      return { on: vi.fn(), kill: vi.fn() } as unknown as ReturnType<typeof spawn>;
+    });
   }
 
   function findCloneArgs(): string[] {
-    const cloneCall = vi.mocked(execFileSync).mock.calls.find(
+    // cloneWithRetry now uses gitAsync → spawn('git', ...), not execFileSync
+    const cloneCall = vi.mocked(spawn).mock.calls.find(
       c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('clone'),
     );
     expect(cloneCall).toBeDefined();
@@ -7815,19 +7839,55 @@ describe('ensureTaskCapabilityContractLoaded', () => {
 
 // ── cloneWithRetry ───────────────────────────────────────────────────────────
 describe('cloneWithRetry', () => {
+  const defaultSpawnImpl = vi.mocked(spawn).getMockImplementation();
+
+  function setupGitCloneMock(successAfterAttempts: number, errorMsg: string, captureArgs?: string[][]) {
+    let callCount = 0;
+    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
+      if (cmd === 'git') {
+        callCount++;
+        if (captureArgs) captureArgs.push((argsRaw as string[]).slice());
+        const shouldFail = callCount <= successAfterAttempts;
+        const errMsg = errorMsg;
+        const stderrCbs: ((d: Buffer) => void)[] = [];
+        const proc = {
+          pid: 999,
+          stdin: { on: vi.fn(), end: vi.fn() },
+          stderr: {
+            on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+              if (event === 'data') stderrCbs.push(cb);
+            }),
+          },
+          stdout: { on: vi.fn() },
+          on: vi.fn((event: string, cb: (code: number) => void) => {
+            if (event === 'close') {
+              void Promise.resolve().then(() => {
+                if (shouldFail) for (const scb of stderrCbs) scb(Buffer.from(errMsg));
+                cb(shouldFail ? 1 : 0);
+              });
+            }
+          }),
+          kill: vi.fn(),
+        };
+        return proc as unknown as ReturnType<typeof spawn>;
+      }
+      // Fall back to default for non-git commands
+      if (defaultSpawnImpl) return defaultSpawnImpl(cmd as string, argsRaw as string[], {});
+      // When no default exists, return a minimal no-op ChildProcess
+      return { on: vi.fn(), kill: vi.fn(), stdin: { on: vi.fn(), end: vi.fn() }, stdout: { on: vi.fn() }, stderr: { on: vi.fn() }, pid: 0 } as unknown as ReturnType<typeof spawn>;
+    });
+  }
+
+  afterEach(() => {
+    vi.mocked(spawn).mockReset();
+    if (defaultSpawnImpl) vi.mocked(spawn).mockImplementation(defaultSpawnImpl);
+  });
+
   it('redacts token-bearing URLs from retry log lines', async () => {
     vi.useFakeTimers();
     const tokenUrl = 'https://x-access-token:ghp_secret123@github.com/org/repo.git';
     const errorMsg = `fatal: repository '${tokenUrl}' not found`;
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'git') {
-        callCount++;
-        if (callCount <= 2) throw new Error(errorMsg);
-        return '';
-      }
-      return '';
-    });
+    setupGitCloneMock(2, errorMsg);
 
     const logLines: string[] = [];
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
@@ -7855,18 +7915,8 @@ describe('cloneWithRetry', () => {
     const staleUrl = 'https://x-access-token:ghs_STALE_TOKEN@github.com/org/repo.git';
     const authErr = "remote: Invalid username or token. Password authentication is not supported.\nfatal: Authentication failed for 'https://github.com/org/repo.git/'";
 
-    // First clone attempt fails with an auth error; second succeeds.
-    let callCount = 0;
     const cloneArgs: string[][] = [];
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown, a: unknown) => {
-      if (cmd === 'git') {
-        callCount++;
-        cloneArgs.push((a as string[]).slice());
-        if (callCount === 1) throw new Error(authErr);
-        return '';
-      }
-      return '';
-    });
+    setupGitCloneMock(1, authErr, cloneArgs);
 
     // force_refresh token endpoint returns a fresh token.
     const fetchMock = makeFetchMock().mockResolvedValue({
@@ -7912,15 +7962,7 @@ describe('cloneWithRetry', () => {
     const url = 'https://x-access-token:ghs_NET_TOKEN@github.com/org/repo.git';
     const netErr = 'fatal: unable to access: Could not resolve host: github.com';
 
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'git') {
-        callCount++;
-        if (callCount === 1) throw new Error(netErr);
-        return '';
-      }
-      return '';
-    });
+    setupGitCloneMock(1, netErr);
 
     const fetchMock = makeFetchMock().mockResolvedValue({
       ok: true,

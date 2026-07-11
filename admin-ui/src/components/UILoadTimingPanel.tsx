@@ -12,8 +12,20 @@ interface TimingSample {
   sample_type: string;
 }
 
+interface PinnedBaseline {
+  id: string;
+  surface: string;
+  sample_type: string;
+  p50: number;
+  p90: number;
+  count: number;
+  label: string;
+  pinned_at: string;
+}
+
 interface UiLoadTimingResponse {
   surfaces: Record<string, TimingSample[]>;
+  baselines: PinnedBaseline[];
 }
 
 export interface PerTypeStats {
@@ -107,6 +119,15 @@ export function UILoadTimingPanel() {
 
   // ── Compute per-surface / per-sample-type before/after split ──────────────
 
+  // Build baseline lookup: surface -> sample_type -> PinnedBaseline
+  const baselineMap: Record<string, Record<string, PinnedBaseline>> = {};
+  if (data?.baselines) {
+    for (const b of data.baselines) {
+      if (!baselineMap[b.surface]) baselineMap[b.surface] = {};
+      baselineMap[b.surface][b.sample_type] = b;
+    }
+  }
+
   const allSampleTypes = new Set<string>();
   interface SurfaceRow {
     surface: string;
@@ -116,7 +137,19 @@ export function UILoadTimingPanel() {
 
   for (const [surface, samples] of Object.entries(surfaces).sort()) {
     for (const s of samples) allSampleTypes.add(s.sample_type);
-    rows.push({ surface, split: computePerTypeSplit(samples, cutoffIso) });
+    const split = computePerTypeSplit(samples, cutoffIso);
+    // Override "before" stats with pinned baseline when available so they
+    // survive the 200-sample FIFO cap.
+    const surfaceBaselines = baselineMap[surface];
+    if (surfaceBaselines) {
+      for (const [st, bl] of Object.entries(surfaceBaselines)) {
+        if (!split[st]) {
+          split[st] = { before: { count: 0, p50: null, p90: null }, after: { count: 0, p50: null, p90: null } };
+        }
+        split[st].before = { count: bl.count, p50: bl.p50, p90: bl.p90 };
+      }
+    }
+    rows.push({ surface, split });
   }
 
   const typeList = Array.from(allSampleTypes).sort();
