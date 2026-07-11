@@ -167,6 +167,9 @@ class Capabilities:
     unshare_path: str | None = None
     userns_ok: bool = False
     docker_usable: bool = False
+    # Daemon accepts CDI GPU devices (--device nvidia.com/gpu=N). Rootless/CDI
+    # daemons reject the legacy --gpus flag, so the argv builder keys on this.
+    docker_cdi_gpu: bool = False
     podman_usable: bool = False
     apptainer_path: str | None = None
     enroot_path: str | None = None
@@ -269,6 +272,51 @@ def probe_container_runtime_usable(binary: str, *, subcommand: str = "info") -> 
         return False
 
 
+def probe_docker_cdi_gpu(binary: str = "docker") -> bool:
+    """True iff the docker daemon exposes CDI spec dirs AND an ``nvidia.com/gpu``
+    CDI spec is actually present in one of them.
+
+    Rootless/CDI-configured daemons (``features.cdi`` + a spec in /etc/cdi or a
+    user spec dir) reject the legacy ``--gpus`` flag ("could not select device
+    driver"), while nvidia-runtime-hook daemons don't know CDI device names —
+    so :func:`build_docker_argv` must pick the GPU flag per daemon. Detection is
+    generic: ask the daemon for its CDISpecDirs (empty/absent on pre-CDI or
+    cdi-disabled daemons) and scan the readable ones for a spec mentioning the
+    ``nvidia.com/gpu`` device kind. Any failure reads as False → the builder
+    keeps the legacy flag, i.e. unchanged behavior on hook-based hosts.
+    """
+    try:
+        result = subprocess.run(
+            [binary, "info", "--format", "{{range .CDISpecDirs}}{{println .}}{{end}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    for spec_dir in (line.strip() for line in (result.stdout or "").splitlines()):
+        if not spec_dir:
+            continue
+        try:
+            names = os.listdir(spec_dir)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith((".yaml", ".yml", ".json")):
+                continue
+            try:
+                with open(
+                    os.path.join(spec_dir, name), encoding="utf-8", errors="replace"
+                ) as fh:
+                    if "nvidia.com/gpu" in fh.read(65536):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
 def probe_systemd_run() -> str | None:
     """Return the systemd-run path if a user scope can plausibly be created."""
     path = _which("systemd-run")
@@ -311,6 +359,7 @@ def detect_capabilities() -> Capabilities:
 
     docker_present = _which("docker") is not None
     docker_usable = probe_container_runtime_usable("docker") if docker_present else False
+    docker_cdi_gpu = probe_docker_cdi_gpu() if docker_usable else False
     podman_usable = probe_container_runtime_usable("podman")
     apptainer_path = _which("apptainer") or _which("singularity")
     enroot_path = _which("enroot")
@@ -328,6 +377,7 @@ def detect_capabilities() -> Capabilities:
         unshare_path=unshare_path,
         userns_ok=userns_ok,
         docker_usable=docker_usable,
+        docker_cdi_gpu=docker_cdi_gpu,
         podman_usable=podman_usable,
         apptainer_path=apptainer_path,
         enroot_path=enroot_path,
@@ -494,6 +544,7 @@ def capabilities_inventory(caps: Capabilities) -> dict[str, bool]:
         "bwrap_ok": caps.bwrap_ok,
         "userns_ok": caps.userns_ok,
         "docker_usable": caps.docker_usable,
+        "docker_cdi_gpu": caps.docker_cdi_gpu,
         "podman_usable": caps.podman_usable,
         "apptainer_ok": bool(caps.apptainer_path),
         "enroot_ok": bool(caps.enroot_path),
@@ -798,10 +849,15 @@ def build_docker_argv(
     cpu_limit: str | None = None,
     mem_limit: str | None = None,
     runtime: str = BACKEND_DOCKER,
+    gpu_cdi: bool = False,
 ) -> list[str]:
     """docker/podman run argv. Env VALUES are passed via ``-e KEY`` (read from the
     subprocess env), never inlined as ``KEY=VALUE`` on argv (which /proc/cmdline
-    would expose). ``--gpus device=<idx,...>`` scopes to the assigned GPUs only.
+    would expose). GPUs are scoped to the assigned indices only: legacy
+    ``--gpus device=<idx,...>`` for nvidia-runtime-hook daemons, or one
+    ``--device nvidia.com/gpu=<idx>`` per GPU when ``gpu_cdi`` is set (CDI
+    daemons reject ``--gpus``, hook daemons don't know CDI names — the caller
+    picks via :func:`probe_docker_cdi_gpu`).
 
     ``command`` semantics:
       * a string → the image is run with a ``bash -lc <command>`` override
@@ -813,7 +869,11 @@ def build_docker_argv(
     """
     argv: list[str] = [runtime, "run", "--rm", "--name", container_name]
     if gpu_indices:
-        argv += ["--gpus", "device=" + ",".join(str(i) for i in gpu_indices)]
+        if gpu_cdi:
+            for i in gpu_indices:
+                argv += ["--device", f"nvidia.com/gpu={i}"]
+        else:
+            argv += ["--gpus", "device=" + ",".join(str(i) for i in gpu_indices)]
     if cpu_limit:
         argv += ["--cpus", str(cpu_limit)]
     if mem_limit:
@@ -1298,6 +1358,7 @@ def plan_compute_execution(
             cpu_limit=cpu_limit,
             mem_limit=mem_limit,
             runtime=backend,
+            gpu_cdi=(backend == BACKEND_DOCKER and caps.docker_cdi_gpu),
         )
         # docker CLIENT env: minimal trusted vars to FIND + configure the runtime,
         # plus the inner values so `-e KEY` can forward them. Never the runner token.

@@ -8,9 +8,12 @@ install of bubblewrap.
 """
 
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 import runner_isolation as iso
@@ -555,6 +558,26 @@ class TestDockerArgv(unittest.TestCase):
         )
         self.assertNotIn("--gpus", argv)
 
+    def test_gpu_cdi_uses_device_flag_not_gpus(self):
+        # CDI daemons (rootless + /etc/cdi spec) reject --gpus; one --device per GPU.
+        argv = iso.build_docker_argv(
+            image="img", command="c", container_name="bp-x",
+            gpu_indices=[2, 3], binds=[], env_keys=[], cwd=None,
+            gpu_cdi=True,
+        )
+        joined = " ".join(argv)
+        self.assertNotIn("--gpus", argv)
+        self.assertIn("--device nvidia.com/gpu=2", joined)
+        self.assertIn("--device nvidia.com/gpu=3", joined)
+
+    def test_gpu_cdi_no_devices_when_no_gpus(self):
+        argv = iso.build_docker_argv(
+            image="img", command="c", container_name="bp-x",
+            gpu_indices=None, binds=[], env_keys=[], cwd=None,
+            gpu_cdi=True,
+        )
+        self.assertNotIn("--device", argv)
+
     def test_resource_limits(self):
         argv = iso.build_docker_argv(
             image="img", command="c", container_name="bp-x",
@@ -918,6 +941,17 @@ class TestComputePlan(unittest.TestCase):
         # Client env carries the inner vars for `-e` forwarding but NOT the token.
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
 
+    def test_docker_cdi_daemon_gets_cdi_device_flags(self):
+        plan = self._common(
+            caps=_caps(docker_usable=True, docker_cdi_gpu=True, gpu_indices=(0, 1)),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            gpu_indices=[1],
+        )
+        self.assertEqual(plan.backend, iso.BACKEND_DOCKER)
+        joined = " ".join(plan.argv)
+        self.assertIn("--device nvidia.com/gpu=1", joined)
+        self.assertNotIn("--gpus", plan.argv)
+
     def test_apptainer_image_backend_no_home(self):
         plan = self._common(
             caps=_caps(apptainer_path="/usr/bin/apptainer", gpu_indices=(0,)),
@@ -937,6 +971,51 @@ class TestComputePlan(unittest.TestCase):
         self.assertTrue(plan.declined)
 
 
+# ── CDI GPU probe ──────────────────────────────────────────────────────────────
+
+class TestProbeDockerCdiGpu(unittest.TestCase):
+    """probe_docker_cdi_gpu: daemon reports CDISpecDirs AND a readable spec
+    mentions nvidia.com/gpu → True; every failure mode reads as False (legacy
+    --gpus behavior preserved on hook-based hosts)."""
+
+    @staticmethod
+    def _info(stdout, rc=0):
+        return subprocess.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr="")
+
+    def test_true_when_spec_dir_has_nvidia_gpu_spec(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "nvidia.yaml"), "w", encoding="utf-8") as fh:
+                fh.write("cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n- name: '0'\n")
+            with mock.patch.object(iso.subprocess, "run", return_value=self._info(d + "\n")):
+                self.assertTrue(iso.probe_docker_cdi_gpu())
+
+    def test_false_when_no_spec_dirs(self):
+        # Pre-CDI daemon or cdi feature disabled: empty CDISpecDirs output.
+        with mock.patch.object(iso.subprocess, "run", return_value=self._info("")):
+            self.assertFalse(iso.probe_docker_cdi_gpu())
+
+    def test_false_when_spec_dir_missing_or_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "nonexistent")
+            with mock.patch.object(iso.subprocess, "run", return_value=self._info(missing + "\n")):
+                self.assertFalse(iso.probe_docker_cdi_gpu())
+            with mock.patch.object(iso.subprocess, "run", return_value=self._info(d + "\n")):
+                self.assertFalse(iso.probe_docker_cdi_gpu())
+
+    def test_false_when_specs_lack_nvidia_gpu(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "other.yaml"), "w", encoding="utf-8") as fh:
+                fh.write("cdiVersion: 0.5.0\nkind: vendor.example/dev\n")
+            with mock.patch.object(iso.subprocess, "run", return_value=self._info(d + "\n")):
+                self.assertFalse(iso.probe_docker_cdi_gpu())
+
+    def test_false_on_docker_info_failure(self):
+        with mock.patch.object(iso.subprocess, "run", return_value=self._info("", rc=1)):
+            self.assertFalse(iso.probe_docker_cdi_gpu())
+        with mock.patch.object(iso.subprocess, "run", side_effect=OSError("boom")):
+            self.assertFalse(iso.probe_docker_cdi_gpu())
+
+
 # ── Capabilities inventory (heartbeat backend-availability map) ────────────────
 
 class TestCapabilitiesInventory(unittest.TestCase):
@@ -944,6 +1023,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
         "bwrap_ok",
         "userns_ok",
         "docker_usable",
+        "docker_cdi_gpu",
         "podman_usable",
         "apptainer_ok",
         "enroot_ok",
@@ -955,6 +1035,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
             bwrap_path="/usr/bin/bwrap",
             userns_ok=True,
             docker_usable=True,
+            docker_cdi_gpu=True,
             podman_usable=True,
             apptainer_path="/usr/bin/apptainer",
             enroot_path="/usr/bin/enroot",
