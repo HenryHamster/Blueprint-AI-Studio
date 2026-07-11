@@ -5,7 +5,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: supersecret_blueprint_pass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD?}
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"
@@ -23,12 +23,12 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:supersecret_blueprint_pass@db:5432/postgres
-      - AGENT_JWT_SECRET=local_dev_agent_secret
-      - WS_TICKET_SECRET=local_dev_ws_secret
-      - GITHUB_APP_ID=123456
-      - GITHUB_PRIVATE_KEY=dummy_key
-      - GITHUB_WEBHOOK_SECRET=dummy_secret
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD?}@db:5432/postgres
+      - AGENT_JWT_SECRET=${AGENT_JWT_SECRET?}
+      - WS_TICKET_SECRET=${WS_TICKET_SECRET?}
+      - GITHUB_APP_ID=${GITHUB_APP_ID?}
+      - GITHUB_PRIVATE_KEY=${GITHUB_PRIVATE_KEY?}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET?}
       - ORCHESTRATOR_URL=http://app:8080
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - LOCAL_MODE=${LOCAL_MODE:-false}

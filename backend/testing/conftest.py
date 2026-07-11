@@ -346,6 +346,22 @@ def reset_rate_limiter():
 _TEST_CSRF_TOKEN = "test-csrf-token-for-client-fixture"
 
 
+@pytest.fixture(autouse=True)
+def _allow_plaintext_credentials_for_tests(monkeypatch):
+    """Allow encryption pass-through for tests without GITHUB_PAT_ENCRYPTION_KEY.
+
+    Most tests do not configure an encryption key and should not need to.
+    This fixture sets ``ALLOW_PLAINTEXT_CREDENTIALS=true`` so that
+    :func:`~app.field_encryption.encrypt_field` and
+    :func:`~app.field_encryption.decrypt_field` pass through values unchanged
+    instead of raising ``RuntimeError``.
+
+    Tests that specifically verify the error path when neither the key nor the
+    opt-in is set can remove the variable with their own ``monkeypatch.delenv``.
+    """
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+
 @pytest_asyncio.fixture(scope="function")
 async def client(override_get_session, override_get_current_user):
     """

@@ -108,7 +108,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0475"
+EXPECTED_SCHEMA_REVISION = "0484"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -169,6 +169,57 @@ _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 
 
 # Webhook dedup state moved to app.routers.github
+
+
+def _verify_encryption_config():
+    """Validate encryption configuration at startup.
+
+    On Cloud Run (``K_REVISION`` is set): require ``GITHUB_PAT_ENCRYPTION_KEY``
+    to be configured — raise ``RuntimeError`` so the deploy fails immediately
+    instead of silently storing credentials in plaintext.
+
+    In development/test (``K_REVISION`` not set): warn when both the encryption
+    key and ``ALLOW_PLAINTEXT_CREDENTIALS`` are absent, so developers know to
+    either configure a key or set the opt-in flag.
+    """
+    from app.field_encryption import (
+        ENCRYPTION_KEY_ENV,
+        ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+        is_encryption_active,
+    )
+
+    if is_encryption_active():
+        return
+
+    on_cloud_run = bool(os.getenv("K_REVISION"))
+    if on_cloud_run:
+        msg = (
+            f"[STARTUP] {ENCRYPTION_KEY_ENV} is not set — field encryption is "
+            "unavailable. This is a fatal configuration error in production. "
+            "Set the environment variable to a valid Fernet key before deploying."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    else:
+        allow_plaintext = os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV)
+        if not allow_plaintext:
+            logger.warning(
+                "[STARTUP] %s is not set and %s is not set — "
+                "field encryption will be a no-op. "
+                "Set %s=true if this is intentional for development, "
+                "or configure %s for production-grade encryption.",
+                ENCRYPTION_KEY_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+                ENCRYPTION_KEY_ENV,
+            )
+        else:
+            logger.warning(
+                "[STARTUP] %s is not set but %s=true — "
+                "credentials will be stored in plaintext (development mode).",
+                ENCRYPTION_KEY_ENV,
+                ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+            )
 
 
 async def _verify_schema_version():

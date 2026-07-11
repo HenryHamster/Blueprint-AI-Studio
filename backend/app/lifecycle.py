@@ -593,6 +593,7 @@ async def lifespan(app):
 
     # Late imports to avoid circular dependency with app.main
     from app.main import (
+        _verify_encryption_config,
         _verify_schema_version,
         _verify_schema_drift,
         _init_deployment_state,
@@ -615,6 +616,11 @@ async def lifespan(app):
 
     # Startup: Initialize DB tables
     await init_db()
+
+    # Validate encryption configuration — fail fast in production if the
+    # encryption key is missing; warn in development if neither key nor
+    # the ALLOW_PLAINTEXT_CREDENTIALS opt-in flag is set.
+    _verify_encryption_config()
 
     # Verify schema version matches expected migration
     await _verify_schema_version()

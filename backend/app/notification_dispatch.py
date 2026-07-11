@@ -24,6 +24,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.url_security import _resolve_safe_external_url
+from app.field_encryption import encrypt_field, decrypt_field
 from app.shared_state import get_project_promotion_target
 
 from app.models import (
@@ -172,7 +173,7 @@ async def _write_dead_letter(
                     reason=reason,
                     attempts=entry.attempts + 1,
                     last_status=last_status,
-                    webhook_url=entry.webhook_url or "",
+                    webhook_url=encrypt_field(entry.webhook_url) or "",
                     payload=entry.payload or {},
                     body=entry.body or {},
                 )
@@ -280,7 +281,7 @@ async def list_dead_letters(
             "reason": r.reason,
             "attempts": r.attempts,
             "last_status": r.last_status,
-            "webhook_url": r.webhook_url,
+            "webhook_url": decrypt_field(r.webhook_url) or "",
             "payload": r.payload,
             "body": r.body,
             "created_at": r.created_at.isoformat(),
@@ -313,7 +314,7 @@ async def redrive_dead_letter(session: AsyncSession, dead_letter_id: str, projec
         body=row.body or {},
         attempts=0,
         next_retry_at=time.monotonic(),
-        webhook_url=row.webhook_url or "",
+        webhook_url=decrypt_field(row.webhook_url) or "",
     )
     await _enqueue_retry_durable(entry)
     await session.delete(row)

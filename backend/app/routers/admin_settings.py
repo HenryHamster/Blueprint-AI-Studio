@@ -23,6 +23,7 @@ from app.database import get_session
 from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
 from app.inline_llm import validate_inline_llm_runtime_config
 from app.url_security import _is_safe_external_url
+from app.notification_dispatch import _attempt_delivery
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
     DeploymentState,
@@ -3077,14 +3078,18 @@ async def _apply_settings(
         if not webhook_url:
             raise HTTPException(status_code=400, detail="No webhook URL configured")
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    webhook_url,
-                    json={"type": "TEST", "message": "Blueprint test notification"},
-                )
-            if resp.status_code >= 400:
+            status_code = await _attempt_delivery(
+                webhook_url,
+                {"type": "TEST", "message": "Blueprint test notification"},
+            )
+            if status_code == 0:
                 raise HTTPException(
-                    status_code=502, detail=f"Webhook returned {resp.status_code}"
+                    status_code=502,
+                    detail="Webhook delivery blocked or failed (SSRF check or unreachable)",
+                )
+            if status_code >= 400:
+                raise HTTPException(
+                    status_code=502, detail=f"Webhook returned {status_code}"
                 )
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")

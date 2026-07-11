@@ -5,7 +5,7 @@ services:
     image: google/alloydbomni
     container_name: blueprint-alloydb
     environment:
-      - POSTGRES_PASSWORD=supersecret_blueprint_pass
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD?}
     ports:
       - "5432:5432"
     volumes:

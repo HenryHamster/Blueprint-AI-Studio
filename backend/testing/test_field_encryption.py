@@ -1,11 +1,19 @@
 """Tests for the field-level encryption module ``app.field_encryption``.
 
 Covers encrypt/decrypt round-trip with a valid Fernet key, None passthrough,
-missing-key no-op behavior, and InvalidToken plaintext fallback.
+missing-key behaviour with ``ALLOW_PLAINTEXT_CREDENTIALS`` opt-in, InvalidToken
+plaintext fallback, and ``is_encryption_active``.
 """
 
+import pytest
 from cryptography.fernet import Fernet
-from app.field_encryption import encrypt_field, decrypt_field
+from app.field_encryption import (
+    encrypt_field,
+    decrypt_field,
+    is_encryption_active,
+    ENCRYPTION_KEY_ENV,
+    ALLOW_PLAINTEXT_CREDENTIALS_ENV,
+)
 
 
 class TestEncryptDecryptRoundTrip:
@@ -80,30 +88,55 @@ class TestNonePassthrough:
 
 
 class TestMissingKeyNoop:
-    """Both functions are no-ops when GITHUB_PAT_ENCRYPTION_KEY is not set."""
+    """Both functions are no-ops when GITHUB_PAT_ENCRYPTION_KEY is not set
+    but ALLOW_PLAINTEXT_CREDENTIALS is explicitly enabled."""
 
     def test_encrypt_noop(self, monkeypatch):
-        """encrypt_field returns the value unchanged when key is absent."""
-        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        """encrypt_field returns the value unchanged when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
         original = "plaintext_token"
         # Identity check: the function returns the exact same object, not a copy
         assert encrypt_field(original) is original
 
     def test_decrypt_noop(self, monkeypatch):
-        """decrypt_field returns the value unchanged when key is absent."""
-        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        """decrypt_field returns the value unchanged when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
         original = "plaintext_token"
         assert decrypt_field(original) is original
 
     def test_encrypt_empty_string_noop(self, monkeypatch):
-        """encrypt_field('') returns '' (the same object) when key is absent."""
-        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        """encrypt_field('') returns '' (the same object) when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
         assert encrypt_field("") == ""
 
     def test_decrypt_empty_string_noop(self, monkeypatch):
-        """decrypt_field('') returns '' (the same object) when key is absent."""
-        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        """decrypt_field('') returns '' (the same object) when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
         assert decrypt_field("") == ""
+
+    def test_encrypt_raises_without_key_and_without_opt_in(self, monkeypatch):
+        """encrypt_field raises RuntimeError when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is not set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.delenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, raising=False)
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            encrypt_field("sensitive")
+
+    def test_decrypt_raises_without_key_and_without_opt_in(self, monkeypatch):
+        """decrypt_field raises RuntimeError when key is absent
+        and ALLOW_PLAINTEXT_CREDENTIALS is not set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.delenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, raising=False)
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            decrypt_field("sensitive")
 
 
 class TestInvalidTokenFallback:
@@ -196,3 +229,23 @@ class TestMaxPlanAccountFieldEncryption:
         legacy_ref = "projects/p/secrets/old-account/versions/1"
         result = decrypt_field(legacy_ref)
         assert result == legacy_ref
+
+
+class TestIsEncryptionActive:
+    """is_encryption_active reports whether encryption is properly configured."""
+
+    def test_active_with_valid_key(self, monkeypatch):
+        """is_encryption_active returns True when a valid key is set."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key)
+        assert is_encryption_active() is True
+
+    def test_inactive_without_key(self, monkeypatch):
+        """is_encryption_active returns False when no key is set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        assert is_encryption_active() is False
+
+    def test_inactive_with_invalid_key(self, monkeypatch):
+        """is_encryption_active returns False when the key is not valid Fernet."""
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, "not-a-valid-fernet-key")
+        assert is_encryption_active() is False

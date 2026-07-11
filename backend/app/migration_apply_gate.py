@@ -53,6 +53,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import tarfile
 import tempfile
@@ -271,10 +272,23 @@ async def _read_prod_state(prod_engine: AsyncEngine) -> _ProdState | None:
         return await conn.run_sync(_read)
 
 
+def _validate_db_name(name: str) -> None:
+    """Validate that a database name contains only alphanumeric characters and
+    underscores before embedding it in DDL SQL. Postgres cannot bind params for
+    identifiers, so regex validation is the correct defense against SQL injection.
+    Raises ``ValueError`` with the invalid name and accepted character set."""
+    if not re.match(r"^[a-zA-Z0-9_]+$", name):
+        raise ValueError(
+            f"Invalid database name {name!r}: must contain only alphanumeric "
+            f"characters and underscores"
+        )
+
+
 async def _create_database(base_url: URL, name: str) -> None:
     """``CREATE DATABASE name`` on *base_url*'s server (AUTOCOMMIT — DDL for a
     new database cannot run inside a transaction). Creating a SEPARATE database
     never touches production's schema."""
+    _validate_db_name(name)
     engine = create_async_engine(
         base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
     )
@@ -288,6 +302,7 @@ async def _create_database(base_url: URL, name: str) -> None:
 async def _drop_database(base_url: URL, name: str) -> None:
     """Best-effort teardown of an ephemeral scratch database. Terminates any
     lingering backends first (a still-open connection blocks ``DROP DATABASE``)."""
+    _validate_db_name(name)
     engine = create_async_engine(
         base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
     )
