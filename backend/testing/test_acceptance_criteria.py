@@ -3123,6 +3123,69 @@ def test_attestation_without_detail_timestamp_expires_from_recorded_at():
     assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
 
 
+def test_timestampless_attestation_expires_by_recorded_at():
+    """Timestamp-less attestations expire via recorded_at when it is set.
+
+    When detail["attested_at"] is absent or unparseable, _evidence_is_attested
+    falls back to e.recorded_at as the expiry anchor and applies the same
+    ATTESTATION_WINDOW_DAYS window.  Only rows where recorded_at is also None
+    remain valid unconditionally.
+
+    Named acceptance test for the attestation-expiry-via-recorded_at fix.
+    """
+    from datetime import datetime as _dt
+
+    old = _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    recent = _utcnow()
+
+    def _ev(detail, recorded_at):
+        return CriterionEvidence(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            criterion_id=uuid.uuid4(),
+            source_kind="operator_attestation",
+            detail=detail,
+            recorded_at=recorded_at,
+        )
+
+    # No attested_at, old recorded_at → expired.
+    ev_old = _ev(None, old)
+    assert ac._evidence_is_attested(ev_old) is False
+    assert ac.compute_criterion_coverage([ev_old]) == "partial"
+
+    # No attested_at, recent recorded_at → still attested.
+    ev_recent = _ev(None, recent)
+    assert ac._evidence_is_attested(ev_recent) is True
+    assert ac.compute_criterion_coverage([ev_recent]) == "attested"
+
+    # Unparseable attested_at, old recorded_at → expired.
+    ev_bad_old = _ev({"attested_at": "not-a-date"}, old)
+    assert ac._evidence_is_attested(ev_bad_old) is False
+
+    # Unparseable attested_at, recent recorded_at → still attested.
+    ev_bad_recent = _ev({"attested_at": "not-a-date"}, recent)
+    assert ac._evidence_is_attested(ev_bad_recent) is True
+
+    # _compute_attestation_expires_at returns recorded_at + window (not None).
+    expires = ac._compute_attestation_expires_at([ev_recent])
+    assert expires is not None
+    expires_dt = _dt.fromisoformat(expires)
+    expected = recent + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expires_dt - expected).total_seconds()) < 2
+
+    # recorded_at=None → valid (no reference point) and expires_at=None.
+    ev_no_rec = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail=None,
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_no_rec) is True
+    assert ac._compute_attestation_expires_at([ev_no_rec]) is None
+
+
 @pytest.mark.asyncio
 async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
     """POST .../attest records timestamped operator_attestation evidence and coverage → 'attested'."""
