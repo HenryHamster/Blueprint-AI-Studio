@@ -7,7 +7,6 @@ surfaces. It is intentionally small and IO-free.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
@@ -355,12 +354,10 @@ def capability_need_proof_status(
 def capability_proof_gate_mode(override: str | None = None) -> str:
     """Return the current proof gate mode: ``"off"``, ``"observe"``, or ``"enforce"``.
 
-    When ``override`` is provided, validates and returns it (so callers can
-    inject a ``runtime_config`` value rather than always reading the env var).
-    Otherwise reads from the ``CAPABILITY_PROOF_GATE_MODE`` env var *at call
-    time* — never cached at import — so the gate can be toggled at runtime
-    without a restart. Default is ``"off"`` (the safest default: the gate never
-    blocks; the env var does not even need to exist).
+    When ``override`` is provided, validates and returns it (callers inject the
+    value from ``runtime_config`` or wherever the canonical source lives).
+    When ``override`` is ``None`` (or omitted), returns ``"off"`` — the safest
+    default: the gate never blocks.
 
     ``"off"`` — the proof gate is disabled; unproven working capabilities
     unconditionally satisfy prerequisites (identical to the pre-gate behaviour).
@@ -374,8 +371,7 @@ def capability_proof_gate_mode(override: str | None = None) -> str:
     """
     if override is not None:
         return override if override in ("off", "observe", "enforce") else "off"
-    raw = os.getenv("CAPABILITY_PROOF_GATE_MODE", "off").strip().lower()
-    return raw if raw in ("off", "observe", "enforce") else "off"
+    return "off"
 
 
 def capability_need_blocked_by_proof_gate(

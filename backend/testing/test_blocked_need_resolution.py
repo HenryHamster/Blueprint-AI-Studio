@@ -536,28 +536,23 @@ def test_working_capability_proof_status_accepts_dict_form_problem_model():
 # ---------------------------------------------------------------------------
 
 
-def test_capability_proof_gate_mode_defaults_to_off(monkeypatch):
-    """Unset / junk env var → "off" (safest default)."""
+def test_capability_proof_gate_mode_defaults_to_off():
+    """No override → "off" (safest default)."""
     from app.capability_registry import capability_proof_gate_mode
 
-    monkeypatch.delenv("CAPABILITY_PROOF_GATE_MODE", raising=False)
     assert capability_proof_gate_mode() == "off"
-    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "")
-    assert capability_proof_gate_mode() == "off"
-    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "garbage")
-    assert capability_proof_gate_mode() == "off"
+    assert capability_proof_gate_mode(None) == "off"
 
 
-def test_capability_proof_gate_mode_reads_env_var(monkeypatch):
-    """All three valid modes round-trip through the env var."""
+def test_capability_proof_gate_mode_no_env_fallback():
+    """The env var path was removed — all consumers read from runtime_config;
+    the function is a pure validator that defaults to 'off'."""
     from app.capability_registry import capability_proof_gate_mode
 
-    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "off")
     assert capability_proof_gate_mode() == "off"
-    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "observe")
-    assert capability_proof_gate_mode() == "observe"
-    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "enforce")
-    assert capability_proof_gate_mode() == "enforce"
+    # Override still works as the canonical path.
+    assert capability_proof_gate_mode(override="observe") == "observe"
+    assert capability_proof_gate_mode(override="enforce") == "enforce"
 
 
 def test_capability_proof_gate_mode_override_takes_precedence():

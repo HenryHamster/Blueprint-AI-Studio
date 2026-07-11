@@ -9311,6 +9311,7 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
         "merge_grade",
         "acceptance_window",
         "debt_pressure",
+        "capability_proof",
     }
     assert set(by_dim) == expected_dims
     assert len(rows) == len(expected_dims), "dual-write must not duplicate rows"
@@ -32706,6 +32707,79 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
     )
     assert version.last_qualification["promotion_failure_count"] == 2
 
+    # --- Capability-proof gate dimension unit tests --------------------------
+    # Tests for the capability_proof_blocked hard blocker in compute_composite.
+    # Advisory in OFF/OBSERVE mode (blocked=False, never blocks), gating only
+    # in ENFORCE mode when unproven capabilities exist (blocked=True).
+
+    def test_compute_composite_capability_proof_not_blocked_does_not_gate(self):
+        """capability_proof_blocked=False never blocks (OFF/OBSERVE mode)."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            capability_proof_blocked=False,
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+        assert result["confidence"] == 1.0
+
+    def test_compute_composite_capability_proof_blocked_label(self):
+        """capability_proof_blocked=True emits the capability_proof_gate_blocked blocker label."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            capability_proof_blocked=True,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "capability_proof_gate_blocked"
+
+    def test_compute_composite_capability_proof_blocker_precedence(self):
+        """capability_proof_gate_blocked fires AFTER criterion_coverage_incomplete
+        but BEFORE smoketest_startup_failed in the hard-blocker ordering."""
+        # Trigger criterion coverage AND capability_proof_blocked — must report
+        # criterion_coverage_incomplete first (higher priority).
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 1,
+                "covered": 0,
+                "partial": 1,
+                "uncovered": 1,
+            },
+            capability_proof_blocked=True,
+        )
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
+        # When criterion coverage is complete and capability_proof_blocked=True
+        # but smoketest_score is also None — must report capability_proof_gate_blocked
+        # first (it has higher priority than smoketest_startup_failed).
+        result2 = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=None,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 1,
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            capability_proof_blocked=True,
+        )
+        assert result2["blocker"] == "capability_proof_gate_blocked"
+
 
 class TestComputeGoalCoverageDrift:
     """Unit tests for the pure compute_goal_coverage_drift scorer."""
@@ -34721,6 +34795,7 @@ async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, moc
         "merge_grade",
         "acceptance_window",
         "debt_pressure",
+        "capability_proof",
     }
     assert expected_dims == dims_found, (
         f"expected dims {expected_dims}, got {dims_found}"

@@ -5631,8 +5631,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     )
     # Proof-status companion of the working-capability set, built from the SAME
     # registry so an unproven "declared working with zero evidence" resolution can
-    # be surfaced. OBSERVE mode only: this map drives a WARNING log below and does
-    # NOT change which needs resolve — the enforce gate is a separate follow-up.
+    # be surfaced.  In OBSERVE mode this map drives a WARNING log below and does
+    # NOT change which needs resolve; in ENFORCE mode (checked below via
+    # capability_need_blocked_by_proof_gate) an unproven capability need DOES
+    # block the dependent — the enforce gate is implemented and active.
     _working_registry_proof = working_capability_proof_status(
         getattr(project_obj, "problem_model", None)
     )

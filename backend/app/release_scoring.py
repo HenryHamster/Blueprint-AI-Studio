@@ -413,6 +413,7 @@ def compute_composite(
     criterion_coverage: dict[str, Any] | None = None,
     merge_grade_misses: bool = False,
     debt_pressure_score: float | None = None,
+    capability_proof_blocked: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -459,6 +460,15 @@ def compute_composite(
         Versions with no criteria, or callers that pass ``None`` for backward
         compatibility, skip this gate.  ``sub_scores["attested_count"]`` records
         the attested surface for observability whenever a summary is supplied.
+      * ``capability_proof_blocked`` is True — the capability proof gate is in
+        ``"enforce"`` mode and at least one ``working`` capability lacks
+        ``proven`` evidence (``"capability_proof_gate_blocked"``).  Governs the
+        integrity of the capability proof gate: a promotion over unproven
+        capability claims bypasses the gate's entire purpose, so this is a hard
+        blocker.  Checked after criterion coverage so the acceptance-criteria
+        gate is not masked, and before the quality dimensions so a candidate
+        whose capability claims are unproven is rejected regardless of audit
+        quality.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -573,6 +583,12 @@ def compute_composite(
         # are NOT counted here — they clear the blocker but incur the confidence
         # penalty applied below (the attestation tier).
         blocker = "criterion_coverage_incomplete"
+    elif capability_proof_blocked:
+        # The capability proof gate is in ENFORCE mode and there are working
+        # capabilities whose proof status is not ``proven`` — the gate would
+        # block dependents that name them.  Block promotion until the unproven
+        # capabilities are either proven or the gate is dialled back to observe.
+        blocker = "capability_proof_gate_blocked"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

@@ -3355,7 +3355,8 @@ async def _dual_write_dimension_results(
     a Per-Dimension Fact Ledger").  Called from ``_finalize_qualification`` once
     the composite ``base_record`` is fully assembled — i.e. after EVERY gate /
     dimension has resolved (CI, audit, test-erosion, smoketest, challenge, both
-    migration gates, merge-grade, acceptance-window, debt-pressure).  Deriving
+    migration gates, merge-grade, acceptance-window, debt-pressure,
+    capability-proof).  Deriving
     the per-dimension facts from the already-assembled ``base_record`` +
     ``composite`` keeps the write in ONE additive place that cannot alter control
     flow, rather than threading a mutation through the ~1300-line finalize body
@@ -3438,6 +3439,17 @@ async def _dual_write_dimension_results(
     challenge_verdicts = base_record.get("challenge_verdicts")
     acc_fraction = sub_scores.get("acceptance_window_fraction")
     debt_score = _score("debt_pressure")
+
+    # Capability-proof gate ledger status: OFF → unavailable (gate not active),
+    # OBSERVE → passed (watching), ENFORCE → same as the composite blocker.
+    _cp_detail = base_record.get("capability_proof_detail") or {}
+    _cp_mode = _cp_detail.get("mode", "off")
+    if _cp_mode == "off":
+        _cp_status = "unavailable"
+    elif _cp_mode == "observe":
+        _cp_status = "passed"
+    else:  # enforce
+        _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
 
     specs: list[dict[str, Any]] = [
         {
@@ -3542,6 +3554,14 @@ async def _dual_write_dimension_results(
             "sub_score": debt_score,
             "blocker": None,
             "detail": base_record.get("completion_debt"),
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "capability_proof",
+            "status": _cp_status,
+            "sub_score": None,
+            "blocker": _own_blocker({"capability_proof_gate_blocked"}),
+            "detail": _cp_detail,
             "producing_task_id": None,
         },
     ]
@@ -4675,6 +4695,33 @@ async def _finalize_qualification(
             "status": "already_on_main_exempt",
             "blocked": False,
         }
+    # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
+    # Reflects whether the capability proof gate is active and — in ENFORCE
+    # mode — whether all working capabilities carry machine-verified proof.
+    # The dimension is always recorded in the ledger, but only blocks promotion
+    # in ENFORCE mode when unproven capabilities exist.
+    _capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
+    capability_proof_blocked = False
+    capability_proof_detail: dict[str, Any] = {"mode": _capability_proof_mode}
+    if _capability_proof_mode == "enforce":
+        from app.capability_registry import working_capability_proof_status as _wcp_status
+
+        _pm = getattr(_policy_project, "problem_model", None)
+        if _pm:
+            _proof_map = _wcp_status(_pm)
+            _unproven = [
+                n for n, s in _proof_map.items() if s != "proven"
+            ]
+            capability_proof_detail["total_working"] = len(_proof_map)
+            capability_proof_detail["unproven_count"] = len(_unproven)
+            capability_proof_detail["unproven"] = _unproven
+            if _unproven:
+                capability_proof_blocked = True
+        else:
+            capability_proof_detail["error"] = "no problem_model"
+
     # --- Completion-debt snapshot (additive, informational, best-effort) ------
     # Fetched before compute_composite so the pressure score can be passed in as
     # an observe-mode sub-score signal.  Never a blocker.  Best-effort: if the
@@ -4749,6 +4796,7 @@ async def _finalize_qualification(
         criterion_coverage=criterion_coverage,
         merge_grade_misses=merge_grade_misses,
         debt_pressure_score=_debt_pressure_score,
+        capability_proof_blocked=capability_proof_blocked,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -4842,6 +4890,10 @@ async def _finalize_qualification(
         # Open completion-debt snapshot at qualification time (additive, informational).
         # None when the ledger module is not yet available or returned no data.
         "completion_debt": _completion_debt,
+        # Capability-proof gate dimension (informational in OFF/OBSERVE,
+        # gating in ENFORCE).  Recorded in the per-dimension fact ledger.
+        "capability_proof_blocked": capability_proof_blocked,
+        "capability_proof_detail": capability_proof_detail,
     }
 
     # Enforce-mode confidence preview — only in observe/off mode, only when no
