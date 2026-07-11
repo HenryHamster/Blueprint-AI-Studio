@@ -7452,3 +7452,175 @@ async def test_attest_criterion_reattest_no_missing_greenlet(
         f"Evidence detail must reflect the refreshed reason; "
         f"got {attest_rows[0].detail!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# merge_evidence_gaps persistence  (acceptance criterion: test_merge_evidence_drop_reason_surfaced)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_drop_reason_surfaced(db_session):
+    """Merged tasks that fail to record evidence persist the drop reason on the open version.
+
+    Exercises the full acceptance criterion:
+      - record_task_merge_evidence with no_active_criteria persists the reason
+        on ReleaseVersion.merge_evidence_gaps.
+      - get_version_coverage_summary exposes merge_evidence_gaps so callers can
+        surface WHY merges did not produce criterion coverage.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapSurfaced")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Must surface gap")
+    criterion_key = criterion.criterion_key
+
+    # Retract the criterion so the merge will hit the no_active_criteria path.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        reason="Test retraction",
+        retracted_by="test",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "merge gap test"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "CI green",
+            }
+        },
+        criterion_ids=[criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0, f"Expected 0 evidence rows for retracted criterion; got {result}"
+
+    # The drop reason must be persisted on the open version.
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a gap is recorded"
+    assert gaps.get(MergeEvidenceReason.no_active_criteria.value, 0) >= 1, (
+        f"Expected no_active_criteria >= 1 in merge_evidence_gaps; got {gaps}"
+    )
+    # The unmatched key must be captured.
+    assert criterion_key in gaps.get("unmatched_criterion_ids", []), (
+        f"Expected {criterion_key!r} in unmatched_criterion_ids; got {gaps}"
+    )
+
+    # get_version_coverage_summary must surface the gaps.
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert "merge_evidence_gaps" in summary, (
+        "get_version_coverage_summary must include 'merge_evidence_gaps' key"
+    )
+    surfaced = summary["merge_evidence_gaps"]
+    assert surfaced is not None, "merge_evidence_gaps in summary must not be None after a gap"
+    assert surfaced.get(MergeEvidenceReason.no_active_criteria.value, 0) >= 1, (
+        f"Summary merge_evidence_gaps must reflect recorded gap; got {surfaced}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gap_no_criteria_recorded(db_session):
+    """record_task_merge_evidence with no criterion_ids increments no_criteria counter."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapNoCriteria")
+    version = await _make_version(db_session, project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "no criteria"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "CI green",
+            }
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a no_criteria gap"
+    assert gaps.get(MergeEvidenceReason.no_criteria.value, 0) >= 1, (
+        f"Expected no_criteria >= 1; got {gaps}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gap_verdict_not_proven_recorded(db_session):
+    """record_task_merge_evidence with unproven verdict increments verdict_not_proven counter."""
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapUnproven")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Unproven crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "unproven merge"}],
+        context={},  # no CODE_ACCEPTANCE_VERDICT_KEY → verdict_not_proven
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert result == 0
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None, "merge_evidence_gaps must be set after a verdict_not_proven gap"
+    assert gaps.get(MergeEvidenceReason.verdict_not_proven.value, 0) >= 1, (
+        f"Expected verdict_not_proven >= 1; got {gaps}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_evidence_gaps_accumulate(db_session):
+    """Multiple gap-producing merges accumulate counters, not overwrite them."""
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "MergeGapAccumulate")
+    version = await _make_version(db_session, project)
+
+    for _ in range(3):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "no criteria"}],
+            context={},
+            criterion_ids=[],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    await db_session.refresh(version)
+    gaps = version.merge_evidence_gaps
+    assert gaps is not None
+    assert gaps.get(MergeEvidenceReason.no_criteria.value, 0) >= 3, (
+        f"Expected no_criteria >= 3 after three gap-producing merges; got {gaps}"
+    )

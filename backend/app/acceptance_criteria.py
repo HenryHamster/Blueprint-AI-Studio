@@ -798,6 +798,46 @@ def _reject_unproven_merge_evidence(
     return False
 
 
+async def _increment_merge_gap(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: MergeEvidenceReason,
+    unmatched_ids: list[str],
+) -> None:
+    """Persist a cumulative merge-evidence gap counter on the open release version.
+
+    Updates the ``merge_evidence_gaps`` JSON column so the gap is visible
+    through the coverage-summary API, not only in logs.
+
+    Best-effort: errors are logged but never re-raised so a failure here never
+    blocks merge finalization.
+    """
+    try:
+        from app.release_version import current_open_version as _cur_open_ver  # noqa: PLC0415
+
+        open_ver = await _cur_open_ver(session, project_id)
+        if open_ver is None:
+            return
+        gaps: dict[str, Any] = dict(open_ver.merge_evidence_gaps or {})
+        reason_key = reason.value
+        gaps[reason_key] = int(gaps.get(reason_key, 0)) + 1
+        if unmatched_ids:
+            existing: list[str] = list(gaps.get("unmatched_criterion_ids", []))
+            for uid in unmatched_ids:
+                if uid not in existing:
+                    existing.append(uid)
+            gaps["unmatched_criterion_ids"] = existing
+        open_ver.merge_evidence_gaps = gaps
+        await session.commit()
+    except Exception:
+        logger.warning(
+            "_increment_merge_gap: failed to persist gap for project=%s reason=%s",
+            project_id,
+            reason,
+            exc_info=True,
+        )
+
+
 async def record_task_merge_evidence(
     session: AsyncSession,
     task: Any,
@@ -871,11 +911,13 @@ async def record_task_merge_evidence(
             getattr(task, "id", None),
             project_id,
         )
+        await _increment_merge_gap(session, project_id, MergeEvidenceReason.no_criteria, [])
         return 0
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
     if _reject_unproven_merge_evidence(verdict, task, project_id, criterion_ids):
+        await _increment_merge_gap(session, project_id, MergeEvidenceReason.verdict_not_proven, criterion_ids)
         return 0
     # Extract provenance fields for the evidence detail dict so operators can
     # audit why a criterion counts as covered without resorting to SQL.
@@ -934,6 +976,9 @@ async def record_task_merge_evidence(
                 getattr(task, "id", None),
                 project_id,
                 criterion_ids,
+            )
+            await _increment_merge_gap(
+                session, project_id, MergeEvidenceReason.no_active_criteria, criterion_ids
             )
             return 0
         # Batch-load all evidence for active criteria in one query to avoid N+1.
@@ -1929,6 +1974,11 @@ async def get_version_coverage_summary(
             }
         )
 
+    from app.release_models import ReleaseVersion  # noqa: PLC0415
+
+    _rv = await session.get(ReleaseVersion, release_version_id)
+    merge_evidence_gaps = _rv.merge_evidence_gaps if _rv is not None else None
+
     return {
         "total": sum(counts.values()),
         "covered": counts["covered"],
@@ -1942,6 +1992,7 @@ async def get_version_coverage_summary(
         "stuck_count": stuck_count,
         "criteria": criteria_detail,
         "failed_corroboration_keys": list(failed_corroboration),
+        "merge_evidence_gaps": merge_evidence_gaps,
     }
 
 

@@ -287,6 +287,21 @@ class ReleaseVersion(SQLModel, table=True):
         back_populates="version"
     )
 
+    # Cumulative tally of merged tasks that failed to record criterion evidence,
+    # persisted per open version so operators can see the gap without trawling
+    # logs.  Shape (all counts are cumulative since the version was opened):
+    #   {
+    #     "no_criteria": int,          -- task carried no criterion_ids at all
+    #     "verdict_not_proven": int,   -- task merged but verdict was not proven
+    #     "no_active_criteria": int,   -- criterion_ids present but no active rows
+    #     "unmatched_criterion_ids": list[str],  -- keys that found no active row
+    #   }
+    # NULL until the first gap is recorded (additive migration).
+    merge_evidence_gaps: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
