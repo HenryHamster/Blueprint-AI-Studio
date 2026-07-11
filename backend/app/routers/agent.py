@@ -854,8 +854,9 @@ async def claim_task(
 
     Status codes:
         200: Task claimed successfully
-        404: No unclaimed task on this VM
+        404: The JWT's task is not claimable on this VM
         429: Task locked by another process (retry recommended)
+        403: Token is not task-scoped
         401: Invalid or expired token
 
     Rate limit: 200 requests/minute.
@@ -867,9 +868,25 @@ async def claim_task(
     # this widens the warm-VM continuity liveness window beyond just the
     # /vm-heartbeat and /next-role endpoints.
     _shared_state.record_vm_heartbeat(vm_id)
+    # Scope the claim to the JWT's task, never "any task pinned to this VM".
+    # Persistent runners pin MANY tasks to one shared vm_instance_id
+    # ('runner:<id>'); an unscoped claim let the agent spawned for task A grab
+    # task B, after which every subsequent call 403'd "Task ID mismatch" and
+    # the agent crash-looped (production 2026-07-11 requeue pile-up). Every
+    # claim caller holds a token minted for its specific task (cold manifest,
+    # warm next-role rotation, runner dispatch), so sub is always present here;
+    # a VM-scoped (taskless) token was never a designed /claim flow.
+    token_task_id = token.get("sub")
+    try:
+        token_task_uuid = uuid.UUID(str(token_task_id))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=403, detail="task-scoped token required to claim"
+        )
     stmt = (
         select(Task)
         .where(
+            Task.id == token_task_uuid,
             Task.vm_instance_id == vm_id,
             Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
         )
@@ -883,6 +900,7 @@ async def claim_task(
         # Distinguish "no task" from "task locked by another process"
         check = await session.execute(
             select(Task.id).where(
+                Task.id == token_task_uuid,
                 Task.vm_instance_id == vm_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
             )
@@ -907,6 +925,7 @@ async def claim_task(
         # the same response.
         replay_cutoff = _utcnow() - timedelta(minutes=5)
         replay_stmt = select(Task).where(
+            Task.id == token_task_uuid,
             Task.vm_instance_id == vm_id,
             Task.status == TaskStatus.IN_PROGRESS,
             Task.last_heartbeat >= replay_cutoff,
@@ -914,7 +933,11 @@ async def claim_task(
         task = (await session.execute(replay_stmt)).scalars().first()
         if not task:
             raise HTTPException(
-                status_code=404, detail="No queued task found for this VM instance."
+                status_code=404,
+                detail=(
+                    f"Task {token_task_id} is not claimable on this VM "
+                    "(not pinned here, or no longer QUEUED/PROVISIONING)."
+                ),
             )
         idempotent_replay = True
 

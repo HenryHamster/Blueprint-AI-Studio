@@ -201,6 +201,70 @@ async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_scoped_to_jwt_task(client: AsyncClient, db_session):
+    """With multiple tasks pinned to one shared vm_instance_id (persistent
+    runner pattern), a claim returns exactly the JWT's task — never an
+    arbitrary sibling. Regression: the unscoped claim let the agent spawned
+    for task B grab older task A, then every follow-up call 403'd
+    "Task ID mismatch" and the agent crash-looped (2026-07-11 pile-up)."""
+    project = Project(name="Claim Scoping Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_vm = "runner:dd59526e-78f1-44ad-913e-85c72cd41151"
+    task_a = Task(
+        project_id=project.id, payloads=[{"cmd": "a"}], vm_instance_id=runner_vm
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    task_b = Task(
+        project_id=project.id, payloads=[{"cmd": "b"}], vm_instance_id=runner_vm
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    token_b = create_agent_token(str(task_b.id), runner_vm)
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token_b})
+
+    assert resp.status_code == 200
+    assert resp.json()["task_id"] == str(task_b.id)
+
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+    assert task_b.status == TaskStatus.IN_PROGRESS
+    assert task_a.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_rejects_taskless_vm_scoped_token(
+    client: AsyncClient, db_session
+):
+    """A VM-scoped (taskless) token cannot claim: /claim requires a task sub."""
+    project = Project(name="Claim VM-Scoped Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-pool-taskless"
+    task = Task(
+        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id=vm_id
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_vm_scoped_token(vm_id, str(project.id))
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 403
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_task_capability_slice(
     client: AsyncClient, db_session
 ):
