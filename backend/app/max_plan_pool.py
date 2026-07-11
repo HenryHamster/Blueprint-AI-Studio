@@ -958,6 +958,18 @@ async def load_max_plan_pool():
                     proj_map = active_per_account_project.setdefault(acct_id, {})
                     proj_map[pid] = proj_map.get(pid, 0) + 1
 
+        # Preserve in-memory usage-meter state across the periodic rebuild —
+        # this loader runs every ~300s from the orchestrator cycle, and the
+        # probe cache would otherwise be wiped with every refresh (the meter
+        # showed permanently-unknown in prod because of exactly that).
+        previous_usage_state: Dict[str, tuple] = {
+            aid: (
+                e.get("usage_snapshot"),
+                e.get("usage_snapshot_at"),
+                e.get("usage_probe_failed_at"),
+            )
+            for aid, e in _account_by_id.items()
+        }
         _max_plan_pools.clear()
         _account_by_id.clear()
         for acct in accounts:
@@ -1027,6 +1039,15 @@ async def load_max_plan_pool():
                 # Per-project runtime state (reconciled from DB on restart).
                 "project_state": reconciled_project_state,
             }
+            # Usage-meter snapshot: carry over the fresher of the previous
+            # in-memory probe result and the DB-persisted rate_limit_usage
+            # blob, so the meter survives both the periodic pool rebuild and
+            # orchestrator restarts.
+            _restore_usage_state(
+                entry,
+                previous_usage_state.get(acct_id),
+                getattr(acct, "rate_limit_usage", None),
+            )
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
             now = _utcnow()
@@ -2269,6 +2290,15 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
 # exactly as it did before this feature. The reactive rate-limit cooldowns
 # (disable_account_model / _account_state_for_model) remain the backstop.
 _USAGE_SNAPSHOT_TTL_SECONDS = 60
+# Cadence for the display-oriented usage-meter refresh (orchestrator calls
+# refresh_usage_meter_snapshots on this interval). Distinct from the 60s
+# selection TTL above: selection wants near-real-time data when the headroom
+# gate is enabled; the admin meter only needs minutes-fresh data.
+_USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
+# A snapshot older than this renders as "stale" on the admin meter — three
+# missed meter refreshes. The 60s selection TTL is intentionally NOT used for
+# display: with a 300s refresh cadence it would flag virtually every render.
+_USAGE_METER_DISPLAY_STALE_SECONDS = 900
 # Neutral headroom rank for accounts whose snapshot is unknown — the midpoint of
 # the [0, 100] headroom scale, mirroring how sparse success-rate falls back to
 # 0.5. Keeps unprobed accounts from being either starved or unduly preferred.
@@ -2378,10 +2408,15 @@ def _usage_headroom_rank(acct: Dict[str, Any], now: datetime) -> float:
 async def _refresh_usage_snapshot(acct_id: str) -> None:
     """Probe one account's usage OUTSIDE the pool lock and cache the result.
 
-    Advisory + total: never raises. On any failure the snapshot is cached as
-    unknown with a fresh timestamp, so a broken account isn't re-probed every
-    selection for the TTL window. Writes the cache under the pool lock; the
+    Advisory + total: never raises. Writes the cache under the pool lock; the
     network probe itself runs lock-free.
+
+    Failure semantics: a failed probe never clobbers a previously KNOWN
+    snapshot — the meter keeps showing last-known values (which age into
+    ``stale``) and only ``usage_probe_failed_at`` is stamped so schedulers
+    back off instead of re-probing on every selection touch. When there is no
+    known prior, the unknown result is cached with a fresh timestamp (same
+    back-off effect through the TTL).
 
     On a SUCCESSFUL probe the snapshot is also persisted to the DB row's
     ``rate_limit_usage`` column so the data survives orchestrator restarts.
@@ -2411,8 +2446,15 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
     async with _max_plan_pool_lock:
         live = _account_by_id.get(acct_id)
         if live is not None:
-            live["usage_snapshot"] = snapshot
-            live["usage_snapshot_at"] = _utcnow()
+            prev = live.get("usage_snapshot")
+            has_known_prior = isinstance(prev, UsageSnapshot) and prev.known
+            if success or not has_known_prior:
+                live["usage_snapshot"] = snapshot
+                live["usage_snapshot_at"] = _utcnow()
+            if success:
+                live.pop("usage_probe_failed_at", None)
+            else:
+                live["usage_probe_failed_at"] = _utcnow()
             live.pop("usage_probe_inflight", None)
     # Persist to the DB row on success so the data survives restarts.
     # Best-effort: a write failure is non-fatal — the in-memory copy is the
@@ -2479,9 +2521,147 @@ def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
 
 
 def _maybe_schedule_usage_refresh(acct: Dict[str, Any], now: datetime) -> None:
-    """Schedule a refresh only when the cached snapshot is missing/stale."""
-    if _cached_usage_snapshot(acct, now) is None:
-        _schedule_usage_refresh(acct)
+    """Schedule a refresh only when the cached snapshot is missing/stale.
+
+    A recent probe FAILURE also suppresses scheduling for one TTL window —
+    failed probes preserve the last-known snapshot (see
+    ``_refresh_usage_snapshot``), so without this stamp a flaky probe would be
+    retried on every selection touch.
+    """
+    if _cached_usage_snapshot(acct, now) is not None:
+        return
+    failed_at = acct.get("usage_probe_failed_at")
+    if (
+        failed_at is not None
+        and (now - failed_at).total_seconds() < _USAGE_SNAPSHOT_TTL_SECONDS
+    ):
+        return
+    _schedule_usage_refresh(acct)
+
+
+def _snapshot_from_persisted_usage(
+    raw: Any,
+) -> tuple[UsageSnapshot, datetime] | None:
+    """Rebuild (UsageSnapshot, its wall-clock stamp) from a persisted
+    ``MaxPlanAccount.rate_limit_usage`` blob written by
+    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch."""
+    if not isinstance(raw, Mapping) or raw.get("source") != "oauth_usage_probe":
+        return None
+    try:
+        updated_at = datetime.fromisoformat(raw.get("updated_at"))
+    except (TypeError, ValueError):
+        return None
+    utils: dict[str, float] = {}
+    resets: dict[str, str | None] = {}
+    for window in ("five_hour", "seven_day"):
+        entry = raw.get(window)
+        if not isinstance(entry, Mapping):
+            continue
+        util = entry.get("utilization")
+        if isinstance(util, bool) or not isinstance(util, (int, float)):
+            continue
+        utils[window] = float(util)
+        reset = entry.get("resets_at")
+        if isinstance(reset, str):
+            resets[window] = reset
+    if not utils:
+        return None
+    snapshot = UsageSnapshot(
+        known=True,
+        window_utilizations=utils,
+        resets_at=resets,
+        probed_at=updated_at.isoformat(),
+    )
+    return snapshot, updated_at
+
+
+def _restore_usage_state(
+    entry: Dict[str, Any],
+    prev_state: tuple | None,
+    persisted_raw: Any,
+) -> None:
+    """Seed a freshly-built pool entry's usage-meter state.
+
+    Takes the fresher of the previous in-memory snapshot (survives the
+    periodic pool rebuild) and the DB-persisted blob (survives restarts).
+    """
+    candidates: list[tuple[datetime, UsageSnapshot]] = []
+    if prev_state is not None:
+        prev_snap, prev_at, prev_failed_at = prev_state
+        if (
+            isinstance(prev_snap, UsageSnapshot)
+            and prev_snap.known
+            and prev_at is not None
+        ):
+            candidates.append((prev_at, prev_snap))
+        if prev_failed_at is not None:
+            entry["usage_probe_failed_at"] = prev_failed_at
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        candidates.append((parsed[1], parsed[0]))
+    if candidates:
+        best_at, best_snap = max(candidates, key=lambda c: c[0])
+        entry["usage_snapshot"] = best_snap
+        entry["usage_snapshot_at"] = best_at
+
+
+def _account_meter_eligible(acct: Dict[str, Any]) -> bool:
+    """True iff this account can produce a usage snapshot worth probing.
+
+    Only Anthropic OAuth accounts have a usage source today (every other
+    provider/auth combination resolves to ``UsageSnapshot.unknown()`` — see
+    the ``probe_usage`` implementations), so the meter loop skips the rest
+    rather than burning no-op probes.
+    """
+    provider = _normalize_provider_name(acct.get("provider"))
+    auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
+    return (
+        provider == LLMProviderName.ANTHROPIC.value
+        and auth_mode == LLMAuthMode.OAUTH.value
+        and bool(acct.get("enabled", True))
+        and bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+    )
+
+
+async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
+    """Schedule usage probes for meter-eligible accounts with aging snapshots.
+
+    Called on an orchestrator cadence (every
+    ``_USAGE_METER_REFRESH_INTERVAL_SECONDS``) so the admin usage meter stays
+    populated regardless of the ``usage_headroom_gate_enabled`` selection gate
+    (default off) — previously the gate was the meter's ONLY data supply, so
+    the meter rendered permanently-unknown in any default-configured deploy.
+    Advisory and non-blocking: probes are fire-and-forget; returns the number
+    scheduled.
+    """
+    now = now or _utcnow()
+    scheduled = 0
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                continue
+            snap = acct.get("usage_snapshot")
+            at = acct.get("usage_snapshot_at")
+            if (
+                isinstance(snap, UsageSnapshot)
+                and snap.known
+                and at is not None
+                and (now - at).total_seconds()
+                < _USAGE_METER_REFRESH_INTERVAL_SECONDS
+            ):
+                continue
+            failed_at = acct.get("usage_probe_failed_at")
+            if (
+                failed_at is not None
+                and (now - failed_at).total_seconds()
+                < _USAGE_METER_REFRESH_INTERVAL_SECONDS
+            ):
+                continue
+            _schedule_usage_refresh(acct)
+            scheduled += 1
+    if scheduled:
+        logger.info("[POOL] usage meter: scheduled %d usage probe(s)", scheduled)
+    return scheduled
 
 
 def _apply_usage_gate(
@@ -2512,11 +2692,17 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
 
     Always returns a dict (additive field). ``known=False`` covers the
     never-probed and probe-unknown states; ``stale`` flags a snapshot older
-    than the selection TTL (selection treats stale as unknown).
+    than the DISPLAY freshness window (three missed meter refreshes) — NOT
+    the 60s selection TTL, which would flag nearly every render under the
+    300s meter cadence. Selection freshness is handled separately by
+    ``_cached_usage_snapshot``.
     """
     snap = acct.get("usage_snapshot")
     at = acct.get("usage_snapshot_at")
-    stale = at is None or (now - at).total_seconds() >= _USAGE_SNAPSHOT_TTL_SECONDS
+    stale = (
+        at is None
+        or (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+    )
     if not isinstance(snap, UsageSnapshot) or not snap.known:
         probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
         return {

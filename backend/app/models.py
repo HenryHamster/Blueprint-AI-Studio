@@ -3288,15 +3288,16 @@ class MaxPlanAccount(SQLModel, table=True):
     )
     # Persisted rate-limit/usage headroom snapshot (latest probe data). Populated
     # by _refresh_usage_snapshot in max_plan_pool on each successful probe so
-    # the data survives orchestrator restarts even before the next probe fires.
+    # the data survives orchestrator restarts, and read back by
+    # load_max_plan_pool to re-seed the in-memory usage meter.
     # Structure: {"five_hour": {"utilization": float, "resets_at": str},
     #             "seven_day": {"utilization": float, "resets_at": str},
-    #             "unified_5h": {"remaining_tokens": int, "limit_tokens": int,
-    #                           "status": str, "resets_at": str},
-    #             "updated_at": str, "source": str}
-    # The unified_5h sub-dict is populated when Messages API response headers are
-    # captured (direct_llm_client calls); the five_hour/seven_day windows are
-    # populated by the OAuth usage probe on every probe cycle.
+    #             "updated_at": str, "source": "oauth_usage_probe"}
+    # The OAuth usage probe (anthropic OAuth accounts only) is the SOLE writer.
+    # Messages-API rate-limit headers (direct_llm_client) are NOT persisted
+    # here: inline LLM calls authenticate with the org-level ANTHROPIC_API_KEY
+    # env credential, so their headers describe the org key's limits, not any
+    # pool account's plan — attributing them to an account row would be wrong.
     rate_limit_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
