@@ -2580,6 +2580,40 @@ def _check_provider_credentials() -> list[str]:
     return found
 
 
+def _agent_deps_missing() -> bool:
+    """Check whether agent node dependencies are missing on this host.
+
+    Returns True when ``agent/src/index.ts`` exists on this host (agent path
+    is expected) but ``agent/node_modules/.bin/tsx`` is absent AND ``tsx`` is
+    not on the system PATH — meaning ``npm install`` / ``npm ci`` was never
+    run in the agent directory. The tsx fallback path in ``_locate_agent_binary``
+    returns a non-None argv (``["tsx", entry_ts]``) even in this state, so the
+    runner appears ready while every agent task fails at subprocess spawn.
+
+    Returns False when no agent source is found (compute-only host — not
+    actionable) or when deps are properly installed.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        agent_dir = os.path.normpath(os.path.join(base, "agent"))
+        entry_ts = os.path.join(agent_dir, "src", "index.ts")
+        if os.path.isfile(entry_ts):
+            # Agent source exists on this host — check deps.
+            tsx_in_node_modules = os.path.isfile(
+                os.path.join(agent_dir, "node_modules", ".bin", "tsx")
+            )
+            # dist/index.js means a pre-built artifact and no tsx needed.
+            dist_built = os.path.isfile(
+                os.path.join(agent_dir, "dist", "index.js")
+            )
+            if not tsx_in_node_modules and not dist_built and not shutil.which("tsx"):
+                return True
+            # Deps are fine — no warning needed.
+            return False
+    # No agent source path on this host at all — compute-only, not actionable.
+    return False
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -2779,6 +2813,17 @@ def _preflight(
         print(
             "  No isolation boundary available — install bubblewrap (or apptainer) "
             "to enable work.",
+            flush=True,
+        )
+
+    # Agent deps check: surface an actionable message when agent source exists
+    # on this host but node dependencies were never installed (tsx not found).
+    # The docker agent backend carries the runtime in the image, so host deps
+    # are irrelevant there — only warn for the bwrap path.
+    if caps.bwrap_ok and _agent_deps_missing():
+        print(
+            "    agent deps  : MISSING — run `cd agent && npm install` (or re-run\n"
+            "                  `blueprint-runner install`, which now bootstraps them).",
             flush=True,
         )
 

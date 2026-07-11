@@ -4,8 +4,10 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -4990,7 +4992,208 @@ class TestProviderCredentials(unittest.TestCase):
         self.assertTrue(result["setup_ok"])
 
 
-# ── Per-task log persistence ────────────────────────────────────────────────
+# ── Agent deps bootstrap (blueprint-runner install) ──────────────────────────
+
+
+class TestBootstrapAgentDeps(unittest.TestCase):
+    """_bootstrap_agent_deps in blueprint_runner: agent npm ci at install time."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._agent_dir = os.path.join(self._tmpdir, "agent")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _make_agent_source(self, *, with_dist=False):
+        """Create a minimal agent source tree under self._agent_dir."""
+        os.makedirs(os.path.join(self._agent_dir, "src"))
+        Path(os.path.join(self._agent_dir, "src", "index.ts")).write_text("// test")
+        Path(os.path.join(self._agent_dir, "package.json")).write_text('{"name":"test-agent"}')
+        Path(os.path.join(self._agent_dir, "package-lock.json")).write_text("{}")
+        if with_dist:
+            os.makedirs(os.path.join(self._agent_dir, "dist"))
+            Path(os.path.join(self._agent_dir, "dist", "index.js")).write_text("// dist")
+
+    def test_bootstrap_calls_npm_ci_when_source_present(self):
+        """npm ci is called when agent source exists and dist is absent."""
+        self._make_agent_source()
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("npm", calls[0][0][0])
+        self.assertEqual(calls[0][1].get("cwd"), self._agent_dir)
+
+    def test_bootstrap_skipped_with_no_agent_deps_flag(self):
+        """npm ci is NOT called when no_agent_deps=True."""
+        self._make_agent_source()
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        br._bootstrap_agent_deps(agent_dir=self._agent_dir, no_agent_deps=True, _run=recording_run)
+        self.assertEqual(len(calls), 0)
+
+    def test_bootstrap_skipped_when_dist_exists(self):
+        """npm ci is NOT called when dist/index.js already exists."""
+        self._make_agent_source(with_dist=True)
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 0, "npm ci should be skipped when dist is present")
+
+    def test_bootstrap_warns_when_npm_not_on_path(self):
+        """Warning is printed when npm is not on PATH, no crash."""
+        self._make_agent_source()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             patch.object(br.shutil, "which", return_value=None):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir)
+        self.assertIn("WARNING", stderr.getvalue())
+        self.assertIn("npm", stderr.getvalue())
+
+    def test_bootstrap_noop_on_compute_only(self):
+        """No crash when agent dir does not exist (compute-only runner)."""
+        compute_dir = os.path.join(self._tmpdir, "no-agent-here")
+        br._bootstrap_agent_deps(agent_dir=compute_dir)
+
+    def test_bootstrap_handles_npm_ci_failure_nonfatally(self):
+        """npm ci non-zero exit is WARNING, not crash."""
+        self._make_agent_source()
+        stderr = io.StringIO()
+        def failing_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args[0], 1)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/npm"), \
+             contextlib.redirect_stderr(stderr):
+            br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=failing_run)
+        self.assertIn("WARNING", stderr.getvalue())
+
+    def test_bootstrap_noop_when_no_package_json(self):
+        """No crash when agent dir exists but no package.json."""
+        # agent dir with src/index.ts but no package.json
+        os.makedirs(os.path.join(self._agent_dir, "src"))
+        Path(os.path.join(self._agent_dir, "src", "index.ts")).write_text("// test")
+        calls = []
+        def recording_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        br._bootstrap_agent_deps(agent_dir=self._agent_dir, _run=recording_run)
+        self.assertEqual(len(calls), 0)
+
+
+# ── Agent deps missing detection (preflight) ────────────────────────────────
+
+
+class TestAgentDepsMissing(unittest.TestCase):
+    """_agent_deps_missing in local_runner: preflight detection."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._old_file = getattr(local_runner, "__file__", None)
+
+    def tearDown(self):
+        if self._old_file is not None:
+            local_runner.__file__ = self._old_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _setup_agent(self, *, with_tsx=False, with_dist=False):
+        """Create fake scripts/../agent structure under tmpdir, redirect __file__."""
+        agent_dir = os.path.join(self._tmpdir, "agent")
+        os.makedirs(os.path.join(agent_dir, "src"))
+        Path(os.path.join(agent_dir, "src", "index.ts")).write_text("// test")
+        if with_tsx:
+            tsx_dir = os.path.join(agent_dir, "node_modules", ".bin")
+            os.makedirs(tsx_dir)
+            Path(os.path.join(tsx_dir, "tsx")).write_text("#!/usr/bin/env node")
+        if with_dist:
+            os.makedirs(os.path.join(agent_dir, "dist"))
+            Path(os.path.join(agent_dir, "dist", "index.js")).write_text("// dist")
+        # Point __file__ into this temp tree so agent is found at tmpdir/agent.
+        fake_scripts = os.path.join(self._tmpdir, "scripts")
+        os.makedirs(fake_scripts)
+        local_runner.__file__ = os.path.join(fake_scripts, "local_runner.py")
+
+    def test_true_when_agent_source_exists_but_no_tsx(self):
+        """Returns True when src/index.ts exists but tsx not installed."""
+        self._setup_agent()
+        with patch.object(local_runner.shutil, "which", return_value=None):
+            self.assertTrue(local_runner._agent_deps_missing())
+
+    def test_false_when_tsx_installed(self):
+        """Returns False when tsx is in node_modules/.bin."""
+        self._setup_agent(with_tsx=True)
+        self.assertFalse(local_runner._agent_deps_missing())
+
+    def test_false_when_dist_built(self):
+        """Returns False when dist/index.js exists (prebuilt artifact)."""
+        self._setup_agent(with_dist=True)
+        self.assertFalse(local_runner._agent_deps_missing())
+
+    def test_false_compute_only(self):
+        """Returns False when no agent source exists on this host."""
+        local_runner.__file__ = os.path.join(self._tmpdir, "scripts", "local_runner.py")
+        with patch.object(local_runner.os, "getcwd", return_value=os.path.join(self._tmpdir, "nowhere")):
+            self.assertFalse(local_runner._agent_deps_missing())
+
+
+class TestPreflightAgentDepsMessage(unittest.TestCase):
+    """Preflight prints actionable missing-deps message."""
+
+    def _run_preflight(self, deps_missing, caps=None):
+        """Run _preflight with mocked agent_binary and return captured output."""
+        if caps is None:
+            caps = _bwrap_caps()
+        gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        buf = io.StringIO()
+        cred_env = _env(ANTHROPIC_API_KEY="sk-ant-test")
+        with patch.dict(os.environ, cred_env, clear=True), \
+             patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_detect_gpu",
+                          return_value={"has_gpu": False, "gpu_count": 0, "gpu_names": []}), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_hostname", return_value="test-box"), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test"), \
+             patch.object(local_runner, "_agent_deps_missing", return_value=deps_missing), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok-abcdefgh-1234",
+                agent_binary=["tsx", "/agent/src/index.ts"],
+                caps=caps, gpu_state=gpu_state,
+                max_concurrent=2, max_concurrent_compute=2,
+            )
+        return buf.getvalue(), result
+
+    def test_actionable_message_when_deps_missing(self):
+        """Preflight includes 'agent deps' line when deps are missing."""
+        output, result = self._run_preflight(deps_missing=True)
+        self.assertIn("MISSING", output)
+        self.assertIn("agent deps", output)
+        self.assertIn("npm install", output)
+        self.assertTrue(result["setup_ok"])
+
+    def test_no_message_when_deps_installed(self):
+        """Preflight does NOT include the missing-deps line when deps are fine."""
+        output, result = self._run_preflight(deps_missing=False)
+        self.assertNotIn("MISSING", output)
+        self.assertNotIn("agent deps", output)
+
+    def test_no_message_when_docker_agent_only(self):
+        """Preflight does NOT warn when agent is docker-only (deps in the image)."""
+        caps = _docker_caps()
+        output, result = self._run_preflight(deps_missing=True, caps=caps)
+        # Docker-only agent doesn't have bwrap, so the check isn't relevant.
+        self.assertNotIn("agent deps", output)
 
 
 class TestTaskLogPersistence(unittest.TestCase):
