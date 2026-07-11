@@ -9523,6 +9523,95 @@ class TestInferDimensionFromInfraError:
 
 
 @pytest.mark.asyncio
+async def test_finalize_infra_failure_persists_partial_dimension_results(
+    db_session, mocker
+):
+    """When _finalize_qualification returns via _handle_infra_failure at a LATE
+    gate (after audit/smoketest scoring, before _dual_write_dimension_results),
+    the already-computed dimension results (CI, audit, test_erosion, smoketest)
+    are persisted in the per-dimension ledger via eager writes, surviving for
+    the re-drive's spawn-skip logic."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session, project, version,
+        audit_logs={
+            # One high-severity finding with a verification_note so the
+            # deterministic _score_audit deducts 0.15 → derived score 0.85.
+            "findings": [
+                {
+                    "severity": "high",
+                    "verification_note": "enough chars to pass the verification threshold ------",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Make the migration-identity gate defer (GitHub fetch failure), so
+    # _finalize_qualification returns via _handle_infra_failure at line ~4665
+    # -- after CI, audit, and smoketest have been scored and eagerly written
+    # to the ledger, but before _dual_write_dimension_results (line 5065).
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote", new=AsyncMock()
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The finalize was held as an infra failure -- not promoted.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "migration_identity_check_unavailable"
+    promote_spy.assert_not_called()
+
+    # Query the per-dimension ledger.
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    candidate_sha = version.last_qualification.get("candidate_sha")
+
+    # CI was eagerly written with the correct status.
+    assert "ci" in by_dim
+    assert by_dim["ci"].status == "passed"  # ci_green=True from _seed
+    assert by_dim["ci"].candidate_sha == candidate_sha
+
+    # Audit was eagerly written with its computed sub_score and status (one
+    # high-severity finding → derived score 0.85 → status "failed").
+    assert "audit" in by_dim
+    assert by_dim["audit"].status == "failed"
+    assert by_dim["audit"].sub_score == 0.85
+    assert by_dim["audit"].candidate_sha == candidate_sha
+
+    # Test_erosion was eagerly written (no deleted test files -> passed).
+    assert "test_erosion" in by_dim
+    assert by_dim["test_erosion"].status == "passed"
+    assert by_dim["test_erosion"].candidate_sha == candidate_sha
+
+    # Smoketest was eagerly written (artifact read -> passed).
+    assert "smoketest" in by_dim
+    assert by_dim["smoketest"].status == "passed"
+    assert by_dim["smoketest"].candidate_sha == candidate_sha
+
+    # Migration_identity was recorded as "unavailable" by _handle_infra_failure.
+    assert "migration_identity" in by_dim
+    assert by_dim["migration_identity"].status == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_infra_failure_isolates_to_failing_dimension(db_session):
     """A migration-gate infra failure marks ONLY migration_identity 'unavailable'
     — the audit dimension's already-'passed' fact for the same candidate tree
@@ -9787,6 +9876,112 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
     promote_spy.assert_not_called()
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_ledger_empty_on_redrive(db_session, mocker):
+    """When the per-dimension ledger is completely empty at the promotion gate
+    on a RE-DRIVE (qualification_attempts > 1), the promotion is HELD as an
+    infra failure rather than failing open -- the ledger should have content
+    from a prior successful finalize, and its absence means
+    _dual_write_dimension_results silently failed."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session, project, version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate a re-drive (qualification_attempts > 1).
+    version.qualification_attempts = 2
+    db_session.add(version)
+    await db_session.flush()
+
+    # Prevent ALL dimension writes (both eager incremental writes and the
+    # final dual-write) -- simulating a silent SAVEPOINT failure.
+    mocker.patch(
+        "app.release_qualifier._upsert_dimension_result",
+        new=AsyncMock(),
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Held, not promoted -- empty ledger on re-drive triggers a HOLD.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "qualification_dimension_ledger_empty"
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, mocker):
+    """When the per-dimension ledger is completely empty at the promotion gate
+    on the FIRST qualification (qualification_attempts == 1), the promotion
+    still fail-opens on the live composite -- a transient ledger-write failure
+    on the first qualification must not block an otherwise-qualified promotion."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session, project, version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # First qualification: qualification_attempts == 1 (the default after
+    # run_qualification).
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.flush()
+
+    # Prevent ALL dimension writes -- simulating a silent SAVEPOINT failure.
+    mocker.patch(
+        "app.release_qualifier._upsert_dimension_result",
+        new=AsyncMock(),
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Fail-open: promoted despite empty ledger (first qualification).
+    assert result["status"] == "promoted"
+    promote_spy.assert_called_once()
 
 
 @pytest.mark.asyncio

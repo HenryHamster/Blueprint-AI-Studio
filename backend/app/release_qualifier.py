@@ -3767,6 +3767,15 @@ async def _finalize_qualification(
             session, version, candidate_sha
         )
 
+    # Eager-write CI dimension so this fact survives a later gate's infra failure
+    # that returns before _dual_write_dimension_results (line 5065).
+    if candidate_sha:
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "ci",
+            status="passed" if ci_green else "blocked",
+            detail=ci_resolution if isinstance(ci_resolution, dict) else None,
+        )
+
     _policy_project = await session.get(Project, version.project_id)
     policy = _load_policy(_policy_project)
 
@@ -4080,6 +4089,27 @@ async def _finalize_qualification(
                     session, version, qual, "audit_report_findings_wrong_type"
                 )
 
+    # Eager-write audit & test_erosion dimension results so they survive an infra
+    # failure on a later gate before _dual_write_dimension_results.
+    if candidate_sha:
+        _audit_inc_status = (
+            "failed" if audit_score is not None and audit_score < 1.0
+            else "passed"
+        )
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "audit",
+            status=_audit_inc_status,
+            sub_score=audit_score,
+        )
+        _te_inc_detail = test_erosion_detail or {}
+        _te_inc_has_deletions = bool(_te_inc_detail.get("deleted_test_files"))
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "test_erosion",
+            status="blocked" if _te_inc_has_deletions else "passed",
+            sub_score=test_erosion_score,
+            detail=_te_inc_detail,
+        )
+
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
     # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
@@ -4121,6 +4151,16 @@ async def _finalize_qualification(
         # Carry the specific smoketest-failure detail (failed suite / named tests)
         # so the agent can target it when smoketest is the binding constraint.
         smoketest_detail = _extract_smoketest_detail(smoketest_result)
+
+        # Eager-write smoketest dimension so this fact survives an infra failure
+        # on a later gate (challenge, migration) before _dual_write_dimension_results.
+        if candidate_sha:
+            await _upsert_dimension_result(
+                session, version, candidate_sha, "smoketest",
+                status="passed",
+                sub_score=smoketest_score,
+                detail=smoketest_detail,
+            )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
     # If the qualifying run intentionally deferred the challenge spawn, do the
@@ -5318,6 +5358,24 @@ async def _finalize_qualification(
             )
             return await _handle_infra_failure(
                 session, version, qual, "qualification_dimension_ledger_incomplete"
+            )
+        # Completely empty ledger.  Distinguish first qualification from a re-drive
+        # using qualification_attempts: on a re-drive (attempts > 1) the ledger was
+        # populated on a prior successful finalize but is now empty — the current
+        # _dual_write_dimension_results silently failed (SAVEPOINT swallowed the
+        # write).  Hold rather than fail-open so the same-tree invariant is not
+        # silently bypassed on a re-check.
+        if (version.qualification_attempts or 0) > 1:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
+                "(candidate=%s, attempts=%d) — dual-write silently failed; "
+                "holding rather than promoting on the live composite",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                version.qualification_attempts,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "qualification_dimension_ledger_empty"
             )
         logger.warning(
             "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
