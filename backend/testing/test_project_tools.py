@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember
+from app.models import Project, ProjectMember, ProjectTool
 
 TEST_USER_ID = "test-user-123"
 
@@ -379,6 +379,72 @@ async def test_content_roundtrip_and_stale_conflict(client: AsyncClient, db_sess
     got3 = await client.get(f"{_BASE}/projects/{project.id}/tools/{tool_id}/content")
     assert got3.json()["content"] == {"strokes": [1, 2, 3]}
     assert got3.json()["content_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_tool_content_requires_membership(client: AsyncClient, db_session):
+    """Non-member gets 404 on tool content GET/PUT; a member can read and write."""
+    import uuid as _uuid
+
+    # ── Non-member: project owned by another user with a tool ──
+    other_uid = "other-" + str(_uuid.uuid4())[:8]
+    other = Project(name="Other-Content", user_id=other_uid)
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    other_tool = ProjectTool(
+        project_id=other.id,
+        kind="whiteboard",
+        slug="other-tool",
+        title="Other Tool",
+        placement="project_section",
+        created_by=other_uid,
+    )
+    db_session.add(other_tool)
+    await db_session.commit()
+    await db_session.refresh(other_tool)
+
+    # GET content as non-member → 404 (project not found).
+    resp = await client.get(
+        f"{_BASE}/projects/{other.id}/tools/{other_tool.id}/content"
+    )
+    assert resp.status_code == 404
+
+    # PUT content as non-member → 404.
+    resp = await client.put(
+        f"{_BASE}/projects/{other.id}/tools/{other_tool.id}/content",
+        json={"content": {"x": 1}, "base_revision": 0},
+    )
+    assert resp.status_code == 404
+
+    # ── Member (not owner) can read content ──
+    member_proj = await _make_project_member(db_session, role="member")
+    member_tool = ProjectTool(
+        project_id=member_proj.id,
+        kind="whiteboard",
+        slug="member-tool",
+        title="Member Tool",
+        placement="project_section",
+        created_by=TEST_USER_ID,
+    )
+    db_session.add(member_tool)
+    await db_session.commit()
+    await db_session.refresh(member_tool)
+
+    resp = await client.get(
+        f"{_BASE}/projects/{member_proj.id}/tools/{member_tool.id}/content"
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"content": {}, "content_revision": 0}
+
+    # Member can save content.
+    resp = await client.put(
+        f"{_BASE}/projects/{member_proj.id}/tools/{member_tool.id}/content",
+        json={"content": {"strokes": [1]}, "base_revision": 0},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["content_revision"] == 1
 
 
 # ---------------------------------------------------------------------------

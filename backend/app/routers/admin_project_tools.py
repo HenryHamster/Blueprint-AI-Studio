@@ -217,6 +217,19 @@ async def _get_project_tool(
     return tool
 
 
+async def _get_tool_for_member(
+    session: AsyncSession, project_id: uuid.UUID, tool_id: uuid.UUID, user_id: str
+) -> ProjectTool:
+    """Authorize a user as project member then fetch the tool, or raise.
+
+    Combines the member-level auth check with the scoped tool lookup so a
+    future content-path endpoint cannot accidentally skip membership
+    enforcement.
+    """
+    await _get_user_project_with_role(project_id, user_id, session, "member")
+    return await _get_project_tool(session, project_id, tool_id)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -372,10 +385,9 @@ async def get_project_tool_content(
     current_user: dict = Depends(get_current_user),
 ):
     """Fetch a tool's mutable content document plus its revision (member+)."""
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+    tool = await _get_tool_for_member(
+        session, project_id, tool_id, current_user["user_id"]
     )
-    tool = await _get_project_tool(session, project_id, tool_id)
     return {"content": tool.content or {}, "content_revision": tool.content_revision}
 
 
