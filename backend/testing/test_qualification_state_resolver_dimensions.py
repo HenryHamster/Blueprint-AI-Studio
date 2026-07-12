@@ -551,9 +551,11 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
 # ---------------------------------------------------------------------------
 
 
-def test_proof_gate_dimension_enforce_mode_passes():
-    """The proof_gate dimension is 'passed' when capability_proof_gate_mode is
-    'enforce', and stays purely informational (never a blocker)."""
+def _proof_gate_qual(**overrides):
+    """A clean, fully-passing qualification blob with the capability-proof mode
+    supplied via the REAL blob shape the release qualifier writes:
+    ``capability_proof_detail={"mode": ...}``.  Callers override
+    capability_proof_detail / blocker to exercise the proof_gate dimension."""
     qual = {
         "status": "promoted",
         "blocker": None,
@@ -564,8 +566,15 @@ def test_proof_gate_dimension_enforce_mode_passes():
         "merge_grade_status": "pass",
         "criterion_coverage": {"total": 3, "covered": 3},
         "smoketest_enabled": True,
-        "capability_proof_gate_mode": "enforce",
     }
+    qual.update(overrides)
+    return qual
+
+
+def test_proof_gate_dimension_enforce_mode_passes():
+    """The proof_gate dimension is 'passed' when the gate mode (read from the
+    real capability_proof_detail.mode blob key) is 'enforce' and nothing blocks."""
+    qual = _proof_gate_qual(capability_proof_detail={"mode": "enforce"})
     result = resolve_dimension_states(qual)
     d = _by_key(result)
     assert d["capability_proof"]["status"] == "passed"
@@ -573,61 +582,46 @@ def test_proof_gate_dimension_enforce_mode_passes():
     assert d["capability_proof"]["reason"] is None
 
 
+def test_proof_gate_dimension_enforce_mode_blocked_surfaces_failed():
+    """In enforce mode, a real capability-proof gate block surfaces as a 'failed'
+    dimension with the gate blocker reason — proving the blob-fallback resolver
+    reads the mode from capability_proof_detail (not the phantom top-level key
+    the release qualifier never writes) AND maps the gate blocker to the
+    capability_proof dimension."""
+    qual = _proof_gate_qual(
+        status="not_promoted",
+        blocker="capability_proof_gate_blocked",
+        capability_proof_detail={"mode": "enforce", "unproven_count": 2},
+    )
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["capability_proof"]["status"] == "failed"
+    assert d["capability_proof"]["reason"] == "capability_proof_gate_blocked"
+
+
 def test_proof_gate_unavailable_when_off():
     """The proof_gate dimension is 'unavailable' when mode is 'off'."""
-    qual = {
-        "status": "promoted",
-        "blocker": None,
-        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
-        "ci_resolution": {"state": "green"},
-        "migration_safety": "ok",
-        "migration_apply_safety": "ok",
-        "merge_grade_status": "pass",
-        "criterion_coverage": {"total": 3, "covered": 3},
-        "smoketest_enabled": True,
-        "capability_proof_gate_mode": "off",
-    }
+    qual = _proof_gate_qual(capability_proof_detail={"mode": "off"})
     result = resolve_dimension_states(qual)
     d = _by_key(result)
     assert d["capability_proof"]["status"] == "unavailable"
     assert d["capability_proof"]["reason"] == "off"
 
 
-def test_proof_gate_unavailable_when_observe():
-    """The proof_gate dimension is 'unavailable' when mode is 'observe'."""
-    qual = {
-        "status": "promoted",
-        "blocker": None,
-        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
-        "ci_resolution": {"state": "green"},
-        "migration_safety": "ok",
-        "migration_apply_safety": "ok",
-        "merge_grade_status": "pass",
-        "criterion_coverage": {"total": 3, "covered": 3},
-        "smoketest_enabled": True,
-        "capability_proof_gate_mode": "observe",
-    }
+def test_proof_gate_passes_when_observe():
+    """The proof_gate dimension is 'passed' (gate watching, not blocking) when
+    mode is 'observe' — mirroring the ledger path's observe→passed semantics."""
+    qual = _proof_gate_qual(capability_proof_detail={"mode": "observe"})
     result = resolve_dimension_states(qual)
     d = _by_key(result)
-    assert d["capability_proof"]["status"] == "unavailable"
-    assert d["capability_proof"]["reason"] == "observe"
+    assert d["capability_proof"]["status"] == "passed"
+    assert d["capability_proof"]["reason"] is None
 
 
-def test_proof_gate_unavailable_when_mode_missing():
-    """The proof_gate dimension is 'unavailable' when capability_proof_gate_mode
-    is not present in the qualification dict (defaults to 'off')."""
-    qual = {
-        "status": "promoted",
-        "blocker": None,
-        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
-        "ci_resolution": {"state": "green"},
-        "migration_safety": "ok",
-        "migration_apply_safety": "ok",
-        "merge_grade_status": "pass",
-        "criterion_coverage": {"total": 3, "covered": 3},
-        "smoketest_enabled": True,
-        # capability_proof_gate_mode intentionally absent
-    }
+def test_proof_gate_unavailable_when_detail_missing():
+    """The proof_gate dimension is 'unavailable' when capability_proof_detail is
+    not present in the qualification dict (mode defaults to 'off')."""
+    qual = _proof_gate_qual()  # no capability_proof_detail
     result = resolve_dimension_states(qual)
     d = _by_key(result)
     assert d["capability_proof"]["status"] == "unavailable"

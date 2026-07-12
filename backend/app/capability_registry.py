@@ -514,6 +514,57 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def capability_proof_gate_release_status(
+    problem_model: object,
+    mode: str | None,
+) -> tuple[bool, dict]:
+    """Derive the release-qualifier capability-proof dimension: ``(blocked, detail)``.
+
+    This is the release-qualification enforcement point of the capability proof
+    gate — the third seam alongside the spawn-time resolver and the
+    blocked-resume sweep. Extracted here as a single IO-free primitive so the
+    qualifier's promotion decision derives from the SAME tiered proof map
+    (:func:`working_capability_proof_status`) and exemption set
+    (:func:`exempt_capability_names`) the other two seams use, rather than
+    re-implementing the "unproven working capability blocks promotion" rule in
+    the 5k-line qualifier where it can silently drift.
+
+    Behaviour (identical to the prior inline derivation it replaces):
+
+    * Returns ``blocked=False`` in ``"off"`` / ``"observe"`` mode (and for any
+      unrecognized mode) — the dimension is recorded but never blocks promotion.
+    * In ``"enforce"`` mode with a truthy ``problem_model``, ``blocked`` is
+      ``True`` iff at least one ``working`` capability has proof status other
+      than ``"proven"`` (``proof_exempt`` capabilities classify as ``"proven"``
+      via :func:`working_capability_proof_status`, so they never block).
+    * In ``"enforce"`` mode with no ``problem_model``, returns
+      ``blocked=False`` with ``detail["error"] == "no problem_model"``.
+
+    ``detail`` always carries ``mode`` and, when the enforce branch runs against
+    a problem model, the ``total_working`` / ``unproven_count`` / ``unproven`` /
+    ``exempt_count`` / ``exempt_names`` audit fields.
+    """
+    mode_norm = str(mode or "off").strip().lower()
+    detail: dict = {"mode": mode_norm}
+    if mode_norm != "enforce":
+        return False, detail
+    if not problem_model:
+        detail["error"] = "no problem_model"
+        return False, detail
+    proof_map = working_capability_proof_status(problem_model)
+    exempt_set = exempt_capability_names(problem_model)
+    # Exempt working capabilities classify as "proven" in the proof map and are
+    # therefore already excluded from the unproven list — the exempt set is
+    # surfaced only for audit visibility.
+    unproven = [name for name, status in proof_map.items() if status != "proven"]
+    detail["total_working"] = len(proof_map)
+    detail["unproven_count"] = len(unproven)
+    detail["unproven"] = unproven
+    detail["exempt_count"] = len(exempt_set)
+    detail["exempt_names"] = sorted(exempt_set)
+    return bool(unproven), detail
+
+
 def off_registry_capability_refs(
     refs: Iterable[object], registry_names: Iterable[str]
 ) -> list[str]:

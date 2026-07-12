@@ -1805,7 +1805,51 @@ def test_capability_proof_gate_full_cycle():
         "the badge must not over-report structural-only evidence as machine-verified"
     )
 
-    # ── Phase 4: DB-backed end-to-end sweep (enforce holds, then resumes) ──────
+    # ── Phase 4: release-qualification enforcement point ──────────────────────
+    # The THIRD enforcement seam (alongside spawn-time and blocked-resume): the
+    # release qualifier derives ``capability_proof_blocked`` from the SAME tiered
+    # proof map via the shared ``capability_proof_gate_release_status`` primitive
+    # the qualifier now delegates to. Assert the full transition here so a
+    # regression in that shared derivation surfaces in the connected cycle.
+    from app.capability_registry import capability_proof_gate_release_status
+
+    # Enforce + unproven working capability → promotion blocked, audited.
+    q_blocked, q_detail = capability_proof_gate_release_status(
+        unproven_model, "enforce"
+    )
+    assert q_blocked is True, (
+        "the release qualifier must block promotion under enforce mode when a "
+        "working capability is unproven"
+    )
+    assert q_detail["mode"] == "enforce"
+    assert q_detail["unproven"] == ["container-runtime"]
+    assert q_detail["unproven_count"] == 1
+    assert q_detail["total_working"] == 1
+
+    # Enforce + proven working capability → promotion NOT blocked.
+    q_blocked_proven, q_detail_proven = capability_proof_gate_release_status(
+        proven_model, "enforce"
+    )
+    assert q_blocked_proven is False, (
+        "a recorded proof must clear the release-qualification gate too"
+    )
+    assert q_detail_proven["unproven"] == []
+    assert q_detail_proven["unproven_count"] == 0
+
+    # Off/observe modes record the dimension but never block promotion.
+    for _mode in ("off", "observe"):
+        _mb, _md = capability_proof_gate_release_status(unproven_model, _mode)
+        assert _mb is False, f"{_mode} mode must never block release promotion"
+        assert _md == {"mode": _mode}
+
+    # Enforce with no problem_model degrades safely (records error, no block).
+    q_blocked_none, q_detail_none = capability_proof_gate_release_status(
+        None, "enforce"
+    )
+    assert q_blocked_none is False
+    assert q_detail_none["error"] == "no problem_model"
+
+    # ── Phase 5: DB-backed end-to-end sweep (enforce holds, then resumes) ──────
     # Drive the REAL blocked-resume sweep (sweep_unblock_blocked_tasks) against a
     # live in-memory DB across the full enforcement cycle:
     #

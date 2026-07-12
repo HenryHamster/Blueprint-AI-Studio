@@ -327,6 +327,7 @@ def resolve_dimension_states(
         "smoketest_startup_failed": "smoketest",
         "audit_missing": "audit",
         "test_file_deleted": "test_erosion",
+        "capability_proof_gate_blocked": "capability_proof",
     }
 
     def _all(status: str, reason: str | None = None) -> list[dict[str, Any]]:
@@ -357,7 +358,12 @@ def resolve_dimension_states(
     merge_grade_coverage = q.get("merge_grade_coverage")
     criterion_coverage: dict[str, Any] = q.get("criterion_coverage") or {}
     goal_alignment = q.get("goal_alignment")
-    proof_gate_mode = str(q.get("capability_proof_gate_mode", "off") or "off")
+    # Derive the capability-proof gate mode from the real blob shape the release
+    # qualifier writes: capability_proof_detail={"mode": off|observe|enforce}.
+    # (There is no top-level capability_proof_gate_mode key — reading one always
+    # defaulted to "off", leaving this dimension dead even in enforce mode.)
+    capability_proof_detail: dict[str, Any] = q.get("capability_proof_detail") or {}
+    proof_gate_mode = str(capability_proof_detail.get("mode", "off") or "off")
 
     # The blocker dimension (if any) is always "failed".
     blocker_dim: str | None = _BLOCKER_TO_DIM.get(blocker) if blocker else None
@@ -489,7 +495,11 @@ def resolve_dimension_states(
             else:
                 dim_status = "unavailable"
         elif key == "capability_proof":
-            if proof_gate_mode == "enforce":
+            # Mirror the ledger's capability-proof semantics (release_qualifier
+            # ~3593): OFF → unavailable (gate inactive), OBSERVE/ENFORCE → passed.
+            # A real enforce-mode block surfaces as "failed" via blocker_dim above
+            # (capability_proof_gate_blocked → capability_proof).
+            if proof_gate_mode in ("observe", "enforce"):
                 dim_status = "passed"
             else:
                 dim_status = "unavailable"
