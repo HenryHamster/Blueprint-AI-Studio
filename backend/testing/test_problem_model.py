@@ -5777,6 +5777,36 @@ def test_evidence_met_summary_capability_and_gap_tallies():
     assert "acceptance" not in summary
 
 
+def test_evidence_met_summary_tallies_attestation_only_capability_as_attested():
+    """A capability whose sole proof is operator_attestation classifies as
+    'attested' and is tallied on that axis — no KeyError from the new tier."""
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="waived",
+                status="working",
+                evidence_refs=[
+                    {"kind": "operator_attestation", "ref": "crit", "proven": True}
+                ],
+            ),
+        ],
+        gaps=[
+            Gap(
+                id="g-att",
+                name="g-att",
+                evidence_refs=[
+                    {"kind": "operator_attestation", "ref": "crit", "proven": True}
+                ],
+            ),
+        ],
+    )
+    summary = evidence_met_summary(model)
+    assert summary["capabilities"]["attested"] == 1
+    assert summary["capabilities"]["proven"] == 0
+    assert summary["gaps"]["attested"] == 1
+    assert summary["gaps"]["proven"] == 0
+
+
 def test_evidence_met_summary_with_coverage_summary():
     model = ProblemModel()
     coverage = {
@@ -5804,10 +5834,12 @@ def test_evidence_met_summary_none_coverage_omits_acceptance_key():
 def test_evidence_met_summary_empty_model():
     summary = evidence_met_summary(ProblemModel())
     assert summary["capabilities"] == {
-        "proven": 0, "path_proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+        "proven": 0, "path_proven": 0, "attested": 0, "backfilled": 0,
+        "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0,
     }
     assert summary["gaps"] == {
-        "proven": 0, "path_proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+        "proven": 0, "path_proven": 0, "attested": 0, "backfilled": 0,
+        "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0,
     }
 
 

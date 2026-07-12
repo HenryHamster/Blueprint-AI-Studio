@@ -168,16 +168,19 @@ export interface StrategicContextRenderableDescriptor {
     alt?: string | null;
     width?: number | null;
     height?: number | null;
+    storage_uri?: string | null;
+  } | null;
+  video?: {
+    url?: string | null;
+    alt?: string | null;
+    storage_uri?: string | null;
+    mime_type?: string | null;
   } | null;
   images?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
   }> | null;
-  video?: {
-    url?: string | null;
-    alt?: string | null;
-  } | null;
   videos?: Array<{
     url?: string | null;
     alt?: string | null;

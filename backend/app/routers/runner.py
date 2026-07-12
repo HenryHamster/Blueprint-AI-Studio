@@ -46,6 +46,7 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.workbench_state import (
     refresh_strategic_local_continuation_on_runner_heartbeat,
 )
@@ -58,7 +59,6 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
-_RUNNER_LIVENESS_SECONDS = 300
 
 logger = logging.getLogger("blueprint")
 

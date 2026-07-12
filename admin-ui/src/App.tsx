@@ -1176,6 +1176,7 @@ export default function App() {
         sessionBusy={strategicSessionBusy}
         sessionRunners={residentStrategicSessionRunners}
         sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+        projectId={selectedProjectId}
         onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
         onStopSession={handleStopStrategicSession}

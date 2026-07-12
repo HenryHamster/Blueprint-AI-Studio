@@ -50,6 +50,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
     KnowledgeDocument,
@@ -15117,3 +15118,377 @@ def test_extract_viewable_candidates_from_bundle_deterministic_order():
     # Order matches archive insertion — NOT sorted (sorting is upstream's job)
     assert names == ["zzz.png", "mmm.png", "aaa.png"]
 
+
+# ---------------------------------------------------------------------------
+# Tests for viewable-file extraction from compute job artifact bundles
+# ---------------------------------------------------------------------------
+
+
+def _make_viewable_tar_bundle(files: dict[str, bytes]) -> bytes:
+    """Thin wrapper around the shared ``_make_tar_gz_bundle`` for readable tests."""
+    return _make_tar_gz_bundle(files)
+
+
+async def _create_compute_job_for_test(db_session) -> uuid.UUID:
+    """Create a minimal Project + ComputeJob and return the job UUID.
+
+    Required because ComputeJobFile has a FK to computejob.id.
+    """
+    project = Project(name=f"vf-test-{uuid.uuid4().hex[:8]}", user_id="test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    job = ComputeJob(
+        project_id=project.id,
+        backend="local-subprocess",
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    return job.id
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_from_bundle_roundtrips(
+    db_session, monkeypatch
+):
+    """A bundle with a mix of viewable and non-viewable files — only images and
+    videos produce ComputeJobFile rows with correct media_type and content_type."""
+    job_id = await _create_compute_job_for_test(db_session)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    jpg_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+    mp4_data = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 100
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./plot.png": png_data,
+            "./photo.jpg": jpg_data,
+            "./screen.jpeg": jpg_data,
+            "./anim.webp": b"RIFF" + b"\x00" * 100,
+            "./icon.gif": b"GIF89a" + b"\x00" * 50,
+            "./diagram.svg": b"<svg></svg>",
+            "./output.mp4": mp4_data,
+            "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
+            # Non-viewable — should be skipped.
+            "./terminal.json": b'{"status": "SUCCEEDED"}',
+            "./command.log": b"all good\n",
+            "./script.py": b"print('hello')",
+            "./results.txt": b"accuracy: 0.95",
+        }
+    )
+
+    # Mock the GCS upload to return a predictable URI and never fail.
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append(
+            {
+                "job_id": job_id_arg,
+                "relpath": safe_relpath,
+                "size": len(data_bytes),
+                "content_type": content_type,
+            }
+        )
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    # 8 viewable files extracted.
+    assert count == 8
+    assert len(uploaded) == 8
+
+    # Verify DB rows.
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 8
+
+    # Verify specific files by safe_relpath.
+    by_name = {r.safe_relpath: r for r in rows}
+    assert "plot.png" in by_name
+    assert by_name["plot.png"].media_type == "image"
+    assert by_name["plot.png"].content_type == "image/png"
+    assert by_name["output.mp4"].media_type == "video"
+    assert by_name["output.mp4"].content_type == "video/mp4"
+    assert "diagram.svg" in by_name
+    assert by_name["diagram.svg"].content_type == "image/svg+xml"
+
+    # Non-viewable files must NOT appear.
+    assert "terminal.json" not in by_name
+    assert "command.log" not in by_name
+    assert "script.py" not in by_name
+    assert "results.txt" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_non_viewable_skipped(db_session, monkeypatch):
+    """Files with extensions not in the viewable set are never extracted."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append({"relpath": safe_relpath})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./data.json": b'{"x": 1}',
+            "./readme.md": b"# Hello",
+            "./Makefile": b"all:\n\techo hi",
+            "./binary.bin": b"\x00\x01\x02\x03",
+            "./model.pt": b"pretrained",
+            "./index.html": b"<html></html>",  # .html is not in the viewable set
+        }
+    )
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    assert count == 0
+    assert len(uploaded) == 0
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_size_cap(db_session, monkeypatch):
+    """Files larger than 25 MB are skipped; smaller files in the same bundle
+    are still extracted."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append({"relpath": safe_relpath, "size": len(data_bytes)})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    # 26 MB oversized JPEG (skip), 1 KB normal PNG (extract).
+    big_file = b"\xff\xd8\xff\xe0" + b"X" * (26 * 1024 * 1024)
+    small_file = b"\x89PNG\r\n\x1a\n" + b"Y" * 1024
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./huge_photo.jpg": big_file,
+            "./tiny_plot.png": small_file,
+        }
+    )
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    assert count == 1
+    assert len(uploaded) == 1
+    assert uploaded[0]["relpath"] == "tiny_plot.png"
+
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].safe_relpath == "tiny_plot.png"
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_50_file_cap(db_session, monkeypatch):
+    """At most 50 viewable files are extracted per bundle; excess are dropped."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append({"relpath": safe_relpath})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    # Create 60 PNG files — only the first 50 should be extracted.
+    members = {}
+    for i in range(60):
+        members[f"./plot_{i:03d}.png"] = b"\x89PNG\r\n\x1a\n" + str(i).encode() * 10
+    bundle = _make_viewable_tar_bundle(members)
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    assert count == 50
+    assert len(uploaded) == 50
+
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 50
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_path_sanitization(db_session, monkeypatch):
+    """Tar members with ``..`` segments or absolute paths are rejected."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append({"relpath": safe_relpath})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00"
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./safe_plot.png": png,
+            "../escape.png": png,
+            "./subdir/../../escape2.png": png,
+            "/etc/passwd.png": png,  # absolute path rejected
+            "./deep/nested/ok.png": png,
+        }
+    )
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    # Only safe_plot.png and deep/nested/ok.png are extracted.
+    assert count == 2
+    extracted_names = {u["relpath"] for u in uploaded}
+    assert extracted_names == {"safe_plot.png", "deep/nested/ok.png"}
+
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert {r.safe_relpath for r in rows} == {"safe_plot.png", "deep/nested/ok.png"}
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_upload_failure_non_blocking(
+    db_session, monkeypatch
+):
+    """A GCS upload failure on one file does not prevent extraction of
+    the remaining viewable files in the bundle."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+    call_count = 0
+
+    async def _flakey_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        nonlocal call_count
+        call_count += 1
+        if "fail_me" in safe_relpath:
+            raise RuntimeError("simulated GCS upload error")
+        uploaded.append({"relpath": safe_relpath})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _flakey_upload)
+
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00"
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./good_a.png": png,
+            "./fail_me.png": png,
+            "./good_b.png": png,
+            "./also_bad_fail_me.jpg": b"\xff\xd8\xff\xe0\x00",
+            "./good_c.png": png,
+        }
+    )
+
+    count = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    # 3 of 5 succeeded.
+    assert count == 3
+    assert len(uploaded) == 3
+    extracted_names = {u["relpath"] for u in uploaded}
+    assert extracted_names == {"good_a.png", "good_b.png", "good_c.png"}
+
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_idempotent(db_session, monkeypatch):
+    """Calling extraction twice on the same job creates no duplicate rows
+    because of the UniqueConstraint on (compute_job_id, object_name)."""
+    job_id = await _create_compute_job_for_test(db_session)
+    uploaded: list[dict] = []
+
+    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
+        uploaded.append({"relpath": safe_relpath})
+        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+
+    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
+
+    png = b"\x89PNG\r\n\x1a\n" + b"Z" * 42
+    mp4 = b"\x00\x00\x00\x18ftypmp42" + b"W" * 42
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./chart.png": png,
+            "./anim.mp4": mp4,
+        }
+    )
+
+    # First extraction.
+    count1 = await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+    assert count1 == 2
+    assert len(uploaded) == 2
+
+    # Second extraction with the same bundle — should NOT create new rows.
+    # The function tries to insert but the savepoint catches the unique-constraint
+    # violation; total rows must still be 2.
+    await compute_jobs.extract_viewable_files_from_bundle(
+        db_session, job_id, bundle
+    )
+    await db_session.commit()
+
+    rows = (
+        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2, f"Expected 2 rows after idempotent re-extraction, got {len(rows)}"
+    # Uploads should NOT have been called a second time in the idempotent pass
+    # (we don't enforce this — the function may still upload then fail at
+    # insert — but row count is the invariant).
+
+
+@pytest.mark.asyncio
+async def test_extract_viewable_files_empty_or_bad_bundle(db_session):
+    """Empty input and unparseable bundles return 0 without raising."""
+    job_id = uuid.uuid4()
+
+    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"") == 0
+    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"not-a-tar") == 0
+    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"\x00" * 100) == 0

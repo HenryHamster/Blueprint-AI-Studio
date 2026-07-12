@@ -202,10 +202,12 @@ def enrich_problem_model_capability_proofs(
             else []
         )
         evidence_refs = entry2.get("evidence_refs")
-        if isinstance(evidence_refs, list):
-            # Empty list explicitly signals "cleared" — treat as unproven rather
-            # than falling through to proof_records, which would change semantics.
-            entry2["proof_status"] = classify_evidence_tiered(evidence_refs) if evidence_refs else "unproven"
+        # Derive proof_status from evidence_refs (tier-1) when available,
+        # falling back to proof_record kind checking (tier-2).
+        # Empty list means no refs captured yet — fall through to proof_records
+        # rather than treating as affirmatively cleared.
+        if isinstance(evidence_refs, list) and evidence_refs:
+            entry2["proof_status"] = classify_evidence_tiered(evidence_refs)
         elif entries:
             # Map proof records to EvidenceRef shape for tiered classification.
             # All stored proof records represent proven evidence (only recorded

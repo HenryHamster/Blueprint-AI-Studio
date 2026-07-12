@@ -1162,7 +1162,10 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         for token in ["image", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
     ):
         return "image"
-    if any(token in fingerprint for token in ["video", ".mp4", ".webm"]):
+    if any(
+        token in fingerprint
+        for token in ["video", ".mp4", ".webm", ".mov"]
+    ):
         return "video"
     if any(token in fingerprint for token in ["chart", "plot", "graph"]):
         return "chart"

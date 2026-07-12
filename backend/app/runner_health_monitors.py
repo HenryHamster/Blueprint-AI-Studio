@@ -43,7 +43,6 @@ logger = logging.getLogger("blueprint")
 _RUNNER_LIVENESS_SECONDS = 300
 
 # Consecutive-failure count at which a live runner is considered degraded.
-# Mirrors admin_runners._FAILURE_STREAK_DEGRADED_THRESHOLD (both must stay in sync).
 _RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
 
 # Default free-disk floor (bytes) below which a live runner is considered low-disk.

@@ -642,8 +642,9 @@ def evidence_met_summary(
     counts on the shared :data:`~app.evidence_primitive.EvidenceStatus` axis::
 
         {
-            "capabilities": {"proven": n, "path_proven": n, "partial": n,
-                             "unproven": n, "contradicted": n, "unverified": n},
+            "capabilities": {"proven": n, "path_proven": n, "attested": n,
+                             "backfilled": n, "partial": n, "unproven": n,
+                             "contradicted": n, "unverified": n},
             "gaps": {…same axes…},
             "acceptance": {…same axes…, "total": t},
         }
@@ -655,7 +656,8 @@ def evidence_met_summary(
     from app.acceptance_criteria import criterion_coverage_to_evidence_status
 
     _AXES: list[EvidenceStatus] = [
-        "proven", "path_proven", "partial", "unproven", "contradicted", "unverified"
+        "proven", "path_proven", "attested", "backfilled", "partial",
+        "unproven", "contradicted", "unverified",
     ]
 
     def _zero() -> dict:

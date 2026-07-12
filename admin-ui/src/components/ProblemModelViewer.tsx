@@ -57,6 +57,7 @@ const sizeColors: Record<string, string> = {
 const proofStatusLabels: Record<string, string> = {
   proven: 'Proven',
   path_proven: 'Path-backed',
+  attested: 'Attested',
   unproven: 'Claimed only',
   exempt: 'Exempt',
 };
@@ -64,6 +65,7 @@ const proofStatusLabels: Record<string, string> = {
 const proofStatusColors: Record<string, string> = {
   proven: 'text-emerald-400',
   path_proven: 'text-amber-400',
+  attested: 'text-amber-400',
   unproven: 'text-neutral-500',
 };
 

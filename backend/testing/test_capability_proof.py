@@ -546,6 +546,64 @@ class TestCapabilityProofViews:
         # no proof records → unproven
         assert caps["cap-empty"]["proof_status"] == "unproven"
 
+    def test_enrich_empty_evidence_refs_falls_back_to_proof_records(self):
+        """enrich with evidence_refs=[] must fall through to proof_records, not 'unproven'.
+
+        An empty list means no refs have been captured yet, not that evidence was
+        checked and found absent.  The proof_records fallback (tier-2) must still
+        apply, matching annotate_capability_proof_status's behaviour which skips
+        classify_evidence when ev_refs is an empty list.
+        """
+        proof_records = {
+            "cap-a": [
+                {
+                    "task_id": "task-1",
+                    "proved_at": "2026-07-01T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_cap.py::test_cap",
+                    "commit_sha": "abc123",
+                }
+            ]
+        }
+        problem_model = {
+            "capabilities": [
+                # evidence_refs=[] — no refs captured yet, but proof_records exist
+                {"name": "cap-a", "status": "working", "evidence_refs": []},
+                # no evidence_refs key at all — same fallback expected
+                {"name": "cap-a-no-key", "status": "working"},
+            ]
+        }
+        # Both entries use the same proof_records (cap-a key matches both names here
+        # for simplicity — we re-use cap-a records for cap-a-no-key by giving it
+        # the same key)
+        proof_records["cap-a-no-key"] = proof_records["cap-a"]
+
+        enriched = enrich_problem_model_capability_proofs(problem_model, proof_records)
+
+        # empty evidence_refs must not short-circuit to 'unproven' — must check
+        # proof_records and return 'proven' (behavioral record present)
+        assert enriched["capabilities"][0]["proof_status"] == "proven", (
+            "evidence_refs=[] must fall through to proof_records, not return 'unproven'"
+        )
+        # no-key case must also reach proof_records
+        assert enriched["capabilities"][1]["proof_status"] == "proven", (
+            "absent evidence_refs must fall through to proof_records"
+        )
+
+        # Cross-check: annotate_capability_proof_status agrees when refs_map omits
+        # the empty-list capability (registry_capability_evidence_refs_map already
+        # filters empty lists, so refs_map will have no entry for cap-a)
+        from app.capability_registry import annotate_capability_proof_status
+        vocab = [
+            {"name": "cap-a", "status": "working"},
+        ]
+        # refs_map has no entry for cap-a (empty list filtered upstream)
+        annotated = annotate_capability_proof_status(vocab, proof_records, {})
+        assert annotated[0]["proof_status"] == "proven", (
+            "annotate_capability_proof_status must also return 'proven' via proof_records "
+            "when no refs_map entry exists — confirming both paths agree"
+        )
+
 
 class TestCapabilityBadgeReflectsEvidence:
     """annotate_capability_proof_status: evidence_refs_map (tier-1) overrides

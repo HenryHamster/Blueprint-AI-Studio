@@ -506,7 +506,7 @@ def test_unverified_merge_backfill_reports_distinct_tier():
         "Bare backfill evidence without backfilled=True flag should be 'partial'"
     )
 
-    # Coverage summary key is reported
+    # backfilled coverage maps onto the shared EvidenceStatus axis as "partial"
     assert ac.criterion_coverage_to_evidence_status("backfilled") == "partial"
 
 
@@ -3148,8 +3148,9 @@ def test_timestampless_attestation_expires_by_recorded_at():
 
     When detail["attested_at"] is absent or unparseable, _evidence_is_attested
     falls back to e.recorded_at as the expiry anchor and applies the same
-    ATTESTATION_WINDOW_DAYS window.  Only rows where recorded_at is also None
-    remain valid unconditionally.
+    ATTESTATION_WINDOW_DAYS window.  A row where recorded_at is also None has
+    NO reference timestamp and cannot be time-bounded — it does NOT count as
+    a valid attestation (a missing timestamp cannot grant perpetual trust).
 
     Named acceptance test for the attestation-expiry-via-recorded_at fix.
     """

@@ -399,7 +399,7 @@ function formatRecordJson(value: unknown): string {
 }
 
 /**
- * The 4-field response of GET
+ * The response of GET
  * `/api/agent/projects/{id}/strategic-session/checkpoint-state`. Read-only
  * mirror of the backend contract — do NOT extend without changing the endpoint.
  */
@@ -408,14 +408,21 @@ export interface CheckpointStateResponse {
   strategic_memory_notes?: unknown;
   running_update?: unknown;
   vision?: unknown;
+  /** Current open operator messages (same shape as the bootstrap payload's
+   *  open_messages). Present on backends that have shipped this field; absent
+   *  on older responses — caller degrades gracefully. */
+  open_messages?: unknown;
 }
 
-/** The four self-model grounding fields the compaction checkpoint carries. */
+/** The self-model grounding fields the compaction checkpoint carries. */
 export interface CheckpointGrounding {
   problemModelJson: string;
   visionJson: string;
   strategicMemoryNotesText: string;
   runningUpdate: string;
+  /** Formatted open operator messages text (from open_messages). Absent when
+   *  not yet computed (older path) or when there are no open messages. */
+  openMessagesText?: string;
 }
 
 /**
@@ -423,6 +430,11 @@ export interface CheckpointGrounding {
  * formatted identically to the session-start bootstrap (problem_model / vision
  * → pretty JSON, notes → shared formatter, running_update → string). Tolerant
  * of missing / mistyped keys so a partial response never throws.
+ *
+ * Note: `openMessagesText` is left empty here because the formatting function
+ * (`buildOpenMessagesText`) lives in strategic-sections.ts which imports the
+ * heavy index surface. Callers in strategic-resident.ts fill this field after
+ * calling formatCheckpointState by formatting `resp.open_messages` directly.
  */
 export function formatCheckpointState(resp: CheckpointStateResponse): CheckpointGrounding {
   return {
@@ -430,6 +442,7 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
     visionJson: formatRecordJson(resp.vision),
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
+    openMessagesText: '',
   };
 }
 
@@ -451,6 +464,7 @@ export function resolveCheckpointGrounding(
   visionJson?: string;
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
+  openMessagesText?: string;
 } {
   const src = refreshed ?? snapshot;
   return {
@@ -458,6 +472,7 @@ export function resolveCheckpointGrounding(
     visionJson: src.visionJson || undefined,
     strategicMemoryNotesText: src.strategicMemoryNotesText || undefined,
     runningUpdate: src.runningUpdate || undefined,
+    openMessagesText: src.openMessagesText || undefined,
   };
 }
 

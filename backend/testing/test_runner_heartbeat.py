@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import select
 
+import app.routers.admin_runners as admin_runners_mod
 import app.routers.runner as runner_mod
 from app.models import (
     LocalRunner,
@@ -32,6 +33,8 @@ from app.models import (
 )
 from app.routers.runner import HeartbeatRequest, _persist_heartbeat_snapshot, heartbeat
 from app.runner_health_monitors import (
+    _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    _RUNNER_LIVENESS_SECONDS,
     _check_post_update_silent_runners,
     _cleanup_stale_heartbeat_snapshots,
 )
@@ -60,6 +63,28 @@ async def _make_runner(session, *, version="v1", capabilities=None, last_seen_at
     await session.commit()
     await session.refresh(runner)
     return project, runner
+
+
+def test_liveness_constant_shared_from_canonical_source():
+    """runner.py and admin_runners.py must import _RUNNER_LIVENESS_SECONDS
+    and _RUNNER_DEGRADED_FAILURE_THRESHOLD from runner_health_monitors, not
+    define their own copies — ensures a single change propagates to all consumers.
+    """
+    assert runner_mod._RUNNER_LIVENESS_SECONDS is _RUNNER_LIVENESS_SECONDS, (
+        "runner.py defines its own _RUNNER_LIVENESS_SECONDS instead of importing "
+        "from runner_health_monitors"
+    )
+    assert admin_runners_mod._RUNNER_LIVENESS_SECONDS is _RUNNER_LIVENESS_SECONDS, (
+        "admin_runners.py defines its own _RUNNER_LIVENESS_SECONDS instead of "
+        "importing from runner_health_monitors"
+    )
+    assert admin_runners_mod._RUNNER_DEGRADED_FAILURE_THRESHOLD is _RUNNER_DEGRADED_FAILURE_THRESHOLD, (
+        "admin_runners.py defines its own degraded threshold instead of importing "
+        "from runner_health_monitors"
+    )
+    # Confirm the canonical values remain correct.
+    assert _RUNNER_LIVENESS_SECONDS == 300
+    assert _RUNNER_DEGRADED_FAILURE_THRESHOLD == 3
 
 
 @pytest.fixture(autouse=True)

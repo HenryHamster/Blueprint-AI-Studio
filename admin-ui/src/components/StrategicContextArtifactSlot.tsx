@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react';
-import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, Gauge, Network, Table2, Video } from 'lucide-react';
+import { useState, useEffect, type ReactNode } from 'react';
+import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Network, Table2 } from 'lucide-react';
 import type {
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
@@ -14,6 +14,7 @@ interface StrategicContextArtifactSlotProps {
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
   showHeader?: boolean;
   showMapDescriptor?: boolean;
+  projectId?: string | null;
 }
 
 function formatCompactNumber(value: number | string | null | undefined): string {
@@ -66,7 +67,7 @@ function descriptorIcon(kind: string): ReactNode {
   if (kind === 'metric_cards') return <Gauge className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'table') return <Table2 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'image') return <FileImage className="h-3.5 w-3.5" aria-hidden="true" />;
-  if (kind === 'video') return <Video className="h-3.5 w-3.5" aria-hidden="true" />;
+  if (kind === 'video') return <FileVideo className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'chart' || kind === 'plot') return <BarChart3 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'unsupported') return <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />;
   return <FileText className="h-3.5 w-3.5" aria-hidden="true" />;
@@ -121,11 +122,33 @@ function DetailValue({
 function DescriptorCard({
   descriptor,
   onOpenTarget,
+  projectId,
 }: {
   descriptor: StrategicContextRenderableDescriptor;
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
+  projectId?: string | null;
 }) {
-  const imageUrl = safeImageUrl(descriptor.image?.url);
+  const imageStorageUri = descriptor.image?.storage_uri ?? null;
+  const [resolvedImageUrl, setResolvedImageUrl] = useState<string | null>(null);
+  const [, setImageError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (imageStorageUri && projectId && !descriptor.image?.url) {
+      (async () => {
+        try {
+          const { resolveArtifactDownloadUrl } = await import('../api');
+          const url = await resolveArtifactDownloadUrl(projectId, imageStorageUri);
+          if (!cancelled) setResolvedImageUrl(url);
+        } catch {
+          if (!cancelled) setImageError(true);
+        }
+      })();
+    }
+    return () => { cancelled = true; };
+  }, [imageStorageUri, projectId, descriptor.image?.url]);
+
+  const imageUrl = safeImageUrl(descriptor.image?.url) ?? safeImageUrl(resolvedImageUrl);
   const chartPoints = descriptor.chart?.points ?? [];
   const maxChartValue = Math.max(1, ...chartPoints.map(point => Math.abs(point.value)));
   const columns = descriptor.columns ?? [];
@@ -344,6 +367,7 @@ export function StrategicContextArtifactSlot({
   onOpenTarget,
   showHeader = true,
   showMapDescriptor = true,
+  projectId,
 }: StrategicContextArtifactSlotProps) {
   if (!contextPackage) return null;
 
@@ -425,6 +449,7 @@ export function StrategicContextArtifactSlot({
           key={`${descriptor.kind}:${descriptor.id}`}
           descriptor={descriptor}
           onOpenTarget={onOpenTarget}
+          projectId={projectId}
         />
       ))}
     </div>

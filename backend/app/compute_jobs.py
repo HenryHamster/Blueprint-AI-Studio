@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import math
 import os
 import re
+import tarfile
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -62,6 +64,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
     Project,
@@ -72,6 +75,7 @@ from app.models import (
 from app.compute_experiment_contract import resolve_compute_spend_approval
 from app.runtime_config_state import runtime_config as _global_runtime_config
 from app.schemas import redact_command_log_text
+from app import storage
 from app.time_utils import _utcnow, exponential_backoff
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
@@ -1175,6 +1179,7 @@ async def _apply_operator_kill_result(
         terminate_ok=terminate_ok,
     )
     await _link_terminal_artifact(session, live)
+    await _extract_viewable_files_for_job(session, live)
     if live.task_id is not None:
         from app.task_lifecycle import fire_task_wakes
 
@@ -2239,6 +2244,7 @@ async def _apply_polled_compute_job_result(
             if compute_rpc_diagnostic is not None:
                 _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
             await _link_terminal_artifact(session, live)
+            await _extract_viewable_files_for_job(session, live)
             if live.task_id is not None:
                 from app.task_lifecycle import fire_task_wakes
 
@@ -2287,6 +2293,7 @@ async def _apply_task_terminal_cancellation(
         else:
             _clear_compute_rpc_diagnostic(live)
         await _link_terminal_artifact(session, live)
+        await _extract_viewable_files_for_job(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes
 
@@ -3023,3 +3030,200 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
             job.id,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Viewable-file extraction from durable artifact bundles
+# ---------------------------------------------------------------------------
+
+# Cap constants for per-bundle extraction — keep extraction bounded so a job
+# with a giant bundle full of images cannot DoS the extraction path.
+_MAX_VIEWABLE_FILES_PER_BUNDLE = 50
+_MAX_VIEWABLE_FILE_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
+
+# Arcname segments that are always rejected (path traversal / absolute refs).
+_REJECTED_PATH_SEGMENTS = frozenset({".."})
+_REJECTED_PATH_PREFIX = "/"
+
+
+def _sanitize_arcname(arcname: str) -> str | None:
+    """Sanitize a tar member arcname into a safe relative path.
+
+    Strips leading ``./``, rejects paths containing ``..`` segments or starting
+    with ``/``, and normalizes a zero-length or ``.``-only result to ``None``.
+    Returns the safe relative path string, or ``None`` if the path is rejected.
+    """
+    # Pre-check for absolute paths and traversal before stripping the
+    # conventional "./" prefix — "lstrip" operates on a character set, not a
+    # prefix string, so we must guard against "/etc/passwd.png" and
+    # "../escape.png" first.
+    if arcname.startswith("/"):
+        return None
+    # Normalize "./" prefix (the tar convention).
+    if arcname.startswith("./"):
+        cleaned = arcname[2:]
+    else:
+        cleaned = arcname
+    if not cleaned or cleaned == ".":
+        return None
+    segments = cleaned.replace("\\", "/").split("/")
+    for seg in segments:
+        if seg in _REJECTED_PATH_SEGMENTS or not seg:
+            return None
+    return cleaned
+
+
+async def extract_viewable_files_from_bundle(
+    session, job_id, bundle_bytes: bytes
+) -> int:
+    """Extract viewable files from a compute job's durable ``bundle.tar.gz``.
+
+    Iterates tar members looking for images and videos whose extension is in
+    ``storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS``, uploads each to GCS individually,
+    and creates ``ComputeJobFile`` rows. The extraction is best-effort: failures
+    on one file (upload error, oversized, unsanitary name) are logged and skipped
+    so the surviving files are still persisted.
+
+    Returns the number of files successfully extracted (0 if the bundle is empty,
+    unparseable, or contains no viewable files).
+    """
+    if not bundle_bytes:
+        return 0
+    extracted_count = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                if extracted_count >= _MAX_VIEWABLE_FILES_PER_BUNDLE:
+                    logger.info(
+                        "[COMPUTE_JOB] viewable files cap (%d) reached for job=%s",
+                        _MAX_VIEWABLE_FILES_PER_BUNDLE,
+                        job_id,
+                    )
+                    break
+                # Resolve extension from the member name (the original arcname).
+                _base, ext = os.path.splitext(member.name)
+                ext_lower = ext.lower()
+                mime_type = storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS.get(ext_lower)
+                if mime_type is None:
+                    # Not a recognised viewable extension — skip.
+                    continue
+                # Size cap: skip oversized files (a 500 MB video in a bundle
+                # shouldn't be extracted inline — the operator can download it).
+                if member.size > _MAX_VIEWABLE_FILE_SIZE_BYTES:
+                    logger.warning(
+                        "[COMPUTE_JOB] skipping oversized viewable file "
+                        "'%s' (%d bytes) for job=%s",
+                        member.name,
+                        member.size,
+                        job_id,
+                    )
+                    continue
+                safe_relpath = _sanitize_arcname(member.name)
+                if safe_relpath is None:
+                    logger.warning(
+                        "[COMPUTE_JOB] rejecting unsafe arcname '%s' in bundle for job=%s",
+                        member.name,
+                        job_id,
+                    )
+                    continue
+                # Read bounded bytes from the member.
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                data = extracted.read(_MAX_VIEWABLE_FILE_SIZE_BYTES + 1)
+                if len(data) != member.size:
+                    # Mismatch: member grew between reading the header and the data.
+                    # Skip rather than persist a partial/corrupt file.
+                    logger.warning(
+                        "[COMPUTE_JOB] size mismatch reading '%s' from bundle for job=%s",
+                        member.name,
+                        job_id,
+                    )
+                    continue
+
+                # Upload to GCS (within a per-file try so one upload failure
+                # doesn't roll back prior successful extractions).
+                try:
+                    storage_uri = await storage.upload_compute_job_media_file(
+                        job_id, safe_relpath, data, mime_type
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[COMPUTE_JOB] upload failed for viewable file '%s' in job=%s",
+                        safe_relpath,
+                        job_id,
+                        exc_info=True,
+                    )
+                    continue
+                if storage_uri is None:
+                    continue
+
+                # Persist the ComputeJobFile row inside a savepoint so a
+                # constraint violation or DB hiccup on one row doesn't lose
+                # files already extracted.
+                media_type = storage._media_kind_for_mime(mime_type)
+                try:
+                    async with session.begin_nested():
+                        row = ComputeJobFile(
+                            compute_job_id=job_id,
+                            safe_relpath=safe_relpath,
+                            media_type=media_type,
+                            storage_uri=storage_uri,
+                            content_type=mime_type,
+                            file_size_bytes=len(data),
+                        )
+                        session.add(row)
+                        await session.flush()
+                    extracted_count += 1
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[COMPUTE_JOB] DB insert failed for viewable file '%s' in job=%s",
+                        safe_relpath,
+                        job_id,
+                        exc_info=True,
+                    )
+                    # Don't try to delete the GCS object on DB failure — it's
+                    # benignly unreferenced and small.
+    except (tarfile.TarError, OSError, EOFError, ValueError, Exception) as exc:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] viewable-file extraction hit an error for job=%s: %s",
+            job_id,
+            exc if isinstance(exc, str) else type(exc).__name__,
+        )
+    return extracted_count
+
+
+async def _extract_viewable_files_for_job(session, job: ComputeJob) -> None:
+    """Download the durable bundle and extract viewable files if the backend
+    produces bundles.
+
+    Only fires for backends that write a durable ``bundle.tar.gz`` to GCS (GCP
+    and runner-subprocess). Local/local-gpu backends use on-disk artifact dirs
+    and are skipped for this pass — their artifacts are accessed directly.
+    """
+    from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
+
+    if job.backend not in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
+        return
+    try:
+        bundle_bytes = await storage.download_compute_job_artifact_bundle(job.id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] failed to download bundle for viewable extraction job=%s",
+            job.id,
+            exc_info=True,
+        )
+        return
+    if not bundle_bytes:
+        return
+    count = await extract_viewable_files_from_bundle(
+        session, job.id, bundle_bytes
+    )
+    # Stamp polling_metadata for observability — the operator can see whether
+    # extraction ran and how many files it produced without querying the new table.
+    meta = dict(job.polling_metadata or {})
+    meta["viewable_file_count"] = count
+    job.polling_metadata = meta
+    session.add(job)

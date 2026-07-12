@@ -694,6 +694,65 @@ async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
         return None
 
 
+# Mapping of file extensions (lowercase, with leading dot) to MIME types for
+# viewable compute-job artifacts extracted from the durable bundle.
+VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+}
+
+
+def _media_kind_for_mime(mime_type: str) -> str:
+    """Map a MIME type to ``"image"`` or ``"video"`` for the media_kind column."""
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("video/"):
+        return "video"
+    # Unknown types should never enter this path because we only extract
+    # files whose extension is in VIEWABLE_COMPUTE_JOB_EXTENSIONS.
+    return "unknown"
+
+
+def compute_job_media_object_name(job_id, safe_relpath: str) -> str:
+    """GCS object name (no bucket) for one extracted viewable compute-job file."""
+    return f"{compute_job_artifact_object_prefix(job_id)}/files/{safe_relpath}"
+
+
+async def upload_compute_job_media_file(
+    job_id, safe_relpath: str, data_bytes: bytes, content_type: str
+) -> str | None:
+    """Upload one extracted viewable file to GCS and return its ``gs://`` URI.
+
+    Best-effort by contract: returns ``None`` on any error instead of raising, so
+    a single file upload failure cannot block extraction of the remaining files.
+    """
+    object_name = compute_job_media_object_name(job_id, safe_relpath)
+
+    def _upload() -> str:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(data=data_bytes, content_type=content_type)
+        return f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    try:
+        return await asyncio.to_thread(_upload)
+    except Exception:
+        logger.warning(
+            "Failed to upload viewable compute job file %s for job %s",
+            safe_relpath,
+            job_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """
     Uploads a JSON payload to GCS and returns the gs:// URI.

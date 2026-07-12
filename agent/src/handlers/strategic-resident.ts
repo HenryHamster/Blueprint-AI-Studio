@@ -444,12 +444,17 @@ export async function handleStrategicResident(
     // directions, or re-propose corrections the operator already made. Prefer
     // grounding refreshed at compaction time (refreshedGrounding, fetched from
     // the checkpoint-state endpoint) over the session-start snapshot.
+    // Pass the bootstrap open messages text in the snapshot so
+    // resolveCheckpointGrounding can fall back to it when the checkpoint-state
+    // fetch fails, but let a refreshed empty feed WIN (operator resolved all
+    // messages mid-session) rather than reverting to the stale bootstrap text.
     const grounding = resolveCheckpointGrounding(
       {
         problemModelJson,
         visionJson,
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
+        openMessagesText: buildOpenMessagesText(openMessages),
       },
       refreshedGrounding,
     );
@@ -458,7 +463,7 @@ export async function handleStrategicResident(
       problemModelJson: grounding.problemModelJson,
       visionJson: grounding.visionJson,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
-      openMessagesText: buildOpenMessagesText(openMessages) || undefined,
+      openMessagesText: grounding.openMessagesText,
       priorSessionContextText: priorSessionContextText || undefined,
       directionsText: refreshedDirectionGrounding
         ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
@@ -624,6 +629,13 @@ export async function handleStrategicResident(
       ) as CheckpointStateResponse | null;
       if (state) {
         refreshedGrounding = formatCheckpointState(state);
+        // Format the refreshed open messages using the same function as the
+        // bootstrap. buildOpenMessagesText lives in strategic-sections.ts
+        // (imports ../index.js), so it cannot be called from the pure lib.
+        const refreshedOpenMsgs = Array.isArray(state.open_messages)
+          ? state.open_messages as Array<Record<string, unknown>>
+          : [];
+        refreshedGrounding.openMessagesText = buildOpenMessagesText(refreshedOpenMsgs);
         sendLog(ws, '[resident] compaction grounding refreshed from checkpoint-state endpoint\n');
       }
     } catch (e) {

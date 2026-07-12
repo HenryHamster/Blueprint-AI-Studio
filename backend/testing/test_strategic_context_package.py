@@ -234,6 +234,7 @@ def test_artifact_renderable_kind_video():
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "output.mp4"}) == "video"
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "demo.webm"}) == "video"
     assert _artifact_renderable_kind({"kind": "video", "label": "result"}) == "video"
+    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "video"
 
 
 def test_artifact_renderable_kind_fallback():
@@ -385,6 +386,7 @@ def test_artifact_descriptor_multi_video_populates_videos_list():
     assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
     assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
     assert desc["videos"][0]["filename"] == "clip0.mp4"
+
 
 
 @pytest.mark.asyncio

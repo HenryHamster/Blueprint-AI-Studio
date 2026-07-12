@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0502"
+EXPECTED_SCHEMA_REVISION = "0503"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1540,7 +1540,7 @@ async def resolve_artifact_download_url(
     # indistinguishable from "not found".
     owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
     if owning_compute_job_id is not None:
-        from app.models import ComputeJob, Artifact  # noqa: PLC0415
+        from app.models import ComputeJob, Artifact, ComputeJobFile  # noqa: PLC0415
 
         job = await session.get(ComputeJob, owning_compute_job_id)
         allowed_uris: set[str] = set()
@@ -1564,7 +1564,19 @@ async def resolve_artifact_download_url(
                     if isinstance(viewable_uri, str) and viewable_uri:
                         allowed_uris.add(viewable_uri)
         if storage_uri not in allowed_uris:
-            raise HTTPException(status_code=404, detail="Artifact not found")
+            # 2c-iii. Per-file compute job media: individually-addressable
+            # viewable files extracted from the bundle are recorded as
+            # ComputeJobFile rows — query by storage_uri and verify the
+            # owning job matches.
+            from sqlalchemy import select as _select  # noqa: PLC0415
+
+            cjf_query = _select(ComputeJobFile).where(
+                ComputeJobFile.storage_uri == storage_uri
+            )
+            cjf_result = await session.execute(cjf_query)
+            cjf = cjf_result.scalar_one_or_none()
+            if cjf is None or cjf.compute_job_id != owning_compute_job_id:
+                raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage
     # outage, not a bad reference.

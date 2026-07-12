@@ -1990,6 +1990,79 @@ describe('resolveCheckpointGrounding', () => {
   });
 });
 
+describe('formatCheckpointState open_messages field', () => {
+  it('sets openMessagesText to empty string when open_messages is missing', () => {
+    const g = formatCheckpointState({ problem_model: { k: 'v' } });
+    expect(g.openMessagesText).toBe('');
+  });
+
+  it('sets openMessagesText to empty string when open_messages is an empty array', () => {
+    const g = formatCheckpointState({ open_messages: [] });
+    expect(g.openMessagesText).toBe('');
+  });
+
+  it('sets openMessagesText to empty string even when open_messages has entries (caller fills it)', () => {
+    // openMessagesText is always '' from formatCheckpointState; the handler
+    // overrides it with buildOpenMessagesText after the call.
+    const g = formatCheckpointState({
+      open_messages: [{ id: 'msg-1', content: 'hello', type: 'QUESTION', from: 'user' }],
+    });
+    expect(g.openMessagesText).toBe('');
+  });
+});
+
+describe('resolveCheckpointGrounding open_messages', () => {
+  const snapshot: CheckpointGrounding = {
+    problemModelJson: '{}',
+    visionJson: '{}',
+    strategicMemoryNotesText: '',
+    runningUpdate: '',
+    openMessagesText: 'STALE open message',
+  };
+
+  it('refreshed openMessagesText wins over the snapshot', () => {
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      openMessagesText: 'FRESH open message',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.openMessagesText).toBe('FRESH open message');
+  });
+
+  it('empty refreshed openMessagesText collapses to undefined (resolved messages win over stale snapshot)', () => {
+    // The operator resolved all messages mid-session; the refreshed empty feed
+    // must WIN so the checkpoint omits the section rather than re-showing stale text.
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      openMessagesText: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.openMessagesText).toBeUndefined();
+  });
+
+  it('falls back to the snapshot openMessagesText when refresh is null', () => {
+    const resolved = resolveCheckpointGrounding(snapshot, null);
+    expect(resolved.openMessagesText).toBe('STALE open message');
+  });
+
+  it('snapshot with no openMessagesText falls back to undefined when refresh is null', () => {
+    const snapshotNoMsgs: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshotNoMsgs, null);
+    expect(resolved.openMessagesText).toBeUndefined();
+  });
+});
+
 describe('buildCompactionCheckpoint groundingRefreshed note', () => {
   it('uses the refreshed-at-compaction note when groundingRefreshed is true', () => {
     const result = buildCompactionCheckpoint({

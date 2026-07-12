@@ -3695,6 +3695,47 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     assert body2["strategic_memory_notes"] == [{"note": "updated note", "set_at": "2025-06-01T00:00:00"}]
     assert body2["running_update"] == "updated update"
 
+    # open_messages must be present and reflect the CURRENT open-message state.
+    assert "open_messages" in body2, "checkpoint-state must include open_messages key"
+    assert isinstance(body2["open_messages"], list)
+    # No open messages yet — feed must be empty.
+    assert body2["open_messages"] == [], f"Expected empty feed, got: {body2['open_messages']}"
+
+    # Add an open message and confirm it appears.
+    msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        content="open question",
+        status="open",
+        message_type=MessageType.QUESTION,
+    )
+    db_session.add(msg)
+    await db_session.commit()
+
+    res3 = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res3.status_code == 200, res3.text
+    body3 = res3.json()
+    assert "open_messages" in body3
+    msg_ids = [m["id"] for m in body3["open_messages"]]
+    assert str(msg.id) in msg_ids, "open message must appear in checkpoint-state feed"
+
+    # Resolve the message and confirm it disappears.
+    msg.status = "resolved"
+    db_session.add(msg)
+    await db_session.commit()
+
+    res4 = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res4.status_code == 200, res4.text
+    body4 = res4.json()
+    resolved_ids = [m["id"] for m in body4["open_messages"]]
+    assert str(msg.id) not in resolved_ids, "resolved message must not appear in checkpoint-state feed"
+
 
 # ---------------------------------------------------------------------------
 # cycle_in_flight: named block reason + completion retry

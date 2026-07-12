@@ -36,7 +36,7 @@ export interface ProjectContext {
 }
 
 export type CapabilityStatus = 'working' | 'partial' | 'planned';
-export type CapabilityProofStatus = 'proven' | 'path_proven' | 'unproven';
+export type CapabilityProofStatus = 'proven' | 'path_proven' | 'attested' | 'unproven';
 
 export interface CapabilityProofRecord {
   task_id: string;

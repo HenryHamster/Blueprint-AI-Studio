@@ -57,6 +57,7 @@ from app.models import (
 )
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
+from app.strategic_payload_summaries import _fetch_open_messages
 from app.shared_state import limiter, runtime_config
 from app.task_locking import (
     project_lock,
@@ -2460,11 +2461,13 @@ async def agent_fetch_checkpoint_state(
     (set-problem-model, set-memory, set-running-update).
     """
     project = await _resolve_agent_project(project_id, token, session)
+    open_messages = await _fetch_open_messages(session, project.id)
     return {
         "problem_model": project.problem_model or {},
         "strategic_memory_notes": project.strategic_memory_notes or [],
         "running_update": project.running_update or "",
         "vision": project.vision or {},
+        "open_messages": open_messages,
     }
 
 

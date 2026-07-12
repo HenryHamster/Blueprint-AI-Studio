@@ -2195,6 +2195,51 @@ class ComputeJob(SQLModel, table=True):
     task: Task | None = Relationship(back_populates="compute_jobs")
 
 
+class ComputeJobFile(SQLModel, table=True):
+    """Individually-addressable viewable file extracted from a compute job bundle.
+
+    Each row records one file (png, jpg, webp, gif, svg, mp4, webm) that was
+    extracted from the job's opaque ``bundle.tar.gz`` at completion time, so it
+    can be signed and rendered inline without downloading the full tarball.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    compute_job_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("computejob.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    safe_relpath: str = Field(
+        sa_column=Column(String(512), nullable=False),
+    )
+    media_type: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+    storage_uri: str = Field(
+        sa_column=Column(String(1024), nullable=False, unique=True),
+    )
+    content_type: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    file_size_bytes: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        Index("ix_computejobfile_job_media", "compute_job_id", "media_type"),
+        Index("ix_computejobfile_storage_uri", "storage_uri"),
+    )
+
+    compute_job: ComputeJob = Relationship()
+
+
 class PoolVm(SQLModel, table=True):
     """Durable fleet-wide registry of pre-provisioned, credentialed, idle agent VMs.
 

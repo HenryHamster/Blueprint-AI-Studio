@@ -25,6 +25,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobStatus,
     Project,
     ProjectMember,
@@ -761,6 +762,82 @@ async def test_resolve_download_url_compute_job_no_result_reference_404(
     resp = await client.get(
         "/api/admin/artifacts/download-url",
         params={"storage_uri": uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ComputeJobFile media-file tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_compute_job_file(
+    session, job: ComputeJob, relpath: str = "plot.png", media_type: str = "image"
+) -> ComputeJobFile:
+    """Create a ComputeJobFile row for a viewable file under a compute job's prefix."""
+    storage_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/files/{relpath}"
+    cjf = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath=relpath,
+        media_type=media_type,
+        storage_uri=storage_uri,
+        content_type="image/png" if media_type == "image" else "video/mp4",
+    )
+    session.add(cjf)
+    await session.commit()
+    await session.refresh(cjf)
+    return cjf
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_compute_job_media_file_ok(
+    client: AsyncClient, db_session, mocker
+):
+    """A ComputeJobFile storage_uri is accepted by the download URL endpoint."""
+    _mock_signing(mocker, url="https://signed.example/media-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+    cjf = await _make_compute_job_file(db_session, job, relpath="plot.png")
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": cjf.storage_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/media-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_compute_job_media_file_wrong_job_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A ComputeJobFile whose compute_job_id doesn't match the URI's embedded
+    job UUID is rejected as 404."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job_a = await _make_compute_job(db_session, project, task)
+    job_b = await _make_compute_job(db_session, project, task)
+
+    # Create a ComputeJobFile whose storage_uri is under job_a's prefix
+    # but whose compute_job_id points to job_b.
+    uri_under_a = f"gs://{BUCKET}/compute-jobs/{job_a.id}/artifacts/files/result.png"
+    cjf = ComputeJobFile(
+        compute_job_id=job_b.id,
+        safe_relpath="result.png",
+        media_type="image",
+        storage_uri=uri_under_a,
+    )
+    db_session.add(cjf)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": uri_under_a, "project_id": str(project.id)},
     )
     assert resp.status_code == 404
     sign.assert_not_called()

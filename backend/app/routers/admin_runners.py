@@ -35,6 +35,10 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.runner_health_monitors import (
+    _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    _RUNNER_LIVENESS_SECONDS,
+)
 from app.workbench_state import clear_preferred_runner_references
 
 logger = logging.getLogger("blueprint")
@@ -53,18 +57,6 @@ _DEFAULT_CAPABILITIES: Dict[str, Any] = {
     "has_gpu": False,
     "max_concurrent": 2,
 }
-
-_RUNNER_LIVENESS_SECONDS = 300
-# Trust-telemetry thresholds for the "connected but failing" (degraded) state.
-# A runner can heartbeat perfectly while every job it is handed fails — the
-# false-green these guard against. A live runner is degraded when either:
-#   * it has failed >= _FAILURE_STREAK_DEGRADED_THRESHOLD jobs in a row, or
-#   * it currently carries active work, has recorded at least one failure, and
-#     has no recent success (last_successful_job_at stale beyond
-#     _SUCCESS_STALE_SECONDS or never set) — "working but not succeeding".
-# The second branch requires >= 1 recorded failure so a freshly-enrolled runner
-# legitimately churning on its first job is never mislabelled as failing.
-_FAILURE_STREAK_DEGRADED_THRESHOLD = 3
 _SUCCESS_STALE_SECONDS = 1800  # 30 min
 # Advisory low-disk flag (does not by itself degrade a runner).
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
@@ -314,7 +306,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         or seconds_since_last_success >= _SUCCESS_STALE_SECONDS
     )
     failure_streak_degraded = (
-        consecutive_job_failures >= _FAILURE_STREAK_DEGRADED_THRESHOLD
+        consecutive_job_failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD
     )
     success_stale_while_working = (
         active_work_count > 0
@@ -391,7 +383,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "memory_low": memory_low,
         "cpu_load_avg": cpu_load_avg,
         "gpu_utilization_pct": gpu_utilization_pct,
-        "failure_streak_threshold": _FAILURE_STREAK_DEGRADED_THRESHOLD,
+        "failure_streak_threshold": _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     }
 
 
