@@ -5011,7 +5011,20 @@ async def _finalize_qualification(
     _gate_category_verdicts: list[dict[str, Any]] | None = None
     _gate_residual: str | None = None
     if _category_ledger is not None and active_categories and not _merge_grade_exempt:
+        # The CURRENTLY-ACTIVE criterion keys.  A retracted / superseded criterion
+        # keeps its (possibly ``not_met``) CategoryVerdict row in the ledger — the
+        # row is never cleared — but it is no longer part of the acceptance
+        # contract, so it must NOT gate.  Both the ledger read-back (FIX 1) and the
+        # fail-closed in-memory fallback (FIX 2) below filter to this set, mirroring
+        # ``category_verdict_ledger.is_candidate_fully_met`` (the sweep / reuse
+        # guard) so the gate and the sweep never disagree.
+        _active_keys = {
+            c.get("category_key")
+            for c in active_categories
+            if c.get("category_key")
+        }
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
+        _ledger_write_failed = False
         if _fresh_category_verdicts is not None:
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
@@ -5034,32 +5047,61 @@ async def _finalize_qualification(
                     merge_grade_cert.get("residual_uncaptured_gap"),
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
+                _ledger_write_failed = True
                 logger.warning(
                     "[RELEASE_QUALIFIER] v%d failed to persist per-category "
-                    "goal-verification verdicts to the ledger — falling back to "
-                    "the holistic gate for this finalize",
+                    "goal-verification verdicts to the ledger — gating on the "
+                    "freshly-computed in-memory verdicts (fail-closed) for this "
+                    "finalize",
                     version.version_number,
                 )
-        # Read the gate inputs back FROM the ledger (canonical source; covers the
-        # re-drive path where no fresh artifact was re-evaluated).
-        try:
-            _ledger_verdicts = await _category_ledger.get_category_verdicts(
-                session, version.id, candidate_sha
-            )
+        if _ledger_write_failed:
+            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
+            # would see stale/absent rows and (via a None gate input) SKIP the
+            # category gate entirely, letting a ``not_met`` candidate promote.  The
+            # freshly-computed in-memory grade is authoritative: feed it to the gate
+            # directly (filtered to the active keys, exactly like the read-back).
             _gate_category_verdicts = [
-                _coerce_ledger_category_verdict(_v) for _v in (_ledger_verdicts or [])
+                cv
+                for cv in (
+                    _coerce_ledger_category_verdict(_v)
+                    for _v in (_fresh_category_verdicts or [])
+                )
+                if cv.get("category_key") in _active_keys
             ] or None
-            _gate_residual = await _category_ledger.get_residual(
-                session, version.id, candidate_sha
-            )
-        except Exception:  # noqa: BLE001 — a read failure falls back to no-gate (safe)
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d failed to read per-category verdicts back "
-                "from the ledger — falling back to the holistic gate",
-                version.version_number,
-            )
-            _gate_category_verdicts = None
-            _gate_residual = None
+            _gate_residual = merge_grade_cert.get("residual_uncaptured_gap")
+        else:
+            # Read the gate inputs back FROM the ledger (canonical source; covers
+            # the re-drive path where no fresh artifact was re-evaluated).
+            try:
+                _ledger_verdicts = await _category_ledger.get_category_verdicts(
+                    session, version.id, candidate_sha
+                )
+                # FIX 1 — filter to the CURRENTLY-ACTIVE criterion keys.  The ledger
+                # returns EVERY row for the (version, sha) pair, including a
+                # retracted criterion's stale ``not_met`` row, which would otherwise
+                # permanently re-block this gate even though the sweep's
+                # ``is_candidate_fully_met`` (which filters the same way) reports the
+                # candidate FULLY MET — a permanent finalize wedge + re-qual loop.
+                _gate_category_verdicts = [
+                    cv
+                    for cv in (
+                        _coerce_ledger_category_verdict(_v)
+                        for _v in (_ledger_verdicts or [])
+                    )
+                    if cv.get("category_key") in _active_keys
+                ] or None
+                _gate_residual = await _category_ledger.get_residual(
+                    session, version.id, candidate_sha
+                )
+            except Exception:  # noqa: BLE001 — a read failure falls back to no-gate (safe)
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d failed to read per-category verdicts back "
+                    "from the ledger — falling back to the holistic gate",
+                    version.version_number,
+                )
+                _gate_category_verdicts = None
+                _gate_residual = None
 
     # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
     # Reflects whether the capability proof gate is active and — in ENFORCE

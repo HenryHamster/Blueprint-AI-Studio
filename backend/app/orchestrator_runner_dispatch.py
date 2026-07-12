@@ -340,10 +340,13 @@ async def _load_active_runners_cache(
         # Inject the authoritative active agent-task count so _runner_active_task_count
         # / _runner_at_capacity size AGENT capacity off committed Task rows rather than
         # the stale-prone heartbeat ``active_task_ids`` list (which can over-report and
-        # falsely pin-block an idle runner).
-        caps[_ACTIVE_AGENT_TASK_COUNT_KEY] = active_task_count_by_runner.get(
-            runner_id, 0
-        )
+        # falsely pin-block an idle runner).  Inject ONLY when the count query
+        # succeeded: on success the loader returns an entry for EVERY runner id (0
+        # for idle), so a missing id means the query FAILED — in which case we leave
+        # the key absent and _runner_active_task_count falls back to the heartbeat
+        # hint instead of reading a false 0 that would let a loaded runner over-pin.
+        if runner_id in active_task_count_by_runner:
+            caps[_ACTIVE_AGENT_TASK_COUNT_KEY] = active_task_count_by_runner[runner_id]
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
         seen_job_ids: set[str] = set()
@@ -435,8 +438,13 @@ async def _load_runner_active_task_counts(
     reaches a terminal status. In-cycle pins made after this snapshot are covered
     separately by the caller's ``runner_pins_this_cycle`` counter.
 
-    Returns ``{runner_id: count}`` (absent runners default to 0). Best-effort: on a
-    query error returns ``{}`` so callers fall back to the heartbeat hint.
+    Returns ``{runner_id: count}`` with an entry for EVERY passed runner id (0 for
+    an idle runner with no active tasks) on a successful query, so a populated dict
+    unambiguously reflects the query result. Best-effort: on a query error returns
+    an EMPTY dict — distinguishable from "all idle" precisely because success seeds
+    every id — which the caller treats as "query failed, do not inject the
+    authoritative count", so ``_runner_active_task_count`` falls back to the
+    heartbeat ``active_task_ids`` hint instead of reading a false 0.
     """
     if not runner_ids:
         return {}
@@ -457,7 +465,11 @@ async def _load_runner_active_task_counts(
         logger.exception("[RUNNERS] Failed to load runner active-task counts")
         return {}
 
-    by_runner: dict[uuid.UUID, int] = {}
+    # Seed every known runner at 0 so a SUCCESSFUL query returns an entry for each
+    # runner id. This makes an empty return dict mean UNAMBIGUOUSLY "query failed"
+    # (see the except above), rather than being indistinguishable from "all idle" —
+    # the ambiguity that made a partial DB failure inject a false 0 everywhere.
+    by_runner: dict[uuid.UUID, int] = dict.fromkeys(runner_ids, 0)
     for (vm_instance_id,) in rows:
         runner_id = vm_id_by_runner.get(vm_instance_id)
         if runner_id is None:

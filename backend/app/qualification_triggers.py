@@ -163,13 +163,14 @@ def resolve_qualification_trigger(
 
     # T1 — coverage_complete: fire when coverage gate is met AND the version has
     # no conclusive verdict (never attempted, sitting at error, or not_promoted
-    # with a coverage-incomplete or uncorroborated-attestation blocker).
+    # with a coverage-incomplete blocker).  ``uncorroborated_attestation`` was
+    # retired from ``compute_composite`` (folded into the per-category confidence
+    # penalty), so it is no longer a blocker any verdict can carry — dropped here.
     _T1_ELIGIBLE_STATUSES = {None, "error"}
-    _T1_NOT_PROMOTED_BLOCKERS = {"criterion_coverage_incomplete", "uncorroborated_attestation"}
+    _T1_NOT_PROMOTED_BLOCKERS = {"criterion_coverage_incomplete"}
     is_t1_eligible = status in _T1_ELIGIBLE_STATUSES or (
         status == "not_promoted"
         and blocker in _T1_NOT_PROMOTED_BLOCKERS
-        and (blocker != "uncorroborated_attestation" or covered > 0)
     )
     if is_t1_eligible and coverage_complete:
         return TriggerDecision(

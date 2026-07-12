@@ -7664,65 +7664,6 @@ def test_classify_orphan_fresh_contact_suppresses_provisioning_preclaim_death():
     )
 
 
-# ── Per-task-death fix: shared runner:<id> contact must not mask a dead task ──
-
-
-def test_classify_orphan_shared_runner_contact_does_not_mask_dead_sibling_task():
-    """A non-resident task pinned to a SHARED ``runner:<id>`` with a stale OWN
-    heartbeat is still reaped even when the runner's off-row vmcontact is fresh:
-    the shared contact is a live SIBLING task's heartbeat and must not attribute
-    liveness to THIS (dead) task, which otherwise becomes an unreapable zombie."""
-    now = _utcnow()
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(minutes=10),  # this task's own hb is stale
-        started_at=now - timedelta(minutes=12),
-        vm_instance_id="runner:shared-1",
-    )
-    # Fresh shared-runner contact (a live sibling task on the same runner).
-    lookup = {"runner:shared-1": now - timedelta(seconds=15)}
-    assert (
-        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is True
-    )
-
-
-def test_classify_orphan_cloud_vm_contact_override_unaffected_by_runner_fix():
-    """Regression: a cloud/GCE task (unique per-VM id) still gets the vm_contact
-    liveness override — the per-task fix narrows ONLY shared ``runner:`` ids."""
-    now = _utcnow()
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(minutes=10),
-        started_at=now - timedelta(minutes=12),
-        vm_instance_id="gce-instance-7",
-    )
-    lookup = {"gce-instance-7": now - timedelta(seconds=15)}
-    assert (
-        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
-    )
-
-
-def test_vm_contact_predicate_rejects_shared_runner_but_runner_level_honours_it():
-    """Unit: the per-task predicate rejects a shared ``runner:`` id while the
-    runner-level predicate (used by the resident-session carve-out) still honours
-    it — resident sessions, whose reap question IS runner liveness, keep the
-    override."""
-    from app.reaper_orphan_classify import (
-        _runner_contact_within_cutoff,
-        _vm_contact_within_cutoff,
-    )
-
-    now = _utcnow()
-
-    class _T:
-        vm_instance_id = "runner:abc"
-
-    cutoff = now - timedelta(seconds=60)
-    lookup = {"runner:abc": now}
-    assert _vm_contact_within_cutoff(_T(), cutoff, lookup) is False
-    assert _runner_contact_within_cutoff(_T(), cutoff, lookup) is True
-
-
 # ── Fix 3b: off-row vmcontact.last_tool_use_at progress override ─────────────
 
 

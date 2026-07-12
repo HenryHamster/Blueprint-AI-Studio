@@ -352,18 +352,6 @@ class TestT4BlockersCleared:
         assert not d.fire
         assert d.reason == "findings_unresolved"
 
-    def test_not_promoted_uncorroborated_attestation_blocked_from_t4(self):
-        """T4 must not fire when blocker is uncorroborated_attestation with no
-        machine evidence — prevents infinite re-qualification loops."""
-        d = _resolve(
-            status="not_promoted",
-            blocker="uncorroborated_attestation",
-            requalification_ready=True,
-            coverage={"total": 2, "covered": 0, "attested": 2},
-        )
-        assert not d.fire
-        assert d.reason == "not_applicable"
-
 
 # ---------------------------------------------------------------------------
 # Not-applicable fallback

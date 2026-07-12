@@ -9378,6 +9378,132 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
 
 
 @pytest.mark.asyncio
+async def test_finalize_gate_ignores_retracted_criterion_stale_not_met_verdict(
+    db_session, mocker
+):
+    """Regression: a RETRACTED criterion's stale ``not_met`` CategoryVerdict row
+    must NOT re-block the finalize goal-verification gate.
+
+    Retraction flips a criterion's status to non-active but never CLEARS its
+    ``CategoryVerdict`` row.  The finalize gate reads verdicts back from the
+    sha-keyed ledger; before the fix it read EVERY row for the (version, sha) pair
+    — including the retracted criterion's stale ``not_met`` — so the gate stayed
+    permanently blocked even though the sweep's ``is_candidate_fully_met`` (which
+    filters to ACTIVE criteria) reported the candidate FULLY MET.  That mismatch is
+    the permanent finalize wedge + re-qualification loop this test guards.  The
+    gate now filters the read-back to the currently-active criterion keys, so with
+    only ``A`` active (and ``A`` met) the gate CLEARS.  Driven on the dry-run track
+    (promotion disabled) so the persisted verdict is observable: without the fix the
+    stale row re-blocks with ``criterion_coverage_incomplete`` (not_promoted).
+    """
+    from app import category_verdict_ledger as _cvl
+    from app import shared_state
+
+    # Dry-run track: the candidate WOULD promote (gate cleared) but promotion ships
+    # dark, so _finalize_qualification records the composite on last_qualification
+    # (blocker + the filtered category_verdicts) instead of delegating to promote().
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _candidate_sha = "feed" * 10
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        version_goal="Ship the widget end to end",
+        seed_merge_grade=True,
+        # The re-grade at candidate X grades ONLY the still-active criterion A;
+        # criterion B was retracted, so the merge-grade rubric no longer includes
+        # it (evaluate_merge_grade grades against the ACTIVE categories).
+        merge_grade_logs={
+            "covers_goal": True,
+            "coverage_score": 0.95,
+            "biggest_gap": None,
+            "category_verdicts": [
+                {"category_key": "c-active-A", "status": "met",
+                 "citations": [{"kind": "diff", "ref": "app/widget.py:10"}]},
+            ],
+        },
+    )
+    # A stays ACTIVE and carries machine-verified merge evidence → it is covered.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-active-A",
+        text="Widget path proven",
+        source_kind="task_merge",
+    )
+    # B was RETRACTED (an uncoverable criterion the operator retired) — it is no
+    # longer part of the acceptance contract, so it is excluded from
+    # active_categories at finalize.
+    retracted_b = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-retracted-B",
+        text="Unreachable criterion since retired",
+        status="retracted",
+        created_by="test",
+    )
+    db_session.add(retracted_b)
+    await db_session.flush()
+    # Its stale ``not_met`` verdict from a PRIOR finalize (when B was still active)
+    # persists in the sha-keyed ledger at THIS candidate sha — retraction never
+    # cleared it.  This is the exact row that used to permanently re-block the gate.
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=_candidate_sha,
+        category_key="c-retracted-B",
+        status="not_met",
+        tier="judged",
+        gap="No reachability evidence — criterion since retracted.",
+        citations=[],
+        grader_run_id="prior-run",
+    )
+    await db_session.commit()
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The gate CLEARS: B's stale not_met is filtered out (retracted → inactive),
+    # leaving only the met active criterion A, so the goal-verification blocker does
+    # NOT fire.  The candidate WOULD promote (dry-run track), not hold at
+    # not_promoted / criterion_coverage_incomplete as it did before the fix.
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    # The gate cleared: no goal-verification blocker on the recorded verdict.
+    assert version.last_qualification["blocker"] is None
+    # The persisted verdicts that DROVE the gate exclude the retracted criterion, so
+    # the release_promotion CI-unresolved recompute inherits the same filtered set.
+    _gate_keys = {
+        v["category_key"]
+        for v in (version.last_qualification.get("category_verdicts") or [])
+    }
+    assert "c-retracted-B" not in _gate_keys
+    assert "c-active-A" in _gate_keys
+
+
+@pytest.mark.asyncio
 async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     """Phase 1: _finalize_qualification dual-writes a per-(candidate_sha, dimension)
     QualificationDimensionResult row for EVERY resolved dimension, alongside the
