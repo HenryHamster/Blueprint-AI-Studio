@@ -3646,8 +3646,9 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     client: AsyncClient, db_session, enable_strategic_session_flag
 ):
     """The checkpoint-state endpoint returns the current problem model, memory
-    notes, and running update — not the bootstrap snapshot — so the compaction
-    checkpoint carries fresh state after mid-session mutations."""
+    notes, running update, and open operator messages — not the bootstrap
+    snapshot — so the compaction checkpoint carries fresh state after mid-session
+    mutations (state edits AND messages filed/resolved)."""
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project, vm="agent-vm-cp")
     await _make_live_local_runner(db_session, project)
@@ -3664,6 +3665,12 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     flag_modified(project, "strategic_memory_notes")
     await db_session.commit()
 
+    # An open operator message present at session start — must be reflected in the
+    # endpoint's open_messages feed.
+    msg_start = await _make_operator_message(
+        db_session, project, content="original operator ask"
+    )
+
     token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.get(
         f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
@@ -3675,14 +3682,27 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     assert body["strategic_memory_notes"] == [{"note": "original note", "set_at": "2025-01-01T00:00:00"}]
     assert body["running_update"] == "original update"
     assert isinstance(body["vision"], dict)
+    # open_messages carries the current open feed, each row with its full id.
+    assert isinstance(body["open_messages"], list)
+    open_ids = {m["id"] for m in body["open_messages"]}
+    open_contents = {m["content"] for m in body["open_messages"]}
+    assert str(msg_start.id) in open_ids
+    assert "original operator ask" in open_contents
 
-    # Simulate a mid-session mutation: update the project state.
+    # Simulate a mid-session mutation: update the project state AND change the
+    # open-message set — resolve the start message, file a new one after session
+    # start.
     project.problem_model = {"claim": "updated"}
     project.strategic_memory_notes = [{"note": "updated note", "set_at": "2025-06-01T00:00:00"}]
     project.running_update = "updated update"
     flag_modified(project, "problem_model")
     flag_modified(project, "strategic_memory_notes")
+    msg_start.status = "resolved"
+    db_session.add(msg_start)
     await db_session.commit()
+    msg_new = await _make_operator_message(
+        db_session, project, content="new mid-session operator ask"
+    )
 
     res2 = await client.get(
         f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
@@ -3694,6 +3714,14 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     assert body2["problem_model"] == {"claim": "updated"}
     assert body2["strategic_memory_notes"] == [{"note": "updated note", "set_at": "2025-06-01T00:00:00"}]
     assert body2["running_update"] == "updated update"
+    # And the CURRENT open-message set: the resolved start message drops out, the
+    # newly-filed one appears — the exact staleness this refresh closes.
+    open_ids2 = {m["id"] for m in body2["open_messages"]}
+    open_contents2 = {m["content"] for m in body2["open_messages"]}
+    assert str(msg_start.id) not in open_ids2
+    assert "original operator ask" not in open_contents2
+    assert str(msg_new.id) in open_ids2
+    assert "new mid-session operator ask" in open_contents2
 
     # open_messages must be present and reflect the CURRENT open-message state.
     assert "open_messages" in body2, "checkpoint-state must include open_messages key"
