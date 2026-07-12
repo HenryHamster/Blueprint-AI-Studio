@@ -1104,6 +1104,156 @@ class QualificationDimensionResult(SQLModel, table=True):
     )
 
 
+class CategoryVerdict(SQLModel, table=True):
+    """Per-(candidate_sha, category) RE-GRADEABLE acceptance verdict.
+
+    Goal-verification redesign persistence layer.  Replaces the *monotonic*
+    ``CriterionEvidence`` accumulation (where a criterion, once it had any
+    evidence row, could never lose coverage) with a per-candidate verdict that
+    a re-grade OVERWRITES — so a category that regressed on a newer candidate
+    tree flips back to ``not_met`` instead of staying satisfied forever.
+
+    One row PER ``(version_id, candidate_sha, category_key)``.  Re-grading a
+    single category is an UPSERT on that key: it rewrites ONLY its own row and
+    never touches another category's verdict (within-candidate isolation).  The
+    active category set is authored as ``VersionAcceptanceCriterion`` rows
+    (``category_key`` here corresponds to ``VersionAcceptanceCriterion``'s
+    ``criterion_key``); an active criterion with no ``met`` verdict for a
+    candidate is NOT met (fail-closed) — see
+    :func:`app.category_verdict_ledger.is_candidate_fully_met`.
+
+    ``category_key`` is nullable and the ``candidate_sha`` is nullable per the
+    migration-linter rules and to mirror ``QualificationDimensionResult``; in
+    practice both are always set at grade time (the upsert key relies on them).
+    """
+
+    __tablename__ = "categoryverdict"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The candidate tree (automain HEAD SHA) this verdict is FOR.  Nullable per
+    # migration-linter rules; the upsert key relies on it in practice.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # The acceptance category — corresponds to
+    # ``VersionAcceptanceCriterion.criterion_key`` for the version.
+    category_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Verdict for this category on this candidate: met | not_met | partial.
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # How the verdict was reached: judged (LLM grader) | machine (deterministic).
+    tier: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Human/agent-readable description of what is still missing when the verdict
+    # is not_met/partial; NULL when fully met.
+    gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    # Supporting citations (file paths, PR refs, evidence blobs) backing the
+    # verdict.  Free-form JSON (list or dict).
+    citations: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    graded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # The grader run (agent task / attempt id) that produced this verdict, for
+    # provenance and cache-key invalidation.  Nullable.
+    grader_run_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "candidate_sha",
+            "category_key",
+            name="uq_categoryverdict_version_sha_category",
+        ),
+    )
+
+
+class ResidualVerdict(SQLModel, table=True):
+    """Per-(candidate_sha) "is any goal aspect uncaptured by the categories?".
+
+    Goal-verification redesign persistence layer.  The category verdicts prove
+    each authored acceptance criterion; the residual records whether the union
+    of those categories still LEAVES a gap — a goal aspect no category covers.
+    A non-null ``uncaptured_gap`` means the candidate cannot be considered fully
+    met even if every category is ``met``
+    (:func:`app.category_verdict_ledger.is_candidate_fully_met`).
+
+    One row PER ``(version_id, candidate_sha)``; a re-grade UPSERTs it.
+    """
+
+    __tablename__ = "residualverdict"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The candidate tree (automain HEAD SHA) this residual is FOR.  Nullable per
+    # migration-linter rules; the upsert key relies on it in practice.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Description of the goal aspect no acceptance category captures; NULL/absent
+    # means the categories fully span the goal (no residual gap).
+    uncaptured_gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    graded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "candidate_sha",
+            name="uq_residualverdict_version_sha",
+        ),
+    )
+
+
 class DimensionState(BaseModel):
     """Read-side projection of a single qualification dimension's state.
 
