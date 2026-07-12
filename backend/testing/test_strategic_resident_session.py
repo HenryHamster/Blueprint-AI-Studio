@@ -3737,6 +3737,79 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     assert str(msg.id) not in resolved_ids, "resolved message must not appear in checkpoint-state feed"
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_state_applies_agent_view_trim(
+    client: AsyncClient, db_session, enable_strategic_session_flag
+):
+    """The checkpoint-state refresh must return the SAME agent-view-trimmed shape
+    the session bootstrap ships — not raw project.problem_model / project.vision.
+
+    The compaction checkpoint refreshes grounding from this endpoint. If it
+    returned raw project state, a successful refresh would re-bloat the restarted
+    session's grounding with archived_gaps, the rejected_agent_edits ledger,
+    unwindowed per-gap memory, and the internal vision continuation blob — a
+    larger, differently-shaped grounding than the session bootstrapped with, which
+    is the opposite of the coherence the refresh was added to preserve.
+    """
+    from app.strategic_problem_view import (
+        _GAP_HISTORY_KEEP,
+        _agent_view_problem_model,
+    )
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project, vm="agent-vm-trim")
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+    await db_session.refresh(task)
+
+    # A problem_model carrying every unbounded field the agent-view trim caps:
+    # archived_gaps, the rejected_agent_edits ledger, and an active gap whose
+    # append-only history exceeds the retained window.
+    long_history = [{"tick": i, "note": f"h{i}"} for i in range(_GAP_HISTORY_KEEP + 7)]
+    project.problem_model = {
+        "claim": "trim-me",
+        "archived_gaps": [{"id": "g-archived", "status": "closed"}],
+        "rejected_agent_edits": [{"id": "rej-1", "reason": "stale"}],
+        "gaps": [{"id": "g-live", "status": "open", "history": long_history}],
+    }
+    # A vision carrying the backend-only continuation blob that _agent_visible_vision strips.
+    project.vision = {
+        "north_star": "keep me",
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {"secret": "internal-only"},
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    pm = body["problem_model"]
+    # archived_gaps and the rejected-edits ledger must be stripped.
+    assert "archived_gaps" not in pm, "archived_gaps must be stripped from refreshed problem_model"
+    assert "rejected_agent_edits" not in pm, "rejected_agent_edits must be stripped from refreshed problem_model"
+    # Per-gap history must be windowed to the retained tail, not shipped whole.
+    live_gap = next(g for g in pm["gaps"] if g["id"] == "g-live")
+    assert len(live_gap["history"]) == _GAP_HISTORY_KEEP, "gap history must be windowed to the retained window"
+    assert live_gap["history"] == long_history[-_GAP_HISTORY_KEEP:], "history window must keep the most recent entries"
+    # The durable, non-trimmable content survives.
+    assert pm["claim"] == "trim-me"
+
+    # The endpoint output must be byte-identical to applying the bootstrap trim helper directly.
+    assert pm == _agent_view_problem_model(project.problem_model)
+
+    # Vision must drop the internal continuation blob while keeping operator-visible fields.
+    assert body["vision"] == {"north_star": "keep me"}
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in body["vision"], (
+        "internal continuation blob must be stripped from refreshed vision"
+    )
+
+
 # ---------------------------------------------------------------------------
 # cycle_in_flight: named block reason + completion retry
 # ---------------------------------------------------------------------------

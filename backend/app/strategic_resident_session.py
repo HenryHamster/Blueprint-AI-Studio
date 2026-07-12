@@ -2462,11 +2462,22 @@ async def agent_fetch_checkpoint_state(
     """
     project = await _resolve_agent_project(project_id, token, session)
     open_messages = await _fetch_open_messages(session, project.id)
+    # Apply the SAME agent-view trims the session bootstrap applies so the
+    # refreshed compaction grounding matches the shape the session started from.
+    # The bootstrap ships _agent_view_problem_model(project.problem_model) and
+    # _agent_visible_vision(project.vision) (strategic_spawning.py:5711-5712);
+    # returning the raw project.problem_model / project.vision here would make a
+    # successful refresh re-bloat the checkpoint with archived_gaps,
+    # rejected_agent_edits, unwindowed per-gap memory, and the internal vision
+    # continuation blob — the opposite of the coherence the refresh preserves.
+    from app.strategic_local_runner import _agent_visible_vision
+    from app.strategic_problem_view import _agent_view_problem_model
+
     return {
-        "problem_model": project.problem_model or {},
+        "problem_model": _agent_view_problem_model(project.problem_model),
         "strategic_memory_notes": project.strategic_memory_notes or [],
         "running_update": project.running_update or "",
-        "vision": project.vision or {},
+        "vision": _agent_visible_vision(project.vision),
         "open_messages": open_messages,
     }
 

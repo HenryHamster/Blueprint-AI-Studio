@@ -34,7 +34,7 @@ import {
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
-  decisionsRegisterText, DECISIONS_REGISTER_CAP,
+  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict,
   serializeDecisionsReg, restoreDecisionsReg,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
@@ -1027,17 +1027,25 @@ export async function handleStrategicResident(
       if (examRecords.length > EXAM_RECORDS_CAP) {
         examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
       }
-      // Build and push to the durable decisions register (full-fidelity notes).
-      const fullTickVerdict = parseTickVerdict(r.resultText);
-      decisionsReg.push({
-        atTick: upd.record.atTick,
-        at: upd.record.at,
-        surfaceKey: upd.record.surfaceKey,
-        verdict: upd.record.verdict,
-        note: fullTickVerdict?.note ?? upd.record.note,
-      });
-      if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
-        decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
+      // Build and push to the durable decisions register (full-fidelity notes),
+      // but ONLY for SETTLED decisions (advanced/found/clear). Interrupted turns
+      // (operator preemption / authority suspend / stall) and unevidenced idle
+      // CLEARs carry no durable conclusion; recording them here would crowd the
+      // fixed register window and evict real decisions — worst at the
+      // autonomous<->operator boundary where interrupts cluster. They remain in
+      // the exam ledger (examRecords) above; only the durable register skips them.
+      if (isSettledDecisionVerdict(upd.record.verdict)) {
+        const fullTickVerdict = parseTickVerdict(r.resultText);
+        decisionsReg.push({
+          atTick: upd.record.atTick,
+          at: upd.record.at,
+          surfaceKey: upd.record.surfaceKey,
+          verdict: upd.record.verdict,
+          note: fullTickVerdict?.note ?? upd.record.note,
+        });
+        if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
+          decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
+        }
       }
       correctiveNextTick = upd.corrective;
       previousTurnAgendaContinue = upd.agendaContinue;

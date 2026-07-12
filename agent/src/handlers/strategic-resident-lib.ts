@@ -1269,6 +1269,27 @@ export interface DecisionsRegisterEntry {
 }
 /** Cap on decisions register entries (durable cross-tick decision memory). */
 export const DECISIONS_REGISTER_CAP = 50;
+
+/** The tick verdicts that represent a SETTLED decision worth remembering across
+ *  ticks: an evidenced CLEAR (nothing actionable on the examined surface), a
+ *  FOUND lead, or an ADVANCED mutation. `interrupted` (operator preemption /
+ *  authority suspend / stall — no verdict emitted) and `unevidenced` (idle CLEAR
+ *  with no tool use, or a missing/garbled marker) are NON-decisions: they carry
+ *  no durable conclusion and must NOT occupy the fixed decisions-register window,
+ *  or they evict real decisions — worst at the autonomous<->operator boundary
+ *  where interrupts cluster. The exam ledger still records those outcomes; only
+ *  the durable register filters them out. */
+const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set(['advanced', 'found', 'clear']);
+
+/**
+ * Whether a tick verdict represents a settled decision that belongs in the
+ * durable decisions register. True only for `advanced` | `found` | `clear`;
+ * false for `unevidenced`, `interrupted`, and any unrecognized string. Pure —
+ * unit-testable in isolation.
+ */
+export function isSettledDecisionVerdict(verdict: string): boolean {
+  return SETTLED_DECISION_VERDICTS.has(verdict);
+}
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default floor-tick interval (ms): even with no state change, review at least

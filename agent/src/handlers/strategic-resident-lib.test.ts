@@ -19,6 +19,7 @@ import {
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type CheckpointGrounding, type CheckpointStateResponse,
   decisionsRegisterText, serializeDecisionsReg, restoreDecisionsReg,
+  isSettledDecisionVerdict,
   DECISIONS_REGISTER_CAP, DECISIONS_REG_MAX_BYTES,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
@@ -984,6 +985,46 @@ describe('decisionsRegisterText decisions register', () => {
       autonomousState: '',
     });
     expect(noReg).not.toContain('Decisions register');
+  });
+});
+
+describe('isSettledDecisionVerdict (durable register admission)', () => {
+  it('accepts only settled decision verdicts (advanced/found/clear)', () => {
+    expect(isSettledDecisionVerdict('advanced')).toBe(true);
+    expect(isSettledDecisionVerdict('found')).toBe(true);
+    expect(isSettledDecisionVerdict('clear')).toBe(true);
+  });
+
+  it('rejects interrupted and unevidenced non-decisions', () => {
+    expect(isSettledDecisionVerdict('interrupted')).toBe(false);
+    expect(isSettledDecisionVerdict('unevidenced')).toBe(false);
+  });
+
+  it('rejects unknown / malformed verdict strings', () => {
+    expect(isSettledDecisionVerdict('')).toBe(false);
+    expect(isSettledDecisionVerdict('Advanced')).toBe(false);
+    expect(isSettledDecisionVerdict('nonsense')).toBe(false);
+  });
+
+  it('filters interrupted/unevidenced entries out of the rendered register', () => {
+    // Simulate the handler's admission gate: only settled verdicts are pushed to
+    // the durable register. A mix of tick outcomes narrows to just the decisions.
+    const allTickVerdicts: DecisionsRegisterEntry[] = [
+      { atTick: 1, at: '2026-07-10T12:00:00Z', surfaceKey: 'direction:d-1', verdict: 'found', note: 'found a lead' },
+      { atTick: 2, at: '2026-07-10T12:05:00Z', surfaceKey: 'qualification', verdict: 'interrupted', note: 'turn interrupted before completion' },
+      { atTick: 3, at: '2026-07-10T12:10:00Z', surfaceKey: 'direction:d-1', verdict: 'advanced', note: 'spawned a plan task' },
+      { atTick: 4, at: '2026-07-10T12:15:00Z', surfaceKey: 'ci-compliance', verdict: 'unevidenced', note: 'no valid TICK-VERDICT marker line' },
+      { atTick: 5, at: '2026-07-10T12:20:00Z', surfaceKey: 'vm-cost', verdict: 'clear', note: 'nothing actionable' },
+    ];
+    const register = allTickVerdicts.filter(e => isSettledDecisionVerdict(e.verdict));
+    expect(register).toHaveLength(3);
+
+    const text = decisionsRegisterText(register, 20);
+    expect(text).toContain('tick-1 [found]');
+    expect(text).toContain('tick-3 [advanced]');
+    expect(text).toContain('tick-5 [clear]');
+    expect(text).not.toContain('[interrupted]');
+    expect(text).not.toContain('[unevidenced]');
   });
 });
 
