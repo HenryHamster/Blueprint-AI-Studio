@@ -3993,9 +3993,15 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     # Mock _path_exists_at_head to return True for the backing path so the test
     # doesn't depend on filesystem state. Patch at the source module since the
     # check imports it with a local `from app.source_ref_validation import`.
+    # Also force named-test discovery to find no covering test (read_head → None)
+    # so this test deterministically exercises the ``backing_path`` fallback tier
+    # rather than depending on whether a checkout exists at HEAD.
     with patch(
         "app.source_ref_validation._path_exists_at_head",
         new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
     ):
         results = await mis.check_capability_proof_gate_gap(ctx)
 
@@ -4030,6 +4036,277 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
         e.get("proven") is True and e.get("kind") == "backing_path"
         for e in evidence_refs
     ), f"expected a proven backing_path evidence_ref, got {evidence_refs}"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_mints_named_test_for_covered_cap(db):
+    """The fleet-wide self-heal mints a ``named_test`` (proven) proof — not merely
+    ``backing_path`` (path_proven) — when a working capability's backing path is
+    exercised by a real, conventionally-named test that references the module.
+
+    This closes the earn-tier scope mismatch: previously this demand-independent
+    sweep could only ever record ``backing_path`` proofs (graded ``path_proven``,
+    below ``proven``), so a non-demanded but fully test-covered capability could
+    never earn a ``proven`` proof and auto-graduation coverage could never rise.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Working capability backed by a source path whose conventional test file
+    # (backend/testing/test_local_runner.py) exists and imports the module.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "runner-dispatch",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+                "backing_paths": ["backend/app/local_runner.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # _path_exists_at_head → True (both the backing path and its derived test path
+    # resolve at HEAD). _read_file_at_head → a test body that imports the module,
+    # so _named_tests_covering_paths returns the covering test ref and the sweep
+    # takes the named_test tier instead of the backing_path fallback.
+    test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=test_body),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    # Fully self-healed via the named_test tier → one OK result, delta 0.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert flagged == [], f"expected no flagged results after named_test self-heal, got {results}"
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1
+    assert "named_test" in ok[0].detail, (
+        f"expected detail to name the named_test tier, got {ok[0].detail!r}"
+    )
+
+    # The recorded proof must be the ``named_test`` tier (graded ``proven``),
+    # NOT the ``backing_path`` fallback (graded ``path_proven``).
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "runner-dispatch" in proof_records, (
+        f"expected proof entry for 'runner-dispatch', got {proof_records}"
+    )
+    entries = proof_records["runner-dispatch"]
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "named_test", (
+        f"expected named_test proof_kind, got {entries[0].get('proof_kind')!r}"
+    )
+
+    # evidence_refs should carry a proven named_test ref.
+    caps = (project.problem_model or {}).get("capabilities", [])
+    cap = next((c for c in caps if c.get("name") == "runner-dispatch"), None)
+    assert cap is not None
+    evidence_refs = cap.get("evidence_refs", [])
+    assert any(
+        e.get("proven") is True and e.get("kind") == "named_test"
+        for e in evidence_refs
+    ), f"expected a proven named_test evidence_ref, got {evidence_refs}"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_falls_back_to_backing_path_without_test(db):
+    """When the backing path resolves at HEAD but no covering test is discoverable
+    (read_head → None), the self-heal falls back to the structural ``backing_path``
+    tier — preserving the prior behavior for uncovered-but-present capabilities.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1, f"expected 1 OK result, got {results}"
+    assert ok[0].delta == 0
+
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    entries = proof_records.get("repo-map", [])
+    assert len(entries) >= 1
+    assert entries[0].get("proof_kind") == "backing_path", (
+        f"expected backing_path fallback, got {entries[0].get('proof_kind')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_proposes_backing_paths(db):
+    """A working capability with NO declared backing_paths whose name-derived
+    discovery surfaces candidate files splits two ways by the named_test bar:
+
+    * A capability whose discovered candidate is TEST-COVERED is auto-resolved
+      directly to a ``named_test`` (proven) proof — moved to ground_truth, no
+      research obligation needed.
+    * A capability whose discovered candidate is NOT test-covered stays flagged,
+      and the concrete candidate paths are folded into the enrolled research
+      obligation's ``detail`` (proposing backing paths) instead of a blank ask.
+
+    This is the named acceptance test for the backing-path-proposal feature. It
+    exercises the enforce-gated production path in ``check_capability_proof_gate_gap``
+    end-to-end against a real EvergreenBacklogItem ledger, mocking only the
+    IO-injectable discovery/verification seams.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            # Discovery finds a test-covered candidate → auto-resolve (named_test).
+            {"name": "runner-dispatch", "status": "working", "evidence_refs": []},
+            # Discovery finds a candidate that is NOT test-covered → suggestion
+            # folded into the research obligation, cap stays flagged.
+            {"name": "audit-sweep", "status": "working", "evidence_refs": []},
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    covered_candidate = "backend/app/local_runner.py"
+    uncovered_candidate = "backend/app/some_audit_sweep_module.py"
+
+    async def _fake_discover(cap_name, **_kwargs):
+        if cap_name == "runner-dispatch":
+            return [covered_candidate]
+        if cap_name == "audit-sweep":
+            return [uncovered_candidate]
+        return []
+
+    # The covered candidate's conventional test resolves at HEAD and imports the
+    # module → named_test tier. The uncovered candidate's test read returns None
+    # → no coverage → falls to the suggestion path. We drive this purely through
+    # _read_file_at_head keyed by path (test file for the covered candidate only).
+    covered_test_path = "backend/testing/test_local_runner.py"
+    test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
+
+    async def _fake_read(path):
+        return test_body if path == covered_test_path else None
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_fake_discover,
+    ), patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=_fake_read,
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+
+    # runner-dispatch auto-resolved to a proven named_test proof.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "runner-dispatch" in proof_records, (
+        f"expected discovery-driven named_test proof for 'runner-dispatch', "
+        f"got {proof_records}"
+    )
+    rd_entries = proof_records["runner-dispatch"]
+    assert rd_entries[0].get("proof_kind") == "named_test", (
+        f"expected named_test proof_kind from discovery, got "
+        f"{rd_entries[0].get('proof_kind')!r}"
+    )
+    # audit-sweep did NOT get a proof (candidate not test-covered).
+    assert "audit-sweep" not in proof_records, (
+        "audit-sweep must NOT be auto-proven from an unverified candidate"
+    )
+
+    # Still flagged: audit-sweep remains an unresolved gap.
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    assert "audit-sweep" in flagged[0].detail
+    assert "discovered candidate" in flagged[0].detail, (
+        f"expected detail to mention discovered candidate suggestions, got "
+        f"{flagged[0].detail!r}"
+    )
+
+    # The research obligation for audit-sweep carries the concrete candidate path
+    # as a proposed backing path; runner-dispatch (auto-resolved) enrolls none.
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    keys = {r.finding_key for r in rows}
+    assert keys == {mis._capability_proof_research_finding_key(pid, "audit-sweep")}, (
+        f"expected exactly the audit-sweep research obligation, got {keys}"
+    )
+    audit_row = rows[0]
+    assert uncovered_candidate in audit_row.detail, (
+        f"expected discovered candidate path folded into obligation detail, got "
+        f"{audit_row.detail!r}"
+    )
 
 
 @pytest.mark.asyncio

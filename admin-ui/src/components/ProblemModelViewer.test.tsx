@@ -217,3 +217,70 @@ describe('ProblemModelViewer — gap-card callback wiring', () => {
     expect(onLinkDirection).not.toHaveBeenCalled();
   });
 });
+
+describe('ProblemModelViewer — proof coverage meter', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => { r.unmount(); }); root = null; }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function renderWith(pm: ProblemModel) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<ProblemModelViewer problemModel={pm} {...defaultProps} />);
+    });
+  }
+
+  test('excludes exempt capabilities from the denominator and counts only proven as covered', async () => {
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'Proven cap', status: 'working', proof_status: 'proven' },
+        { name: 'Unproven cap', status: 'working', proof_status: 'unproven' },
+        { name: 'Exempt cap', status: 'working', proof_exempt: true, proof_status: 'unproven' },
+        { name: 'Planned cap', status: 'planned', proof_status: 'unproven' },
+      ],
+    });
+    await renderWith(pm);
+
+    // 1 proven of 2 non-exempt working (the exempt + planned caps are excluded).
+    const value = host!.querySelector('[data-testid="proof-coverage-value"]');
+    expect(value).not.toBeNull();
+    expect(value!.textContent).toBe('1/2 (50%)');
+  });
+
+  test('shows n/a when there are zero non-exempt working capabilities', async () => {
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'Exempt cap', status: 'working', proof_exempt: true, proof_status: 'unproven' },
+        { name: 'Planned cap', status: 'planned', proof_status: 'unproven' },
+      ],
+    });
+    await renderWith(pm);
+
+    const meter = host!.querySelector('[data-testid="proof-coverage-meter"]');
+    expect(meter).not.toBeNull();
+    expect(meter!.textContent).toContain('n/a');
+    expect(host!.querySelector('[data-testid="proof-coverage-value"]')).toBeNull();
+  });
+
+  test('reports full coverage when every non-exempt working capability is proven', async () => {
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'A', status: 'working', proof_status: 'proven' },
+        { name: 'B', status: 'working', proof_status: 'proven' },
+        { name: 'C', status: 'working', proof_exempt: true, proof_status: 'unproven' },
+      ],
+    });
+    await renderWith(pm);
+
+    const value = host!.querySelector('[data-testid="proof-coverage-value"]');
+    expect(value!.textContent).toBe('2/2 (100%)');
+  });
+});

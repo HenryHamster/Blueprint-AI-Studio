@@ -923,6 +923,146 @@ async def _named_tests_covering_paths(
     return covering
 
 
+# --- Automated backing-path discovery (proposal path) ------------------------
+
+# Search tokens shorter than this are dropped from capability-name matching:
+# two-char fragments ("ci", "ui") match almost any file and produce noise.
+_CAP_TOKEN_MIN_LEN = 3
+# Hard cap on discovered candidates per capability — bounds both the named_test
+# coverage probe and the suggestion list folded into a research obligation.
+_MAX_DISCOVERED_CANDIDATES = 5
+
+
+async def _list_head_files(repo_root: str = "/tmp/workspace") -> list[str] | None:
+    """Return every tracked file path at HEAD via ``git ls-files``, or ``None``.
+
+    Tri-state-ish, mirroring :func:`_read_file_at_head`: ``None`` on any
+    indeterminacy (no checkout, git error/timeout) so discovery degrades to
+    "found nothing" rather than guessing. Never raises.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning("[CAPABILITY_PROOF] git ls-files timeout listing HEAD tree")
+            return None
+        if proc.returncode != 0:
+            return None
+        return [
+            line for line in stdout.decode(errors="replace").splitlines() if line.strip()
+        ]
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to list HEAD files", exc_info=True
+        )
+        return None
+
+
+def _capability_search_tokens(cap_name: str) -> list[str]:
+    """Derive file-search tokens from a capability name.
+
+    Normalizes to kebab-case (:func:`normalize_capability_name`) and splits into
+    the alphanumeric tokens long enough to be discriminating (``>=
+    _CAP_TOKEN_MIN_LEN``). Returns ``[]`` for an unnormalizable name or one whose
+    tokens are all too short to search on.
+    """
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return []
+    return [t for t in norm.split("-") if len(t) >= _CAP_TOKEN_MIN_LEN]
+
+
+async def _discover_candidate_backing_paths(
+    cap_name: str,
+    *,
+    list_head_files=_list_head_files,
+    verify_path=None,
+    max_candidates: int = _MAX_DISCOVERED_CANDIDATES,
+) -> list[str]:
+    """Propose candidate backing-path files for a capability that declares none.
+
+    Given a capability name, derive search tokens from its normalized kebab form
+    (:func:`_capability_search_tokens`), scan the HEAD file tree
+    (``list_head_files``), and keep the paths whose *basename* contains EVERY
+    search token — a strict match so a multi-word capability lands on a
+    specifically-named file rather than an incidental single-token hit. Each
+    survivor must also pass :func:`_looks_like_file_path` AND verify present at
+    HEAD via ``verify_path`` (defaults to
+    :func:`app.source_ref_validation._path_exists_at_head`).
+
+    IO is fully injectable (``list_head_files`` / ``verify_path``) so the helper
+    is unit-testable without a git checkout, and — like the rest of the earn
+    loop — it never raises: any discovery/verification failure degrades to a
+    shorter (possibly empty) list.
+
+    Returns a deduplicated, deterministically-ordered (most-specific first),
+    bounded (``max_candidates``) list of candidate paths, or ``[]`` when nothing
+    usable is found. This is advisory only: the caller decides whether the
+    candidates clear the proof bar or merely seed a research obligation — this
+    helper never records a proof or mutates the registry.
+    """
+    from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
+
+    _verify = verify_path or _path_exists_at_head
+
+    tokens = _capability_search_tokens(cap_name)
+    if not tokens:
+        return []
+
+    try:
+        tree = await list_head_files()
+    except Exception:  # noqa: BLE001 — a listing failure is non-fatal
+        logger.warning(
+            "[CAPABILITY_PROOF] discovery: HEAD file listing failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        return []
+    if not tree:
+        return []
+
+    # Rank candidate paths by basename specificity (shortest basename first) so
+    # the most on-the-nose match leads; ties break on the full path for stable,
+    # deterministic ordering across runs.
+    scored: list[tuple[int, str]] = []
+    for path in tree:
+        if not isinstance(path, str) or not _looks_like_file_path(path):
+            continue
+        base = path.rsplit("/", 1)[-1].lower()
+        if not all(tok in base for tok in tokens):
+            continue
+        scored.append((len(base), path))
+    if not scored:
+        return []
+    scored.sort(key=lambda sp: (sp[0], sp[1]))
+
+    verified: list[str] = []
+    seen: set[str] = set()
+    for _, path in scored:
+        if path in seen:
+            continue
+        try:
+            exists = await _verify(path)
+        except Exception:  # noqa: BLE001 — a verify failure is non-fatal
+            exists = None
+        if exists is True:
+            seen.add(path)
+            verified.append(path)
+        if len(verified) >= max_candidates:
+            break
+    return verified
+
+
 async def commission_proof_earn_loop(
     project: Any,
     demand_result: dict[str, Any],

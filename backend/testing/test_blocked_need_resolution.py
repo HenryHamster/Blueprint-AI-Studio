@@ -1872,6 +1872,8 @@ async def _run_full_cycle_db_sweep() -> None:
     so it composes with the sync pure-logic phases via ``asyncio.run`` without a
     nested-event-loop conflict.
     """
+    from sqlalchemy.orm.attributes import flag_modified
+
     from app.blocked_task_unblock_sweeps import sweep_unblock_blocked_tasks
     from app.capability_proof import record_capability_proof
     from app.models import Project, Task, TaskStatus
@@ -2005,6 +2007,82 @@ async def _run_full_cycle_db_sweep() -> None:
                 "a recorded proof must let the enforce gate resume the dependent"
             )
             assert blocked.status == TaskStatus.QUEUED
+
+            # ── Phase D: proof that landed ONLY in capability_proof_records ────
+            # record_capability_proof stamps BOTH evidence_refs (tier-1) and the
+            # durable capability_proof_records column (tier-2); the evidence_refs
+            # append is fail-open. Simulate the tier-1 append having been lost
+            # (problem_model shape blocked it) so the proof survives only in
+            # capability_proof_records — the exact case the release-qualifier and
+            # badge seams already tolerate. The blocked-resume enforce gate must
+            # now agree: the tier-2 fold in _fetch_working_capability_proof_status
+            # upgrades the capability to 'proven' and resumes its dependent.
+            pm = project.problem_model
+            pm["capabilities"].append(
+                {"name": "GPU runtime", "status": "working"}
+            )
+            # Durable proof recorded ONLY in the project-level column — NO
+            # evidence_refs on the capability entry itself.
+            project.capability_proof_records = {
+                **(project.capability_proof_records or {}),
+                "gpu-runtime": [
+                    {
+                        "task_id": "provider-gpu",
+                        "proof_kind": "named_test",
+                        "proof_ref": (
+                            "testing/test_blocked_need_resolution.py::"
+                            "test_capability_proof_gate_full_cycle"
+                        ),
+                        "proved_at": _utcnow().isoformat(),
+                        "commit_sha": "",
+                    }
+                ],
+            }
+            flag_modified(project, "problem_model")
+            flag_modified(project, "capability_proof_records")
+            s.add(project)
+            await s.commit()
+
+            gpu_need = {"kind": "capability", "ref": "gpu-runtime"}
+            now2 = _utcnow()
+            gpu_blocked = Task(
+                project_id=project.id,
+                title="gpu-dependent",
+                description="x",
+                status=TaskStatus.BLOCKED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                depends_on=[],
+                blocker_kind="precondition",
+                blocked_reason="BLOCKER: needs capability gpu-runtime",
+                blocked_at=now2,
+                recheck_after=now2 - timedelta(minutes=1),  # due
+                context={
+                    "blocker": {
+                        "source": "agent",
+                        "waiting_on": "capability",
+                        "needs": [gpu_need],
+                        "need": gpu_need,
+                    }
+                },
+            )
+            s.add(gpu_blocked)
+            await s.commit()
+            await s.refresh(gpu_blocked)
+
+            requeued3 = await sweep_unblock_blocked_tasks(
+                s, _utcnow(), verify_pr_merged=_stub_verify
+            )
+            await s.refresh(gpu_blocked)
+            assert requeued3 == 1, (
+                "a proof recorded only in capability_proof_records (tier-2, the "
+                "fail-open evidence_refs append lost) must still clear the "
+                "enforce gate — the blocked-resume seam must agree with the "
+                "release-qualifier and badge seams"
+            )
+            assert gpu_blocked.status == TaskStatus.QUEUED
     finally:
         if saved_mode is None:
             _rc.pop("capability_proof_gate_mode", None)

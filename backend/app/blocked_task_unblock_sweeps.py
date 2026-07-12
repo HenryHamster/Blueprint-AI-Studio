@@ -371,6 +371,64 @@ async def _fetch_working_capability_names(session, project_id) -> set:
     return working_capability_names(getattr(project, "problem_model", None))
 
 
+# Rank of each tiered proof status, ascending in confidence. Used to fold the
+# durable ``capability_proof_records`` tier-2 signal into the evidence_refs-derived
+# tier-1 map WITHOUT ever downgrading a stronger tier-1 status.
+_PROOF_STATUS_RANK: dict[str, int] = {
+    "contradicted": 0,
+    "unverified": 0,
+    "unproven": 0,
+    "partial": 1,
+    "path_proven": 2,
+    "proven": 3,
+}
+
+
+def _fold_proof_records_tier2(
+    status_by_name: dict, proof_records: object
+) -> dict:
+    """Upgrade an evidence_refs-derived proof map with durable proof_records.
+
+    ``record_capability_proof`` stamps a landed provider's proof into BOTH the
+    capability's ``evidence_refs`` (tier-1, read by
+    :func:`working_capability_proof_status`) AND the project-level
+    ``capability_proof_records`` column (tier-2). The evidence_refs append is
+    fail-open — if the problem_model shape blocks it, the proof survives ONLY in
+    ``capability_proof_records``. The release-qualifier and badge seams already
+    consult that tier-2 fallback (:func:`enrich_problem_model_capability_proofs`),
+    so the blocked-resume enforce gate must too — otherwise an enforce-mode
+    dependent is stranded BLOCKED on a capability the other two seams treat as
+    proven.
+
+    Only ``working`` capabilities already present in ``status_by_name`` are
+    considered (the tier-1 map is authoritative on WHICH capabilities exist and
+    are working), and a tier-2 status is applied only when it is strictly stronger
+    than the tier-1 status — so a landed proof never regresses a capability the
+    evidence_refs already classify more highly.
+    """
+    if not isinstance(proof_records, dict) or not status_by_name:
+        return status_by_name
+    from app.evidence_primitive import classify_evidence_tiered
+
+    for name, tier1 in list(status_by_name.items()):
+        if _PROOF_STATUS_RANK.get(tier1, 0) >= _PROOF_STATUS_RANK["proven"]:
+            continue
+        entries = proof_records.get(name)
+        if not isinstance(entries, list):
+            continue
+        synthetic = [
+            {"kind": e.get("proof_kind"), "proven": True}
+            for e in entries
+            if isinstance(e, dict)
+        ]
+        if not synthetic:
+            continue
+        tier2 = classify_evidence_tiered(synthetic)
+        if _PROOF_STATUS_RANK.get(tier2, 0) > _PROOF_STATUS_RANK.get(tier1, 0):
+            status_by_name[name] = tier2
+    return status_by_name
+
+
 async def _fetch_working_capability_proof_status(session, project_id) -> dict:
     """``{canonical_name: proof_status}`` for the project's ``working`` capabilities.
 
@@ -380,12 +438,22 @@ async def _fetch_working_capability_proof_status(session, project_id) -> dict:
     alias-aware working set), so the boolean registry-satisfies check derives its
     name set from these keys — one project fetch serves both the resolution and
     the OBSERVE-mode proof surfacing. Cached per project across the sweep batch.
+
+    The evidence_refs-derived tier-1 map is then folded with the project's durable
+    ``capability_proof_records`` (tier-2) so this enforce-gate seam agrees with the
+    release-qualifier / badge seams even when the fail-open evidence_refs append
+    did not land (see :func:`_fold_proof_records_tier2`).
     """
     from app.capability_registry import working_capability_proof_status
     from app.models import Project
 
     project = await session.get(Project, project_id)
-    return working_capability_proof_status(getattr(project, "problem_model", None))
+    status_by_name = working_capability_proof_status(
+        getattr(project, "problem_model", None)
+    )
+    return _fold_proof_records_tier2(
+        status_by_name, getattr(project, "capability_proof_records", None)
+    )
 
 
 async def _classify_blocker_needs(

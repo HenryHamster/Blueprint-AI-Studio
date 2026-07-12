@@ -7,8 +7,10 @@ import {
   patchEvergreenFillSettings,
   patchStructuralHealthSettings,
   patchMetricsIntegritySettings,
+  patchCapabilityProofGateSettings,
   apiFetch,
   type EvergreenFillSettings,
+  type CapabilityProofGateMode,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
 import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
@@ -185,6 +187,16 @@ export function SettingsOrchestratorSection({
   // Metrics integrity sweep mode — fetched via settings and patched on change.
   const [sweepMode, setSweepMode] = useState<string>('off');
 
+  // Capability proof gate — fetched via settings and patched on change. Defaults
+  // mirror the backend GET fallbacks (off / disabled / 0.5 / 0.95) so an older
+  // payload missing these keys does not crash the panel.
+  const [proofGateMode, setProofGateMode] = useState<CapabilityProofGateMode>('off');
+  const [proofAutoGradEnabled, setProofAutoGradEnabled] = useState(false);
+  const [proofObserveThreshold, setProofObserveThreshold] = useState(0.5);
+  const [proofEnforceThreshold, setProofEnforceThreshold] = useState(0.95);
+  const [proofObserveThresholdInput, setProofObserveThresholdInput] = useState('0.5');
+  const [proofEnforceThresholdInput, setProofEnforceThresholdInput] = useState('0.95');
+
   const loadFillSettings = useCallback(async () => {
     try {
       const s = await fetchEvergreenFillSettings();
@@ -208,6 +220,20 @@ export function SettingsOrchestratorSection({
         setAuditMode(String(mode));
         const sweep = data?.metrics_integrity_sweep_mode ?? 'off';
         setSweepMode(String(sweep));
+        // Capability proof gate — default to off/false/0.5/0.95 for older payloads.
+        const gateMode = data?.capability_proof_gate_mode ?? 'off';
+        setProofGateMode(
+          gateMode === 'observe' || gateMode === 'enforce' ? gateMode : 'off',
+        );
+        setProofAutoGradEnabled(Boolean(data?.capability_proof_gate_auto_graduation_enabled ?? false));
+        const observeT = Number(data?.capability_proof_gate_auto_graduation_observe_threshold ?? 0.5);
+        const enforceT = Number(data?.capability_proof_gate_auto_graduation_enforce_threshold ?? 0.95);
+        const safeObserve = Number.isFinite(observeT) ? observeT : 0.5;
+        const safeEnforce = Number.isFinite(enforceT) ? enforceT : 0.95;
+        setProofObserveThreshold(safeObserve);
+        setProofEnforceThreshold(safeEnforce);
+        setProofObserveThresholdInput(String(safeObserve));
+        setProofEnforceThresholdInput(String(safeEnforce));
       }
     } catch {
       // silently ignore — defaults remain
@@ -243,6 +269,52 @@ export function SettingsOrchestratorSection({
       // on error, keep current mode
     }
   }, []);
+
+  const patchProofGateMode = useCallback(async (mode: CapabilityProofGateMode) => {
+    try {
+      await patchCapabilityProofGateSettings({ capability_proof_gate_mode: mode });
+      setProofGateMode(mode);
+    } catch {
+      void loadAuditMode();
+    }
+  }, [loadAuditMode]);
+
+  const patchProofAutoGrad = useCallback(async (enabled: boolean) => {
+    try {
+      await patchCapabilityProofGateSettings({ capability_proof_gate_auto_graduation_enabled: enabled });
+      setProofAutoGradEnabled(enabled);
+    } catch {
+      void loadAuditMode();
+    }
+  }, [loadAuditMode]);
+
+  // Commit a threshold input (observe/enforce). Only valid 0.0–1.0 values are
+  // sent; anything else reverts the input to the last-applied value. The backend
+  // additionally rejects out-of-range values, so this is a client-side hint.
+  const commitProofThreshold = useCallback((
+    key:
+      | 'capability_proof_gate_auto_graduation_observe_threshold'
+      | 'capability_proof_gate_auto_graduation_enforce_threshold',
+    raw: string,
+    fallback: number,
+    applyValue: (v: number) => void,
+    setInput: (v: string) => void,
+  ) => {
+    const n = parseFloat(raw);
+    if (!isNaN(n) && n >= 0 && n <= 1) {
+      applyValue(n);
+      setInput(String(n));
+      void (async () => {
+        try {
+          await patchCapabilityProofGateSettings({ [key]: n });
+        } catch {
+          void loadAuditMode();
+        }
+      })();
+    } else {
+      setInput(String(fallback));
+    }
+  }, [loadAuditMode]);
 
   const commitFillNumber = useCallback((
     key: keyof EvergreenFillSettings,
@@ -772,6 +844,82 @@ export function SettingsOrchestratorSection({
             </div>
           </div>
         </div>
+      </div>
+
+      {/* Capability Proof Gate */}
+      <div data-testid="capability-proof-gate-section">
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Capability Proof Gate</h3>
+        <p className="text-xs text-neutral-500 mb-3">
+          In <em>enforce</em> mode, capabilities without a <code>proven</code> proof no longer satisfy prerequisite
+          resolution. Auto-graduation advances the mode (off&nbsp;→&nbsp;observe&nbsp;→&nbsp;enforce, forward-only)
+          automatically once fleet proof coverage crosses the thresholds below.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="md:col-span-2 lg:col-span-3">
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
+            <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit" data-testid="proof-gate-mode">
+              {(['off', 'observe', 'enforce'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => void patchProofGateMode(mode)}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
+                    proofGateMode === mode
+                      ? 'bg-neutral-700 text-neutral-100'
+                      : 'text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  {mode}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-end">
+            <div className="w-full">
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Graduation</label>
+              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+                <Toggle enabled={proofAutoGradEnabled} onChange={v => void patchProofAutoGrad(v)} />
+                <span className="text-xs text-neutral-400">{proofAutoGradEnabled ? 'Enabled' : 'Disabled'}</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <label htmlFor="proof-gate-observe-threshold" className="block text-xs font-medium text-neutral-400 mb-1.5">Observe Threshold (0–1)</label>
+            <input
+              id="proof-gate-observe-threshold"
+              data-testid="proof-gate-observe-threshold"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={proofObserveThresholdInput}
+              onChange={e => setProofObserveThresholdInput(e.target.value)}
+              onBlur={() => commitProofThreshold('capability_proof_gate_auto_graduation_observe_threshold', proofObserveThresholdInput, proofObserveThreshold, setProofObserveThreshold, setProofObserveThresholdInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitProofThreshold('capability_proof_gate_auto_graduation_observe_threshold', proofObserveThresholdInput, proofObserveThreshold, setProofObserveThreshold, setProofObserveThresholdInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="proof-gate-enforce-threshold" className="block text-xs font-medium text-neutral-400 mb-1.5">Enforce Threshold (0–1)</label>
+            <input
+              id="proof-gate-enforce-threshold"
+              data-testid="proof-gate-enforce-threshold"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={proofEnforceThresholdInput}
+              onChange={e => setProofEnforceThresholdInput(e.target.value)}
+              onBlur={() => commitProofThreshold('capability_proof_gate_auto_graduation_enforce_threshold', proofEnforceThresholdInput, proofEnforceThreshold, setProofEnforceThreshold, setProofEnforceThresholdInput)}
+              onKeyDown={e => { if (e.key === 'Enter') commitProofThreshold('capability_proof_gate_auto_graduation_enforce_threshold', proofEnforceThresholdInput, proofEnforceThreshold, setProofEnforceThreshold, setProofEnforceThresholdInput); }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+        </div>
+        {proofObserveThreshold > proofEnforceThreshold && (
+          <p className="text-ui-sm text-amber-400 mt-2" data-testid="proof-gate-threshold-warning">
+            Observe threshold should be ≤ enforce threshold — auto-graduation advances off → observe → enforce.
+          </p>
+        )}
       </div>
 
       {/* Evergreen Fill Observability */}

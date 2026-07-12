@@ -5,6 +5,7 @@ import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
 import {
   fetchMetricsIntegrityObservability,
   patchMetricsIntegritySettings,
+  patchCapabilityProofGateSettings,
 } from '../api';
 
 vi.mock('../api', () => ({
@@ -20,11 +21,16 @@ vi.mock('../api', () => ({
   patchEvergreenFillSettings: vi.fn().mockResolvedValue(undefined),
   patchStructuralHealthSettings: vi.fn().mockResolvedValue(undefined),
   patchMetricsIntegritySettings: vi.fn().mockResolvedValue(undefined),
+  patchCapabilityProofGateSettings: vi.fn().mockResolvedValue(undefined),
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: vi.fn().mockResolvedValue({
       structural_health_audit_mode: 'off',
       metrics_integrity_sweep_mode: 'off',
+      capability_proof_gate_mode: 'off',
+      capability_proof_gate_auto_graduation_enabled: false,
+      capability_proof_gate_auto_graduation_observe_threshold: 0.5,
+      capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
     }),
   }),
   fetchEvergreenFillObservability: vi.fn().mockResolvedValue({
@@ -322,5 +328,60 @@ describe('SettingsOrchestratorSection', () => {
     fireEvent.change(input, { target: { value: '5' } });
     fireEvent.blur(input);
     expect(onUpdate).toHaveBeenCalledWith(5);
+  });
+
+  it('renders the Capability Proof Gate control group', () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    const section = screen.getByTestId('capability-proof-gate-section');
+    expect(section).toBeTruthy();
+    expect(section.textContent).toContain('Capability Proof Gate');
+    const modeGroup = within(section).getByTestId('proof-gate-mode');
+    expect(within(modeGroup).getByRole('button', { name: 'off' })).toBeInTheDocument();
+    expect(within(modeGroup).getByRole('button', { name: 'observe' })).toBeInTheDocument();
+    expect(within(modeGroup).getByRole('button', { name: 'enforce' })).toBeInTheDocument();
+  });
+
+  it('capability proof gate controls patch settings', async () => {
+    const user = userEvent.setup();
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    const section = screen.getByTestId('capability-proof-gate-section');
+
+    // Wait for the settings fetch to seed the current-mode state so we can
+    // observe the mode button reflecting 'off' before we change it.
+    const modeGroup = within(section).getByTestId('proof-gate-mode');
+
+    // Mode selector issues a partial PATCH of just the mode key.
+    await user.click(within(modeGroup).getByRole('button', { name: 'enforce' }));
+    await waitFor(() => {
+      expect(patchCapabilityProofGateSettings).toHaveBeenCalledWith({ capability_proof_gate_mode: 'enforce' });
+    });
+
+    // Auto-graduation toggle issues a partial PATCH of just the boolean key.
+    const toggle = within(section).getByRole('button', { name: '' });
+    await user.click(toggle);
+    await waitFor(() => {
+      expect(patchCapabilityProofGateSettings).toHaveBeenCalledWith({ capability_proof_gate_auto_graduation_enabled: true });
+    });
+
+    // A valid threshold blur issues a partial PATCH of just that threshold key.
+    const observe = within(section).getByTestId('proof-gate-observe-threshold');
+    fireEvent.change(observe, { target: { value: '0.7' } });
+    fireEvent.blur(observe);
+    await waitFor(() => {
+      expect(patchCapabilityProofGateSettings).toHaveBeenCalledWith({ capability_proof_gate_auto_graduation_observe_threshold: 0.7 });
+    });
+  });
+
+  it('reverts an out-of-range proof-gate threshold without patching', async () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    const section = screen.getByTestId('capability-proof-gate-section');
+    // Let the fetch settle so the input holds the seeded 0.95 default.
+    const enforce = await within(section).findByTestId('proof-gate-enforce-threshold') as HTMLInputElement;
+    await waitFor(() => expect(enforce.value).toBe('0.95'));
+    vi.mocked(patchCapabilityProofGateSettings).mockClear();
+    fireEvent.change(enforce, { target: { value: '2.5' } });
+    fireEvent.blur(enforce);
+    expect(patchCapabilityProofGateSettings).not.toHaveBeenCalled();
+    expect(enforce.value).toBe('0.95');
   });
 });

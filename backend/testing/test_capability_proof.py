@@ -21,7 +21,10 @@ from app.capability_proof import (
     _PROOF_KIND_NAMED_TEST,
     _PROOF_KIND_TRIAL_ADOPTION,
     _candidate_test_paths,
+    _capability_search_tokens,
+    _discover_candidate_backing_paths,
     _extract_proof_ref,
+    _list_head_files,
     _module_dotted_path,
     _named_tests_covering_paths,
     _proof_kind_from_verdict,
@@ -2521,6 +2524,207 @@ class TestNamedTestsCoveringPaths:
             ["backend/app/capability_proof.py"], verify_path=_verify, read_head=_read
         )
         assert refs == []
+
+
+class TestCapabilitySearchTokens:
+    """_capability_search_tokens: kebab-name → discriminating search tokens."""
+
+    def test_multiword_name_splits_to_tokens(self):
+        assert _capability_search_tokens("runner-dispatch") == ["runner", "dispatch"]
+
+    def test_normalizes_non_kebab_input(self):
+        # Mixed case / underscores collapse to kebab before splitting.
+        assert _capability_search_tokens("Runner_Dispatch") == ["runner", "dispatch"]
+
+    def test_drops_short_tokens(self):
+        # "ci" (len 2) is below _CAP_TOKEN_MIN_LEN and dropped; "integration" kept.
+        assert _capability_search_tokens("ci-integration") == ["integration"]
+
+    def test_unnormalizable_name_returns_empty(self):
+        assert _capability_search_tokens("") == []
+        assert _capability_search_tokens("---") == []
+        assert _capability_search_tokens(None) == []  # type: ignore[arg-type]
+
+    def test_all_short_tokens_returns_empty(self):
+        assert _capability_search_tokens("a-b-c") == []
+
+
+class TestDiscoverCandidateBackingPaths:
+    """_discover_candidate_backing_paths: name-derived HEAD candidate discovery."""
+
+    @staticmethod
+    def _lister(paths):
+        async def _list():
+            return paths
+
+        return _list
+
+    @staticmethod
+    def _verifier(present):
+        async def _verify(p):
+            return p in present
+
+        return _verify
+
+    @pytest.mark.asyncio
+    async def test_matches_source_file_whose_basename_has_all_tokens(self):
+        tree = [
+            "backend/app/orchestrator_runner_dispatch.py",  # both tokens
+            "backend/app/models.py",  # neither token
+            "backend/app/runner.py",  # only "runner"
+        ]
+        present = set(tree)
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=self._lister(tree),
+            verify_path=self._verifier(present),
+        )
+        assert out == ["backend/app/orchestrator_runner_dispatch.py"]
+
+    @pytest.mark.asyncio
+    async def test_filters_non_file_and_unverified_candidates(self):
+        tree = [
+            "backend/app/runner_dispatch.py",  # verified → kept
+            "runner dispatch note",  # not _looks_like_file_path (space) → dropped
+            "backend/app/legacy_runner_dispatch.py",  # matches but NOT present → dropped
+        ]
+        present = {"backend/app/runner_dispatch.py"}
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=self._lister(tree),
+            verify_path=self._verifier(present),
+        )
+        assert out == ["backend/app/runner_dispatch.py"]
+
+    @pytest.mark.asyncio
+    async def test_ranks_most_specific_first_and_bounds_count(self):
+        # Five matching files; max_candidates=2 keeps the two shortest basenames.
+        tree = [
+            "backend/app/runner_dispatch_extended_helper.py",
+            "backend/app/runner_dispatch.py",
+            "backend/app/runner_dispatch_v2.py",
+            "backend/app/runner_dispatch_legacy_shim.py",
+            "backend/app/a_runner_dispatch.py",
+        ]
+        present = set(tree)
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=self._lister(tree),
+            verify_path=self._verifier(present),
+            max_candidates=2,
+        )
+        assert out == [
+            "backend/app/runner_dispatch.py",
+            "backend/app/a_runner_dispatch.py",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_repeated_tree_entries(self):
+        tree = [
+            "backend/app/runner_dispatch.py",
+            "backend/app/runner_dispatch.py",
+        ]
+        present = {"backend/app/runner_dispatch.py"}
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=self._lister(tree),
+            verify_path=self._verifier(present),
+        )
+        assert out == ["backend/app/runner_dispatch.py"]
+
+    @pytest.mark.asyncio
+    async def test_empty_or_none_tree_returns_empty(self):
+        for tree in ([], None):
+            out = await _discover_candidate_backing_paths(
+                "runner-dispatch",
+                list_head_files=self._lister(tree),
+                verify_path=self._verifier(set()),
+            )
+            assert out == []
+
+    @pytest.mark.asyncio
+    async def test_unnormalizable_name_returns_empty_without_listing(self):
+        called = {"listed": False}
+
+        async def _list():
+            called["listed"] = True
+            return ["backend/app/anything.py"]
+
+        out = await _discover_candidate_backing_paths(
+            "---",
+            list_head_files=_list,
+            verify_path=self._verifier({"backend/app/anything.py"}),
+        )
+        assert out == []
+        # No search tokens → helper short-circuits before listing the tree.
+        assert called["listed"] is False
+
+    @pytest.mark.asyncio
+    async def test_listing_exception_is_non_fatal(self):
+        async def _list():
+            raise RuntimeError("git ls-files blew up")
+
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=_list,
+            verify_path=self._verifier(set()),
+        )
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_verify_exception_is_non_fatal(self):
+        async def _verify(p):
+            raise RuntimeError("git blew up")
+
+        out = await _discover_candidate_backing_paths(
+            "runner-dispatch",
+            list_head_files=self._lister(["backend/app/runner_dispatch.py"]),
+            verify_path=_verify,
+        )
+        assert out == []
+
+
+class TestListHeadFiles:
+    """_list_head_files: git ls-files wrapper degrades to None, never raises."""
+
+    @pytest.mark.asyncio
+    async def test_missing_repo_root_returns_none(self):
+        out = await _list_head_files(repo_root="/tmp/does-not-exist-xyz")
+        assert out is None
+
+    @pytest.mark.asyncio
+    async def test_git_error_returns_none(self):
+        from unittest.mock import AsyncMock, patch
+
+        class _Proc:
+            returncode = 128
+
+            async def communicate(self):
+                return (b"", b"fatal: not a git repo")
+
+        with patch("os.path.isdir", return_value=True), patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=_Proc()),
+        ):
+            out = await _list_head_files(repo_root="/tmp/whatever")
+        assert out is None
+
+    @pytest.mark.asyncio
+    async def test_success_returns_nonblank_lines(self):
+        from unittest.mock import AsyncMock, patch
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"backend/app/a.py\n\nbackend/app/b.py\n", b"")
+
+        with patch("os.path.isdir", return_value=True), patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=_Proc()),
+        ):
+            out = await _list_head_files(repo_root="/tmp/whatever")
+        assert out == ["backend/app/a.py", "backend/app/b.py"]
 
 
 class TestRecordCapabilityNamedTestProof:

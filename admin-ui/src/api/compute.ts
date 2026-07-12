@@ -1647,6 +1647,32 @@ export async function patchMetricsIntegritySettings(patch: { metrics_integrity_s
   }
 }
 
+export type CapabilityProofGateMode = 'off' | 'observe' | 'enforce';
+
+export interface CapabilityProofGateSettings {
+  capability_proof_gate_mode: CapabilityProofGateMode;
+  capability_proof_gate_auto_graduation_enabled: boolean;
+  capability_proof_gate_auto_graduation_observe_threshold: number;
+  capability_proof_gate_auto_graduation_enforce_threshold: number;
+}
+
+// PATCHes any partial of the four capability-proof-gate config keys. The backend
+// validates the mode enum, the boolean, and clamps thresholds to 0.0–1.0; only
+// the keys the operator changed should be sent.
+export async function patchCapabilityProofGateSettings(
+  patch: Partial<CapabilityProofGateSettings>,
+): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update capability proof gate settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update capability proof gate settings: ${res.status}`);
+  }
+}
+
 
 export interface FleetRunner {
   id: string;
