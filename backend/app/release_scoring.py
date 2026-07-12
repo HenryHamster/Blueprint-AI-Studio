@@ -77,7 +77,34 @@ UNCORROBORATED_PENALTY_MULTIPLIER = 2.0
 # not a pure operator waiver.  Proportional to the backfilled fraction:
 # ``BACKFILL_PENALTY_WEIGHT * (backfilled / total)``, applied as a multiplier
 # ``confidence *= (1 - penalty)`` after the attestation penalty.
+#
+# NOTE (goal-verification redesign): the attestation/backfill penalty constants
+# above belong to the retired criterion-"coverage" tier system.  They are kept
+# for back-compat rendering of historical verdicts; the LIVE confidence penalty
+# is now JUDGED_TIER_PENALTY_WEIGHT (below), keyed off per-category verdict tier.
 BACKFILL_PENALTY_WEIGHT = 0.05
+
+# Confidence penalty applied per the goal-verification redesign.  v1 grades every
+# acceptance-criterion CATEGORY at the JUDGED tier — an uninvested LLM reading the
+# merged diff — which is a lower-confidence signal than machine/test-cited
+# evidence (the v2 "machine" tier).  When no hard gate fires (every active
+# category is ``met``), confidence is docked in proportion to the fraction of MET
+# categories still resting on the judged tier: ``JUDGED_TIER_PENALTY_WEIGHT *
+# (judged_met / met)``, applied as ``confidence *= (1 - penalty)``.  Deliberately
+# small so a healthy all-judged candidate (the whole of v1) stays promotable while
+# still scoring visibly below a machine-verified one.  This REUSES the old
+# attestation-penalty machinery, repurposed from evidence-tier to grader-tier.
+JUDGED_TIER_PENALTY_WEIGHT = 0.05
+
+# Recognised per-category verdict statuses.  ``partial`` gates identically to
+# ``not_met`` (only ``met`` clears the gate); the distinction is informational.
+_CATEGORY_STATUSES: frozenset[str] = frozenset({"met", "not_met", "partial"})
+# Recognised citation kinds.  v1 emits only ``diff`` citations (the grader reads
+# the merged diff); ``test`` is reserved for the v2 machine/test-citation tier.
+_CITATION_KINDS: frozenset[str] = frozenset({"diff", "test"})
+# Caps so a runaway artifact cannot bloat the persisted verdict / payload.
+_MAX_CITATIONS = 8
+_CITATION_REF_MAX = 200
 
 
 def coerce_completion_debt_weight(weights_raw: Any) -> float:
@@ -141,9 +168,133 @@ def is_contentless_goal(goal_text: str) -> bool:
     return goal_text.strip().lower() in _CONTENTLESS_GOAL_WORDS
 
 
+def _normalize_citations(raw: Any) -> list[dict[str, str]]:
+    """Normalise a per-category citation list to ``[{kind, ref}, ...]``.
+
+    v1 accepts ``diff`` and ``test`` citation kinds (``test`` reserved for v2);
+    an unknown kind is coerced to ``diff``.  Bare strings are read as ``diff``
+    refs.  Entries without a usable ``ref`` are dropped, and the list is capped
+    at ``_MAX_CITATIONS`` so an over-eager grader cannot bloat the ledger row.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for c in raw:
+        if isinstance(c, dict):
+            kind = str(c.get("kind") or "").strip().lower()
+            if kind not in _CITATION_KINDS:
+                kind = "diff"
+            ref = str(
+                c.get("ref") or c.get("path") or c.get("location") or ""
+            ).strip()
+        elif isinstance(c, str):
+            kind = "diff"
+            ref = c.strip()
+        else:
+            continue
+        if ref:
+            out.append({"kind": kind, "ref": ref[:_CITATION_REF_MAX]})
+        if len(out) >= _MAX_CITATIONS:
+            break
+    return out
+
+
+def _normalize_category_verdicts(
+    artifact: dict[str, Any] | None,
+    active_categories: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Grade the artifact's per-category verdicts against the ACTIVE rubric.
+
+    The rubric is the set of ACTIVE ``VersionAcceptanceCriterion`` rows — each is
+    a CATEGORY the merged diff must satisfy.  v1 = JUDGED tier only: the grader
+    reads the merged diff and, per category, decides ``met`` / ``partial`` /
+    ``not_met``, CITES the diff location(s), and writes the gap.  Enforcement
+    (uncited "it's fine" → ``not_met``):
+
+      * A category the artifact never graded → ``not_met`` (it was not assessed).
+      * A category graded ``met`` with NO citations → downgraded to ``not_met``
+        (an uncited pass is not evidence).
+      * ``partial`` is preserved as an informational distinction but gates
+        identically to ``not_met`` downstream.
+      * An unknown/absent status → ``not_met``.
+
+    Every returned verdict stubs ``tier="judged"`` — the machine/test-citation
+    tier is v2.  Returns ``(category_verdicts, residual_uncaptured_gap)`` where
+    ``residual_uncaptured_gap`` is the grader's answer to "is there a goal aspect
+    that NONE of the categories capture?" (a non-empty string hard-blocks).
+    """
+    emitted: dict[str, dict[str, Any]] = {}
+    raw_list = artifact.get("category_verdicts") if isinstance(artifact, dict) else None
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            if isinstance(item, dict):
+                key = str(item.get("category_key") or item.get("key") or "").strip()
+                if key:
+                    emitted[key] = item
+
+    verdicts: list[dict[str, Any]] = []
+    for cat in active_categories:
+        key = str(cat.get("category_key") or cat.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        raw = emitted.get(key)
+        if not isinstance(raw, dict):
+            verdicts.append(
+                {
+                    "category_key": key,
+                    "status": "not_met",
+                    "tier": "judged",
+                    "gap": "Not graded by the blind merge-grade against the merged diff.",
+                    "citations": [],
+                }
+            )
+            continue
+        status = str(raw.get("status") or "").strip().lower()
+        if status not in _CATEGORY_STATUSES:
+            status = "not_met"
+        citations = _normalize_citations(raw.get("citations"))
+        gap_raw = raw.get("gap")
+        gap = (
+            str(gap_raw).strip()[:_FINDING_SUMMARY_MAX]
+            if gap_raw not in (None, "")
+            else None
+        )
+        if status == "met" and not citations:
+            # v1 rule: an uncited "it's fine" is not evidence — force not_met.
+            status = "not_met"
+            gap = gap or (
+                "Marked met but cited no diff location; an uncited pass is not evidence."
+            )
+        if status in ("not_met", "partial") and not gap:
+            gap = "No gap description supplied by the grader."
+        verdicts.append(
+            {
+                "category_key": key,
+                "status": status,
+                "tier": "judged",
+                # ``met`` may legitimately carry no gap; not_met/partial always do.
+                "gap": gap if status != "met" else (gap or None),
+                "citations": citations,
+            }
+        )
+
+    residual_raw: Any = None
+    if isinstance(artifact, dict):
+        residual_raw = artifact.get("residual_uncaptured_gap")
+        if residual_raw in (None, ""):
+            residual_raw = artifact.get("residual")
+    residual = (
+        str(residual_raw).strip()[:_FINDING_SUMMARY_MAX]
+        if isinstance(residual_raw, str) and residual_raw.strip()
+        else None
+    )
+    return verdicts, residual
+
+
 def evaluate_merge_grade(
     goal: str | None,
     artifact: dict[str, Any] | None,
+    active_categories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Normalise a blind merge-grade artifact into a goal-coverage verdict.
 
@@ -162,9 +313,21 @@ def evaluate_merge_grade(
         ``covers_goal`` True → ``status="pass"``, ``blocked`` False; False →
         ``status="fail"``, ``blocked`` True (the hard promotion blocker).
 
-    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail}``.
-    ``status`` is one of ``pass`` | ``fail`` | ``not_applicable`` |
-    ``unparseable``.
+    The ``status``/``covers_goal``/``coverage``/``biggest_gap`` keys are the
+    HOLISTIC back-compat signal (still read by ``compute_goal_coverage_drift``,
+    the ``merge_grade_*`` verdict columns, and the armed ``merge_grade_misses``
+    gate).  When ``active_categories`` is supplied (the ACTIVE acceptance-criteria
+    rubric), the goal-verification redesign ADDS a per-category grade:
+    ``category_verdicts`` (a list of ``{category_key, status, tier, gap,
+    citations}`` — see :func:`_normalize_category_verdicts`) and
+    ``residual_uncaptured_gap`` (the grader's "gap no category captures" answer).
+    These drive the NEW hard gate in :func:`compute_composite`.  When
+    ``active_categories`` is absent/empty (no rubric) both are ``None`` and only
+    the holistic signal applies — preserving the pre-redesign no-criteria path.
+
+    Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail,
+    category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
+    ``fail`` | ``not_applicable`` | ``unparseable``.
     """
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
@@ -175,6 +338,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": False,
             "detail": None,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
     if not isinstance(artifact, dict):
         return {
@@ -184,6 +349,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": True,
             "detail": None,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
 
     raw_covers = artifact.get("covers_goal")
@@ -205,6 +372,8 @@ def evaluate_merge_grade(
             "biggest_gap": None,
             "blocked": True,
             "detail": artifact,
+            "category_verdicts": None,
+            "residual_uncaptured_gap": None,
         }
 
     biggest_gap_raw = artifact.get("biggest_gap")
@@ -213,6 +382,14 @@ def evaluate_merge_grade(
         if biggest_gap_raw not in (None, "")
         else None
     )
+    # Per-category grade (goal-verification redesign).  Only computed when an
+    # ACTIVE rubric is supplied; otherwise the holistic signal above stands alone.
+    category_verdicts: list[dict[str, Any]] | None = None
+    residual_uncaptured_gap: str | None = None
+    if active_categories:
+        category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
+            artifact, active_categories
+        )
     return {
         "status": "pass" if covers_goal else "fail",
         "covers_goal": covers_goal,
@@ -220,6 +397,8 @@ def evaluate_merge_grade(
         "biggest_gap": biggest_gap,
         "blocked": not covers_goal,
         "detail": artifact,
+        "category_verdicts": category_verdicts,
+        "residual_uncaptured_gap": residual_uncaptured_gap,
     }
 
 
@@ -421,6 +600,8 @@ def compute_composite(
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
     criterion_coverage: dict[str, Any] | None = None,
+    category_verdicts: list[dict[str, Any]] | None = None,
+    residual_uncaptured_gap: str | None = None,
     merge_grade_misses: bool = False,
     debt_pressure_score: float | None = None,
     capability_proof_blocked: bool = False,
@@ -458,25 +639,24 @@ def compute_composite(
         pure and only consumes the boolean.
       * ``merge_grade_misses`` is True — the required blind merge-grade ran and
         found that the candidate misses the frozen version goal
-        (``"merge_grade_misses"``).  Checked before criterion coverage so an
+        (``"merge_grade_misses"``).  Checked before the category gate so an
         empty or not-yet-mapped acceptance-criteria set cannot mask the grade.
-      * ``criterion_coverage`` reports at least one GENUINELY uncovered
-        version-scoped acceptance criterion — ``total - covered - attested > 0``
-        (``"criterion_coverage_incomplete"``).  Criteria covered only by a
-        non-expired operator attestation do NOT hard-block; instead they incur a
-        proportional confidence penalty (``ATTESTATION_PENALTY_WEIGHT``) applied
-        after the weighted sum, so an attestation-covered version scores visibly
-        below a machine-verified one while the deadlock-breaker waiver survives.
-        Versions with no criteria, or callers that pass ``None`` for backward
-        compatibility, skip this gate.  ``sub_scores["attested_count"]`` records
-        the attested surface for observability whenever a summary is supplied.
-      * ``criterion_coverage`` reports ALL acceptance criteria covered only
-        by operator attestation with zero machine-verified evidence —
-        ``covered == 0 and attested > 0`` (``"uncorroborated_attestation"``).
-        Hard-blocks because an entirely uncorroborated version (no criterion
-        carries machine-verified evidence) must not be promotable, even when
-        other sub-scores are high.  ``sub_scores["uncorroborated_attested"]``
-        records the condition for observability alongside the blocker.
+      * GOAL-VERIFICATION GATE (redesign) — ``category_verdicts`` is a per-active-
+        category grade (the acceptance criteria ARE the categories).  Blocks
+        (``"criterion_coverage_incomplete"``) when ANY active category's status
+        is not ``met`` (``partial`` gates identically to ``not_met``; the
+        distinction is informational), OR when ``residual_uncaptured_gap`` is a
+        non-empty string (the grader found a goal aspect NO category captures).
+        This REPLACES the retired coverage-count gate AND the
+        ``uncorroborated_attestation`` gate — a category resting on
+        lower-confidence evidence no longer hard-blocks; instead it is folded into
+        the judged-tier confidence penalty (below).  The blocker STRING is kept
+        (``criterion_coverage_incomplete``) so the downstream re-drive / trigger /
+        state-resolver plumbing keyed on it keeps working.  ``category_verdicts``
+        ``None`` (no rubric, or a caller passing ``None`` for back-compat) skips
+        the gate entirely — preserving the pre-redesign no-criteria path.
+        ``sub_scores["unmet_categories"]`` / ``["residual_uncaptured_gap"]``
+        record WHY for observability.
       * ``capability_proof_blocked`` is True — the capability proof gate is in
         ``"enforce"`` mode and at least one ``working`` capability lacks
         ``proven`` evidence (``"capability_proof_gate_blocked"``).  Governs the
@@ -583,36 +763,26 @@ def compute_composite(
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
-        # the canonical criterion-coverage gate so operators see the right label.
+        # the canonical goal-verification gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif (
-        criterion_coverage is not None
-        and int(criterion_coverage.get("total") or 0) > 0
-        and (
-            int(criterion_coverage.get("total") or 0)
-            - int(criterion_coverage.get("covered") or 0)
-            - int(criterion_coverage.get("attested") or 0)
-            - int(criterion_coverage.get("backfilled") or 0)
-        )
-        > 0
+    elif category_verdicts is not None and any(
+        (v or {}).get("status") != "met" for v in category_verdicts
     ):
-        # A GENUINELY uncovered criterion (partial or no-evidence) still hard-
-        # blocks.  Criteria covered only by a non-expired operator attestation
-        # OR unverified-merge backfill evidence are NOT counted here — they
-        # clear the blocker but incur the confidence penalty applied below
-        # (the attestation/backfill tier).
+        # GOAL-VERIFICATION GATE (redesign): the acceptance criteria ARE the
+        # merge-grade's categories.  ANY active category not at ``met`` blocks
+        # (``partial`` gates identically to ``not_met`` — only ``met`` clears).
+        # This replaces the retired coverage-count arithmetic AND the
+        # uncorroborated-attestation gate; a lower-confidence (judged-tier)
+        # category no longer hard-blocks — that is folded into the confidence
+        # penalty below.  The blocker STRING is preserved so downstream re-drive /
+        # trigger / state-resolver plumbing keyed on it keeps firing.
         blocker = "criterion_coverage_incomplete"
-    elif (
-        criterion_coverage is not None
-        and int(criterion_coverage.get("total") or 0) > 0
-        and int(criterion_coverage.get("covered") or 0) == 0
-        and int(criterion_coverage.get("attested") or 0) > 0
-    ):
-        # ALL acceptance criteria rely solely on operator attestation — zero
-        # machine-verified evidence (covered == 0).  Hard-block promotion so
-        # an entirely uncorroborated version cannot promote on attestations
-        # alone, regardless of other sub-scores.
-        blocker = "uncorroborated_attestation"
+    elif residual_uncaptured_gap:
+        # RESIDUAL gate (redesign): the grader found a goal aspect that NONE of
+        # the categories capture — the rubric is incomplete for this candidate, so
+        # even an all-``met`` category set cannot certify the goal.  Same blocker
+        # string, distinguished for operators via sub_scores["residual_uncaptured_gap"].
+        blocker = "criterion_coverage_incomplete"
     elif capability_proof_blocked:
         # The capability proof gate is in ENFORCE mode and there are working
         # capabilities whose proof status is not ``proven`` — the gate would
@@ -661,10 +831,31 @@ def compute_composite(
         sub_scores["attested_count"] = attested_count
         sub_scores["backfilled_count"] = backfilled_count
         # Record whether attestations are completely uncorroborated (covered==0)
-        # for observability — this flag is set before the blocker early-return
-        # so operators can see it alongside the uncorroborated_attestation blocker.
+        # for observability — kept for back-compat rendering of historical rows.
         if covered_count == 0 and attested_count > 0 and total_criteria > 0:
             sub_scores["uncorroborated_attested"] = True
+
+    # Goal-verification observability (redesign): surface the per-category grade
+    # and residual so operators see WHY the gate fired (or would fire), not just
+    # the blocker string.  Recorded whenever a per-category grade was supplied,
+    # even when a different blocker won the ordered chain.
+    if category_verdicts is not None:
+        _unmet = [
+            str((v or {}).get("category_key") or "")
+            for v in category_verdicts
+            if (v or {}).get("status") != "met"
+        ]
+        sub_scores["category_count"] = len(category_verdicts)
+        sub_scores["met_category_count"] = len(category_verdicts) - len(_unmet)
+        if _unmet:
+            sub_scores["unmet_categories"] = [k for k in _unmet if k]
+        # Fraction of MET categories still resting on the judged tier (v1 = all).
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(1 for v in _met if (v or {}).get("tier", "judged") != "machine")
+            sub_scores["judged_tier_met_fraction"] = round(_judged / len(_met), 4)
+    if residual_uncaptured_gap:
+        sub_scores["residual_uncaptured_gap"] = str(residual_uncaptured_gap)
 
     if blocker is not None:
         return {
@@ -694,28 +885,33 @@ def compute_composite(
     else:
         confidence = existing_confidence
 
-    # Attestation penalty: reaching here means no genuinely uncovered criterion
-    # blocked promotion, but some criteria may be covered ONLY by a lower-
-    # confidence operator attestation.  Apply a proportional multiplier so an
-    # attestation-covered version scores visibly below a machine-verified one,
-    # without hard-blocking (the deadlock-breaker waiver is preserved).
-    if attested_count > 0 and total_criteria > 0:
+    # Judged-tier confidence penalty (goal-verification redesign): reaching here
+    # means every active category is ``met`` (the gate passed).  v1 grades every
+    # category at the JUDGED tier — an LLM reading the merged diff — a lower-
+    # confidence signal than machine/test-cited evidence (the v2 machine tier).
+    # Dock confidence in proportion to the fraction of MET categories still on the
+    # judged tier, so an all-judged candidate scores visibly below a
+    # machine-verified one WITHOUT hard-blocking.  This REUSES the old
+    # attestation-penalty machinery, repurposed from evidence-tier to grader-tier.
+    if category_verdicts:
+        _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
+        if _met:
+            _judged = sum(1 for v in _met if (v or {}).get("tier", "judged") != "machine")
+            penalty = JUDGED_TIER_PENALTY_WEIGHT * (_judged / len(_met))
+            confidence *= 1.0 - penalty
+
+    # Back-compat: legacy callers that still pass a coverage-count summary (rather
+    # than per-category verdicts) retain the old attestation/backfill haircut so
+    # historical/second-caller behaviour is unchanged.  New callers pass
+    # ``category_verdicts`` and take the judged-tier penalty above instead.
+    if category_verdicts is None and attested_count > 0 and total_criteria > 0:
         penalty = ATTESTATION_PENALTY_WEIGHT * (attested_count / total_criteria)
-        # Escalate when attestations are completely uncorroborated — no criterion
-        # carries machine-verified evidence (covered == 0), meaning every
-        # attested criterion is a pure operator waiver with zero corroboration.
         covered_count = int(criterion_coverage.get("covered") or 0)
         if covered_count == 0:
             penalty *= UNCORROBORATED_PENALTY_MULTIPLIER
             sub_scores["uncorroborated_attested"] = True
         confidence *= 1.0 - penalty
-
-    # Backfill penalty: criteria covered solely by unverified-merge backfill
-    # evidence (test shipped in PR changes but the merge was never CI-verified)
-    # incur a lighter proportional penalty to reflect their lower confidence
-    # relative to machine-verified evidence.  Like attestation, this is a
-    # confidence multiplier, not a hard block.
-    if backfilled_count > 0 and total_criteria > 0:
+    if category_verdicts is None and backfilled_count > 0 and total_criteria > 0:
         penalty = BACKFILL_PENALTY_WEIGHT * (backfilled_count / total_criteria)
         confidence *= 1.0 - penalty
 

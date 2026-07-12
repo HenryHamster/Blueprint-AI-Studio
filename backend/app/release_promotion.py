@@ -306,7 +306,12 @@ def _recover_confidence_from_ci_unresolved(
         smoketest_enabled=smoketest_enabled,
         migration_collision=base_record.get("migration_safety") == "block",
         migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
-        criterion_coverage=base_record.get("criterion_coverage"),
+        # Goal-verification redesign: re-run the SAME per-category gate on the
+        # persisted verdicts (this recompute is same-sha — CI unresolved → green —
+        # so the sha-keyed verdicts on base_record are still valid).  ``None`` when
+        # the finalize recorded no rubric / an exempt grade, matching that path.
+        category_verdicts=base_record.get("category_verdicts"),
+        residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
         debt_pressure_score=debt_pressure_score,
     )

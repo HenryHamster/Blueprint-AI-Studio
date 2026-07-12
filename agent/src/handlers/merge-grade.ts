@@ -41,12 +41,40 @@ import {
 // narrative: the payload never carries it, and the prompt forbids requesting or
 // inferring one. The grade is strictly merged-diff vs stated-goal.
 
+// ── Goal-verification redesign: per-category grade ───────────────────────────
+//
+// The version's ACTIVE acceptance criteria are the merge-grade's CATEGORIES. For
+// each, the grader decides met / not_met / partial, CITES the merged-diff
+// location(s) that support the verdict, and writes the gap. The backend
+// re-normalises this against the authoritative active-criteria rubric (an
+// ungraded category, or a `met` with no citation, is forced to `not_met`), so
+// the agent only needs to emit its best-effort per-category judgement here.
+export type CategoryStatus = 'met' | 'not_met' | 'partial';
+export type CitationKind = 'diff' | 'test';
+
+export interface CategoryCitation {
+  kind: CitationKind;
+  ref: string;
+}
+
+export interface CategoryVerdict {
+  category_key: string;
+  status: CategoryStatus;
+  gap: string | null;
+  citations: CategoryCitation[];
+}
+
 export interface MergeGradeArtifact {
   graded_candidate_sha: string;
   covers_goal: boolean;
   coverage_score: number;
   biggest_gap: string;
   rationale: string;
+  // Per-active-category verdicts (empty when no rubric was supplied).
+  category_verdicts: CategoryVerdict[];
+  // The single goal aspect NO category captures, or null when the categories
+  // fully decompose the goal. A non-empty string hard-blocks promotion.
+  residual_uncaptured_gap: string | null;
 }
 
 /**
@@ -110,11 +138,68 @@ export function validateMergeGradeShape(raw: unknown): ParsedValueValidationResu
 }
 
 /**
+ * Coerce an arbitrary parsed citation list into the stable `{kind, ref}[]`
+ * shape. Bare strings are read as `diff` refs; an unknown kind falls back to
+ * `diff`. Entries without a usable ref are dropped, and the list is capped so a
+ * runaway grade cannot bloat the artifact.
+ */
+function normalizeCitations(raw: unknown): CategoryCitation[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CategoryCitation[] = [];
+  for (const c of raw) {
+    let kind: CitationKind = 'diff';
+    let ref = '';
+    if (c && typeof c === 'object' && !Array.isArray(c)) {
+      const o = c as Record<string, unknown>;
+      const k = strVal(o.kind).trim().toLowerCase();
+      kind = k === 'test' ? 'test' : 'diff';
+      ref = strVal(o.ref || o.path || o.location).trim();
+    } else if (typeof c === 'string') {
+      ref = c.trim();
+    }
+    if (ref) out.push({ kind, ref: ref.slice(0, 200) });
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+/**
+ * Coerce an arbitrary parsed `category_verdicts` array into the stable
+ * `CategoryVerdict[]` shape. Lenient by design: the backend re-normalises
+ * against the authoritative active-criteria rubric (ungraded → not_met, `met`
+ * without a citation → not_met), so this only preserves the agent's judgement.
+ */
+export function normalizeCategoryVerdicts(raw: unknown): CategoryVerdict[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CategoryVerdict[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const categoryKey = strVal(o.category_key || o.key).trim();
+    if (!categoryKey) continue;
+    const statusRaw = strVal(o.status).trim().toLowerCase();
+    const status: CategoryStatus = (statusRaw === 'met' || statusRaw === 'partial')
+      ? statusRaw
+      : 'not_met';
+    const gapStr = strVal(o.gap).trim();
+    out.push({
+      category_key: categoryKey,
+      status,
+      gap: gapStr !== '' ? gapStr : null,
+      citations: normalizeCitations(o.citations),
+    });
+  }
+  return out;
+}
+
+/**
  * Coerce an arbitrary parsed object into the stable RELEASE_MERGE_GRADE
  * contract shape. `graded_candidate_sha` is ALWAYS forced to the pinned
  * candidate (never trusting whatever the LLM wrote). `covers_goal` and
  * `coverage_score` are reconciled so both are always populated and consistent:
- * a missing score derives from the boolean (and vice versa).
+ * a missing score derives from the boolean (and vice versa). The per-category
+ * verdicts and residual are carried verbatim (coerced) — the backend enforces
+ * the citation/rubric rules.
  */
 export function normalizeMergeGradeOutput(raw: unknown, candidateSha: string): MergeGradeArtifact {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw))
@@ -135,12 +220,16 @@ export function normalizeMergeGradeOutput(raw: unknown, candidateSha: string): M
     ? clampedScore
     : (coversGoal ? 1 : 0);
 
+  const residualRaw = strVal(obj.residual_uncaptured_gap || obj.residual).trim();
+
   return {
     graded_candidate_sha: candidateSha,
     covers_goal: coversGoal,
     coverage_score: coverageScore,
     biggest_gap: strVal(obj.biggest_gap).trim(),
     rationale: strVal(obj.rationale || obj.reason).trim(),
+    category_verdicts: normalizeCategoryVerdicts(obj.category_verdicts),
+    residual_uncaptured_gap: residualRaw !== '' ? residualRaw : null,
   };
 }
 
@@ -196,6 +285,35 @@ function formatMergedPrsSection(payload: Record<string, unknown>): string {
   return (
     'The following pull requests were merged toward this version goal — judge ' +
     'whether, taken together, their changes satisfy the goal:\n' + lines.join('\n') + '\n\n'
+  );
+}
+
+/**
+ * Render the acceptance-criteria CATEGORY rubric (goal-verification redesign).
+ * Each active category carries a stable `category_key` the agent MUST echo back
+ * in its per-category verdict. Returns '' when no rubric was supplied — the
+ * grade is then holistic-only and the backend applies no per-category gate.
+ */
+function formatCategoriesSection(payload: Record<string, unknown>): string {
+  const raw = Array.isArray(payload.categories) ? payload.categories : [];
+  const lines: string[] = [];
+  for (const entry of raw) {
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      const o = entry as Record<string, unknown>;
+      const key = strVal(o.category_key || o.criterion_key || o.key).trim();
+      const text = strVal(o.text || o.description).trim();
+      if (key) lines.push(`- \`${key}\`: ${text || '(no description)'}`);
+    }
+  }
+  if (lines.length === 0) return '';
+  return (
+    '## Acceptance-criterion categories (grade EACH against the merged diff)\n' +
+    'These are the version\'s acceptance criteria — the CATEGORIES you must grade ' +
+    'the merged diff against. For EACH category below, decide `met`, `partial`, or ' +
+    '`not_met`, CITE the merged-diff location(s) that justify the verdict, and name ' +
+    'the gap when it is not fully met. Echo the exact `category_key` back in each ' +
+    'verdict. A category you mark `met` with NO citation is treated as NOT met.\n' +
+    lines.join('\n') + '\n\n'
   );
 }
 
@@ -326,17 +444,52 @@ export async function handleReleaseMergeGrade(
     ? `## Version goal (grade strictly against this)\n${versionGoal}\n\n`
     : '## Version goal\n(No goal text was supplied in your payload. If the goal is genuinely empty, set covers_goal=false, coverage_score=0, and name the missing goal as the biggest_gap.)\n\n';
   const mergedPrsSection = formatMergedPrsSection(payload);
+  const categoriesSection = formatCategoriesSection(payload);
+  const hasCategories = categoriesSection !== '';
 
   const mgCorePrompt = `You are an UNINVESTED, independent release MERGE-GRADER. You did not write any of this code and have no stake in it. \`${candidateSha}\` is the PINNED release candidate commit; it has already been fetched into this clone on \`${baseBranch}\`, so the diff range \`${diffRange}\` resolves. Your single job: judge whether the MERGED diff actually satisfies the version goal below.
 
 BLINDNESS RULE (critical): grade STRICTLY the merged code changes against the stated goal. You have NO access to any strategist progress narrative, status report, or self-description of what was "supposed" to have shipped — and you must NOT request, infer, reconstruct, or rely on one. The only evidence that counts is the actual merged diff versus the goal text. Do not let any narrative claim of progress substitute for code that is actually present in the diff.
 
-${goalSection}${mergedPrsSection}## Your task
+${goalSection}${mergedPrsSection}${categoriesSection}## Your task
 
 1. **Obtain the merged diff.** Run \`git diff ${diffRange}\` (and \`git diff --stat ${diffRange}\`, \`git log ${diffRange} --oneline\`) to see exactly what the candidate \`${candidateSha}\` changes relative to \`${baseBranch}\`. Always use the pinned SHA \`${candidateSha}\`, never a bare branch name.
 
 2. **Grade goal coverage.** Decompose the version goal into the concrete things it requires. For each, check the merged diff for code that actually delivers it (read the changed files; do not trust commit messages or PR titles). Decide how much of the goal the merged diff genuinely covers.
+${hasCategories ? `
+3. **Grade EACH acceptance-criterion category.** For every category listed above, read the merged diff and decide \`met\` / \`partial\` / \`not_met\`. You MUST cite the concrete diff location(s) (file path, ideally file:line, that you actually read) that justify a \`met\` or \`partial\` verdict — an uncited "it looks fine" counts as \`not_met\`. For anything not fully \`met\`, write the specific gap. Echo the exact \`category_key\` for each.
 
+4. **Answer the residual question.** After grading every category, ask: is there any part of the version goal that NONE of these categories captures? If yes, put that single uncaptured aspect in \`residual_uncaptured_gap\` (a non-empty sentence). If the categories fully decompose the goal, set \`residual_uncaptured_gap\` to null.
+
+5. **Name the single biggest gap.** Identify the ONE biggest thing the goal still requires that the merged diff does NOT deliver. This is required and must be a single, specific, non-empty sentence. If the goal is fully covered, state that the largest remaining risk/gap is minor and name it concretely (still non-empty).
+
+6. **Emit results.** Write your grade as a JSON object to \`/tmp/release_merge_grade_${taskId}.json\` with EXACTLY this structure:
+
+\`\`\`json
+{
+  "graded_candidate_sha": "${candidateSha}",
+  "covers_goal": false,
+  "coverage_score": 0.4,
+  "biggest_gap": "The goal requires <a concrete capability the goal names>, but the merged diff only adds <the partial piece that is present> — the rest of that capability is not wired up.",
+  "rationale": "Read <the changed file(s)>: <why the diff only partially covers the goal>, so under half the goal is delivered.",
+  "category_verdicts": [
+    {
+      "category_key": "<echo the exact key from the category list>",
+      "status": "met",
+      "gap": null,
+      "citations": [{"kind": "diff", "ref": "path/to/file.py:42"}]
+    },
+    {
+      "category_key": "<another key>",
+      "status": "not_met",
+      "gap": "The merged diff does not add <the thing this criterion requires>.",
+      "citations": [{"kind": "diff", "ref": "path/to/other.py"}]
+    }
+  ],
+  "residual_uncaptured_gap": null
+}
+\`\`\`
+` : `
 3. **Name the single biggest gap.** Identify the ONE biggest thing the goal still requires that the merged diff does NOT deliver. This is required and must be a single, specific, non-empty sentence. If the goal is fully covered, state that the largest remaining risk/gap is minor and name it concretely (still non-empty).
 
 4. **Emit results.** Write your grade as a JSON object to \`/tmp/release_merge_grade_${taskId}.json\` with EXACTLY this structure:
@@ -350,16 +503,18 @@ ${goalSection}${mergedPrsSection}## Your task
   "rationale": "Read <the changed file(s)>: <why the diff only partially covers the goal>, so under half the goal is delivered."
 }
 \`\`\`
-
+`}
 Field semantics:
 - \`graded_candidate_sha\`: the pinned candidate SHA — use exactly \`${candidateSha}\`.
 - \`covers_goal\`: boolean — true only if the merged diff substantively delivers the goal.
 - \`coverage_score\`: float in [0, 1] — 0.0 = the merged diff does nothing toward the goal, 1.0 = the goal is fully delivered by the merged diff.
 - \`biggest_gap\`: REQUIRED, a single non-empty sentence naming the SINGLE biggest thing the goal still requires that the merged diff does not deliver. Must be specific (cite the missing capability), never empty.
-- \`rationale\`: a short justification citing the specific files/changes you read.
+- \`rationale\`: a short justification citing the specific files/changes you read.${hasCategories ? `
+- \`category_verdicts\`: REQUIRED array — one entry per acceptance-criterion category above. Each entry: \`category_key\` (echo the exact key), \`status\` ("met" | "partial" | "not_met"), \`gap\` (a specific sentence when not fully met, else null), and \`citations\` (array of {"kind": "diff", "ref": "<file or file:line you actually read>"}). A \`met\` verdict MUST carry at least one citation.
+- \`residual_uncaptured_gap\`: a single sentence naming any goal aspect NO category captures, or null when the categories fully decompose the goal.` : ''}
 
 Rules:
-- Read the actual merged diff and the relevant files before grading — do NOT speculate.
+- Read the actual merged diff and the relevant files before grading — do NOT speculate.${hasCategories ? '\n- Every `category_verdicts` entry must echo a `category_key` from the list above; do not invent keys. Cite real diff locations you read — uncited "met" is treated as not met.' : ''}
 - IMPORTANT: Write ONLY the JSON object to \`/tmp/release_merge_grade_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
