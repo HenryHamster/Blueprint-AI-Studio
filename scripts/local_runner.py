@@ -2144,6 +2144,7 @@ def _report_compute_job(
     exit_code: int | None = None,
     result_metrics: dict | None = None,
     command_log: dict | None = None,
+    resume_hydration: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -2162,6 +2163,8 @@ def _report_compute_job(
         body["result_metrics"] = result_metrics
     if command_log is not None:
         body["command_log"] = command_log
+    if resume_hydration is not None:
+        body["resume_hydration"] = resume_hydration
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -2225,6 +2228,109 @@ def _build_multipart_body(
     body += file_bytes + crlf
     body += b"--" + bnd + b"--" + crlf
     return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+# Predecessor run-status files stripped from a hydrated resume bundle so they
+# cannot contaminate THIS run's terminal detection / metric parsing. The
+# checkpoint files the resumed command actually needs (weights, optimizer state,
+# etc.) are kept — only Blueprint's own per-run status files are removed.
+_RESUME_STALE_ARTIFACT_NAMES = frozenset(
+    {"result.json", "command.log.json", "terminal.json", "live_tail.b64"}
+)
+
+
+def _safe_resume_members(tar: "tarfile.TarFile", dest_dir: str) -> list:
+    """Return tar members that extract safely under *dest_dir*.
+
+    Rejects absolute paths, ``..`` escapes, and non-regular/non-dir members
+    (symlinks, devices, fifos) so a hostile or corrupt bundle can never write
+    outside the artifact dir. The bundle is Blueprint-produced and same-project,
+    but resume runs on operator hardware — fail-closed on traversal regardless.
+    """
+    dest_abs = os.path.abspath(dest_dir)
+    safe: list = []
+    for member in tar.getmembers():
+        name = member.name
+        if not name or name.startswith("/") or os.path.isabs(name):
+            continue
+        target = os.path.abspath(os.path.join(dest_dir, name))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
+            continue
+        if not (member.isreg() or member.isdir()):
+            continue
+        safe.append(member)
+    return safe
+
+
+def _download_input_artifact(
+    orchestrator_url: str, token: str, job_id: str, artifact_dir: str
+) -> dict:
+    """Cross-job checkpoint resume: fetch + extract the predecessor bundle.
+
+    GETs the predecessor's durable bundle from
+    ``/api/runner/compute-job/{job_id}/input-artifact`` (the server resolves the
+    validated predecessor id from the pinned job — the runner cannot request an
+    arbitrary bundle), extracts it INTO *artifact_dir* so the resumed command sees
+    the prior checkpoint already present, then strips predecessor run-status files
+    so they cannot contaminate this run.
+
+    Returns a provenance dict (``ok`` plus ``file_count`` / ``bytes`` on success,
+    or ``reason`` on failure) describing what actually happened. Best-effort by
+    contract: a failed fetch/extract returns ``ok=False`` (the command still runs,
+    from scratch) and NEVER raises — but the failure is surfaced honestly, never
+    claimed as a successful resume.
+    """
+    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status not in (200, 201):
+                return {"ok": False, "reason": f"http_{resp.status}"}
+            payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "reason": f"http_{exc.code}"}
+    except Exception as exc:  # noqa: BLE001 — resume is strictly best-effort
+        return {"ok": False, "reason": f"download_error:{type(exc).__name__}"}
+
+    if not payload:
+        return {"ok": False, "reason": "empty_bundle"}
+    if len(payload) > _RUNNER_ARTIFACT_MAX_BYTES:
+        return {"ok": False, "reason": "bundle_too_large"}
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
+            tar.extractall(artifact_dir, members=_safe_resume_members(tar, artifact_dir))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"extract_error:{type(exc).__name__}"}
+
+    # Strip predecessor run-status files anywhere in the extracted tree so they
+    # are not mistaken for THIS run's outputs.
+    for root, _dirs, names in os.walk(artifact_dir):
+        for name in names:
+            if name in _RESUME_STALE_ARTIFACT_NAMES:
+                try:
+                    os.remove(os.path.join(root, name))
+                except OSError:
+                    pass
+
+    file_count = 0
+    total_bytes = 0
+    for root, _dirs, names in os.walk(artifact_dir):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                file_count += 1
+                try:
+                    total_bytes += os.path.getsize(path)
+                except OSError:
+                    pass
+    if file_count == 0:
+        return {"ok": False, "reason": "no_files_after_extract"}
+    return {"ok": True, "file_count": file_count, "bytes": total_bytes}
 
 
 def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_dir: str) -> None:
@@ -2394,6 +2500,7 @@ def _run_compute_job(
     repo_token = job_body.get("repo_token") or None
     accelerator_type = job_body.get("accelerator_type") or None
     allow_host_fallback = bool(job_body.get("allow_host_fallback", False))
+    input_artifact_job_id = job_body.get("input_artifact_job_id") or None
 
     caps = capabilities if capabilities is not None else _get_capabilities()
     cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
@@ -2435,6 +2542,39 @@ def _run_compute_job(
         result_file = os.path.join(tmpdir, "result.json")
         artifact_dir = os.path.join(tmpdir, "artifacts")
         os.makedirs(artifact_dir, exist_ok=True)
+
+        # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
+        # into the artifact dir BEFORE any command runs (mirrors the repo-clone
+        # window below), so the resumed command sees the prior checkpoint already
+        # present. Best-effort + honest: provenance (success OR failure) is
+        # reported so the operator can see exactly what happened — a failed
+        # hydration is never claimed as a successful resume.
+        if input_artifact_job_id:
+            provenance = _download_input_artifact(
+                orchestrator_url, token, job_id, artifact_dir
+            )
+            provenance["resumed_from_job_id"] = str(input_artifact_job_id)
+            if provenance.get("ok"):
+                print(
+                    f"[compute] job {job_id}: resumed from {input_artifact_job_id} "
+                    f"({provenance.get('file_count')} file(s), "
+                    f"{provenance.get('bytes')} bytes hydrated)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[compute] job {job_id}: checkpoint resume from "
+                    f"{input_artifact_job_id} FAILED "
+                    f"({provenance.get('reason')}); running from scratch",
+                    flush=True,
+                )
+            _report_compute_job(
+                orchestrator_url,
+                token,
+                job_id,
+                exec_status="running",
+                resume_hydration=provenance,
+            )
 
         # Reserve a disjoint GPU subset when the host has GPUs (16 GB V100 → 1/job).
         if caps.has_gpu:

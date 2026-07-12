@@ -546,6 +546,12 @@ class ComputeJobResponse(BaseModel):
     artifact_id: uuid.UUID | None = None
     polling_metadata: Dict[str, Any] = Field(default_factory=dict)
     compute_rpc_diagnostic: Dict[str, Any] | None = None
+    # Cross-job checkpoint resume, promoted from polling_metadata so the operator
+    # can see (without digging into the launch bag) that a run resumed and from
+    # where. ``input_artifact_job_id`` is the declared+validated resume source;
+    # ``resume_provenance`` is what actually happened at hydration time.
+    input_artifact_job_id: str | None = None
+    resume_provenance: Dict[str, Any] | None = None
 
 
 def serialize_compute_job_response(job: object) -> Dict[str, Any]:
@@ -556,6 +562,17 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         diagnostic = (data.get("polling_metadata") or {}).get("compute_rpc_diagnostic")
         if isinstance(diagnostic, dict):
             data["compute_rpc_diagnostic"] = diagnostic
+    # Promote the resume source + provenance from polling_metadata so both agent
+    # and operator surfaces expose them as first-class fields. They remain in
+    # polling_metadata too (not stripped by the _safe redactor).
+    metadata = data.get("polling_metadata")
+    if isinstance(metadata, dict):
+        source = metadata.get("input_artifact_job_id")
+        if isinstance(source, str) and source:
+            data["input_artifact_job_id"] = source
+        provenance = metadata.get("resume_provenance")
+        if isinstance(provenance, dict) and provenance:
+            data["resume_provenance"] = provenance
     return data
 
 

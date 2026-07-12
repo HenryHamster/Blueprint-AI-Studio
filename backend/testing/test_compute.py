@@ -16941,3 +16941,384 @@ def test_build_compute_launch_kwargs_forwards_declared_metric():
         {}, command="python x.py", spend_cap_usd=1.0, deadline_seconds=60
     )
     assert "declared_metric" not in absent
+
+
+# ── Cross-job checkpoint resume (input_artifact_job_id) ───────────────────────
+
+
+async def _make_resume_predecessor_job(
+    db_session, *, project_id, with_bundle: bool = True
+) -> ComputeJob:
+    """Insert a terminal runner-subprocess predecessor job.
+
+    When ``with_bundle`` is True the row carries a durable ``result_reference`` so
+    ``_compute_job_has_durable_bundle`` treats it as a valid resume source; when
+    False it has produced no bundle and must be rejected as a resume source.
+    """
+    job = ComputeJob(
+        project_id=project_id,
+        backend=compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME,
+        machine_type="e2-standard-2",
+        status=ComputeJobStatus.SUCCEEDED,
+        accrued_cost_usd=0.0,
+        completed_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    if with_bundle:
+        job.result_reference = storage.compute_job_artifact_uri(job.id)
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+    return job
+
+
+async def _make_pinned_runner_and_task(db_session, project_id):
+    """Create a runner in the project and a compute_experiment task pinned to it."""
+    from app import auth as auth_mod
+    from app.models import LocalRunner
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project_id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project_id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return runner, token, task
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monkeypatch):
+    """End-to-end cross-job checkpoint resume on the runner-subprocess path.
+
+    (1) create_compute_job validates + persists input_artifact_job_id;
+    (2) the claim response surfaces it to the runner;
+    (3) the new GET .../input-artifact endpoint streams the predecessor's durable
+        bundle so the runner can extract the prior checkpoint into its artifact
+        dir (the extracted bundle actually contains the checkpoint);
+    (4) the runner's reported resume provenance is recorded in polling_metadata
+        and exposed (with input_artifact_job_id) on the serialized response.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Resume Project", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    predecessor = await _make_resume_predecessor_job(
+        db_session, project_id=project.id, with_bundle=True
+    )
+    _runner, token, task = await _make_pinned_runner_and_task(db_session, project.id)
+
+    # The predecessor's durable bundle carries a real checkpoint plus a stale
+    # terminal.json from the prior run (which the runner-side extractor strips).
+    bundle_bytes = _make_tar_gz_bundle(
+        {
+            "checkpoint/model.pt": b"WEIGHTS-EPOCH-7",
+            "terminal.json": _terminal_record_bytes(status="SUCCEEDED"),
+        }
+    )
+
+    async def _fake_download(job_id):
+        assert str(job_id) == str(predecessor.id)
+        return bundle_bytes
+
+    monkeypatch.setattr(storage, "download_compute_job_artifact_bundle", _fake_download)
+
+    # (1) Launch the successor with the resume source — validated + persisted.
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py --resume",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        input_artifact_job_id=str(predecessor.id),
+    )
+    assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
+    assert job.polling_metadata.get("input_artifact_job_id") == str(predecessor.id)
+
+    # Forwarded into the launch spec the backend consumes.
+    spec = compute_jobs._build_launch_spec(job)
+    assert spec.input_artifact_job_id == str(predecessor.id)
+
+    # Move to STARTING so the runner can claim it (mirrors monitor launch tick).
+    job.status = ComputeJobStatus.STARTING
+    db_session.add(job)
+    await db_session.commit()
+
+    # (2) Claim surfaces the resume source to the runner.
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["job_id"] == str(job.id)
+    assert body["input_artifact_job_id"] == str(predecessor.id)
+
+    # (3) The download endpoint streams the predecessor bundle; the extracted
+    # bytes actually contain the prior checkpoint (i.e. it hydrates the run).
+    dl = await client.get(
+        f"/api/runner/compute-job/{job.id}/input-artifact",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert dl.status_code == 200, dl.text
+    assert dl.content == bundle_bytes
+    with tarfile.open(fileobj=io.BytesIO(dl.content), mode="r:gz") as tar:
+        names = tar.getnames()
+        assert "checkpoint/model.pt" in names
+        extracted = tar.extractfile("checkpoint/model.pt").read()
+    assert extracted == b"WEIGHTS-EPOCH-7"
+
+    # (4) Runner reports honest hydration provenance → recorded + serialized.
+    rep = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "exec_status": "running",
+            "resume_hydration": {
+                "resumed_from_job_id": str(predecessor.id),
+                "ok": True,
+                "file_count": 1,
+                "bytes": len(b"WEIGHTS-EPOCH-7"),
+            },
+        },
+    )
+    assert rep.status_code == 200, rep.text
+    await db_session.refresh(job)
+    provenance = (job.polling_metadata or {}).get("resume_provenance")
+    assert provenance is not None
+    assert provenance["ok"] is True
+    assert provenance["resumed_from_job_id"] == str(predecessor.id)
+    assert provenance["file_count"] == 1
+
+    serialized = schemas.serialize_compute_job_response(job)
+    assert serialized["input_artifact_job_id"] == str(predecessor.id)
+    assert serialized["resume_provenance"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
+    db_session, monkeypatch
+):
+    """A dangling input_artifact_job_id is rejected at launch (fail-closed) and no
+    job row is created — never a silent no-op."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(uuid.uuid4()),
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_not_found"
+    jobs = (
+        (await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_malformed_input_artifact_job_id(
+    db_session, monkeypatch
+):
+    """A non-UUID input_artifact_job_id is rejected with a clear agent-facing error."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id="not-a-uuid",
+        )
+    assert exc.value.detail["error"] == "invalid_input_artifact_job_id"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_cross_project_input_artifact(
+    db_session, monkeypatch
+):
+    """A resume source owned by a DIFFERENT project is refused."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    other_project = Project(name="Other Project", user_id="u")
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+    foreign = await _make_resume_predecessor_job(
+        db_session, project_id=other_project.id, with_bundle=True
+    )
+
+    task = await _make_compute_task(db_session)
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(foreign.id),
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_cross_project"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_bundleless_input_artifact(
+    db_session, monkeypatch
+):
+    """A resume source that never produced a durable bundle is refused — resuming
+    from nothing would be reproducibility dishonesty."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    task = await _make_compute_task(db_session)
+    predecessor = await _make_resume_predecessor_job(
+        db_session, project_id=task.project_id, with_bundle=False
+    )
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(predecessor.id),
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_has_no_bundle"
+
+
+@pytest.mark.asyncio
+async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
+    """When a resume source is set, GcpComputeBackend.launch mints a download
+    signed URL and the startup script pulls + extracts the predecessor bundle
+    into the artifact dir BEFORE the command runs."""
+    backend = GcpComputeBackend()
+    predecessor_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py --resume",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        input_artifact_job_id=str(predecessor_id),
+    )
+
+    download_calls: list = []
+
+    async def fake_upload_url(jid, *, expires_at=None):
+        return "https://storage.example.com/upload"
+
+    async def fake_download_url(jid, *, expires_at=None):
+        download_calls.append(jid)
+        return "https://storage.example.com/predecessor-bundle"
+
+    provision_calls: list = []
+
+    async def fake_provision(
+        vm_id, *, startup_script, machine_type, provisioning_model,
+        accelerator=None, accelerator_count=1,
+    ):
+        provision_calls.append(startup_script)
+        return True
+
+    monkeypatch.setattr(
+        storage, "generate_compute_job_artifact_upload_signed_url", fake_upload_url
+    )
+    monkeypatch.setattr(
+        storage, "generate_compute_job_artifact_download_signed_url", fake_download_url
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    await backend.launch(spec)
+
+    assert download_calls == [str(predecessor_id)]
+    script = provision_calls[0]
+    # Downloads the predecessor bundle and extracts it into the artifact dir.
+    assert "https://storage.example.com/predecessor-bundle" in script
+    assert (
+        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)} "
+        f"--no-same-owner -xzf" in script
+    )
+    assert "resume_hydration.ok" in script
+    assert "resume_hydration.failed" in script
+
+
+@pytest.mark.asyncio
+async def test_gcp_startup_script_no_resume_block_without_source(monkeypatch):
+    """Without a resume source the startup script is unchanged (no resume block)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "resume_hydration.ok" not in script
+    assert "blueprint_resume_bundle.tar.gz" not in script
+
+
+@pytest.mark.asyncio
+async def test_compute_job_input_artifact_endpoint_404_without_source(
+    client, db_session, monkeypatch
+):
+    """The input-artifact endpoint 404s when the pinned job declares no resume
+    source (fail-closed, no bytes leaked)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="No Resume", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _runner, token, task = await _make_pinned_runner_and_task(db_session, project.id)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.STARTING
+    db_session.add(job)
+    await db_session.commit()
+
+    dl = await client.get(
+        f"/api/runner/compute-job/{job.id}/input-artifact",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert dl.status_code == 404

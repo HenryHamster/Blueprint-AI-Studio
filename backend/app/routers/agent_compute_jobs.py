@@ -69,6 +69,12 @@ class LaunchComputeJobRequest(BaseModel):
     # a still-running job whose reported metric plateaus over the watchdog window
     # is cut early instead of burning its full deadline. Omission = no watchdog.
     declared_metric: str | None = Field(default=None, min_length=1, max_length=128)
+    # Optional cross-job checkpoint resume: the id of a prior compute job whose
+    # durable artifact bundle is hydrated into $BLUEPRINT_ARTIFACT_DIR before the
+    # command runs, so a long/interrupted job resumes from its predecessor's
+    # latest checkpoint instead of restarting from zero. Validated at launch time
+    # (must exist, same project, and have produced a durable bundle).
+    input_artifact_job_id: str | None = Field(default=None, max_length=64)
 
 
 @router.post("/compute-jobs")
@@ -140,6 +146,7 @@ async def launch_compute_job(
             container_image=req.container_image,
             container_registry_auth=req.container_registry_auth,
             declared_metric=req.declared_metric,
+            input_artifact_job_id=req.input_artifact_job_id,
         )
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc

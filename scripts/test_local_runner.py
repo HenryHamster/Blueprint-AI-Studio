@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -6072,6 +6073,120 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
             os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "notanint"}
         ):
             self.assertEqual(local_runner._compute_image_keep_days(), 7)
+
+
+class _FakeResp:
+    """Minimal context-manager HTTP response for mocking urlopen."""
+
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _make_bundle(members):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+class DownloadInputArtifactTests(unittest.TestCase):
+    """Cross-job checkpoint resume: runner-side bundle hydration."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="bp_resume_test_")
+        self.artifact_dir = os.path.join(self.tmpdir, "artifacts")
+        os.makedirs(self.artifact_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_hydrates_prior_bundle_and_strips_stale(self):
+        """A successful download extracts the checkpoint into the artifact dir,
+        strips predecessor run-status files, and reports honest provenance."""
+        bundle = _make_bundle(
+            {
+                "checkpoint/model.pt": b"WEIGHTS-EPOCH-7",
+                "terminal.json": b"STALE",
+                "result.json": b"{}",
+            }
+        )
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, bundle),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertTrue(prov["ok"], prov)
+        # Checkpoint present.
+        ckpt = os.path.join(self.artifact_dir, "checkpoint", "model.pt")
+        self.assertTrue(os.path.isfile(ckpt))
+        with open(ckpt, "rb") as fh:
+            self.assertEqual(fh.read(), b"WEIGHTS-EPOCH-7")
+        # Stale run-status files stripped.
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "terminal.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "result.json")))
+        # Provenance counts only surviving files (the single checkpoint).
+        self.assertEqual(prov["file_count"], 1)
+        self.assertEqual(prov["bytes"], len(b"WEIGHTS-EPOCH-7"))
+
+    def test_download_http_error_reports_failure_not_resume(self):
+        """A 404 from the endpoint yields ok=False (never a claimed resume)."""
+        import urllib.error
+
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError("u", 404, "nf", {}, None),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "http_404")
+        self.assertEqual(os.listdir(self.artifact_dir), [])
+
+    def test_empty_bundle_reports_failure(self):
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, b""),
+        ):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "empty_bundle")
+
+    def test_safe_members_rejects_path_traversal(self):
+        """A bundle with an absolute / .. member must not escape the dest dir."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name in ("../escape.txt", "/abs.txt", "ok.txt"):
+                info = tarfile.TarInfo(name=name)
+                info.size = 3
+                tar.addfile(info, io.BytesIO(b"xyz"))
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, buf.getvalue()),
+        ):
+            local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        # Only the safe member landed; no escape above the artifact dir.
+        self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "ok.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "escape.txt")))
 
 
 if __name__ == "__main__":

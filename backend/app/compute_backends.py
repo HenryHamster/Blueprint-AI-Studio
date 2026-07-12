@@ -298,6 +298,12 @@ class ComputeLaunchSpec:
     # Registry credentials for private/gated registries.  Only {server, username}
     # survive to the persisted launch spec; password is never written to the DB.
     container_registry_auth: dict | None = None
+    # Optional cross-job checkpoint resume source: the id of a prior compute job
+    # whose durable artifact bundle is fetched and extracted into the artifact dir
+    # BEFORE the command runs, so a long job resumes from its predecessor's latest
+    # checkpoint instead of restarting from zero. Validated at launch time (same
+    # project, durable bundle present). Absent ⇒ no resume (existing behavior).
+    input_artifact_job_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -785,10 +791,24 @@ class GcpComputeBackend:
                 expires_at=artifact_expiry_at,
             )
         )
+        # Cross-job checkpoint resume: mint a short-lived signed GET for the
+        # predecessor's durable bundle so the VM can pull + extract it into the
+        # artifact dir before the command runs. The resume source was validated at
+        # create_compute_job time (same project, durable bundle present).
+        input_artifact_download_url: str | None = None
+        if spec.input_artifact_job_id:
+            input_artifact_download_url = (
+                await storage.generate_compute_job_artifact_download_signed_url(
+                    spec.input_artifact_job_id,
+                    expires_at=artifact_expiry_at,
+                )
+            )
         ok = await compute.provision_ephemeral_vm(
             external_id,
             startup_script=_build_gcp_startup_script(
-                spec, artifact_upload_url=artifact_upload_url
+                spec,
+                artifact_upload_url=artifact_upload_url,
+                input_artifact_download_url=input_artifact_download_url,
             ),
             machine_type=spec.machine_type,
             provisioning_model=spec.provisioning_model,
@@ -2056,7 +2076,10 @@ def _artifact_upload_expiry(deadline_at: datetime | None) -> datetime:
 
 
 def _build_gcp_startup_script(
-    spec: ComputeLaunchSpec, *, artifact_upload_url: str
+    spec: ComputeLaunchSpec,
+    *,
+    artifact_upload_url: str,
+    input_artifact_download_url: str | None = None,
 ) -> str:
     env_lines = []
     for key, value in sorted((spec.env or {}).items()):
@@ -2268,6 +2291,63 @@ def _build_gcp_startup_script(
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
+    # Cross-job checkpoint resume: pull the predecessor's durable bundle from its
+    # signed GET URL and extract it into the artifact dir BEFORE the command runs,
+    # so a resumed job sees the prior checkpoint already present. Kept to
+    # single-line curl / python3 / tar invocations (no heredoc nesting) per the
+    # repo's "generating code for one language from another" guidance. Honest by
+    # design: a failed download/extract writes a `resume_hydration.failed` marker
+    # (never claims resume happened) and lets the command run from scratch; a
+    # success writes `resume_hydration.ok`. Both markers land in the uploaded
+    # bundle. Stale run-status files from the predecessor (result.json /
+    # command.log.json / terminal.json / live_tail.b64) are removed after extract
+    # so they cannot contaminate THIS run's terminal detection; the boot beacon
+    # below then re-lays a fresh terminal.json.
+    resume_block = ""
+    if input_artifact_download_url:
+        _resume_url_q = shlex.quote(input_artifact_download_url)
+        _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
+        _resume_ok_q = shlex.quote(
+            os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
+        )
+        _resume_fail_q = shlex.quote(
+            os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
+        )
+        _resume_stale = " ".join(
+            shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
+            for _name in (
+                "result.json",
+                "command.log.json",
+                "terminal.json",
+                "live_tail.b64",
+            )
+        )
+        resume_block = (
+            f"rm -f {_resume_bundle_q}\n"
+            f"if timeout {upload_timeout} curl --fail --silent --show-error "
+            f"--location --output {_resume_bundle_q} {_resume_url_q} "
+            f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
+            "'import urllib.request,sys; "
+            "urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "
+            f"{_resume_url_q} {_resume_bundle_q} >/dev/null 2>&1; then\n"
+            f"  RESUME_DL=1\n"
+            f"else\n"
+            f"  RESUME_DL=0\n"
+            f"fi\n"
+            f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
+            f"tar -C {artifact_dir} --no-same-owner -xzf {_resume_bundle_q} "
+            f">/dev/null 2>&1; then\n"
+            f"  rm -f {_resume_stale}\n"
+            f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'  echo "[resume] hydrated predecessor checkpoint bundle into '
+            f'artifact dir"\n'
+            f"else\n"
+            f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
+            f'  echo "[resume] predecessor checkpoint hydration FAILED — '
+            f'running from scratch"\n'
+            f"fi\n"
+            f"rm -f {_resume_bundle_q}"
+        )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
     artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
@@ -2350,6 +2430,7 @@ export {ARTIFACT_DIR_ENV}={artifact_dir}
 rm -f {result_file}
 rm -f {command_log_path}
 mkdir -p {artifact_dir}
+{resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
   >/dev/null 2>&1 || true

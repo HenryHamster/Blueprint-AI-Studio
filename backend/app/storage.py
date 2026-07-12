@@ -487,6 +487,50 @@ async def generate_compute_job_artifact_upload_signed_url(
         raise
 
 
+async def generate_compute_job_artifact_download_signed_url(
+    job_id, *, expires_at: datetime.datetime | None = None
+) -> str:
+    """Generate a signed GET URL for one compute job's durable artifact bundle.
+
+    Symmetric with :func:`generate_compute_job_artifact_upload_signed_url` — mints
+    a short-lived V4 signed GET on ``<root>/<job_id>/artifacts/bundle.tar.gz`` so a
+    successor compute-job VM can ``curl`` the predecessor's checkpoint bundle down
+    and extract it into its artifact dir before the command runs (cross-job
+    checkpoint resume). The object is Blueprint-owned and per-job; the signed URL
+    scopes access to exactly that one bundle for the expiry window.
+    """
+
+    object_name = compute_job_artifact_object_name(job_id)
+    logger.info(
+        "Generating compute-job artifact download signed URL for gs://%s/%s",
+        ARTIFACT_BUCKET_NAME,
+        object_name,
+    )
+
+    def _generate():
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        expiration = expires_at or (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(hours=2)
+        )
+        if expiration.tzinfo is None:
+            expiration = expiration.replace(tzinfo=datetime.timezone.utc)
+        return _generate_v4_signed_url(
+            blob,
+            version="v4",
+            expiration=expiration,
+            method="GET",
+        )
+
+    try:
+        return await asyncio.to_thread(_generate)
+    except Exception:
+        logger.exception("Failed to generate compute-job artifact download signed URL")
+        raise
+
+
 def _compute_job_artifact_condition_title(job_id) -> str:
     """Stable IAM-condition title so a binding can be re-found for revoke."""
     return f"blueprint-compute-job-artifacts-{job_id}"

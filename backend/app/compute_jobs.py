@@ -289,6 +289,82 @@ class ComputeLaunchPreconditionFailed(Exception):
         super().__init__(str(detail.get("message") or detail.get("error") or detail))
 
 
+def _compute_job_has_durable_bundle(job: ComputeJob) -> bool:
+    """True when a compute job actually produced a durable artifact bundle.
+
+    A cross-job resume source must have a downloadable bundle. ``result_reference``
+    / ``artifact_id`` are stamped by ``_link_terminal_artifact`` only after a real
+    bundle is linked, and runner-subprocess jobs additionally record a
+    ``runner_artifact`` descriptor. Any of these signals means a ``bundle.tar.gz``
+    exists under the job's per-job artifact prefix.
+    """
+    if job.result_reference or job.artifact_id is not None:
+        return True
+    runner_artifact = (job.polling_metadata or {}).get("runner_artifact")
+    return isinstance(runner_artifact, dict) and bool(runner_artifact.get("uri"))
+
+
+async def _resolve_resume_source_job_id(
+    session, *, project_id, input_artifact_job_id: str
+) -> str:
+    """Validate a cross-job checkpoint-resume source and return its canonical id.
+
+    Rejects (raising :class:`ComputeLaunchPreconditionFailed`, mapped to an
+    agent-facing error) a malformed uuid, a job that does not exist, a job owned
+    by a DIFFERENT project, or a job that never produced a durable artifact
+    bundle. Fail-closed by contract: a dangling / foreign / empty resume reference
+    must never silently no-op — that would recreate the fail-open reproducibility
+    dishonesty this project is fighting.
+    """
+    raw = str(input_artifact_job_id or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "invalid_input_artifact_job_id",
+                "message": f"input_artifact_job_id is not a valid UUID: {raw!r}",
+                "input_artifact_job_id": raw,
+            }
+        ) from exc
+    source = await session.get(ComputeJob, parsed)
+    if source is None:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_not_found",
+                "message": (
+                    f"input_artifact_job_id {parsed} does not reference an "
+                    "existing compute job"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    if source.project_id != project_id:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_cross_project",
+                "message": (
+                    "input_artifact_job_id belongs to a different project — "
+                    "cross-project checkpoint resume is refused"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    if not _compute_job_has_durable_bundle(source):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_has_no_bundle",
+                "message": (
+                    f"input_artifact_job_id {parsed} produced no durable artifact "
+                    "bundle (no result_reference / artifact / runner_artifact) — "
+                    "nothing to resume from"
+                ),
+                "input_artifact_job_id": str(parsed),
+            }
+        )
+    return str(parsed)
+
+
 def clamp_spend_cap_usd(raw_value: float) -> float:
     return max(
         MIN_COMPUTE_JOB_SPEND_CAP_USD,
@@ -382,6 +458,7 @@ async def create_compute_job(
     container_registry_auth: dict | None = None,
     allow_host_fallback: bool = False,
     declared_metric: str | None = None,
+    input_artifact_job_id: str | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -481,6 +558,16 @@ async def create_compute_job(
             project_id=locked_task.project_id,
             requirement=live_proof_requirement,
         )
+    # Cross-job checkpoint resume: validate the resume source BEFORE persisting the
+    # row so a bad reference is rejected at launch (agent-facing error) rather than
+    # silently no-op'ing at hydration time. Same-project + durable-bundle enforced.
+    resolved_input_artifact_job_id: str | None = None
+    if input_artifact_job_id is not None and str(input_artifact_job_id).strip():
+        resolved_input_artifact_job_id = await _resolve_resume_source_job_id(
+            session,
+            project_id=locked_task.project_id,
+            input_artifact_job_id=input_artifact_job_id,
+        )
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=resolved_machine_type,
@@ -494,6 +581,7 @@ async def create_compute_job(
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
         container_image=container_image,
+        input_artifact_job_id=resolved_input_artifact_job_id,
     )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
@@ -623,6 +711,12 @@ async def create_compute_job(
         polling_metadata["runner_hostname"] = runner_hostname
     if allow_host_fallback:
         polling_metadata["allow_host_fallback"] = True
+    if resolved_input_artifact_job_id is not None:
+        # Durable launch input (like command / container_image): the resume source
+        # whose checkpoint bundle is hydrated into $BLUEPRINT_ARTIFACT_DIR before
+        # the command runs. Recorded so the operator can see the run resumed and
+        # from where, and so _build_launch_spec can forward it to the backend.
+        polling_metadata["input_artifact_job_id"] = resolved_input_artifact_job_id
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -962,6 +1056,7 @@ def _build_launch_request_fingerprint(
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
     container_image: str | None = None,
+    input_artifact_job_id: str | None = None,
 ) -> str:
     payload = {
         "accelerator": accelerator,
@@ -976,6 +1071,7 @@ def _build_launch_request_fingerprint(
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
         "live_proof_requirement": live_proof_requirement,
+        "input_artifact_job_id": input_artifact_job_id,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2666,6 +2762,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         setup_step=meta.get("setup_step") or None,
         container_image=meta.get("container_image") or None,
         container_registry_auth=container_registry_auth,
+        input_artifact_job_id=meta.get("input_artifact_job_id") or None,
     )
 
 

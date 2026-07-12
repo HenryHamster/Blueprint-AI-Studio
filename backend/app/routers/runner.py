@@ -883,6 +883,12 @@ class ComputeJobReportRequest(BaseModel):
     exit_code: int | None = None
     result_metrics: Dict[str, Any] | None = None
     command_log: Dict[str, Any] | None = None
+    # Cross-job checkpoint resume provenance: what actually happened when the
+    # runner hydrated the predecessor's bundle into the artifact dir before the
+    # command ran. Stamped into polling_metadata['resume_provenance'] so the
+    # operator can SEE the run resumed (and from where / how much), or that the
+    # hydration failed — never claimed when it did not happen.
+    resume_hydration: Dict[str, Any] | None = None
 
 
 @router.post("/next-compute-job")
@@ -980,6 +986,10 @@ async def next_compute_job(
         "repo_token": repo_token,
         "accelerator_type": job.accelerator_type,
         "allow_host_fallback": refreshed_meta.get("allow_host_fallback", False),
+        # Cross-job checkpoint resume: when set, the runner fetches this
+        # predecessor's durable bundle and extracts it into the artifact dir
+        # before spawning the subprocess. Validated at create_compute_job time.
+        "input_artifact_job_id": refreshed_meta.get("input_artifact_job_id"),
     }
 
 
@@ -1092,6 +1102,25 @@ async def report_compute_job(
                 meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
+        if isinstance(payload.resume_hydration, dict):
+            # Whitelist known provenance keys so a runner cannot bloat the row.
+            raw = payload.resume_hydration
+            provenance: Dict[str, Any] = {}
+            src = raw.get("resumed_from_job_id")
+            if isinstance(src, str) and src.strip():
+                provenance["resumed_from_job_id"] = src.strip()[:64]
+            if isinstance(raw.get("ok"), bool):
+                provenance["ok"] = raw["ok"]
+            for key in ("file_count", "bytes"):
+                val = raw.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                    provenance[key] = val
+            reason = raw.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                provenance["reason"] = reason.strip()[:200]
+            if provenance:
+                provenance["recorded_at"] = now.isoformat()
+                meta["resume_provenance"] = provenance
         job.polling_metadata = meta
         job.last_heartbeat_at = now
         job.updated_at = now
@@ -1242,3 +1271,67 @@ async def upload_compute_job_artifact(
     await session.commit()
 
     return {"ok": True, "runner_artifact": artifact_info}
+
+
+@router.get("/compute-job/{job_id}/input-artifact")
+async def download_compute_job_input_artifact(
+    job_id: uuid.UUID,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream the predecessor checkpoint bundle for a claimed resume job.
+
+    Cross-job checkpoint resume: ``{job_id}`` is the CURRENT job the runner is
+    executing (pinned to this runner). Its ``polling_metadata`` carries the
+    validated ``input_artifact_job_id`` of the predecessor whose durable bundle
+    should be hydrated into the artifact dir before the command runs. The server
+    resolves that predecessor id from the pinned job (the runner cannot ask for an
+    arbitrary bundle), re-checks the predecessor belongs to the SAME project, and
+    streams its ``bundle.tar.gz`` bytes.
+
+    Returns 404 when the current job is not visible to this runner, carries no
+    resume source, the predecessor is missing / cross-project, or its bundle
+    object does not exist — fail-closed, never leaking whether an object exists.
+    """
+    allowed, retry_after = await check_runner_rate_limit(
+        str(runner.id), "download_compute_job_input_artifact"
+    )
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    # Same ownership scoping as the report/upload endpoints: pinned runner only.
+    result = await session.execute(
+        select(ComputeJob).where(
+            ComputeJob.id == job_id,
+            ComputeJob.project_id == runner.project_id,
+            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+            ComputeJob.polling_metadata["runner_target_id"].as_string()
+            == str(runner.id),
+        )
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+
+    source_id_raw = (job.polling_metadata or {}).get("input_artifact_job_id")
+    if not source_id_raw:
+        raise HTTPException(status_code=404, detail="job has no resume source")
+    try:
+        source_id = uuid.UUID(str(source_id_raw))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=404, detail="job has no resume source")
+
+    # Defense-in-depth: the predecessor must still exist and belong to this
+    # runner's project before we stream any bytes (launch-time validation already
+    # enforced same-project, but re-check in case the row changed).
+    source_job = await session.get(ComputeJob, source_id)
+    if source_job is None or source_job.project_id != runner.project_id:
+        raise HTTPException(status_code=404, detail="resume source not found")
+
+    from app import storage
+
+    bundle = await storage.download_compute_job_artifact_bundle(source_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="resume source bundle not found")
+
+    return Response(content=bundle, media_type="application/gzip")
