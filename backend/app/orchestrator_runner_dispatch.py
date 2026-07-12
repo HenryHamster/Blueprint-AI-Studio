@@ -264,6 +264,44 @@ def _runner_has_free_vram(
     return any(mib >= required_mib for mib in free_mib_list)
 
 
+def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Whether a runner is trustworthy GPU-capable for accelerator dispatch.
+
+    The runner self-reports ``has_gpu`` (a ``StrictBool``) in its heartbeat, but a
+    mis-set flag would SILENTLY DEFEAT the GPU capability gate — the runner would win
+    GPU-accelerator jobs it cannot execute, and they die missing-GPU on the box
+    instead of holding for real hardware. We therefore do NOT trust the bare bool
+    over the runner's own GPU TELEMETRY: the same heartbeat carries
+    ``gpu_count`` / ``gpu_names`` (nvidia-smi-derived facts persisted alongside
+    ``has_gpu`` in capabilities JSONB). When ``has_gpu`` is claimed true but that
+    telemetry positively contradicts it (a reported count of 0, or an empty names
+    list), the claim is disbelieved: the runner is treated as CPU-only and simply not
+    sent accelerator jobs (they hold for a genuinely GPU-capable runner, per the
+    existing no-eligible-runner hold paths — never a crash).
+
+    Absence of telemetry is NOT a contradiction. An older runner (or one that does
+    not expose nvidia-smi) may set ``has_gpu`` without reporting a count/names; as
+    with :func:`_runner_has_free_vram`, we gate only on real contradicting data, not
+    on missing telemetry — so a legitimately-configured runner that just does not
+    report the extra fields is never demoted (backward compatible). ``gpu_count`` is
+    authoritative when present; ``gpu_names`` is the fallback signal when the count
+    is absent.
+    """
+    caps = runner.capabilities or {}
+    if not caps.get("has_gpu"):
+        return False
+    # has_gpu is claimed true — cross-check the runner's own GPU telemetry, trusting
+    # the fact over the bare bool when the fact is present.
+    gpu_count = caps.get("gpu_count")
+    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool):
+        return gpu_count > 0
+    gpu_names = caps.get("gpu_names")
+    if isinstance(gpu_names, list):
+        return len(gpu_names) > 0
+    # No GPU telemetry reported at all — trust the self-report (backward compatible).
+    return True
+
+
 def _runner_max_concurrent_compute(
     runner: LocalRunner | RunnerDispatchSnapshot,
 ) -> int | None:
@@ -808,7 +846,10 @@ def _select_eligible_runner(
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
     not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
-    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU).  When a
+    be VERIFIED GPU-capable via :func:`_runner_gpu_capable` — the self-reported
+    ``has_gpu`` bool cross-checked against the runner's own GPU telemetry, so a
+    mis-set flag cannot silently defeat the GPU capability gate (a CPU runner, or one
+    whose telemetry contradicts its ``has_gpu`` claim, cannot provide a GPU).  When a
     ``container_image`` is declared the runner must advertise a container isolation
     backend (docker, podman, etc.) — the orchestrator will not route a
     container-image-dependent job to a runner whose isolation support is unknown.
@@ -849,7 +890,13 @@ def _select_eligible_runner(
         and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
     ]
     if accelerator:
-        eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+        # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool: a
+        # mis-set flag would silently defeat this gate and win GPU jobs the runner
+        # cannot run. _runner_gpu_capable cross-checks has_gpu against the runner's
+        # own nvidia-smi telemetry (gpu_count/gpu_names) and disbelieves a claim its
+        # telemetry contradicts. Fail-safe: a runner that cannot be verified
+        # GPU-capable falls out of `eligible` and the task holds for real hardware.
+        eligible = [r for r in eligible if _runner_gpu_capable(r)]
     if container_image:
         eligible = [r for r in eligible if _runner_has_container_capability(r)]
     if vram_gb is not None and vram_gb > 0:

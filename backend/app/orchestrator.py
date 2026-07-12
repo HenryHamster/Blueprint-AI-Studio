@@ -418,6 +418,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _runner_active_work_count,
     _runner_agent_available,
     _runner_at_capacity,
+    _runner_gpu_capable,
     _runner_handles_task_type,
     _select_eligible_runner,
     _strategic_local_hold_timeout_seconds,

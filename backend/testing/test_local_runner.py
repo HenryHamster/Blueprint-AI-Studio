@@ -464,6 +464,97 @@ def test_runner_handles_task_type_intersects_operator_policy_and_runner_floor():
     assert orch._runner_handles_task_type(policy_limited, "review") is False
 
 
+def test_runner_gpu_capable_verifies_self_report_against_telemetry():
+    """`_runner_gpu_capable` disbelieves a mis-set `has_gpu` when the runner's OWN
+    GPU telemetry (gpu_count/gpu_names) contradicts the claim, but trusts the flag
+    when telemetry is absent (backward compatible with older runners)."""
+    # No claim → not GPU-capable (unchanged from the bare has_gpu filter).
+    assert orch._runner_gpu_capable(_snapshot({})) is False
+    assert orch._runner_gpu_capable(_snapshot({"has_gpu": False})) is False
+
+    # Claim CORROBORATED by telemetry → GPU-capable.
+    assert (
+        orch._runner_gpu_capable(
+            _snapshot({"has_gpu": True, "gpu_count": 1, "gpu_names": ["Tesla T4"]})
+        )
+        is True
+    )
+    # gpu_count is authoritative when present: a positive count is trusted even if
+    # names were not reported.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_count": 2}))
+        is True
+    )
+
+    # Claim CONTRADICTED by telemetry (the mis-set-flag lie) → NOT GPU-capable.
+    # gpu_count of 0 is a direct contradiction.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_count": 0}))
+        is False
+    )
+    # Empty gpu_names (with no count) is the fallback contradiction signal.
+    assert (
+        orch._runner_gpu_capable(_snapshot({"has_gpu": True, "gpu_names": []}))
+        is False
+    )
+    # gpu_count is authoritative over names: count 0 wins even if a stray name rode
+    # along, so a runner reporting an honest nvidia-smi count of 0 is disbelieved.
+    assert (
+        orch._runner_gpu_capable(
+            _snapshot({"has_gpu": True, "gpu_count": 0, "gpu_names": ["ghost"]})
+        )
+        is False
+    )
+
+    # Absence of telemetry is NOT a contradiction — an older runner that sets
+    # has_gpu but reports no count/names is still trusted (backward compatible).
+    assert orch._runner_gpu_capable(_snapshot({"has_gpu": True})) is True
+
+
+def test_select_eligible_runner_excludes_gpu_liar_prefers_honest_runner():
+    """A runner claiming `has_gpu=true` whose telemetry shows no GPU is excluded from
+    GPU-accelerator dispatch; a genuinely GPU-capable runner is selected instead."""
+    project_id = uuid.uuid4()
+    # Liar: claims a GPU but its own telemetry reports zero GPUs.
+    liar = _snapshot(
+        {"task_types": "all", "has_gpu": True, "gpu_count": 0, "gpu_names": []}
+    )
+    # Honest GPU runner: claim corroborated by telemetry.
+    honest = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["Tesla T4"],
+        }
+    )
+    cache = {project_id: [liar, honest]}
+
+    # A GPU-accelerator task must route to the honest runner, never the liar.
+    chosen = orch._select_eligible_runner(
+        cache, project_id, "compute_experiment", "T4", {}
+    )
+    assert chosen is honest
+
+    # With ONLY the liar available, a GPU task finds no eligible runner (it then
+    # holds for real hardware rather than dispatching to a box that cannot run it).
+    liar_only = {project_id: [liar]}
+    assert (
+        orch._select_eligible_runner(
+            liar_only, project_id, "compute_experiment", "T4", {}
+        )
+        is None
+    )
+    # A CPU task (no accelerator) is unaffected — the liar is a perfectly good CPU
+    # runner, so the GPU gate never touches it.
+    assert (
+        orch._select_eligible_runner(
+            liar_only, project_id, "compute_experiment", None, {}
+        )
+        is liar
+    )
+
+
 class TestRunnerHealthAgentUnavailableReason:
     """_runner_health() surfaces agent_unavailable_reason from capabilities JSONB."""
 
