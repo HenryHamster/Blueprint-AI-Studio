@@ -1775,19 +1775,21 @@ async def sweep_protect_referenced_compute_image_digests(
     for img in images:
         full_repo = f"{img.registry_repo}/{img.image_name}"
         repos.add(full_repo)
-        if img.digest and img.digest in referenced and apply_tag(
-            full_repo, img.digest
-        ):
-            applied += 1
+        if img.digest and img.digest in referenced:
+            # Run blocking subprocess call off the event-loop thread so the
+            # sweep cannot stall API responsiveness or heartbeat processing.
+            if await asyncio.to_thread(apply_tag, full_repo, img.digest):
+                applied += 1
 
     for full_repo in repos:
         try:
-            existing = list_tags(full_repo)
+            existing = await asyncio.to_thread(list_tags, full_repo)
         except Exception:  # noqa: BLE001 — registry helpers fail open
             continue
         for tag in existing:
-            if tag not in protected_tags and delete_tag(full_repo, tag):
-                pruned += 1
+            if tag not in protected_tags:
+                if await asyncio.to_thread(delete_tag, full_repo, tag):
+                    pruned += 1
 
     return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
 
