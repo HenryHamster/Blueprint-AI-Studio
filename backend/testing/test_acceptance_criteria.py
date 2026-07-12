@@ -640,6 +640,171 @@ async def test_coverage_summary_empty(db_session):
 
 
 # ---------------------------------------------------------------------------
+# phantom acceptance-criteria bookkeeping drift guard
+# ---------------------------------------------------------------------------
+
+
+def test_extract_referenced_criterion_keys_pattern():
+    """extract_referenced_criterion_keys finds c-<8hex> tokens, ignores non-keys."""
+    text = (
+        "Progress: 0/6 covered against c-bbf215e3 and c-a5940d77; "
+        "see commit deadbeefcafe (not a key) and c-ZZZ (bad hex)."
+    )
+    keys = ac.extract_referenced_criterion_keys(text)
+    assert keys == {"c-bbf215e3", "c-a5940d77"}
+    # word boundary: a longer hex run is NOT a criterion key
+    assert ac.extract_referenced_criterion_keys("c-deadbeef00") == set()
+    # defensive: non-string / empty inputs never raise
+    assert ac.extract_referenced_criterion_keys(None) == set()
+    assert ac.extract_referenced_criterion_keys("") == set()
+    assert ac.extract_referenced_criterion_keys(12345) == set()  # type: ignore[arg-type]
+
+
+def test_reconcile_flags_phantom_keys():
+    """A referenced key with no registered match is a phantom (dangling) key."""
+    report = ac.reconcile_criterion_key_references(
+        registered={"c-11111111"},
+        referenced={"c-11111111", "c-22222222"},
+    )
+    assert report["phantom_keys"] == ["c-22222222"]
+    assert report["zero_registered"] is False
+    assert report["has_drift"] is True
+
+
+def test_reconcile_flags_zero_registered_when_referenced():
+    """Keys referenced while zero criteria are registered → zero_registered drift."""
+    report = ac.reconcile_criterion_key_references(
+        registered=set(),
+        referenced={"c-33333333"},
+    )
+    assert report["zero_registered"] is True
+    assert report["phantom_keys"] == ["c-33333333"]
+    assert report["has_drift"] is True
+
+    # No drift when nothing is referenced and nothing is registered.
+    clean = ac.reconcile_criterion_key_references(registered=set(), referenced=set())
+    assert clean["has_drift"] is False
+    assert clean["zero_registered"] is False
+
+    # No drift when every referenced key is registered.
+    matched = ac.reconcile_criterion_key_references(
+        registered={"c-44444444"}, referenced={"c-44444444"}
+    )
+    assert matched["has_drift"] is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_includes_phantom_bookkeeping_key(db_session):
+    """get_version_coverage_summary always carries a phantom_bookkeeping report;
+    it flags drift when prose references keys not registered on the version."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    # Register one real criterion, then reference a DIFFERENT (dangling) key in prose.
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Tests pass")
+    project.problem_model = {
+        "intent": {"current_focus": "Ship the tiering redesign for c-deadbeef"}
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["has_drift"] is True
+    assert "c-deadbeef" in report["phantom_keys"]
+    # the registered key is NOT flagged
+    assert c1.criterion_key not in report["phantom_keys"]
+    assert report["zero_registered"] is False  # one criterion IS registered
+    assert report["registered_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_no_phantom_when_prose_matches(db_session):
+    """No drift when the only referenced key is a registered active criterion."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Tests pass")
+
+    # Reference the real, registered key — via a direction's success_evidence.
+    project.directions = [
+        {
+            "id": "d-1",
+            "status": "active",
+            "context": {"success_evidence": f"criterion {c1.criterion_key} covered"},
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["phantom_bookkeeping"]["has_drift"] is False
+    assert summary["phantom_bookkeeping"]["phantom_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_zero_registered_criteria_and_dangling_key_flagged(db_session):
+    """End-to-end drift guard: an open version with ZERO registered criteria whose
+    focus prose / direction success_evidence still reference criterion keys reads
+    PASS at every gate today. This must instead surface a needs_operator
+    'phantom_criterion_bookkeeping' attention item so the drift fails loud.
+
+    Reproduces the v25 'phantom bookkeeping' failure: prose claimed coverage
+    against criterion keys that were never registered on the open version, while
+    live criterion_coverage read total==0.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)  # status defaults to 'open'
+
+    # Zero registered criteria, but strategic focus AND an active direction both
+    # reference criterion keys as though they were being tracked.
+    project.problem_model = {
+        "intent": {
+            "current_focus": "Author v25 acceptance contract: 0/6 covered on c-a5940d77"
+        }
+    }
+    project.directions = [
+        {
+            "id": "d-a5940d77",
+            "status": "active",
+            "context": {"success_evidence": "attestation tiering c-bbf215e3 verified"},
+        },
+        # retired direction references are ignored (must not add drift on their own)
+        {
+            "id": "d-old",
+            "status": "retired",
+            "context": {"success_evidence": "legacy c-99999999"},
+        },
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    # The coverage summary itself must expose the drift, sourced from BOTH prose
+    # fields, with zero_registered set (no active criteria exist).
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    report = summary["phantom_bookkeeping"]
+    assert report["zero_registered"] is True
+    assert report["has_drift"] is True
+    assert set(report["phantom_keys"]) == {"c-a5940d77", "c-bbf215e3"}
+    # retired-direction key must NOT appear
+    assert "c-99999999" not in report["phantom_keys"]
+    assert report["registered_count"] == 0
+
+    # And it must surface as a needs_operator attention item end-to-end.
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    phantom_items = [
+        item
+        for item in attention["items"]
+        if item.get("reason") == "phantom_criterion_bookkeeping"
+    ]
+    assert len(phantom_items) == 1
+    item = phantom_items[0]
+    assert item["severity"] == "needs_operator"
+    assert item["kind"] == "version"
+    assert item["lifecycle"]["mode"] == "acceptance_criteria_lifecycle"
+    assert attention["counts"]["phantom_criterion_bookkeeping"] == 1
+
+
+# ---------------------------------------------------------------------------
 # stuck-criterion diagnosis (_classify_stuck_reasons / get_version_coverage_summary)
 # ---------------------------------------------------------------------------
 

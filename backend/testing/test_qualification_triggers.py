@@ -113,17 +113,20 @@ class TestT1CoverageComplete:
         assert d.fire
         assert d.trigger == "coverage_complete"
 
-    def test_attested_only_is_not_coverage_incomplete(self):
-        # All criteria attested-only — coverage gate satisfied (matching scorer).
+    def test_attestation_only_coverage_does_not_fire_coverage_complete(self):
+        # Attestation is a lower-confidence tier; attested-only criteria do NOT
+        # clear the coverage gate — only machine-verified (covered) and backfilled
+        # evidence arms the T1 trigger.  Regression guard for the parity bug.
         d = _resolve(status=None, coverage={"total": 2, "covered": 0, "attested": 2})
-        assert d.fire
-        assert d.trigger == "coverage_complete"
+        assert not d.fire
+        assert d.reason == "coverage_incomplete"
 
-    def test_mixed_attested_and_covered_fires(self):
-        # Mix of covered + attested satisfies the gate.
+    def test_mixed_attested_and_covered_does_not_fire_when_attested_criteria_remain(self):
+        # Covered=1 of total=3, attested=2: the 2 attested-only criteria are not
+        # machine-verified so they do not clear the gate.
         d = _resolve(status=None, coverage={"total": 3, "covered": 1, "attested": 2})
-        assert d.fire
-        assert d.trigger == "coverage_complete"
+        assert not d.fire
+        assert d.reason == "coverage_incomplete"
 
     def test_attested_not_enough_when_uncovered_remains(self):
         # Even with some attested, uncovered criteria still block.
@@ -147,14 +150,23 @@ class TestT1CoverageComplete:
         assert d.fire is True
         assert d.trigger == "coverage_complete"
 
-    def test_mixed_backfilled_covered_and_attested_fires(self):
-        # A mix spanning all three clearing tiers satisfies the gate.
+    def test_mixed_backfilled_and_covered_fires_when_no_uncovered_remain(self):
+        # Covered + backfilled spans all criteria (no attested-only gap): fires.
+        d = _resolve(
+            status=None,
+            coverage={"total": 2, "covered": 1, "attested": 0, "backfilled": 1},
+        )
+        assert d.fire is True
+        assert d.trigger == "coverage_complete"
+
+    def test_mixed_backfilled_covered_attested_does_not_fire_when_attested_remain(self):
+        # Even with covered+backfilled present, attested-only criteria still block.
         d = _resolve(
             status=None,
             coverage={"total": 3, "covered": 1, "attested": 1, "backfilled": 1},
         )
-        assert d.fire is True
-        assert d.trigger == "coverage_complete"
+        assert not d.fire
+        assert d.reason == "coverage_incomplete"
 
     def test_backfilled_not_enough_when_uncovered_remains(self):
         # Backfilled closes some but genuinely-uncovered criteria still block,

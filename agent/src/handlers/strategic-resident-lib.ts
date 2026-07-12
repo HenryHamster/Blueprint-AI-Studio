@@ -998,6 +998,11 @@ export interface BootstrapContext {
   /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
    *  `## Project Skills` section when non-empty. Absent or omitted defaults to ''. */
   skillsText?: string;
+  /** Pre-rendered durable decisions register (from `decisionsRegisterText`),
+   *  restored from persisted `task.context._decisions_reg` on a full session
+   *  restart. Carries its own `## Decisions register …` header. Empty string or
+   *  whitespace → section omitted (clean-restart no-op). Absent → defaults to ''. */
+  decisionsRegisterText?: string;
 
 }
 
@@ -1026,6 +1031,12 @@ conversation with the operator in memory. You operate at two speeds:
   heredoc or pipe. The live stream is a transcript, but the durable chat reply
   the operator reads is the message you send. Every reply to an operator
   message REQUIRES a \`./messages send\`; do not answer only in the stream.
+  When the operator's message SETTLES or CORRECTS a course — rejects an option,
+  reverses a call, fixes a fact, or gives a standing instruction — end your turn
+  with one trailing marker line \`OPERATOR-DECISION: <the settled fact, stated as
+  a durable rule>\`. This is captured into your durable decisions register so a
+  restarted session does NOT re-propose what the operator already settled. Emit
+  it ONLY for genuine settlements, never for routine Q&A.
 - **Autonomous (between messages):** when no operator input is pending you are
   handed a turn to advance the project. Complete ONE meaningful unit of progress —
   refine the problem model, open/refine/retire a direction, spawn needed work,
@@ -1102,6 +1113,15 @@ ${ctx.strategicMemoryNotesText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  // Durable decisions register — settled cross-tick decisions restored from the
+  // persisted context on a full session restart. Rendered here (mirroring the
+  // compaction checkpoint) so the FIRST post-restart turn — usually a live
+  // operator reply — is not generated blind to already-settled decisions. The
+  // text carries its own `## Decisions register …` header. Empty on a clean
+  // restart, in which case the section is omitted (byte-for-byte no-op).
+  if (ctx.decisionsRegisterText?.trim()) {
+    sections.push(ctx.decisionsRegisterText.trim());
   }
   return sections.join('\n\n');
 }
@@ -1279,13 +1299,23 @@ export const DECISIONS_REGISTER_CAP = 50;
  *  or they evict real decisions — worst at the autonomous<->operator boundary
  *  where interrupts cluster. The exam ledger still records those outcomes; only
  *  the durable register filters them out. */
-const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set(['advanced', 'found', 'clear']);
+/** The verdict tag stamped on a decisions-register entry that captures a
+ *  correction/decision the operator settled in live chat (as opposed to an
+ *  autonomous tick verdict). Included in SETTLED_DECISION_VERDICTS so an
+ *  operator-settled decision is treated as durable just like an autonomous one —
+ *  this is what stops the strategist re-proposing a course the operator already
+ *  corrected after a session restart. */
+export const OPERATOR_DECISION_VERDICT = 'operator';
+
+const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set([
+  'advanced', 'found', 'clear', OPERATOR_DECISION_VERDICT,
+]);
 
 /**
  * Whether a tick verdict represents a settled decision that belongs in the
- * durable decisions register. True only for `advanced` | `found` | `clear`;
- * false for `unevidenced`, `interrupted`, and any unrecognized string. Pure —
- * unit-testable in isolation.
+ * durable decisions register. True for `advanced` | `found` | `clear` and the
+ * operator-settled `operator` verdict; false for `unevidenced`, `interrupted`,
+ * and any unrecognized string. Pure — unit-testable in isolation.
  */
 export function isSettledDecisionVerdict(verdict: string): boolean {
   return SETTLED_DECISION_VERDICTS.has(verdict);
@@ -1437,6 +1467,27 @@ export function parseTickVerdict(
       else surfaceKey = rest;
     }
     return { verdict, surfaceKey, note };
+  }
+  return null;
+}
+
+/**
+ * Parse the trailing OPERATOR-DECISION marker line from an operator-turn's
+ * result text. The resident strategist is instructed (bootstrap prompt) to end a
+ * reply with `OPERATOR-DECISION: <settled fact>` whenever the operator corrects
+ * or settles a course in live chat. Scans from the LAST line so a mid-reply
+ * mention cannot be mistaken for the marker. Returns the settled-fact note
+ * (leading dash stripped), or null when no marker is present or its note is
+ * empty. Pure — unit-testable in isolation.
+ */
+export function parseOperatorDecision(resultText: string): string | null {
+  if (typeof resultText !== 'string') return null;
+  const lines = resultText.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(lines[i]);
+    if (!m) continue;
+    const note = m[1].replace(/^[—–-]\s*/, '').trim();
+    return note.length > 0 ? note : null;
   }
   return null;
 }

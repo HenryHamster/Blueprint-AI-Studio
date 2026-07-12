@@ -130,6 +130,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stale_queued_task"): 60,
     ("needs_operator", "stuck_criteria"): 65,
     ("needs_operator", "stuck_acceptance_criterion"): 65,
+    ("needs_operator", "phantom_criterion_bookkeeping"): 64,
     ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "attestation_expired"): 67,
     ("needs_operator", "corroboration_failed"): 68,
@@ -254,6 +255,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed",
         "operator_action": "monitor_active_direction_progress",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "phantom_criterion_bookkeeping": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criteria_registered_or_prose_reconciled_or_version_closed",
+        "operator_action": "register_criteria_or_correct_referenced_keys",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -1409,6 +1417,54 @@ def _coverage_blocked_attention_item(
     }
 
 
+def _phantom_criterion_bookkeeping_attention_item(
+    project_id: uuid.UUID,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Surface criterion-key drift: prose tracks coverage against keys that are
+    not registered on the open version (or no criteria are registered at all).
+
+    Without this the version reads PASS/not-applicable at every gate silently —
+    the "phantom bookkeeping" failure. The item points the operator at the
+    acceptance-criteria surface to register the real criteria or fix the prose.
+    """
+    phantom_keys = report.get("phantom_keys") or []
+    zero_registered = bool(report.get("zero_registered"))
+    parts: list[str] = []
+    if zero_registered:
+        parts.append(
+            "focus prose references acceptance criteria but the open version "
+            "has zero registered criteria"
+        )
+    if phantom_keys:
+        preview = ", ".join(phantom_keys[:5])
+        noun = "key" if len(phantom_keys) == 1 else "keys"
+        parts.append(f"{len(phantom_keys)} referenced {noun} not registered: {preview}")
+    detail = "; ".join(parts) if parts else "criterion-key bookkeeping drift detected"
+    label = (
+        "Acceptance criteria referenced in prose are not registered"
+        if zero_registered
+        else "Referenced acceptance-criteria keys are not registered"
+    )
+    return {
+        "id": f"project:{project_id}:phantom_criterion_bookkeeping",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "phantom_criterion_bookkeeping",
+        "label": label,
+        "detail": _compact_text(detail, max_chars=200),
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "acceptance_criteria",
+        }),
+    }
+
+
 # Statuses that indicate a linked task is genuinely in-flight or already
 # succeeded — a debt with at least one such task is NOT stale-unworked.
 # FAILED, CANCELLED, and missing (unknown) task ids do NOT count.
@@ -2120,10 +2176,13 @@ async def build_operator_attention(
     corroboration_failed_count = 0
     corroboration_failed_items: list[dict[str, Any]] = []
     failed_corroboration_keys: set[str] = set()
+    phantom_bookkeeping_report: dict[str, Any] = {}
     try:
         open_version = await current_open_version(session, project.id)
         if open_version is not None:
             coverage = await get_version_coverage_summary(session, open_version.id)
+
+            phantom_bookkeeping_report = coverage.get("phantom_bookkeeping") or {}
 
             # Read failed corroboration keys from the coverage summary, which
             # already computed them via get_failed_corroboration_keys internally.
@@ -2328,6 +2387,12 @@ async def build_operator_attention(
         )
     if coverage_blocked_count > 0:
         add_candidate(_coverage_blocked_attention_item(project.id, coverage_blocked_count))
+    if phantom_bookkeeping_report.get("has_drift"):
+        add_candidate(
+            _phantom_criterion_bookkeeping_attention_item(
+                project.id, phantom_bookkeeping_report
+            )
+        )
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
     for direction in churn_recommended_directions[:3]:
@@ -2461,6 +2526,9 @@ async def build_operator_attention(
             "churn_retirement_recommended": len(churn_recommended_directions),
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
+            "phantom_criterion_bookkeeping": (
+                1 if phantom_bookkeeping_report.get("has_drift") else 0
+            ),
             "attestation_expired": attestation_expired_count,
             "attestation_expiring": attestation_expiring_count,
             "corroboration_failed": corroboration_failed_count,

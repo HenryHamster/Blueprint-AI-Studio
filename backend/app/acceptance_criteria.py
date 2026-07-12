@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 import secrets
 import uuid
 from collections import defaultdict
@@ -304,6 +305,93 @@ MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY = 10
 def generate_criterion_key() -> str:
     """Return a stable 'c-<8hexchars>' key for a new acceptance criterion."""
     return f"c-{secrets.token_hex(4)}"
+
+
+# Matches the ``c-<8 hex chars>`` criterion-key token minted by
+# :func:`generate_criterion_key`. ``\b`` word boundaries keep it from matching
+# inside a longer hex run (e.g. a commit SHA); the token is anchored to exactly
+# eight lowercase-hex characters so a longer or shorter run is not a criterion key.
+_CRITERION_KEY_RE = re.compile(r"\bc-[0-9a-f]{8}\b")
+
+
+def extract_referenced_criterion_keys(text: str | None) -> set[str]:
+    """Extract ``c-<8hex>`` criterion-key tokens referenced in free-text prose.
+
+    Used to reconcile keys named in strategic focus prose / direction
+    success_evidence against the criteria actually registered on a version.
+    Non-string / empty input yields an empty set (never raises) so callers can
+    feed it arbitrary JSONB blob fields defensively.
+    """
+    if not isinstance(text, str) or not text:
+        return set()
+    return set(_CRITERION_KEY_RE.findall(text))
+
+
+def reconcile_criterion_key_references(
+    registered: set[str],
+    referenced: set[str],
+) -> dict[str, Any]:
+    """Reconcile referenced criterion keys against the registered active set.
+
+    ``registered`` is the set of ACTIVE criterion keys on the version; ``referenced``
+    is the set of keys named in prose/success_evidence.
+
+    Returns a drift report::
+
+        {
+            "phantom_keys": [sorted keys referenced but NOT registered],
+            "zero_registered": bool,  # keys are referenced yet the version has
+                                      # zero active registered criteria
+            "has_drift": bool,        # either signal present
+        }
+
+    ``phantom_keys`` catches dangling references (prose cites a key that was never
+    registered — v24-era keys re-cited on v25). ``zero_registered`` catches the
+    "phantom bookkeeping" case where prose tracks coverage against keys but no
+    criteria exist to back them, so every gate reads PASS/not-applicable silently.
+    """
+    phantom_keys = sorted(referenced - registered)
+    zero_registered = bool(referenced) and not registered
+    return {
+        "phantom_keys": phantom_keys,
+        "zero_registered": zero_registered,
+        "has_drift": bool(phantom_keys) or zero_registered,
+    }
+
+
+def _gather_referenced_criterion_keys(
+    project: Any,
+) -> set[str]:
+    """Collect criterion-key tokens referenced across a project's strategic prose.
+
+    Sources: ``problem_model.intent.current_focus`` (the forward-looking mission
+    statement) and each active direction's ``context.success_evidence``. Every
+    field is read defensively — a malformed blob contributes nothing rather than
+    raising.
+    """
+    referenced: set[str] = set()
+
+    problem_model = getattr(project, "problem_model", None)
+    if isinstance(problem_model, dict):
+        intent = problem_model.get("intent")
+        if isinstance(intent, dict):
+            referenced |= extract_referenced_criterion_keys(
+                intent.get("current_focus")
+            )
+
+    directions = getattr(project, "directions", None)
+    if isinstance(directions, list):
+        for direction in directions:
+            if not isinstance(direction, dict):
+                continue
+            if direction.get("status") in _RETIRED_DIRECTION_STATUSES:
+                continue
+            ctx = direction.get("context")
+            if isinstance(ctx, dict):
+                referenced |= extract_referenced_criterion_keys(
+                    ctx.get("success_evidence")
+                )
+    return referenced
 
 
 async def create_criterion(
@@ -2091,6 +2179,13 @@ async def get_version_coverage_summary(
             'superseded': N,
             'inactive': N,
             'stuck_count': N,
+            'phantom_bookkeeping': {  # criterion-key drift guard (best-effort)
+                'phantom_keys': [str, ...],  # referenced but never registered
+                'zero_registered': bool,     # keys referenced, zero active criteria
+                'has_drift': bool,
+                'referenced_keys': [str, ...],
+                'registered_count': int,
+            },
             'criteria': [
                 {
                     'criterion_key': str,
@@ -2238,6 +2333,45 @@ async def get_version_coverage_summary(
     _rv = await session.get(ReleaseVersion, release_version_id)
     merge_evidence_gaps = _rv.merge_evidence_gaps if _rv is not None else None
 
+    # Drift guard: reconcile criterion keys referenced in strategic prose against
+    # the criteria actually registered on this version. A zero-criteria version
+    # (or prose citing never-registered keys) otherwise reads PASS at every gate
+    # with no warning — the "phantom bookkeeping" failure this surfaces loud.
+    # Reuses the already-loaded criteria rows (no extra query); registered =
+    # ACTIVE criterion keys, matching the count-clearing coverage gate.
+    phantom_bookkeeping = {
+        "phantom_keys": [],
+        "zero_registered": False,
+        "has_drift": False,
+        "referenced_keys": [],
+        "registered_count": 0,
+    }
+    if _rv is not None:
+        try:
+            from app.models import Project  # noqa: PLC0415 — avoid import cycle
+
+            _project = await session.get(Project, _rv.project_id)
+            registered_keys = {
+                c.criterion_key
+                for c in criteria_in_order
+                if c.status == "active"
+            }
+            referenced_keys = (
+                _gather_referenced_criterion_keys(_project)
+                if _project is not None
+                else set()
+            )
+            phantom_bookkeeping = reconcile_criterion_key_references(
+                registered_keys, referenced_keys
+            )
+            phantom_bookkeeping["referenced_keys"] = sorted(referenced_keys)
+            phantom_bookkeeping["registered_count"] = len(registered_keys)
+        except Exception:  # noqa: BLE001 — best-effort drift signal, never blocks
+            logger.exception(
+                "phantom-bookkeeping drift guard failed for version %s",
+                release_version_id,
+            )
+
     return {
         "total": sum(counts.values()),
         "covered": counts["covered"],
@@ -2252,6 +2386,7 @@ async def get_version_coverage_summary(
         "criteria": criteria_detail,
         "failed_corroboration_keys": list(failed_corroboration),
         "merge_evidence_gaps": merge_evidence_gaps,
+        "phantom_bookkeeping": phantom_bookkeeping,
     }
 
 

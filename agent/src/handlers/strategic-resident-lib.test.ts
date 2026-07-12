@@ -10,6 +10,7 @@ import {
   buildStagedDirectionsText, formatDirectionGroundingText,
   MESSAGE_POLL_LIMIT,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
+  parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
@@ -753,6 +754,38 @@ describe('buildBootstrapPrompt', () => {
     const p = buildBootstrapPrompt(base); // priorSessionContextText not set
     expect(p).not.toContain('## Prior session context');
   });
+
+  it('decisions_register_reaches_bootstrap_on_full_restart', () => {
+    // On a full session restart the durable decisions register is restored from
+    // the persisted context and rendered by decisionsRegisterText, then threaded
+    // into the bootstrap prompt so the first (usually operator-reply) turn is not
+    // blind to settled decisions. This test exercises that seam end-to-end.
+    const register: DecisionsRegisterEntry[] = [
+      { at: '2026-07-10T00:00:00Z', atTick: 3, verdict: 'SETTLED', surfaceKey: 'direction:d-a5940d77', note: 'attestation tiering approved by operator' },
+      { at: '2026-07-11T00:00:00Z', atTick: 7, verdict: 'REJECTED', surfaceKey: 'direction:d-68d4ef5a', note: 'operator declined project-baked image rollout' },
+    ];
+    const p = buildBootstrapPrompt({
+      ...base,
+      decisionsRegisterText: decisionsRegisterText(register, DECISIONS_REGISTER_CAP),
+    });
+    expect(p).toContain('## Decisions register (durable cross-tick memory)');
+    expect(p).toContain('direction:d-a5940d77');
+    expect(p).toContain('attestation tiering approved by operator');
+    expect(p).toContain('operator declined project-baked image rollout');
+  });
+
+  it('omits the decisions register on a clean restart (empty register)', () => {
+    // A clean restart restores an empty register; decisionsRegisterText([]) === ''
+    // so the section must be omitted (byte-for-byte no-op against the base prompt).
+    const withEmpty = buildBootstrapPrompt({
+      ...base,
+      decisionsRegisterText: decisionsRegisterText([], DECISIONS_REGISTER_CAP),
+    });
+    expect(withEmpty).not.toContain('## Decisions register');
+    // Omitted field behaves identically to an empty string.
+    expect(buildBootstrapPrompt(base)).not.toContain('## Decisions register');
+    expect(withEmpty).toEqual(buildBootstrapPrompt(base));
+  });
 });
 
 describe('retired/prior-context renderers', () => {
@@ -1025,6 +1058,75 @@ describe('isSettledDecisionVerdict (durable register admission)', () => {
     expect(text).toContain('tick-5 [clear]');
     expect(text).not.toContain('[interrupted]');
     expect(text).not.toContain('[unevidenced]');
+  });
+});
+
+describe('parseOperatorDecision (operator-settled corrections)', () => {
+  it('extracts the trailing OPERATOR-DECISION marker note', () => {
+    const text = [
+      'Understood — I will drop the images-first rewrite.',
+      'OPERATOR-DECISION: Do NOT pursue the images-first compute rewrite; operator settled on the table-based path.',
+    ].join('\n');
+    expect(parseOperatorDecision(text)).toBe(
+      'Do NOT pursue the images-first compute rewrite; operator settled on the table-based path.',
+    );
+  });
+
+  it('returns null when no marker is present', () => {
+    expect(parseOperatorDecision('Thanks, that answers my question.')).toBeNull();
+  });
+
+  it('ignores a mid-reply mention and reads the LAST marker line', () => {
+    const text = [
+      'You asked earlier about OPERATOR-DECISION: markers in the transcript.',
+      'Here is my actual answer.',
+      'OPERATOR-DECISION: Ship the fix behind a flag.',
+    ].join('\n');
+    expect(parseOperatorDecision(text)).toBe('Ship the fix behind a flag.');
+  });
+
+  it('strips a leading dash and is case-insensitive on the label', () => {
+    expect(parseOperatorDecision('operator-decision: — reverse the retirement of d-abc')).toBe(
+      'reverse the retirement of d-abc',
+    );
+  });
+
+  it('returns null for an empty note or non-string input', () => {
+    expect(parseOperatorDecision('OPERATOR-DECISION:   ')).toBeNull();
+    // @ts-expect-error deliberate non-string input
+    expect(parseOperatorDecision(undefined)).toBeNull();
+  });
+
+  it('an operator verdict is admitted to the durable register and survives round-trip', () => {
+    expect(isSettledDecisionVerdict(OPERATOR_DECISION_VERDICT)).toBe(true);
+    const entry: DecisionsRegisterEntry = {
+      atTick: 7,
+      at: '2026-07-12T09:00:00Z',
+      surfaceKey: 'operator:message',
+      verdict: OPERATOR_DECISION_VERDICT,
+      note: 'Do NOT re-propose the images-first rewrite.',
+    };
+    const restored = restoreDecisionsReg(serializeDecisionsReg([entry]));
+    expect(restored).not.toBeNull();
+    expect(restored?.[0].verdict).toBe(OPERATOR_DECISION_VERDICT);
+    expect(restored?.[0].note).toBe('Do NOT re-propose the images-first rewrite.');
+    expect(decisionsRegisterText([entry], 20)).toContain('[operator] operator:message');
+  });
+});
+
+describe('buildBootstrapPrompt operator-decision instruction', () => {
+  const base = {
+    contextPrefix: '', projectName: 'Blueprint', problemModelJson: '{}',
+    runningUpdate: '', directionsText: '', stagedDirectionsText: '',
+    retiredDirectionsText: '', previousDecisionOutcomesText: '',
+    strategicMemoryNotesText: '', visionJson: '', openMessagesText: '',
+    sessionId: 's-1', fetchGuidanceText: '', priorSessionContextText: '',
+    skillsText: '', decisionsRegisterText: '',
+  };
+  it('instructs the strategist to emit an OPERATOR-DECISION marker on a settlement', () => {
+    const p = buildBootstrapPrompt(base);
+    expect(p).toContain('OPERATOR-DECISION:');
+    expect(p).toContain('durable decisions register');
   });
 });
 

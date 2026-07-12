@@ -35,7 +35,7 @@ import {
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict,
-  serializeDecisionsReg, restoreDecisionsReg,
+  serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
@@ -333,6 +333,20 @@ export async function handleStrategicResident(
       .join('\n');
   })();
 
+  // ── Durable decisions register ──────────────────────────────────────────
+  // Full-fidelity cross-tick memory of settled decisions, preserved across
+  // compaction AND full session restarts (VM recycles, process crashes) so
+  // the strategist stops re-deriving settled facts and re-proposing
+  // corrections tick over tick. Restored from task.context._decisions_reg
+  // (written by the heartbeat round-trip, same pattern as the exam ledger).
+  // Restored HERE — above the bootstrap assembly — so the register can be
+  // rendered into the bootstrap prompt: on a full restart the first turn is
+  // usually a live operator reply, and it must not be generated blind to
+  // settled decisions (compaction restart already carries it via the checkpoint).
+  const decisionsReg: DecisionsRegisterEntry[] = restoreDecisionsReg(
+    typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
+  ) ?? [];
+
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
@@ -349,6 +363,7 @@ export async function handleStrategicResident(
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
     skillsText,
+    decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
   });
 
   const cfg = residentConfig(payload);
@@ -378,16 +393,6 @@ export async function handleStrategicResident(
   let correctiveNextTick = restoredLedger?.corrective ?? false;
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
-
-  // ── Durable decisions register ──────────────────────────────────────────
-  // Full-fidelity cross-tick memory of settled decisions, preserved across
-  // compaction AND full session restarts (VM recycles, process crashes) so
-  // the strategist stops re-deriving settled facts and re-proposing
-  // corrections tick over tick. Restored from task.context._decisions_reg
-  // (written by the heartbeat round-trip, same pattern as the exam ledger).
-  const decisionsReg: DecisionsRegisterEntry[] = restoreDecisionsReg(
-    typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
-  ) ?? [];
 
   // ── Compaction state ─────────────────────────────────────────────────────
   // Track cumulative input tokens (latest turn) and the last compaction time
@@ -697,6 +702,31 @@ export async function handleStrategicResident(
     }
   };
 
+  // Capture an operator-settled correction into the durable decisions register.
+  // Operator turns (fast path + interrupt path) never emit a TICK-VERDICT, so
+  // the autonomous decisions-register push at the bottom of the loop never sees
+  // them; without this, a correction the operator makes in live chat drops out of
+  // open_messages once handled and survives nowhere durable — so a restarted
+  // session re-proposes exactly what the operator already settled. The strategist
+  // is instructed (bootstrap prompt) to end such a turn with an OPERATOR-DECISION
+  // marker; when present we record it here BEFORE the operator-turn heartbeat so
+  // it is serialized into task.context._decisions_reg on that same heartbeat.
+  const recordOperatorDecision = (r: ResidentTurnResult): void => {
+    const note = parseOperatorDecision(r.resultText);
+    if (!note) return;
+    decisionsReg.push({
+      atTick: examTick,
+      at: new Date().toISOString(),
+      surfaceKey: 'operator:message',
+      verdict: OPERATOR_DECISION_VERDICT,
+      note,
+    });
+    if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
+      decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
+    }
+    streamer.status('operator correction recorded to durable decisions register');
+  };
+
   const pollMessages = async (): Promise<ResidentInboundMessage[]> => {
     const collected: ResidentInboundMessage[] = [];
     try {
@@ -909,6 +939,9 @@ export async function handleStrategicResident(
         // mark them handled — they stop counting as open backlog and won't be
         // re-delivered to a restarted session.
         const consumedIds = msgs.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        // Capture any operator-settled correction into the durable register
+        // BEFORE the heartbeat so it is serialized in this same round-trip.
+        recordOperatorDecision(r);
         const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
         if (hb?.stop_requested) break;
         if (r.processGone) { stopReason = 'session_process_exited'; break; }
@@ -1065,6 +1098,9 @@ export async function handleStrategicResident(
         // Extract the ids of the messages we just consumed so the backend can mark
         // them handled — same as the fast-path operator-message pre-emption above.
         const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        // Capture any operator-settled correction into the durable register
+        // BEFORE the heartbeat so it is serialized in this same round-trip.
+        recordOperatorDecision(or);
         const hb2 = await heartbeat(true, consumedIds);
         if (hb2?.stop_requested) break;
         if (or.processGone) { stopReason = 'session_process_exited'; break; }
