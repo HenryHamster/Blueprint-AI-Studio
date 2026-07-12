@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1042,12 +1042,110 @@ def _compute_strategic_state_revision(
     return hashlib.sha256(seed.encode()).hexdigest()[:16]
 
 
+# Pure wall-clock stamps / derived durations that advance on every poll without
+# a real state change. They are excluded from the full-body ETag so an unchanged
+# poll yields a matching token (and thus a 304). Everything NOT listed here is
+# covered by the ETag by default, so broadening the response never risks a false
+# 304 — at worst an un-normalized noise field makes the ETag over-sensitive
+# (a redundant 200), never under-sensitive.
+_STRATEGIC_STATE_ETAG_VOLATILE_KEYS = frozenset(
+    {
+        # sha_freshness stamps: datetime.now() on every call.
+        "checked_at",
+        "generated_at",
+        # Runner health: a derived now() - last_seen_at duration. The underlying
+        # last_seen_at / is_live / device_status remain in the hash and cover the
+        # meaningful liveness transitions.
+        "seconds_since_last_seen",
+        # since_last_check_in window end is always "now"; "since" (the real last
+        # check-in time) stays in the hash.
+        "until",
+    }
+)
+
+
+def _strip_volatile_for_etag(obj: Any) -> Any:
+    """Recursively drop pure-clock noise keys so the ETag is stable across
+    unchanged polls. See ``_STRATEGIC_STATE_ETAG_VOLATILE_KEYS``."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_volatile_for_etag(v)
+            for k, v in obj.items()
+            if k not in _STRATEGIC_STATE_ETAG_VOLATILE_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_volatile_for_etag(v) for v in obj]
+    return obj
+
+
+def _compute_strategic_state_etag(result: Dict[str, Any]) -> str:
+    """Full-body revision token used ONLY for the HTTP 304 transmission
+    short-circuit.
+
+    Hashes the ENTIRE assembled response body — so ANY change to a volatile
+    field the narrow ``state_revision`` does not cover (runtime_summary,
+    resident_runner_options, workbench_state, work_session, model_integrity,
+    sha_freshness verdict, costs, counts, …) flips the token — with two
+    deliberate exclusions:
+
+    * ``context_package`` embeds per-request signed download URLs that change
+      every poll; its meaningful inputs are already reflected in the top-level
+      strategic / problem_model / directions / message+task count / attention
+      fields (and gated by the narrow ``state_revision`` build-skip), so
+      dropping the raw block keeps the token stable without hiding real changes.
+    * pure wall-clock stamps / derived durations (see the volatile-keys set).
+
+    This is intentionally SEPARATE from ``_compute_strategic_state_revision``
+    (which stays the narrow context-package build-skip token) — do not conflate
+    them.
+    """
+    projected = {
+        k: v
+        for k, v in result.items()
+        if k not in ("context_package", "state_revision")
+    }
+    seed = json.dumps(
+        _strip_volatile_for_etag(projected), sort_keys=True, default=str
+    )
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _quote_etag(token: str) -> str:
+    """Format a raw hex token as a strong HTTP ETag header value."""
+    return f'"{token}"'
+
+
+def _if_none_match_hits(if_none_match: str | None, etag: str) -> bool:
+    """Return True when a client ``If-None-Match`` header matches the current
+    full-body ``etag``.
+
+    Tolerates the standard header shapes a proxy/browser may produce: a
+    comma-separated list, weak validators (``W/"…"``), surrounding quotes, and
+    the ``*`` wildcard.
+    """
+    if not if_none_match:
+        return False
+    for raw in if_none_match.split(","):
+        candidate = raw.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
+            candidate = candidate[1:-1]
+        if candidate == etag:
+            return True
+    return False
+
+
 @router.get("/projects/{project_id}/strategic-state")
 @limiter.limit("30/minute")
 async def get_project_strategic_state(
     request: Request,
     project_id: uuid.UUID,
+    response: Response,
     state_revision: str | None = Query(None),
+    if_none_match: str | None = Header(None, alias="If-None-Match"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1423,7 +1521,7 @@ async def get_project_strategic_state(
     )
     integrity_trend = await _integrity_conflict_trend(session, project.id)
 
-    return {
+    result: Dict[str, Any] = {
         "project_id": str(project.id),
         "strategic": {
             "active_cycle": active_cycle_summary,
@@ -1491,6 +1589,25 @@ async def get_project_strategic_state(
         "strategic_memory_notes": project.strategic_memory_notes or [],
     }
 
+    # HTTP 304 transmission short-circuit. The full-body ETag covers every
+    # volatile field (unlike the narrow state_revision, which only gates the
+    # context-package build-skip above), so a matching If-None-Match proves the
+    # ENTIRE body is unchanged and we can skip re-transmitting it. Internal
+    # direct callers (get_project_strategic_session and friends) pass a throwaway
+    # Response and no If-None-Match, so they always receive the full dict — the
+    # 304 path is reachable only for a real HTTP GET carrying If-None-Match.
+    etag = _compute_strategic_state_etag(result)
+    if _if_none_match_hits(if_none_match, etag):
+        logger.info(
+            "[STRATEGIC_STATE] 304 not modified for project %s "
+            "(full-body ETag unchanged)",
+            project.id,
+        )
+        return Response(status_code=304, headers={"ETag": _quote_etag(etag)})
+    response.headers["ETag"] = _quote_etag(etag)
+    return result
+
+
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
 async def get_project_strategic_session(
@@ -1505,6 +1622,9 @@ async def get_project_strategic_session(
     state = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1519,7 +1639,7 @@ async def get_project_strategic_session(
 @router.get("/projects/{project_id}/strategic-conversation")
 @limiter.limit("60/minute")
 async def get_project_strategic_conversation(
-    request: Request,  # noqa: ARG001
+    request: Request,
     project_id: uuid.UUID,
     include_message_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
@@ -1590,6 +1710,9 @@ async def upsert_project_strategic_session(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1629,6 +1752,9 @@ async def execute_project_strategic_session_command(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1664,6 +1790,9 @@ async def execute_project_strategic_session_command(
     refreshed_state = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1856,6 +1985,9 @@ async def create_project_strategic_session_check_in(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )
@@ -1934,6 +2066,9 @@ async def create_project_strategic_session_message(
     state_response = await get_project_strategic_state(
         request,
         project_id,
+        # Internal direct call: pass a throwaway Response (headers discarded) and
+        # no If-None-Match so the full dict is always returned.
+        response=Response(),
         session=session,
         current_user=current_user,
     )

@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import { useStrategicReadModel } from './useStrategicReadModel';
-import { fetchStrategicStateWithRevision } from '../strategicStateApi';
+import { fetchStrategicStateWithRevision, STRATEGIC_STATE_NOT_MODIFIED } from '../strategicStateApi';
 import type { StrategicSessionResponse, StrategicStateResponse } from '../strategicStateApi';
 
-vi.mock('../strategicStateApi', () => ({
+vi.mock('../strategicStateApi', async () => {
+  const NOT_MODIFIED = { notModified: true } as const;
+  return {
+  STRATEGIC_STATE_NOT_MODIFIED: NOT_MODIFIED,
+  isStrategicStateNotModified: (r: unknown) => r === NOT_MODIFIED,
   fetchStrategicStateWithRevision: vi.fn(),
   fetchStrategicWorkbenchState: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),
@@ -17,7 +21,8 @@ vi.mock('../strategicStateApi', () => ({
   stopStrategicSession: vi.fn(),
   getMessageAttachmentUploadUrl: vi.fn(),
   fetchStrategicState: vi.fn(),
-}));
+  };
+});
 
 // Disable the poller so tests drive fetches via result.current.refresh().
 // usePoller's own behavior is tested in usePoller.test.ts.
@@ -320,6 +325,49 @@ describe('useStrategicReadModel', () => {
     // Second call: should pass the revision from the first response
     await act(async () => { await result.current.refresh(); });
     expect(mockFetch.mock.calls[1][1]).toBe('abc123');
+  });
+
+  it('sends the held ETag as the 4th fetch arg and stores the new one from the response', async () => {
+    const state1 = { ...makeState('proj-1'), state_revision: 'abc123', state_etag: '"etag-1"' };
+    const state2 = { ...makeState('proj-1'), state_revision: 'def456', state_etag: '"etag-2"' };
+
+    mockFetch.mockResolvedValueOnce(state1);
+    mockFetch.mockResolvedValueOnce(state2);
+
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+
+    // First call: no stored etag yet → passes null/undefined.
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[0][3] ?? null).toBeNull();
+
+    // Second call: should pass the etag captured from the first response.
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[1][3]).toBe('"etag-1"');
+  });
+
+  it('keeps cached data, refs, and clears loading/error on a 304 not-modified result', async () => {
+    const state = { ...makeState('proj-1'), state_revision: 'abc123', state_etag: '"etag-1"' };
+    mockFetch.mockResolvedValueOnce(state);
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+
+    // Prime the read model with a full response.
+    await act(async () => { await result.current.refresh(); });
+    expect(result.current.data?.state_revision).toBe('abc123');
+
+    // Next poll returns the not-modified sentinel — data must be preserved and
+    // NOT cleared, and no error must be set.
+    mockFetch.mockResolvedValueOnce(STRATEGIC_STATE_NOT_MODIFIED);
+    await act(async () => { await result.current.refresh(); });
+    expect(result.current.data?.state_revision).toBe('abc123');
+    expect(result.current.error).toBeNull();
+    expect(result.current.loading).toBe(false);
+
+    // The held revision + etag are unchanged, so the subsequent poll re-sends them.
+    mockFetch.mockResolvedValueOnce(STRATEGIC_STATE_NOT_MODIFIED);
+    await act(async () => { await result.current.refresh(); });
+    const lastCall = mockFetch.mock.calls[mockFetch.mock.calls.length - 1];
+    expect(lastCall[1]).toBe('abc123'); // state_revision preserved
+    expect(lastCall[3]).toBe('"etag-1"'); // etag preserved
   });
 
   it('resets state_revision ref on project change', async () => {

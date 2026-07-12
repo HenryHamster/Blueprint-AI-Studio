@@ -1002,6 +1002,12 @@ export interface StrategicStateResponse {
    *  ?state_revision= on the next poll so the server can skip the expensive
    *  context-package build if inputs haven't changed. */
   state_revision?: string | null;
+  /** Client-only field: NOT sent by the server in the body. Populated by
+   *  {@link fetchStrategicStateWithRevision} from the `ETag` response header,
+   *  which covers the FULL response body. Round-tripped as the `If-None-Match`
+   *  request header on the next poll so the server can reply 304 Not Modified
+   *  (empty body) when nothing changed. */
+  state_etag?: string | null;
   model_integrity?: {
     orphaned_gaps: Array<{ id: string; name: string; status: string; recovery_hint?: string }>;
     ungrounded_directions: Array<{
@@ -1057,24 +1063,56 @@ export async function fetchStrategicState(
   return res.json() as Promise<StrategicStateResponse>;
 }
 
-/** Fetch strategic state with an optional state_revision for server-side
- *  context-package skip (returns cached response when inputs unchanged). */
+/** Sentinel returned by {@link fetchStrategicStateWithRevision} when the server
+ *  replies HTTP 304 Not Modified (the held revision/ETag still matches). Callers
+ *  must keep their existing cached state and revision unchanged — the 304 body
+ *  is empty and must NOT be parsed. */
+export const STRATEGIC_STATE_NOT_MODIFIED = { notModified: true } as const;
+export type StrategicStateNotModified = typeof STRATEGIC_STATE_NOT_MODIFIED;
+
+/** Type guard so callers can narrow the fetch result and TypeScript can refine
+ *  the non-sentinel branch to {@link StrategicStateResponse}. */
+export function isStrategicStateNotModified(
+  result: StrategicStateResponse | StrategicStateNotModified,
+): result is StrategicStateNotModified {
+  return result === STRATEGIC_STATE_NOT_MODIFIED;
+}
+
+/** Fetch strategic state with the held revision tokens for two server-side
+ *  short-circuits:
+ *   - `?state_revision=` (narrow token) lets the server skip the expensive
+ *     context-package build when its inputs are unchanged.
+ *   - `If-None-Match` (full-body ETag) lets the server reply 304 Not Modified
+ *     with an empty body when NOTHING in the response changed, eliminating the
+ *     redundant full-body transmission on an unchanged poll.
+ *  Returns {@link STRATEGIC_STATE_NOT_MODIFIED} on a 304 (does not read the
+ *  empty body); otherwise returns the parsed state with `state_etag` populated
+ *  from the response ETag header for the next poll. */
 export async function fetchStrategicStateWithRevision(
   projectId: string,
   stateRevision: string | null,
   signal?: AbortSignal,
-): Promise<StrategicStateResponse> {
+  etag?: string | null,
+): Promise<StrategicStateResponse | StrategicStateNotModified> {
   const params = stateRevision ? `?state_revision=${encodeURIComponent(stateRevision)}` : '';
+  const options: RequestInit | undefined = etag
+    ? { headers: { 'If-None-Match': etag } }
+    : undefined;
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-state${params}`,
-    undefined,
+    options,
     2,
     30000,
     signal,
     false,
   );
+  // 304 Not Modified: empty body — signal the caller to keep its cached state.
+  if (res.status === 304) return STRATEGIC_STATE_NOT_MODIFIED;
   if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
-  return res.json() as Promise<StrategicStateResponse>;
+  const body = (await res.json()) as StrategicStateResponse;
+  const responseEtag = res.headers.get('ETag');
+  if (responseEtag) body.state_etag = responseEtag;
+  return body;
 }
 
 export async function fetchStrategicWorkbenchState(

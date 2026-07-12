@@ -7791,6 +7791,158 @@ async def test_strategic_state_absent_revision_triggers_full_build(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_sets_etag_header_on_full_200(
+    client: AsyncClient, db_session
+):
+    """A full 200 response carries a strong ETag header covering the whole body."""
+    project = await _make_project(db_session)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    etag = resp.headers.get("ETag")
+    assert etag is not None, "full 200 must set an ETag header"
+    # Strong validator: a double-quoted hex sha256 digest.
+    assert etag.startswith('"') and etag.endswith('"'), "ETag must be quoted"
+    assert len(etag.strip('"')) == 64, "ETag must be a full sha256 hex digest"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_matching_revision_returns_304(
+    client: AsyncClient, db_session
+):
+    """ACCEPTANCE: a re-poll whose If-None-Match matches the current full-body
+    ETag returns HTTP 304 Not Modified with an EMPTY body, eliminating the
+    redundant full-body transmission on an unchanged poll."""
+    project = await _make_project(db_session)
+
+    # First poll: full 200 body + ETag header.
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp1.status_code == 200
+    etag = resp1.headers.get("ETag")
+    assert etag is not None
+    full_bytes = len(resp1.content)
+    assert full_bytes > 0
+
+    # Second poll with the held ETag and NOTHING changed → 304, empty body.
+    resp2 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state",
+        headers={"If-None-Match": etag},
+    )
+    assert resp2.status_code == 304, (
+        f"unchanged poll must 304; got {resp2.status_code} body={resp2.text[:200]!r}"
+    )
+    # Measurement: the 304 body is empty vs the full 200 body.
+    assert len(resp2.content) == 0, "304 must have an empty body"
+    # The 304 echoes the ETag so the client can keep reusing it.
+    assert resp2.headers.get("ETag") == etag
+    # Transmission reduction: ~100% of the body bytes are eliminated.
+    reduction = 1.0 - (len(resp2.content) / full_bytes)
+    assert reduction > 0.99, (
+        f"304 must eliminate ~all body bytes (full={full_bytes}, reduction={reduction:.4f})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_nonmatching_if_none_match_returns_full_200(
+    client: AsyncClient, db_session
+):
+    """A stale/bogus If-None-Match must NOT 304 — the client gets the full body
+    and a fresh ETag."""
+    project = await _make_project(db_session)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state",
+        headers={"If-None-Match": '"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"'},
+    )
+    assert resp.status_code == 200
+    assert len(resp.content) > 0
+    assert resp.json().get("project_id") == str(project.id)
+    assert resp.headers.get("ETag") is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_volatile_field_change_busts_etag(
+    client: AsyncClient, db_session
+):
+    """CRITICAL INVARIANT: a change to a field the NARROW state_revision does not
+    cover (here the operator workbench state) must change the full-body ETag so a
+    held token no longer 304s — no field update is ever silently suppressed."""
+    project = await _make_project(db_session)
+
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp1.status_code == 200
+    etag1 = resp1.headers.get("ETag")
+    assert etag1 is not None
+    assert resp1.json()["workbench"]["active_surface"] != "runtime"
+
+    # Mutate the workbench active_surface — this lives in the `workbench` body
+    # field, which the narrow context-package revision token does NOT hash.
+    db_session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={
+                "_strategic_workbench": {
+                    "version": 1,
+                    "interaction_mode": "continuous",
+                    "active_surface": "runtime",
+                    "selected_refs": [],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    # Re-poll with the OLD ETag: the body changed, so the server must NOT 304.
+    resp2 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state",
+        headers={"If-None-Match": etag1},
+    )
+    assert resp2.status_code == 200, "a changed body must never be suppressed by a 304"
+    assert resp2.json()["workbench"]["active_surface"] == "runtime"
+    etag2 = resp2.headers.get("ETag")
+    assert etag2 is not None and etag2 != etag1, "ETag must change when the body changes"
+
+    # And the fresh ETag now 304s on an unchanged re-poll.
+    resp3 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state",
+        headers={"If-None-Match": etag2},
+    )
+    assert resp3.status_code == 304
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_etag_stable_across_context_package_build_skip(
+    client: AsyncClient, db_session
+):
+    """The full-body ETag must be IDENTICAL whether the context-package was built
+    or skipped for the same underlying state, so a client's held ETag (issued on a
+    full build) still 304s on a later build-skipped poll."""
+    project = await _make_project(db_session)
+
+    # First poll: full build (context_package present) → ETag E.
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp1.status_code == 200
+    etag = resp1.headers.get("ETag")
+    narrow_revision = resp1.json().get("state_revision")
+    assert etag is not None and narrow_revision is not None
+    assert resp1.json().get("context_package") is not None
+
+    # Poll with the narrow revision (build skipped) but a NON-matching ETag so we
+    # still get a 200 body — confirm context_package is skipped yet the returned
+    # ETag equals the original (context_package is excluded from the ETag).
+    resp2 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state?state_revision={narrow_revision}",
+        headers={"If-None-Match": '"0000000000000000000000000000000000000000000000000000000000000000"'},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json().get("context_package") is None, "build must be skipped"
+    assert resp2.headers.get("ETag") == etag, (
+        "ETag must not depend on whether context_package was built"
+    )
+
+
+@pytest.mark.asyncio
 async def test_compute_strategic_state_revision_deterministic(
     db_session,
 ):
