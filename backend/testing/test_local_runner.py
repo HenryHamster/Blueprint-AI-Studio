@@ -38,8 +38,12 @@ from app.models import (
     _utcnow,
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
-from app.routers.admin_runners import _runner_health
+from app.routers.admin_runners import (
+    _normalize_gpu_indices_allowed,
+    _runner_health,
+)
 from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
+from app.runner_config import config_generation, live_safe_config
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -412,6 +416,70 @@ def test_parse_heartbeat_timestamp_tolerates_bad_input():
     assert parsed is not None and parsed.tzinfo is None  # normalized to naive UTC
     # Offset is normalized to UTC (12:00+02:00 -> 10:00 naive UTC).
     assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
+
+
+# ── Live-safe config projection + generation hash (pure, no DB) ───────────────
+
+
+class TestLiveSafeConfigProjection:
+    def test_projects_live_safe_subset_with_compute_default(self):
+        cfg = live_safe_config(
+            {
+                "task_types": ["create", "fix"],
+                "max_concurrent": 4,
+                "has_gpu": True,  # telemetry — must NOT leak into the subset
+                "gpu_count": 2,
+            }
+        )
+        assert cfg == {
+            "max_concurrent": 4,
+            # compute ceiling defaults to max_concurrent when unset.
+            "max_concurrent_compute": 4,
+            "task_types": ["create", "fix"],
+            "gpu_indices_allowed": "all",
+        }
+        assert "has_gpu" not in cfg and "gpu_count" not in cfg
+
+    def test_gpu_indices_allowed_dedup_and_sorted(self):
+        cfg = live_safe_config({"gpu_indices_allowed": [2, 0, 2, 1]})
+        assert cfg["gpu_indices_allowed"] == [0, 1, 2]
+
+    def test_generation_is_order_independent_but_value_sensitive(self):
+        base = live_safe_config(
+            {"task_types": ["a", "b"], "gpu_indices_allowed": [1, 0]}
+        )
+        reordered = live_safe_config(
+            {"gpu_indices_allowed": [0, 1], "task_types": ["a", "b"]}
+        )
+        # Same effective config → identical generation (order-independent).
+        assert config_generation(base) == config_generation(reordered)
+        # A single live-safe field change → different generation.
+        changed = live_safe_config(
+            {"task_types": ["a", "b"], "gpu_indices_allowed": [0, 1, 2]}
+        )
+        assert config_generation(changed) != config_generation(base)
+
+    def test_missing_max_concurrent_compute_defaults_but_explicit_wins(self):
+        assert live_safe_config({"max_concurrent": 3})["max_concurrent_compute"] == 3
+        assert (
+            live_safe_config({"max_concurrent": 3, "max_concurrent_compute": 1})[
+                "max_concurrent_compute"
+            ]
+            == 1
+        )
+
+
+class TestNormalizeGpuIndicesAllowed:
+    def test_accepts_all_sentinel_and_valid_list(self):
+        assert _normalize_gpu_indices_allowed("all") == "all"
+        assert _normalize_gpu_indices_allowed([3, 1, 1, 0]) == [0, 1, 3]
+        # Empty list is a deliberate "no GPUs allowed" restriction.
+        assert _normalize_gpu_indices_allowed([]) == []
+
+    def test_rejects_junk(self):
+        for bad in ["none", ["gpu0"], [1.5], [True], [-1], {"0": True}, 0]:
+            with pytest.raises(ValueError):
+                _normalize_gpu_indices_allowed(bad)
 
 
 def _snapshot(caps: dict) -> "orch.RunnerDispatchSnapshot":
@@ -1273,6 +1341,214 @@ class TestAdminRunnerEndpoints:
             "status": runner.status,
             "hostname": runner.hostname,
         }
+
+
+# ── Live-safe config channel (heartbeat two-way + PATCH + view) ──────────────
+
+
+class TestRunnerConfigChannel:
+    @pytest.mark.asyncio
+    async def test_heartbeat_response_carries_config_block_and_stable_generation(
+        self, client: AsyncClient, db_session
+    ):
+        """The heartbeat response includes the live-safe config block + a stable
+        generation, and keeps the backward-compat enrolled_max_concurrent field."""
+        project = await _make_project(db_session)
+        _runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["create", "fix"],
+                "has_gpu": False,
+                "max_concurrent": 3,
+            },
+        )
+        resp1 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp1.status_code == 200
+        body1 = resp1.json()
+        # Backward-compat fields preserved.
+        assert body1["enrolled_max_concurrent"] == 3
+        assert "version_hint" in body1
+        # New config block.
+        config = body1["config"]
+        assert config["max_concurrent"] == 3
+        assert config["max_concurrent_compute"] == 3  # defaults to max_concurrent
+        assert config["task_types"] == ["create", "fix"]
+        assert config["gpu_indices_allowed"] == "all"
+        gen1 = config["config_generation"]
+        assert isinstance(gen1, str) and gen1
+        assert body1["config_generation"] == gen1
+
+        # A second heartbeat with no config change yields the SAME generation.
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": ["t1"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["config"]["config_generation"] == gen1
+
+    @pytest.mark.asyncio
+    async def test_patch_live_safe_field_changes_generation(
+        self, client: AsyncClient, db_session
+    ):
+        """A PATCH that changes a live-safe field (max_concurrent, gpu allowlist)
+        moves the config_generation surfaced on the runner view."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        before = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        gen_before = before["config"]["config_generation"]
+
+        # Change a live-safe field.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": [0, 1]},
+        )
+        assert patch.status_code == 200
+        cfg = patch.json()["config"]
+        assert cfg["gpu_indices_allowed"] == [0, 1]
+        assert cfg["config_generation"] != gen_before
+        # Newly desired but not-yet-applied → pending.
+        assert cfg["config_pending"] is True
+
+        # The heartbeat response now advertises the new generation, so the daemon
+        # can detect the drift.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.json()["config"]["config_generation"] == cfg["config_generation"]
+
+    @pytest.mark.asyncio
+    async def test_applied_config_generation_resolves_pending(
+        self, client: AsyncClient, db_session
+    ):
+        """A heartbeat carrying applied_config_generation persists it; config_pending
+        is False only when the applied generation matches the desired one."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 5},
+        )
+
+        # Discover the current desired generation from the heartbeat response.
+        desired_gen = (
+            await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()["config"]["config_generation"]
+
+        # Before any applied report, the view shows pending/unknown, never errors.
+        view0 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view0["config"]["applied_config_generation"] is None
+        assert view0["config"]["config_pending"] is True
+
+        # Daemon reports it has applied a DIFFERENT (stale) generation → pending.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": "stale000deadbeef",
+                "applied_max_concurrent": 2,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view1 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view1["config"]["applied_config_generation"] == "stale000deadbeef"
+        assert view1["config"]["applied"] == {"max_concurrent": 2}
+        assert view1["config"]["config_pending"] is True
+
+        # Daemon now reports the matching desired generation → NOT pending.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": desired_gen,
+                "applied_max_concurrent": 5,
+                "applied_gpu_indices_allowed": "all",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view2 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view2["config"]["applied_config_generation"] == desired_gen
+        assert view2["config"]["config_pending"] is False
+
+        # Applied report must NOT clobber the operator-configured desired subset.
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 5
+        assert runner.capabilities["task_types"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_gpu_indices_allowed_patch_validation(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH accepts 'all' and a valid list (deduped/sorted); junk is 422."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        ok_all = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": "all"},
+        )
+        assert ok_all.status_code == 200
+        assert ok_all.json()["capabilities"]["gpu_indices_allowed"] == "all"
+
+        ok_list = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpu_indices_allowed": [2, 0, 0, 1]},
+        )
+        assert ok_list.status_code == 200
+        assert ok_list.json()["capabilities"]["gpu_indices_allowed"] == [0, 1, 2]
+
+        for bad in (["gpu0"], [-1], "everything", [1.5]):
+            rej = await client.patch(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+                json={"gpu_indices_allowed": bad},
+            )
+            assert rej.status_code == 422, bad
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_invariants_hold_with_gpu_axis(
+        self, client: AsyncClient, db_session
+    ):
+        """Adding the GPU allowlist must not relax the strategic_local clamps:
+        max_concurrent stays 1 and task_types stays the strategic set."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "strategic-gpu", "preset": "strategic_local"},
+        )
+        assert resp.status_code == 200
+        runner_id = uuid.UUID(resp.json()["runner_id"])
+
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/capabilities",
+            json={
+                "gpu_indices_allowed": [0],
+                "max_concurrent": 8,  # must still be clamped to 1
+                "task_types": "all",  # must still be clamped to strategic set
+            },
+        )
+        assert patch.status_code == 200
+        caps = patch.json()["capabilities"]
+        assert caps["gpu_indices_allowed"] == [0]
+        assert caps["max_concurrent"] == 1
+        assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        # The config block reflects the clamped values, not the requested ones.
+        assert patch.json()["config"]["desired"]["max_concurrent"] == 1
 
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────

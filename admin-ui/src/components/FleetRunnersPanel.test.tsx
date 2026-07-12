@@ -32,6 +32,15 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
 // so heartbeats POSTed to the UI origin silently vanish (SPA HTML 200).
 const API_BASE_URL_FIXTURE = 'https://blueprint-orchestrator-xyz.a.run.app';
 
+// React tracks controlled-input values via a native value setter, so assigning
+// `input.value` directly is invisible to onChange. Drive it through the prototype
+// setter, then dispatch the 'input' event React binds to for text inputs.
+function typeInto(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
@@ -40,10 +49,11 @@ vi.mock('../api', async () => {
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
     rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
+    updateRunnerCapabilities: vi.fn(async () => SAMPLE_RUNNERS[0]),
   });
 });
 
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
+import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerStats, fetchRunnerTelemetry } from '../api';
 
 describe('FleetRunnersPanel — behavioral', () => {
   let root: Root | null = null;
@@ -1164,5 +1174,231 @@ describe('FleetRunnersPanel — behavioral', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // ── Live config: applied-vs-pending badge + GPU allowlist editor ─────────────
+
+  test('renders config-pending badge when config_pending is true', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          gpu_indices_allowed: [0, 1],
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('config pending — applying on next heartbeat');
+    // Pending state is amber, distinct from the applied emerald.
+    expect(badge?.className).toContain('text-amber-300');
+    expect(badge?.textContent).not.toContain('config applied');
+  });
+
+  test('renders config-applied badge when applied matches desired', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain('config applied');
+    expect(badge?.className).toContain('text-emerald-300');
+    expect(badge?.textContent).not.toContain('config pending');
+  });
+
+  test('renders no config badge for a runner without a config block', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    const el = await mount();
+    expect(el.querySelector('[data-testid="fleet-runner-config-status"]')).toBeNull();
+  });
+
+  test('editing the GPU allowlist to an index list calls updateRunnerCapabilities with gpu_indices_allowed', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Currently "all" — open the editor.
+    expect(el.textContent).toContain('GPUs: all');
+    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    // Uncheck "all" to reveal the index input.
+    const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
+    expect(allToggle).not.toBeNull();
+    expect(allToggle.checked).toBe(true);
+    // Native click toggles the checkbox and fires the 'click' event React binds
+    // its onChange to for checkboxes (a dispatched 'input' event is unreliable).
+    await act(async () => { allToggle.click(); });
+
+    const indexInput = el.querySelector('input[aria-label="GPU indices allowed"]') as HTMLInputElement;
+    expect(indexInput).not.toBeNull();
+    await act(async () => { typeInto(indexInput, '2, 0, 2'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
+    expect(saveBtn).not.toBeNull();
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Parsed to a deduped, sorted, non-negative integer array.
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpu_indices_allowed: [0, 2],
+    });
+  });
+
+  test('saving the GPU allowlist while "all" is checked sends the "all" sentinel', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: [0, 1],
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Currently restricted — open the editor and re-check "all".
+    expect(el.textContent).toContain('GPUs: 0,1');
+    const editBtn = el.querySelector('button[aria-label="Edit GPU allowlist"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all GPUs"]') as HTMLInputElement;
+    // Opened from a restricted list → starts unchecked.
+    expect(allToggle.checked).toBe(false);
+    await act(async () => { allToggle.click(); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPU allowlist"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpu_indices_allowed: 'all',
+    });
+  });
+
+  test('the GPU allowlist editor is absent for non-GPU runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit GPU allowlist"]')).toBeNull();
+  });
+
+  // ── Cloud-cost-avoided rollup in the telemetry detail ────────────────────────
+
+  async function openTelemetry(el: HTMLDivElement) {
+    const toggle = [...el.querySelectorAll('button')].find(b =>
+      b.getAttribute('aria-label')?.startsWith('Toggle telemetry for runner'),
+    );
+    await act(async () => { (toggle as HTMLButtonElement).click(); });
+    await act(async () => {});
+  }
+
+  test('telemetry detail renders the cloud-cost-avoided and claim-latency lines when the backend reports them', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 4,
+      jobs_terminal_count: 3,
+      jobs_succeeded_count: 3,
+      jobs_success_rate: 1,
+      cloud_cost_avoided_usd: 12.5,
+      cloud_cost_avoided_basis: 2,
+      claim_latency_ms_p50: 1200,
+      claim_latency_ms_p95: 3400,
+      claim_latency_ms_p99: 5600,
+      claim_latency_ms_max: 6000,
+      claim_latency_sample_count: 3,
+      last_n_outcomes: [],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    expect(text).toContain('Cloud cost avoided:');
+    expect(text).toContain('$12.50');
+    expect(text).toContain('Claim latency:');
+    expect(text).toContain('1200ms');
+    expect(text).toContain('3 samples');
+  });
+
+  test('telemetry detail omits the claim-latency line when there is no cold-start sample', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 1,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // Cloud-cost line always renders (defaults to $0.00); claim-latency block is gated.
+    expect(text).toContain('Cloud cost avoided:');
+    expect(text).not.toContain('Claim latency:');
   });
 });

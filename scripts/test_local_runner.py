@@ -493,6 +493,238 @@ class TestHostLoadThrottle(unittest.TestCase):
         self.assertTrue(len(calls) >= 1)
 
 
+# ── Live-safe config applied from heartbeat response ──────────────────────────
+
+class TestLiveRunnerConfig(unittest.TestCase):
+    """Unit tests for the _LiveRunnerConfig holder: apply, clamp, report."""
+
+    def _holder(self, gpu_indices=(0, 1, 2, 3)):
+        gpu_state = _gpu_state(gpu_indices)
+        holder = local_runner._LiveRunnerConfig(
+            2, 2, task_types="all", gpu_state=gpu_state,
+            all_gpu_indices=list(gpu_indices),
+        )
+        return holder, gpu_state
+
+    def test_grow_and_shrink_concurrency(self):
+        holder, _ = self._holder()
+        self.assertEqual(holder.max_concurrent(), 2)
+        applied = holder.apply({"max_concurrent": 8, "config_generation": "g1"})
+        self.assertTrue(applied)
+        self.assertEqual(holder.max_concurrent(), 8)
+        # Shrink: the new value is the live source of truth; running work is the
+        # caller's concern (the holder never touches it).
+        holder.apply({"max_concurrent": 1, "config_generation": "g2"})
+        self.assertEqual(holder.max_concurrent(), 1)
+
+    def test_compute_limit_applied_independently(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent_compute": 5, "config_generation": "g"})
+        self.assertEqual(holder.max_concurrent_compute(), 5)
+        self.assertEqual(holder.max_concurrent(), 2)  # untouched
+
+    def test_clamp_out_of_range(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 999, "config_generation": "hi"})
+        self.assertEqual(holder.max_concurrent(), local_runner._LiveRunnerConfig.MAX_CONCURRENT)
+        holder.apply({"max_concurrent": 0, "config_generation": "lo"})
+        self.assertEqual(holder.max_concurrent(), local_runner._LiveRunnerConfig.MIN_CONCURRENT)
+
+    def test_null_field_keeps_current_default(self):
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 6, "config_generation": "g1"})
+        # A subsequent block with a null max_concurrent must not clobber the value.
+        holder.apply({"max_concurrent": None, "task_types": ["fix"], "config_generation": "g2"})
+        self.assertEqual(holder.max_concurrent(), 6)
+
+    def test_task_types_allowlist_applied_and_reported(self):
+        holder, _ = self._holder()
+        holder.apply({"task_types": ["create", "fix"], "config_generation": "g"})
+        self.assertEqual(holder.report()["applied_task_types"], ["create", "fix"])
+        holder.apply({"task_types": "all", "config_generation": "g2"})
+        self.assertEqual(holder.report()["applied_task_types"], "all")
+
+    def test_gpu_allowlist_updates_scheduling_set(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        holder.apply({"gpu_indices_allowed": [1, 2], "config_generation": "g"})
+        self.assertEqual(gpu_state["allowed"], [1, 2])
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], [1, 2])
+        # "all" maps back to every DETECTED index.
+        holder.apply({"gpu_indices_allowed": "all", "config_generation": "g2"})
+        self.assertEqual(sorted(gpu_state["allowed"]), [0, 1, 2, 3])
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], "all")
+
+    def test_gpu_allowlist_intersected_with_detected(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1))
+        # Server asks for index 5 which this host lacks — never assign it.
+        holder.apply({"gpu_indices_allowed": [0, 5], "config_generation": "g"})
+        self.assertEqual(gpu_state["allowed"], [0])
+        # The reported value mirrors the server projection (so the echoed
+        # generation matches), even though only [0] is concretely assignable.
+        self.assertEqual(holder.report()["applied_gpu_indices_allowed"], [0, 5])
+
+    def test_generation_advances_only_when_fully_applicable(self):
+        holder, _ = self._holder()
+        self.assertIsNone(holder.report()["applied_config_generation"])
+        self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "gen-A"}))
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-A")
+        # A block carrying an UNRECOGNIZED non-null field is not fully applicable:
+        # the known fields still apply, but the generation stays pending (older).
+        applied = holder.apply({
+            "max_concurrent": 7,
+            "future_field": "something",
+            "config_generation": "gen-B",
+        })
+        self.assertFalse(applied)
+        self.assertEqual(holder.max_concurrent(), 7)  # known field still applied
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-A")  # not advanced
+
+    def test_malformed_block_is_noop(self):
+        holder, _ = self._holder()
+        self.assertFalse(holder.apply(None))
+        self.assertFalse(holder.apply("not-a-dict"))
+        self.assertEqual(holder.max_concurrent(), 2)
+
+
+class TestComputePollLoopLiveConfig(unittest.TestCase):
+    """_compute_poll_loop gates on the LIVE compute limit, not the static arg."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_live_limit_overrides_static_max_concurrent(self):
+        """A live config that GROWS the compute limit lets a claim proceed even
+        though the static positional max_concurrent would block it."""
+        post_calls = []
+        sleep_iters = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            post_calls.append(url)
+            return 204, None, None
+
+        def fake_sleep(secs):
+            sleep_iters[0] += 1
+            if sleep_iters[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        # One job already running; static ceiling is 1 (would block), but the
+        # live holder was grown to 2 (should allow a claim).
+        active_jobs = {"job-a"}
+        lock = threading.Lock()
+        holder = local_runner._LiveRunnerConfig(1, 2)
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock,
+                max_concurrent=1, live_config=holder,
+            )
+        self.assertTrue(post_calls, "live-grown compute limit must allow the claim")
+
+    def test_live_limit_blocks_when_shrunk(self):
+        """A live config that SHRINKS the compute limit stops new claims even
+        though the static positional max_concurrent would allow them."""
+        post_calls = []
+        sleep_iters = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            post_calls.append(url)
+            return 204, None, None
+
+        def fake_sleep(secs):
+            sleep_iters[0] += 1
+            if sleep_iters[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        active_jobs = {"job-a"}
+        lock = threading.Lock()
+        holder = local_runner._LiveRunnerConfig(5, 1)  # live compute limit = 1
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock,
+                max_concurrent=5, live_config=holder,
+            )
+        self.assertEqual(post_calls, [], "live-shrunk compute limit must block the claim")
+
+
+class TestHeartbeatLiveConfig(unittest.TestCase):
+    """_heartbeat_loop applies the server config block and echoes applied-vs-pending."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _drive(self, response_body, seed=(2, 2), all_gpu=(0, 1)):
+        """Run _heartbeat_loop for two ticks; return (holder, [posted bodies])."""
+        gpu_state = _gpu_state(all_gpu)
+        holder = local_runner._LiveRunnerConfig(
+            seed[0], seed[1], task_types="all", gpu_state=gpu_state,
+            all_gpu_indices=list(all_gpu),
+        )
+        bodies = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            bodies.append(dict(body))
+            calls[0] += 1
+            if calls[0] >= 2:
+                local_runner._shutdown_event.set()
+            return 200, response_body
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_write_status_json"), \
+             patch("time.sleep", lambda *_: None):
+            local_runner._heartbeat_loop(
+                "https://api.example.com", "tok", active_tasks, lock, {},
+                live_config=holder,
+            )
+        return holder, bodies
+
+    def test_config_block_applied_and_echoed(self):
+        response = {
+            "ok": True,
+            "config": {
+                "max_concurrent": 8,
+                "max_concurrent_compute": 4,
+                "task_types": ["create"],
+                "gpu_indices_allowed": [0, 1],
+                "config_generation": "gen-xyz",
+            },
+        }
+        holder, bodies = self._drive(response)
+        # Live values applied.
+        self.assertEqual(holder.max_concurrent(), 8)
+        self.assertEqual(holder.max_concurrent_compute(), 4)
+        # First body: nothing applied yet (generation pending / seed value).
+        self.assertIsNone(bodies[0]["applied_config_generation"])
+        self.assertEqual(bodies[0]["applied_max_concurrent"], 2)
+        # Second body: echoes the generation + applied values from the first tick.
+        self.assertEqual(bodies[1]["applied_config_generation"], "gen-xyz")
+        self.assertEqual(bodies[1]["applied_max_concurrent"], 8)
+        self.assertEqual(bodies[1]["applied_max_concurrent_compute"], 4)
+        self.assertEqual(bodies[1]["applied_task_types"], ["create"])
+        self.assertEqual(bodies[1]["applied_gpu_indices_allowed"], [0, 1])
+
+    def test_env_defaults_when_no_config_block(self):
+        """No config block in the response leaves the env-seeded defaults intact
+        and the applied generation null (server renders as pending/unknown)."""
+        holder, bodies = self._drive({"ok": True, "version_hint": "abc"}, seed=(3, 3))
+        self.assertEqual(holder.max_concurrent(), 3)
+        self.assertEqual(holder.max_concurrent_compute(), 3)
+        for body in bodies:
+            self.assertIsNone(body["applied_config_generation"])
+            self.assertEqual(body["applied_max_concurrent"], 3)
+
+
 # ── Stale workspace cleanup ────────────────────────────────────────────────────
 
 class TestStaleWorkspaceCleanup(unittest.TestCase):
@@ -4509,7 +4741,10 @@ class TestCredentialPersistence(unittest.TestCase):
 
 
 class TestConcurrencyPresetMismatch(unittest.TestCase):
-    """Warn when BLUEPRINT_RUNNER_MAX_CONCURRENT disagrees with server enrolled max_concurrent."""
+    """_preflight still surfaces the backward-compat enrolled_max_concurrent field,
+    but main() no longer emits a warn-only mismatch warning — a server config block
+    delivered on the heartbeat RESPONSE now OVERRIDES the env default live (see
+    TestHeartbeatLiveConfig), so the old "disagrees" advisory was removed."""
 
     def setUp(self):
         local_runner._shutdown_event.clear()
@@ -4549,8 +4784,10 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
         result = self._run_preflight(enrolled_max_concurrent=None)
         self.assertIsNone(result.get("enrolled_max_concurrent"))
 
-    def test_mismatch_warning_emitted(self):
-        """main() warns when client max_concurrent != server enrolled_max_concurrent."""
+    def test_no_warn_only_mismatch_path(self):
+        """main() no longer emits the warn-only "disagrees" advisory when the env
+        default differs from the server enrolled max_concurrent — that path was
+        replaced by live config application via the heartbeat response."""
         fake_body = {
             "ok": True,
             "last_seen_at": "2026-01-01T00:00:00Z",
@@ -4596,10 +4833,10 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             except SystemExit:
                 pass
 
-        warning_lines = [line for line in output_lines if "BLUEPRINT_RUNNER_MAX_CONCURRENT" in line and "enrolled" in line.lower()]
-        self.assertTrue(
+        warning_lines = [line for line in output_lines if "disagrees" in line and "enrolled" in line.lower()]
+        self.assertFalse(
             warning_lines,
-            f"Expected mismatch warning in output. Got: {output_lines[:10]}",
+            f"Did not expect the removed warn-only mismatch advisory. Got: {warning_lines}",
         )
 
     def test_no_mismatch_warning_when_values_match(self):

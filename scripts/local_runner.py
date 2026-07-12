@@ -1455,6 +1455,175 @@ def _reap_loop(
         time.sleep(2)
 
 
+# ── Live-safe config: server-authoritative reconfiguration via heartbeat ──────
+
+class _LiveRunnerConfig:
+    """Thread-safe holder for the LIVE-SAFE runner config subset.
+
+    The heartbeat RESPONSE carries a server-authoritative ``config`` block
+    (``max_concurrent`` / ``max_concurrent_compute`` / ``task_types`` /
+    ``gpu_indices_allowed`` plus a ``config_generation`` marker). The env-var
+    startup values seed this holder as the INITIAL defaults; a server config
+    block OVERRIDES them live. The agent and compute claim loops read
+    ``max_concurrent()`` / ``max_concurrent_compute()`` each iteration, so
+    GROWING the limit lets new claims proceed on the next tick and SHRINKING it
+    simply stops NEW claims — running work is never touched. The daemon echoes
+    the applied generation + values back on the next heartbeat so the
+    orchestrator/UI can render desired-vs-applied (``config_pending``).
+    """
+
+    # Concurrency bounds the server validates (backend runner_config). A live
+    # update is clamped to this range so a bad push can never wedge the runner
+    # idle (< 1) or blow the pool past the ceiling (> 64).
+    MIN_CONCURRENT = 1
+    MAX_CONCURRENT = 64
+
+    # The live-safe keys this daemon knows how to apply mid-flight. A config
+    # block carrying an UNRECOGNIZED non-null field is treated as
+    # not-fully-applicable: the daemon leaves the new generation UNAPPLIED and
+    # keeps reporting the older one, so the server renders it as pending rather
+    # than the daemon silently dropping a field it does not understand.
+    _KNOWN_KEYS = frozenset(
+        {"max_concurrent", "max_concurrent_compute", "task_types", "gpu_indices_allowed"}
+    )
+
+    def __init__(
+        self,
+        max_concurrent: int,
+        max_concurrent_compute: int,
+        task_types="all",
+        gpu_state: dict | None = None,
+        all_gpu_indices=None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._max_concurrent = self._clamp(max_concurrent)
+        self._max_concurrent_compute = self._clamp(max_concurrent_compute)
+        self._task_types = task_types  # "all" or list[str]
+        # Reported live-safe GPU allowlist value: "all" sentinel or a sorted
+        # list of indices (mirrors the server's projected representation so the
+        # echoed generation matches without recomputing the hash).
+        self._gpu_indices_allowed = "all"
+        # Shared GPU-scheduling dict; the concrete allowlist lives under
+        # ["allowed"] and is read by _assign_gpus under ["lock"].
+        self._gpu_state = gpu_state
+        self._all_gpu_indices = list(all_gpu_indices or [])
+        # None until the first server generation is applied; the server treats a
+        # null applied generation as pending/unknown (never an error).
+        self._applied_generation: str | None = None
+
+    @classmethod
+    def _clamp(cls, value) -> int:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return cls.MIN_CONCURRENT
+        return max(cls.MIN_CONCURRENT, min(cls.MAX_CONCURRENT, v))
+
+    def max_concurrent(self) -> int:
+        with self._lock:
+            return self._max_concurrent
+
+    def max_concurrent_compute(self) -> int:
+        with self._lock:
+            return self._max_concurrent_compute
+
+    def report(self) -> dict:
+        """Applied-vs-pending report fields for the next HeartbeatRequest body."""
+        with self._lock:
+            return {
+                "applied_config_generation": self._applied_generation,
+                "applied_max_concurrent": self._max_concurrent,
+                "applied_max_concurrent_compute": self._max_concurrent_compute,
+                "applied_task_types": self._task_types,
+                "applied_gpu_indices_allowed": self._gpu_indices_allowed,
+            }
+
+    def apply(self, config) -> bool:
+        """Reconcile a server config block onto the live process.
+
+        Returns True when every delivered field was applied and the generation
+        advanced; False when an unrecognized field forced the generation to stay
+        pending. Never raises — a malformed/absent block leaves live config
+        untouched and reports False.
+        """
+        if not isinstance(config, dict):
+            return False
+        generation = config.get("config_generation")
+        # Forward-compat guard: an unknown non-null field is NOT known-live-safe,
+        # so we refuse to claim the generation as applied and keep reporting the
+        # older one (the server renders it as still-pending).
+        fully_applicable = True
+        for key, value in config.items():
+            if key == "config_generation":
+                continue
+            if key not in self._KNOWN_KEYS and value is not None:
+                fully_applicable = False
+
+        with self._lock:
+            mc = config.get("max_concurrent")
+            if mc is not None:
+                self._max_concurrent = self._clamp(mc)
+            mcc = config.get("max_concurrent_compute")
+            if mcc is not None:
+                self._max_concurrent_compute = self._clamp(mcc)
+            if "task_types" in config:
+                tt = config.get("task_types")
+                if tt == "all" or tt is None:
+                    self._task_types = "all"
+                elif isinstance(tt, list):
+                    self._task_types = [str(x) for x in tt if isinstance(x, str) and x]
+            if "gpu_indices_allowed" in config:
+                self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
+            if fully_applicable and isinstance(generation, str) and generation:
+                self._applied_generation = generation
+        return fully_applicable
+
+    def _apply_gpu_allowlist_locked(self, raw) -> None:
+        """Update the reported allowlist and the shared GPU-scheduling set.
+
+        ``"all"``/``None`` → no restriction (every detected GPU); a list → that
+        subset, intersected with detected GPUs so a NEW job is never assigned a
+        GPU this host does not have. Running jobs keep their already-assigned
+        GPUs (only the ``allowed`` set for FUTURE assignments changes).
+        Called with ``self._lock`` held.
+        """
+        if raw is None or raw == "all":
+            self._gpu_indices_allowed = "all"
+            concrete = list(self._all_gpu_indices)
+        elif isinstance(raw, list):
+            wanted: list[int] = []
+            seen: set[int] = set()
+            for item in raw:
+                if isinstance(item, bool):
+                    continue
+                if isinstance(item, int):
+                    value = item
+                elif isinstance(item, str) and item.strip().lstrip("+").isdecimal():
+                    value = int(item.strip())
+                else:
+                    continue
+                if value < 0 or value in seen:
+                    continue
+                seen.add(value)
+                wanted.append(value)
+            wanted.sort()
+            self._gpu_indices_allowed = wanted
+            concrete = (
+                [i for i in wanted if i in self._all_gpu_indices]
+                if self._all_gpu_indices
+                else list(wanted)
+            )
+        else:
+            return
+        if self._gpu_state is not None:
+            gpu_lock = self._gpu_state.get("lock")
+            if gpu_lock is not None:
+                with gpu_lock:
+                    self._gpu_state["allowed"] = concrete
+            else:
+                self._gpu_state["allowed"] = concrete
+
+
 # ── Heartbeat (background thread) ─────────────────────────────────────────────
 
 def _heartbeat_loop(
@@ -1472,6 +1641,7 @@ def _heartbeat_loop(
     max_network_failures: int = 0,
     caps: "iso.Capabilities | None" = None,
     agent_image: str | None = None,
+    live_config: "_LiveRunnerConfig | None" = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -1592,12 +1762,26 @@ def _heartbeat_loop(
                 "gpu_free_vram_mib": _gpu_free_vram_mib() if has_gpu else None,
                 **gpu_capabilities,
             }
+            # Applied-vs-pending config report: echo the live-safe generation +
+            # values the daemon currently has in effect so the orchestrator/UI
+            # can tell desired-vs-applied apart. Reflects what was applied on the
+            # PREVIOUS tick (the config block from THIS response is applied below
+            # and reported on the FOLLOWING heartbeat).
+            if live_config is not None:
+                body.update(live_config.report())
             status, resp_body = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
                 # Parse orchestrator version hint so the runner can detect staleness.
                 if isinstance(resp_body, dict):
+                    # Apply the server-authoritative live-safe config block (if
+                    # present) onto the running process. Live-safe fields take
+                    # effect on the next claim tick without disrupting in-flight
+                    # work; the applied generation is echoed on the next
+                    # heartbeat (see body.update above).
+                    if live_config is not None:
+                        live_config.apply(resp_body.get("config"))
                     version_hint = resp_body.get("version_hint")
                     if version_hint and version:
                         runner_sha = _describe_sha(version)
@@ -2585,6 +2769,7 @@ def _compute_poll_loop(
     gpu_state: dict | None = None,
     telemetry: "_TelemetryState | None" = None,
     max_gpu_util_pct: int = 0,
+    live_config: "_LiveRunnerConfig | None" = None,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job.
 
@@ -2600,7 +2785,15 @@ def _compute_poll_loop(
             with lock:
                 active_count = len(active_jobs)
 
-            if active_count >= max_concurrent:
+            # A live server config push can grow/shrink the compute ceiling
+            # mid-flight; read it each iteration so the gate is the source of
+            # truth (the static `max_concurrent` is only the env-var default).
+            effective_max = (
+                live_config.max_concurrent_compute()
+                if live_config is not None
+                else max_concurrent
+            )
+            if active_count >= effective_max:
                 time.sleep(poll_interval)
                 continue
 
@@ -3654,16 +3847,11 @@ def main() -> None:
         print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
 
-    enrolled_max_concurrent = result.get("enrolled_max_concurrent")
-    if enrolled_max_concurrent is not None and max_concurrent != enrolled_max_concurrent:
-        print(
-            f"[runner] WARNING: BLUEPRINT_RUNNER_MAX_CONCURRENT={max_concurrent} disagrees "
-            f"with the server-enrolled preset max_concurrent={enrolled_max_concurrent}. "
-            f"The orchestrator uses the server-side limit; set "
-            f"BLUEPRINT_RUNNER_MAX_CONCURRENT={enrolled_max_concurrent} to match the "
-            f"enrollment and avoid claiming more (or fewer) tasks than declared.",
-            flush=True,
-        )
+    # NOTE: the env-var BLUEPRINT_RUNNER_MAX_CONCURRENT is only the INITIAL
+    # default. The heartbeat RESPONSE carries a server-authoritative live-safe
+    # config block (max_concurrent / max_concurrent_compute / task_types /
+    # gpu_indices_allowed) that OVERRIDES it on the next tick — no warn-only
+    # mismatch path any more, and no SSH/restart to reconfigure a live runner.
 
     if not (agent_claimable or compute_claimable):
         print(
@@ -3684,9 +3872,28 @@ def main() -> None:
     lock = threading.Lock()
     # SEPARATE capacity pools (I5): agents and compute never contend for one
     # shared semaphore, so the advertised concurrency is honest and a saturated
-    # agent pool can't starve compute (or vice-versa).
-    agent_capacity = threading.BoundedSemaphore(max_concurrent)
-    compute_capacity = threading.BoundedSemaphore(max_concurrent_compute)
+    # agent pool can't starve compute (or vice-versa). Sized to a HARD CEILING
+    # (never below the env default or the server's 1-64 live-safe bound) so the
+    # semaphore never becomes the binding constraint when a live config push
+    # GROWS the limit — the `active_count >= live_limit` gate below is the real
+    # source of truth the claim loops read each tick.
+    agent_capacity = threading.BoundedSemaphore(
+        max(max_concurrent, _LiveRunnerConfig.MAX_CONCURRENT)
+    )
+    compute_capacity = threading.BoundedSemaphore(
+        max(max_concurrent_compute, _LiveRunnerConfig.MAX_CONCURRENT)
+    )
+    # Live-safe config holder, seeded from the env-var startup values. The
+    # heartbeat loop overwrites its live-safe fields when the server sends a
+    # config block; the agent + compute claim loops read the live limit each
+    # iteration. "all" GPU sentinel maps to every DETECTED index (caps.gpu_indices).
+    live_config = _LiveRunnerConfig(
+        max_concurrent,
+        max_concurrent_compute,
+        task_types="all",
+        gpu_state=gpu_state,
+        all_gpu_indices=list(caps.gpu_indices or []),
+    )
     telemetry = _TelemetryState()
     workspace_root = _workspace_root()
 
@@ -3727,6 +3934,9 @@ def main() -> None:
             # docker+image box even without bwrap.
             "caps": caps,
             "agent_image": agent_image,
+            # Live-safe config channel: the heartbeat loop applies the server's
+            # config block and echoes applied-vs-pending back.
+            "live_config": live_config,
         },
         daemon=True,
     )
@@ -3755,7 +3965,8 @@ def main() -> None:
             ),
             kwargs={"base_poll_interval": base_poll_interval, "capabilities": caps,
                     "gpu_state": gpu_state, "telemetry": telemetry,
-                    "max_gpu_util_pct": max_gpu_util_pct},
+                    "max_gpu_util_pct": max_gpu_util_pct,
+                    "live_config": live_config},
             daemon=True,
         )
         compute_poll.start()
@@ -3794,7 +4005,10 @@ def main() -> None:
             with lock:
                 active_count = len(active_tasks)
 
-            if active_count >= max_concurrent:
+            # A live server config push can grow/shrink the agent ceiling
+            # mid-flight; read it each iteration so the gate is the source of
+            # truth (the static `max_concurrent` is only the env-var default).
+            if active_count >= live_config.max_concurrent():
                 time.sleep(poll_interval)
                 continue
 

@@ -1739,6 +1739,25 @@ export interface FleetRunner {
     gpu_utilization_pct?: number | null;
     failure_streak_threshold?: number;
   };
+  // Server-authoritative live-safe config the daemon converges to on heartbeat,
+  // plus the desired-vs-applied generation markers. Optional: runners enrolled
+  // before this contract, or that have not yet reported an applied generation,
+  // omit it (or report applied_config_generation=null → config_pending=true).
+  config?: {
+    desired?: {
+      max_concurrent?: number | null;
+      max_concurrent_compute?: number | null;
+      task_types?: string | string[];
+      gpu_indices_allowed?: 'all' | number[];
+    };
+    config_generation?: string;
+    applied?: Record<string, unknown> | null;
+    applied_config_generation?: string | null;
+    // True whenever the operator changed config but the daemon has not yet
+    // echoed the matching generation (includes the never-reported case).
+    config_pending?: boolean;
+    gpu_indices_allowed?: 'all' | number[];
+  };
   last_seen_at: string | null;
   created_at: string | null;
 }
@@ -1818,7 +1837,12 @@ export async function revokeFleetRunner(projectId: string, runnerId: string): Pr
 export async function updateRunnerCapabilities(
   projectId: string,
   runnerId: string,
-  capabilities: { max_concurrent?: number; task_types?: string | string[]; max_concurrent_compute?: number },
+  capabilities: {
+    max_concurrent?: number;
+    task_types?: string | string[];
+    max_concurrent_compute?: number;
+    gpu_indices_allowed?: 'all' | number[];
+  },
 ): Promise<FleetRunner> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/capabilities`,

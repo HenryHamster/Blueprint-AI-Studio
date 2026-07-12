@@ -38,6 +38,7 @@ from app.auth import create_agent_token, get_current_runner
 from app.broadcast import broadcast_to_project
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.runner_rate_limiter import check_runner_rate_limit
+from app.runner_config import config_generation, live_safe_config
 from app.database import get_session
 from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
@@ -237,6 +238,16 @@ class HeartbeatRequest(BaseModel):
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
     gpu_free_vram_mib: List[int] | None = None
+    # ── Applied-config report (two-way heartbeat config channel) ──────────────
+    # The daemon echoes back the LIVE-SAFE config generation it currently has in
+    # effect plus the applied live values, so the orchestrator/UI can tell
+    # desired-vs-applied apart (config_pending). All optional: an older daemon
+    # that never reports these simply shows as pending/unknown, never errors.
+    applied_config_generation: str | None = None
+    applied_max_concurrent: int | None = None
+    applied_max_concurrent_compute: int | None = None
+    applied_task_types: List[StrictStr] | str | None = None
+    applied_gpu_indices_allowed: List[int] | str | None = None
 
 
 @router.post("/next-task")
@@ -627,6 +638,35 @@ async def heartbeat(
         caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
     if payload.gpu_free_vram_mib is not None:
         caps["gpu_free_vram_mib"] = [max(0, int(v)) for v in payload.gpu_free_vram_mib]
+    # Applied-config report. Stored under dedicated caps keys (applied_config /
+    # applied_config_generation) so it never clobbers the operator-configured
+    # desired subset (max_concurrent, task_types, gpu_indices_allowed) or the
+    # hardware-reported telemetry — same merge discipline as every field above.
+    # Only written when the daemon reports it, so an older daemon leaves these
+    # absent (→ config_pending resolves to True/unknown, never an error).
+    if payload.applied_config_generation is not None:
+        caps["applied_config_generation"] = payload.applied_config_generation
+    applied_report: Dict[str, Any] = {}
+    if payload.applied_max_concurrent is not None:
+        applied_report["max_concurrent"] = max(0, int(payload.applied_max_concurrent))
+    if payload.applied_max_concurrent_compute is not None:
+        applied_report["max_concurrent_compute"] = max(
+            0, int(payload.applied_max_concurrent_compute)
+        )
+    if payload.applied_task_types is not None:
+        applied_report["task_types"] = (
+            "all"
+            if payload.applied_task_types == "all"
+            else list(payload.applied_task_types)
+        )
+    if payload.applied_gpu_indices_allowed is not None:
+        applied_report["gpu_indices_allowed"] = (
+            "all"
+            if payload.applied_gpu_indices_allowed == "all"
+            else [max(0, int(v)) for v in payload.applied_gpu_indices_allowed]
+        )
+    if applied_report:
+        caps["applied_config"] = applied_report
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:
@@ -722,11 +762,20 @@ async def heartbeat(
     # Lazy import to avoid circular dependency (main.py imports this module).
     from app.main import _current_sha
 
+    # Server-authoritative LIVE-SAFE config the daemon may apply mid-flight, plus
+    # a deterministic generation marker that changes iff the subset changes. The
+    # daemon reconciles this against its applied_config_generation on the next
+    # tick and reports back. enrolled_max_concurrent/version_hint are kept for
+    # backward compatibility (older daemons read only those).
+    live_config = live_safe_config(caps)
+    generation = config_generation(live_config)
     return {
         "ok": True,
         "last_seen_at": runner.last_seen_at.isoformat(),
         "enrolled_max_concurrent": caps.get("max_concurrent"),
         "version_hint": _current_sha,
+        "config": {**live_config, "config_generation": generation},
+        "config_generation": generation,
     }
 
 

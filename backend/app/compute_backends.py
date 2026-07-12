@@ -144,6 +144,70 @@ def is_zero_cost_backend(name: str) -> bool:
     """Return True for backends that run on operator/local hardware Blueprint does not pay for."""
     return name in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME)
 
+
+# Terminal statuses for a compute job — only completed jobs have a well-defined
+# elapsed window (started_at -> completed_at) to price a cloud equivalent over.
+_TERMINAL_COMPUTE_STATUSES = (
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+)
+
+
+def cloud_equivalent_cost_usd(job: ComputeJob) -> float | None:
+    """Dollars the self-hosted fleet *avoided* by running ``job`` locally.
+
+    This is the on-demand GCP price the same job's machine/accelerator shape would
+    have accrued over its actual run window (``started_at`` -> ``completed_at``),
+    had it run on paid cloud compute instead of an operator-owned runner.
+
+    Returns ``None`` (job does not contribute to the avoided rollup) when:
+      * the backend is NOT a zero-cost/self-hosted backend (a cloud job avoided
+        nothing — Blueprint actually paid for it),
+      * the job is not terminal (no settled run window to price),
+      * ``started_at`` or ``completed_at`` is missing, or the window is negative,
+      * the machine/accelerator shape is unknown or unsupported by the rate table.
+
+    Never raises: pricing an unpriceable shape yields ``None``, not an exception,
+    so a single malformed row cannot 500 the fleet-stats endpoint.
+    """
+    # Import here to avoid a module-load cycle (vm_cost_rates is otherwise a leaf).
+    from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
+
+    backend_name = getattr(job, "backend", None)
+    if not backend_name or not is_zero_cost_backend(backend_name):
+        return None
+    if getattr(job, "status", None) not in _TERMINAL_COMPUTE_STATUSES:
+        return None
+
+    started_at = getattr(job, "started_at", None)
+    completed_at = getattr(job, "completed_at", None)
+    if started_at is None or completed_at is None:
+        return None
+    elapsed_seconds = (completed_at - started_at).total_seconds()
+    if elapsed_seconds <= 0:
+        return None
+
+    accelerator = getattr(job, "accelerator_type", None)
+    count = getattr(job, "accelerator_count", None) or 1
+    try:
+        rate_per_second = get_compute_rate_per_second(
+            machine_type=getattr(job, "machine_type", None),
+            accelerator=accelerator,
+            count=count,
+            spot=False,
+        )
+    except AcceleratorRejection:
+        return None
+    except (KeyError, ValueError):
+        # Unknown machine type / unsupported shape — do not attribute a cost.
+        return None
+
+    if rate_per_second <= 0:
+        return None
+    return rate_per_second * elapsed_seconds
+
 # Fixed in-container path where the job's state directory is mounted.
 # The command writes result.json and artifacts/ here; the host-side mount makes
 # them visible at the job's state dir path without any post-run copy step.

@@ -142,6 +142,61 @@ function capsSummary(caps: FleetRunner['capabilities']): string {
   return parts.join(' · ') || '—';
 }
 
+/** Desired-vs-applied config badge for a runner row. Pending = operator changed
+ *  live-safe config but the daemon has not yet echoed the matching generation
+ *  (applies on the next heartbeat); applied = the daemon's reported generation
+ *  matches. Returns null for runners that never reported a config block. */
+function configStatus(runner: FleetRunner): { label: string; cls: string; pending: boolean } | null {
+  const config = runner.config;
+  if (!config) return null;
+  if (config.config_pending) {
+    return {
+      label: 'config pending — applying on next heartbeat',
+      cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+      pending: true,
+    };
+  }
+  // config_pending is false only once the daemon echoed the desired generation.
+  if (config.applied_config_generation != null) {
+    return {
+      label: 'config applied',
+      cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+      pending: false,
+    };
+  }
+  return null;
+}
+
+/** Current GPU allowlist for a runner, from the server-authoritative desired
+ *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
+function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
+  const allow = runner.config?.gpu_indices_allowed;
+  if (Array.isArray(allow)) return allow;
+  return 'all';
+}
+
+function gpuAllowlistLabel(runner: FleetRunner): string {
+  const allow = gpuAllowlistValue(runner);
+  if (allow === 'all') return 'GPUs: all';
+  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
+}
+
+/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
+ *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
+function parseGpuIndexList(text: string): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    if (!token) continue;
+    if (!/^\d+$/.test(token)) continue;
+    const value = Number(token);
+    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out.sort((a, b) => a - b);
+}
+
 function isStrategicRunner(runner: FleetRunner): boolean {
   const taskTypes = runner.capabilities.task_types;
   return runner.capabilities.runner_preset === 'strategic_local'
@@ -469,6 +524,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const [revoking, setRevoking] = useState<string | null>(null);
   const [editingCapabilities, setEditingCapabilities] = useState<string | null>(null);
   const [editMaxConcurrent, setEditMaxConcurrent] = useState<number>(2);
+  const [editingGpuAllowlist, setEditingGpuAllowlist] = useState<string | null>(null);
+  const [gpuAllowlistAll, setGpuAllowlistAll] = useState<boolean>(true);
+  const [gpuAllowlistText, setGpuAllowlistText] = useState<string>('');
   const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
@@ -605,6 +663,26 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     } finally {
       setUpdatingCapabilities(null);
     }
+  };
+
+  const handleUpdateGpuAllowlist = async (runner: FleetRunner, gpuIndicesAllowed: 'all' | number[]) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingGpuAllowlist(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { gpu_indices_allowed: gpuIndicesAllowed });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const beginEditGpuAllowlist = (runner: FleetRunner) => {
+    const current = gpuAllowlistValue(runner);
+    setGpuAllowlistAll(current === 'all');
+    setGpuAllowlistText(current === 'all' ? '' : current.join(','));
+    setEditingGpuAllowlist(runner.id);
   };
 
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
@@ -797,6 +875,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const readiness = runnerReadiness(runner, runnerLive, slots);
             const workday = workdayReadinessLine(readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
+            const configState = configStatus(runner);
             const backends = formatBackendInventory(runner.capabilities);
             const hasBackendInfo =
               backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
@@ -912,6 +991,70 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     {runner.capabilities.has_gpu && (
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
+                    {runner.capabilities.has_gpu && (
+                      editingGpuAllowlist === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
+                          data-testid="fleet-runner-gpu-allowlist-editor"
+                        >
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={gpuAllowlistAll}
+                              onChange={e => setGpuAllowlistAll(e.target.checked)}
+                              aria-label="Allow all GPUs"
+                            />
+                            all
+                          </label>
+                          {!gpuAllowlistAll && (
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              value={gpuAllowlistText}
+                              onChange={e => setGpuAllowlistText(e.target.value)}
+                              placeholder="0,1"
+                              aria-label="GPU indices allowed"
+                              className="w-16 bg-transparent text-center text-xs text-purple-300 outline-none"
+                              autoFocus
+                            />
+                          )}
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => handleUpdateGpuAllowlist(runner, gpuAllowlistAll ? 'all' : parseGpuIndexList(gpuAllowlistText))}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save GPU allowlist"
+                                aria-label="Save GPU allowlist"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingGpuAllowlist(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel GPU allowlist"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-purple-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                          {gpuAllowlistLabel(runner)}
+                          <button
+                            onClick={() => beginEditGpuAllowlist(runner)}
+                            className="text-purple-300/70 hover:text-purple-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            title="Edit GPU allowlist"
+                            aria-label="Edit GPU allowlist"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
+                    )}
                     {runner.health?.agent_available !== undefined && (
                       <span
                         className={`rounded border px-1.5 py-0.5 text-xs ${
@@ -931,6 +1074,17 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                    {configState && (
+                      <span
+                        className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
+                        data-testid="fleet-runner-config-status"
+                      >
+                        {configState.pending
+                          ? <RefreshCw className="w-3 h-3 animate-spin" />
+                          : <Check className="w-3 h-3" />}
+                        {configState.label}
+                      </span>
+                    )}
                   </div>
                   <div
                     className={`mt-1 text-xs font-medium ${workday.ready ? 'text-emerald-300' : 'text-amber-300'}`}

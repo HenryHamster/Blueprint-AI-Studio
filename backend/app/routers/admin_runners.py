@@ -30,6 +30,11 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.runner_config import (
+    GPU_INDICES_ALL,
+    config_generation,
+    live_safe_config,
+)
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
 from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
@@ -85,6 +90,10 @@ class RunnerUpdateCapabilitiesRequest(BaseModel):
     max_concurrent: int | None = None
     task_types: str | list[str] | None = None
     max_concurrent_compute: int | None = None
+    # GPU-index allowlist: "all" (no restriction) or a list of non-negative GPU
+    # indices the runner may schedule onto. Part of the LIVE-SAFE config subset
+    # pushed to the daemon via the heartbeat response.
+    gpu_indices_allowed: str | list[int] | None = None
 
 
 class RunnerStatusUpdateRequest(BaseModel):
@@ -169,6 +178,46 @@ def _normalize_max_concurrent(raw: Any) -> int:
     if value < 1 or value > 64:
         raise ValueError("capabilities.max_concurrent must be between 1 and 64")
     return value
+
+
+def _normalize_gpu_indices_allowed(raw: Any) -> str | list[int]:
+    """Validate the GPU-index allowlist: the ``"all"`` sentinel or a list of
+    non-negative ints. Deduplicated and sorted so storage (and therefore the
+    live-safe config generation hash) is order-independent. An empty list is
+    accepted and means "no GPU indices allowed" (a deliberate restriction).
+    """
+    if raw == GPU_INDICES_ALL:
+        return GPU_INDICES_ALL
+    if not isinstance(raw, list):
+        raise ValueError(
+            "capabilities.gpu_indices_allowed must be 'all' or a list of "
+            "non-negative integers"
+        )
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        if isinstance(item, bool):
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if isinstance(item, int):
+            value = item
+        elif isinstance(item, float) and item.is_integer():
+            value = int(item)
+        elif isinstance(item, str) and item.strip().isdecimal():
+            value = int(item.strip())
+        else:
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if value < 0:
+            raise ValueError(
+                "capabilities.gpu_indices_allowed entries must be non-negative integers"
+            )
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return sorted(normalized)
 
 
 def _runner_active_task_count(capabilities: Dict[str, Any] | None) -> int:
@@ -389,6 +438,31 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
     }
 
 
+def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Desired-vs-applied LIVE-SAFE config for the Fleet UI.
+
+    ``desired`` is the server-authoritative subset the daemon should converge to;
+    ``config_generation`` is its deterministic marker. ``applied_config_generation``
+    is what the daemon last reported having in effect (None until it reports).
+    ``config_pending`` is True whenever the two generations differ — including the
+    "never reported" case, so an old/silent daemon reads as pending, not applied.
+    """
+    caps = capabilities or {}
+    desired = live_safe_config(caps)
+    desired_generation = config_generation(desired)
+    applied_generation = caps.get("applied_config_generation")
+    if not isinstance(applied_generation, str):
+        applied_generation = None
+    return {
+        "desired": desired,
+        "config_generation": desired_generation,
+        "applied": caps.get("applied_config"),
+        "applied_config_generation": applied_generation,
+        "config_pending": applied_generation != desired_generation,
+        "gpu_indices_allowed": desired["gpu_indices_allowed"],
+    }
+
+
 def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
     now = _utcnow()
     token_age_days = (
@@ -403,6 +477,7 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         "status": runner.status,
         "capabilities": runner.capabilities,
         "health": _runner_health(runner),
+        "config": _runner_config_view(runner.capabilities),
         "last_seen_at": (
             runner.last_seen_at.isoformat() if runner.last_seen_at else None
         ),
@@ -522,6 +597,14 @@ async def update_runner_capabilities(
         if payload.max_concurrent_compute is not None:
             mcc = _normalize_max_concurrent(payload.max_concurrent_compute)
             caps["max_concurrent_compute"] = mcc
+
+        # GPU-index allowlist is orthogonal to the strategic_local invariants
+        # (which pin concurrency/task_types) — it applies to every runner and
+        # never relaxes those clamps.
+        if payload.gpu_indices_allowed is not None:
+            caps["gpu_indices_allowed"] = _normalize_gpu_indices_allowed(
+                payload.gpu_indices_allowed
+            )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

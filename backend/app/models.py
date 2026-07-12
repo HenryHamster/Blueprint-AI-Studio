@@ -4923,6 +4923,11 @@ class LocalRunner(SQLModel, table=True):
     #  — has_gpu et al. are overwritten at first heartbeat. gpu_utilization_pct and
     #  disk_free_bytes are display-only trust telemetry, stashed here alongside the
     #  other heartbeat-reported hardware fields rather than as dedicated columns.
+    #  Live-safe config channel (all here, no columns/migration): the operator-set
+    #  desired subset is "max_concurrent" / "max_concurrent_compute" / "task_types"
+    #  / "gpu_indices_allowed" ("all" | [int]); the daemon echoes back what it has
+    #  applied as "applied_config" (same shape) + "applied_config_generation" (the
+    #  content hash it last converged to). See app.runner_config.
     capabilities: Dict[str, Any] = Field(
         default_factory=lambda: {
             "task_types": "all",
