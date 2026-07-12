@@ -47,6 +47,7 @@ from app.routers.admin_runners import _runner_health
 from app.strategic_runtime_work import (
     local_runner_hold_task_filters,
     strategic_local_runner_hold_task_filters,
+    task_awaiting_container_runner_since,
     task_awaiting_local_runner_since,
     task_awaiting_strategic_local_runner_since,
 )
@@ -512,14 +513,23 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
 
 
 def _local_runner_hold_attention_item(task: Task) -> dict[str, Any]:
+    container_since = task_awaiting_container_runner_since(task)
     awaiting_since = (
         task_awaiting_local_runner_since(task)
+        or container_since
         or task_awaiting_strategic_local_runner_since(task)
     )
+    # A container hold is waiting on a Docker-capable runtime, not offline
+    # hardware — word the detail accordingly so the operator sees the real cause.
+    hold_subject = (
+        "container-capable runner"
+        if container_since and not task_awaiting_local_runner_since(task)
+        else "local runner hardware"
+    )
     hold_detail = (
-        f"Waiting for local runner hardware since {awaiting_since}"
+        f"Waiting for {hold_subject} since {awaiting_since}"
         if awaiting_since
-        else "Waiting for local runner hardware"
+        else f"Waiting for {hold_subject}"
     )
     task_detail = task.latest_status_message or task.blocked_reason or task.park_reason
     if task_detail:

@@ -7,7 +7,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Dict
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -55,6 +55,10 @@ _PROBLEM_WAKE_STATES = (
 _RUNTIME_WORK_PREVIEW_LIMIT = 6
 _RUNNER_CANDIDATE_LIMIT = 8
 LOCAL_RUNNER_HOLD_CONTEXT_KEY = "awaiting_local_runner_since"
+# Sibling compute hold: an image-declaring job that found no container-capable
+# runner is parked under this key. It shares the local-runner hold class for
+# counting, operator-attention surfacing, and timeout escalation.
+CONTAINER_RUNNER_HOLD_CONTEXT_KEY = "awaiting_container_runner_since"
 _LOCAL_STRATEGIC_RUNNING_STATUSES = frozenset(
     {
         TaskStatus.IN_PROGRESS,
@@ -130,6 +134,18 @@ def task_awaiting_local_runner_since(task: Task | None) -> str | None:
     return str(raw)
 
 
+def task_awaiting_container_runner_since(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    context = task.context or {}
+    raw = context.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return _string_or_none(raw)
+    return str(raw)
+
+
 def task_awaiting_strategic_local_runner_since(task: Task | None) -> str | None:
     if task is None:
         return None
@@ -169,20 +185,29 @@ def task_is_local_runner_hold(task: Task | None) -> bool:
         task.status == TaskStatus.QUEUED
         and not task.archived
         and _task_type(task) == "compute_experiment"
-        and task_awaiting_local_runner_since(task) is not None
+        and (
+            task_awaiting_local_runner_since(task) is not None
+            or task_awaiting_container_runner_since(task) is not None
+        )
     )
 
 
 def local_runner_hold_task_filters(project_id: uuid.UUID) -> tuple[ColumnElement[bool], ...]:
-    awaiting_since = Task.context[LOCAL_RUNNER_HOLD_CONTEXT_KEY].as_string()
+    awaiting_local = Task.context[LOCAL_RUNNER_HOLD_CONTEXT_KEY].as_string()
+    awaiting_container = Task.context[CONTAINER_RUNNER_HOLD_CONTEXT_KEY].as_string()
     return (
         Task.project_id == project_id,
         Task.archived.is_(False),
         Task.status == TaskStatus.QUEUED,
         Task.requires_approval.is_not(True),
         Task.payloads[0]["type"].as_string() == "compute_experiment",
-        awaiting_since.is_not(None),
-        awaiting_since != "",
+        # A compute_experiment is held either for a require-local runner or for a
+        # container-capable runner (image-declaring GPU job on a Docker-less box);
+        # both stalls are the same operator-facing hold class.
+        or_(
+            and_(awaiting_local.is_not(None), awaiting_local != ""),
+            and_(awaiting_container.is_not(None), awaiting_container != ""),
+        ),
     )
 
 

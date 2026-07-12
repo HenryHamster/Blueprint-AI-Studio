@@ -11167,6 +11167,151 @@ async def test_held_require_local_compute_alerts_before_timeout(db_session, mock
     assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
 
 
+@pytest.mark.asyncio
+async def test_held_container_runner_compute_alerts_before_timeout(db_session, mocker):
+    """A container-image compute_experiment held (awaiting_container_runner_since)
+    longer than the early-warning threshold but under the 6h timeout emits a
+    distinct WARNING alert while the task stays QUEUED, and the second sweep pass
+    does not duplicate it. This closes the silent-indefinite-stall gap: without the
+    fix the container hold is invisible to the sweep and never escalates.
+    """
+    from sqlmodel import select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="Container Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="stranded container compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 container-hold alert, got {len(alerts)}"
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    # Distinct copy from the require-local hold so the operator sees the real cause.
+    assert "container-capable" in alert.title.lower()
+    assert "docker_usable" in alert.message
+
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+@pytest.mark.asyncio
+async def test_held_container_runner_compute_fails_after_timeout(db_session, mocker):
+    """A container-image compute_experiment held past the 6h wait timeout is
+    terminal-FAILED (PROVISION_FAILURE) with a container-specific reason — there
+    is no safe cloud fallback for an image-declaring job that needs a
+    Docker-capable runner. Guards against the hold stalling indefinitely.
+    """
+    from app.failure_classification import PROVISION_FAILURE
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="Container Hold Timeout", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 120)
+    task = make_task(
+        project_id=project.id,
+        title="expired container compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+    assert failed_count == 1
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.FAILED
+    assert (refreshed.context or {}).get("failure_category") == PROVISION_FAILURE
+    assert "container-capable" in (refreshed.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_container_runner_hold_surfaces_in_local_hold_filters(db_session):
+    """A container-image compute hold is counted by local_runner_hold_task_filters
+    (the SQL predicate driving the operator-attention count and items) exactly like
+    a require-local hold — the broadened OR predicate must compile and execute so
+    the container stall is no longer invisible to the operator surface.
+    """
+    from sqlalchemy import func, select
+    from app.strategic_runtime_work import (
+        local_runner_hold_task_filters,
+        task_awaiting_container_runner_since,
+        task_is_local_runner_hold,
+    )
+
+    project = make_project(name="Container Hold Filter", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow().isoformat()
+    task = make_task(
+        project_id=project.id,
+        title="container held",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_container_runner_since": held_since},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    count = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(*local_runner_hold_task_filters(project.id))
+        )
+    ).scalar()
+    assert count == 1, "container hold must be counted by the local-hold filter"
+
+    # Python-side classifiers agree with the SQL predicate.
+    assert task_awaiting_container_runner_since(task) == held_since
+    assert task_is_local_runner_hold(task) is True
+
+
 # ---------------------------------------------------------------------------
 # MissingGreenlet hardening: strategic local-runner dispatch-prep path
 # ---------------------------------------------------------------------------

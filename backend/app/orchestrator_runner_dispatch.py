@@ -618,6 +618,7 @@ async def _try_runner_dispatch(
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
     new_ctx.pop("awaiting_local_runner_since", None)
+    new_ctx.pop("awaiting_container_runner_since", None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
@@ -667,9 +668,13 @@ async def _try_runner_dispatch(
     # flagged the stall is now stale — dismiss it. Best-effort: a resolve
     # failure must never abort a successful dispatch.
     try:
-        from app.alert_dispatch import _resolve_local_runner_hold_alert
+        from app.alert_dispatch import (
+            _resolve_container_runner_hold_alert,
+            _resolve_local_runner_hold_alert,
+        )
 
         await _resolve_local_runner_hold_alert(session, task.id)
+        await _resolve_container_runner_hold_alert(session, task.id)
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
@@ -1385,9 +1390,13 @@ async def _dispatch_compute_experiment_directly(
     # flagged the stall is now stale — dismiss it. Best-effort: a resolve
     # failure must never abort a successful dispatch.
     try:
-        from app.alert_dispatch import _resolve_local_runner_hold_alert
+        from app.alert_dispatch import (
+            _resolve_container_runner_hold_alert,
+            _resolve_local_runner_hold_alert,
+        )
 
         await _resolve_local_runner_hold_alert(session, task.id)
+        await _resolve_container_runner_hold_alert(session, task.id)
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
@@ -1675,11 +1684,14 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
 
     Two hold classes share the bounded-wait contract but resolve DIFFERENTLY:
 
-    * **compute_experiment** (``context['awaiting_local_runner_since']``): held
-      QUEUED instead of cloud-provisioned when no live self-hosted runner claimed
-      it. A hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` (6h) is marked
-      terminal-FAILED (PROVISION_FAILURE) — a require-local compute run has no
-      safe cloud fallback (it needs the operator's GPU), so failing is correct.
+    * **compute_experiment** (``context['awaiting_local_runner_since']`` or
+      ``context['awaiting_container_runner_since']``): held QUEUED instead of
+      cloud-provisioned when no live self-hosted runner claimed it (require-local)
+      or no runner advertises ``docker_usable`` for an image-declaring job
+      (container hold). A hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS``
+      (6h) is marked terminal-FAILED (PROVISION_FAILURE) — neither variant has a
+      safe cloud fallback (each needs specific operator hardware/runtime), so
+      failing is correct. Both emit an early-warning alert first.
 
     * **continuous local Strategic** (``context['awaiting_strategic_local_runner_since']``
       + ``context['strategic_local_runner_required']``): SAFETY self-heal. A hold
@@ -1720,9 +1732,23 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         ctx = task.context or {}
         task_type = str((task.first_payload or {}).get("type") or "")
         compute_stamp = ctx.get("awaiting_local_runner_since")
+        container_stamp = ctx.get("awaiting_container_runner_since")
         strategic_stamp = ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
         is_compute_hold = (
             bool(compute_stamp)
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        # Container-image hold: an image-declaring job parked because no live
+        # runner advertises docker_usable. Same bounded-wait contract as the
+        # require-local compute hold (early-warning alert, then 6h terminal FAIL —
+        # no safe cloud fallback), but distinct alert copy + failure reason so the
+        # operator sees the accurate cause. Require-local takes precedence if a
+        # stale local stamp somehow coexists.
+        is_container_hold = (
+            bool(container_stamp)
+            and not is_compute_hold
             and task_type == "compute_experiment"
             and not task.archived
             and task.requires_approval is not True
@@ -1734,10 +1760,15 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
-        if not is_compute_hold and not is_strategic_hold:
+        if not is_compute_hold and not is_container_hold and not is_strategic_hold:
             continue
 
-        stamped = strategic_stamp if is_strategic_hold else compute_stamp
+        if is_strategic_hold:
+            stamped = strategic_stamp
+        elif is_container_hold:
+            stamped = container_stamp
+        else:
+            stamped = compute_stamp
         stamped_at = _parse_local_runner_hold_timestamp(stamped)
         if stamped_at is None:
             continue
@@ -1746,22 +1777,36 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             # Within the full wait window — keep holding. For compute holds, emit a
             # proactive early-warning alert once the hold passes the shorter threshold
             # so the operator learns the hardware is offline in minutes, not 6h.
-            if is_compute_hold:
+            if is_compute_hold or is_container_hold:
                 alert_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS)
                 if stamped_at <= alert_cutoff:
-                    from app.alert_dispatch import _maybe_create_local_runner_hold_alert
-
                     held_secs = int((now - stamped_at).total_seconds())
                     remaining_secs = max(
                         0, _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS - held_secs
                     )
                     try:
-                        created = await _maybe_create_local_runner_hold_alert(
-                            task,
-                            session,
-                            held_seconds=held_secs,
-                            timeout_seconds=remaining_secs,
-                        )
+                        if is_container_hold:
+                            from app.alert_dispatch import (
+                                _maybe_create_container_runner_hold_alert,
+                            )
+
+                            created = await _maybe_create_container_runner_hold_alert(
+                                task,
+                                session,
+                                held_seconds=held_secs,
+                                timeout_seconds=remaining_secs,
+                            )
+                        else:
+                            from app.alert_dispatch import (
+                                _maybe_create_local_runner_hold_alert,
+                            )
+
+                            created = await _maybe_create_local_runner_hold_alert(
+                                task,
+                                session,
+                                held_seconds=held_secs,
+                                timeout_seconds=remaining_secs,
+                            )
                         if created:
                             await session.commit()
                     except Exception:
@@ -1820,11 +1865,18 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
 
         # compute_experiment hold — terminal FAIL (no safe cloud fallback).
         hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
-        reason = (
-            f"require_local_runner: no self-hosted runner became available "
-            f"within {hours}h — operator hardware offline; bring a runner "
-            f"online and requeue"
-        )
+        if is_container_hold:
+            reason = (
+                f"container_image: no container-capable runner (docker_usable) "
+                f"became available within {hours}h — enroll a Docker-capable "
+                f"runner and requeue, or requeue without a container_image"
+            )
+        else:
+            reason = (
+                f"require_local_runner: no self-hosted runner became available "
+                f"within {hours}h — operator hardware offline; bring a runner "
+                f"online and requeue"
+            )
         task.status = TaskStatus.FAILED
         task.latest_status_message = reason[:500]
         persist_failure_category(task, PROVISION_FAILURE)

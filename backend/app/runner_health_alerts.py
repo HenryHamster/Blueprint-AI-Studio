@@ -847,6 +847,120 @@ async def _resolve_local_runner_hold_alert(
     return len(open_alerts)
 
 
+_CONTAINER_RUNNER_HOLD_ALERT_TITLE = "Compute hold: no container-capable runner"
+
+
+async def _maybe_create_container_runner_hold_alert(
+    task: "object",
+    session: AsyncSession,
+    *,
+    held_seconds: int,
+    timeout_seconds: int,
+) -> bool:
+    """Create a deduplicated WARNING alert for an aging container-runner compute hold.
+
+    Sibling of :func:`_maybe_create_local_runner_hold_alert`. Fires when a
+    ``compute_experiment`` declaring a ``container_image`` has been QUEUED longer
+    than the early-warning threshold because no live runner advertises the
+    ``docker_usable`` capability — the exact stall the project-baked-image
+    authoring default triggers on any GPU box without Docker. Distinct title so
+    the operator sees the accurate cause (missing container runtime, not an
+    offline require-local host).
+
+    Deduplicated on ``(task_id, title, dismissed_at IS NULL)`` so repeated sweep
+    passes raise exactly ONE alert per hold episode. The caller commits after this
+    returns ``True``. Returns ``False`` when the alert already exists (dedup hit).
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    held_str = _fmt_duration_seconds(held_seconds)
+    remaining_str = _fmt_duration_seconds(timeout_seconds)
+    msg = (
+        f"A container-image compute experiment has been waiting {held_str} for a "
+        f"container-capable runner (docker_usable) with none online — the task "
+        f"will hard-fail in ~{remaining_str} if no such runner comes online. "
+        f"Enroll a Docker-capable runner or requeue the task without a "
+        f"container_image to use cloud compute."
+    )[:1000]
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+        message=msg,
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                task.project_id,
+                "RUNNER_CONTAINER_HOLD",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "held_seconds": held_seconds,
+                    "held_duration": held_str,
+                    "timeout_seconds": timeout_seconds,
+                    "remaining_duration": remaining_str,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_CONTAINER_HOLD dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_container_runner_hold_alert(
+    session: AsyncSession,
+    task_id: "uuid.UUID",
+) -> int:
+    """Dismiss any open container-runner-hold alert when the held task dispatches.
+
+    Companion to :func:`_maybe_create_container_runner_hold_alert`, mirroring
+    :func:`_resolve_local_runner_hold_alert`. Idempotent no-op when no open alert
+    exists; best-effort — a resolve failure must never abort the dispatch that
+    triggered it. Returns the number of alerts dismissed.
+    """
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task_id,
+            Alert.title == _CONTAINER_RUNNER_HOLD_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(alert.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE = "runner.fleet_no_healthy"
 
 

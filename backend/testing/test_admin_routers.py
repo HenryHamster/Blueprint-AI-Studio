@@ -9499,6 +9499,8 @@ class TestNotificationConfigSettings:
             "RUNNER_FLEET_OFFLINE",
             "RUNNER_LOW_DISK",
             "RUNNER_OUTAGE_ESCALATED",
+            "RUNNER_LOCAL_HOLD",
+            "RUNNER_CONTAINER_HOLD",
         ]
         resp = await client.patch(
             "/api/admin/settings",

@@ -1781,6 +1781,7 @@ async def _resolve_wake_delivery_stall_alert(
 # so existing ``from app.alert_dispatch import ...`` callers keep working.
 from app.runner_health_alerts import (  # noqa: F401
     _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE,
+    _CONTAINER_RUNNER_HOLD_ALERT_TITLE,
     _LOCAL_RUNNER_HOLD_ALERT_TITLE,
     _RUNNER_DEACTIVATED_EVENT_TYPE,
     _RUNNER_DEGRADED_EVENT_TYPE,
@@ -1790,6 +1791,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _RUNNER_LOW_DISK_EVENT_TYPE,
     _RUNNER_LOW_MEMORY_EVENT_TYPE,
     _fleet_no_healthy_runner_dedupe_key,
+    _maybe_create_container_runner_hold_alert,
     _maybe_create_fleet_no_healthy_runner_alert,
     _maybe_create_local_runner_hold_alert,
     _maybe_create_runner_deactivated_alert,
@@ -1800,6 +1802,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_escalate_runner_deactivated_alert,
     _maybe_escalate_runner_deactivated_alerts,
     _maybe_escalate_runner_degraded_alerts,
+    _resolve_container_runner_hold_alert,
     _resolve_fleet_no_healthy_runner_alert,
     _resolve_local_runner_hold_alert,
     _resolve_runner_deactivated_alert,
