@@ -402,6 +402,53 @@ def test_cap_bump_resolves_admin_release_version_breach():
     )
 
 
+@pytest.mark.parametrize(
+    "target_rel",
+    ["autonomous_research.py", "compute_jobs.py"],
+)
+def test_cap_bump_resolves_d18e8b14_breaches(target_rel):
+    """After bumping caps via check_size_limits --fix, the modules the 2026-07-12
+    d18e8b14 ci-compliance remediation targets must be within their new caps on the
+    real file tree.
+
+    automain HEAD d18e8b14 reported backend/autonomous_research.py at 3353 lines over
+    its old cap of 3350, and backend/compute_jobs.py at 3642 over its old cap of 3400
+    (the latter introduced by the cross-job checkpoint-resume merge). The fix bumps
+    both caps in module_size_limits.json; this merge-test gate proves the bumped JSON
+    is consistent with the actual file sizes on disk, so the test fails if a cap is
+    reverted (or a file grows past its new cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_capped_backend_modules_within_cap_on_disk():
     """Every capped backend module must be at or under its cap on the real tree.
 
