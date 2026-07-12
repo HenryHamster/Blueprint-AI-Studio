@@ -1,4 +1,4 @@
-import { describe, test, expect, vi, afterEach } from 'vitest';
+import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
@@ -9,6 +9,7 @@ import {
   computeJobRuntimeSec,
   computeJobMargin,
   computeJobExecutionLocation,
+  computeJobEvidenceTier,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
@@ -228,6 +229,68 @@ describe('ComputeJobsPanel helpers', () => {
   test('computeJobExecutionLocation falls back to raw string for unknown backends', () => {
     expect(computeJobExecutionLocation('gcp_compute_engine')).toEqual({ label: 'gcp_compute_engine', isOperatorHardware: false });
     expect(computeJobExecutionLocation('unknown-backend')).toEqual({ label: 'unknown-backend', isOperatorHardware: false });
+  });
+
+  test('computeJobEvidenceTier: local-subprocess and runner-subprocess → covered', () => {
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-subprocess' }))).toBe('covered');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess' }))).toBe('covered');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-gpu' }))).toBe('covered');
+  });
+
+  test('computeJobEvidenceTier: gcp → attested', () => {
+    expect(computeJobEvidenceTier(makeJob({ backend: 'gcp' }))).toBe('attested');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'gcp_compute_engine' }))).toBe('attested');
+  });
+});
+
+describe('ComputeJobsPanel evidence-tier badge rendering', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  test('renders evidence-tier badge on terminal operator-hardware job', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      accrued_cost_usd: 0,
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { getByText } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getByText('Machine verified')).toBeTruthy();
+    });
+  });
+
+  test('active job renders no evidence-tier badge', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'RUNNING',
+      outcome: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { queryByText } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(queryByText('Machine verified')).toBeNull();
+    });
   });
 });
 

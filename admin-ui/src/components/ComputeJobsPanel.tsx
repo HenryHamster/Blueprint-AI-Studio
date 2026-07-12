@@ -9,6 +9,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -20,6 +21,7 @@ import {
   computeJobProjectedSpend,
   computeJobMargin,
   computeJobExecutionLocation,
+  computeJobEvidenceTier,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
@@ -1645,11 +1647,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     );
                   })()}
                 </div>
-                <span
-                  className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
-                >
-                  {active ? job.status : computeJobTerminalLabel(job)}
-                </span>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {!active && (
+                    <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />
+                  )}
+                  <span
+                    className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold ${statusBadgeClass(job)}`}
+                  >
+                    {active ? job.status : computeJobTerminalLabel(job)}
+                  </span>
+                </div>
               </div>
 
               {isOperatorHardware ? (

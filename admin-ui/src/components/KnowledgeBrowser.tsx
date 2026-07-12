@@ -396,6 +396,27 @@ function ComputeRunProvenanceDetail({
   );
 }
 
+/** Compact chip showing execution location (operator hardware vs cloud) for compute_experiment list cards. */
+function ExecutionLocationBadge({
+  doc,
+}: {
+  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict'>;
+}) {
+  if (doc.source_kind !== 'compute_experiment') return null;
+  const v = doc.forward_quality_verdict;
+  const tdRaw = v && typeof v.terminal_diagnostics === 'object' && v.terminal_diagnostics !== null
+    ? v.terminal_diagnostics as Record<string, unknown>
+    : null;
+  const backend = typeof tdRaw?.executing_backend === 'string' ? tdRaw.executing_backend : null;
+  if (!backend) return null;
+  const location = computeJobExecutionLocation(backend);
+  return (
+    <span className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${location.isOperatorHardware ? 'bg-amber-950/50 text-amber-300' : 'bg-sky-950/50 text-sky-300'}`}>
+      {location.label}
+    </span>
+  );
+}
+
 function CopyableId({ id }: { id: string }) {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(() => {
@@ -980,6 +1001,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     <CriterionVerdictBadge doc={doc} />
                     <AcceptanceGradeBadge doc={doc} />
                     <EvidenceTierBadge tier={doc.evidence_tier} />
+                    <ExecutionLocationBadge doc={doc} />
                     <OriginBadge doc={doc} />
                     <LifecycleBadge status={doc.lifecycle_status} />
                     {doc.direction_id && (

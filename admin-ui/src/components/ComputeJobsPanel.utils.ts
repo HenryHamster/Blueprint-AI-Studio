@@ -1,4 +1,15 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
+
+/** Derive the evidence tier for a compute job, mirroring backend
+ *  knowledge_completion.py::_compute_evidence_tier. */
+export function computeJobEvidenceTier(
+  job: Pick<ComputeJob, 'backend' | 'status' | 'outcome'>,
+): 'covered' | 'attested' | 'backfilled' | 'uncovered' {
+  const backend = job.backend ?? '';
+  if (backend.startsWith('local-') || backend === 'runner-subprocess') return 'covered';
+  if (backend) return 'attested';
+  return 'uncovered';
+}
 import { parseTimestamp } from '../utils/time';
 export { formatDurationSec as fmtDuration } from '../utils/time';
 

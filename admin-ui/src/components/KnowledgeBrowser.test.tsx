@@ -1438,3 +1438,112 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
     expect(text).not.toContain('Run provenance');
   });
 });
+
+describe('KnowledgeBrowser — renders execution-location badge on compute_experiment list card', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function renderListWithDoc(doc: typeof computeDoc & { forward_quality_verdict?: unknown }) {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [doc] as never, total: 1, limit: 50, offset: 0 });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(doc.title),
+    ) as HTMLElement | undefined;
+  }
+
+  test('renders Operator hardware badge in list card for local-subprocess backend', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-local',
+      title: 'Local subprocess execution doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'local-subprocess' },
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('Operator hardware');
+  });
+
+  test('renders cloud label in list card for gcp backend', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-gcp',
+      title: 'GCP cloud execution doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'gcp' },
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('GCP cloud');
+  });
+
+  test('renders no location badge when executing_backend is absent', async () => {
+    const doc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-absent',
+      title: 'No backend doc',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        // no terminal_diagnostics
+      },
+    };
+    const card = await renderListWithDoc(doc);
+    expect(card).toBeTruthy();
+    expect(card?.textContent).not.toContain('Operator hardware');
+    expect(card?.textContent).not.toContain('GCP cloud');
+  });
+
+  test('renders no location badge for non-compute_experiment source kind', async () => {
+    const { fetchKnowledgeDocuments } = await import('../api');
+    const nonComputeDoc = {
+      ...computeDoc,
+      id: 'doc-loc-badge-web',
+      title: 'Web research non-compute doc',
+      source_kind: 'web_research',
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: { executing_backend: 'local-subprocess' },
+      },
+    };
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({ documents: [nonComputeDoc] as never, total: 1, limit: 50, offset: 0 });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<KnowledgeBrowser selectedProjectId="project-test" onClose={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const card = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(nonComputeDoc.title),
+    );
+    expect(card).toBeTruthy();
+    expect(card?.textContent).not.toContain('Operator hardware');
+    expect(card?.textContent).not.toContain('GCP cloud');
+  });
+});
