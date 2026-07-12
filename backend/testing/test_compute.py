@@ -2208,6 +2208,146 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
     assert job.polling_metadata["terminal_status"] == ComputeJobStatus.SUCCEEDED.value
 
 
+@pytest.mark.parametrize(
+    "log_text, expected",
+    [
+        (
+            "ERROR: Detected Tesla V100-SXM2-16GB GPU, which is not supported by "
+            "this container\nERROR: No supported GPU(s) detected to run this "
+            "container",
+            True,
+        ),
+        # GPU-model line alone still trips it (NGC entrypoint phrasing).
+        ("Detected A40 GPU, which is not supported by this container", True),
+        # A normal successful run is not a false positive.
+        ("throughput_tflops: 42.0\nrun complete", False),
+        # Non-fatal mentions of "gpu" and "supported" must not trip it.
+        ("Using GPU 0; mixed precision supported", False),
+    ],
+)
+def test_status_reports_no_usable_gpu(log_text, expected):
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        command_log={"text": log_text},
+    )
+    assert compute_jobs._status_reports_no_usable_gpu(status) is expected
+
+
+def test_status_reports_no_usable_gpu_handles_missing_log():
+    # No command log at all — must not raise, must be False.
+    assert (
+        compute_jobs._status_reports_no_usable_gpu(
+            ComputeStatusResult(status=ComputeJobStatus.SUCCEEDED, exit_code=0)
+        )
+        is False
+    )
+    # Malformed command_log (text not a string) is tolerated.
+    assert (
+        compute_jobs._status_reports_no_usable_gpu(
+            ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                command_log={"text": None},
+            )
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reclassifies_no_usable_gpu_as_failure(
+    db_session, monkeypatch
+):
+    """A container that exits 0 but reports no usable GPU is a FAILURE.
+
+    Regression guard for a real incident: an fp16/fp32 matmul GPU experiment ran
+    on an operator V100 under ``nvcr.io/nvidia/pytorch:25.01-py3`` (Volta not
+    supported by that image). The entrypoint printed a fatal "No supported
+    GPU(s) detected" error and exited 0, so the backend reported SUCCEEDED and
+    the job was recorded outcome=SUCCESS despite never producing its metric.
+    """
+    project = Project(name="No Usable GPU", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="gpu matmul experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    gpu_error_log = (
+        "Unable to find image 'nvcr.io/nvidia/pytorch:25.01-py3' locally\n"
+        "ERROR: Detected Tesla V100-SXM2-16GB GPU, which is not supported by "
+        "this container\n"
+        "ERROR: No supported GPU(s) detected to run this container"
+    )
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-gpu-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="no-gpu-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            # Container exited 0 despite the fatal GPU-incompatibility error.
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                command_log={"text": gpu_error_log},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Outcome is FAILURE, not SUCCESS, even though the container exited 0.
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "no usable GPU" in (job.terminal_reason or "")
+
+
 @pytest.mark.asyncio
 async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_success(
     db_session, monkeypatch

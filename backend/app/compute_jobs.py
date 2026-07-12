@@ -1009,6 +1009,42 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
     return status.exit_code == 124
 
 
+# Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
+# the NGC / ``nvcr.io/nvidia/pytorch`` images) when the host GPU predates the
+# image's minimum CUDA compute capability — e.g. a Tesla V100 (Volta, CC 7.0)
+# under a container built for Turing+. The entrypoint prints the error and can
+# still exit 0, so the backend reports SUCCEEDED even though the command never
+# had a usable GPU and produced no metric. Matching these markers lets the
+# poller reclassify the run as a FAILURE so a GPU/image mismatch is diagnosed
+# loudly instead of masquerading as a clean, metric-less success.
+_NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
+    "no supported gpu(s) detected to run this container",
+    "gpu, which is not supported by this container",
+)
+_NO_USABLE_GPU_TERMINAL_REASON = (
+    "container reported no usable GPU — host GPU/image compatibility mismatch"
+)
+
+
+def _status_reports_no_usable_gpu(status: ComputeStatusResult) -> bool:
+    """True when the command log carries a fatal no-usable-GPU diagnostic.
+
+    Some container entrypoints print a fatal "No supported GPU(s) detected" /
+    "GPU, which is not supported by this container" message when the host GPU is
+    too old for the image's CUDA build, yet may still exit 0 — in which case the
+    backend reports SUCCEEDED. Detecting the marker lets the poller reclassify
+    the run as a FAILURE instead of a silent, metric-less success.
+    """
+    command_log = status.command_log
+    if not isinstance(command_log, dict):
+        return False
+    text = command_log.get("text")
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _NO_USABLE_GPU_LOG_MARKERS)
+
+
 async def get_compute_job_for_task(
     session, *, job_id: uuid.UUID, task_id: uuid.UUID
 ) -> ComputeJob | None:
@@ -1938,15 +1974,23 @@ async def _process_single_compute_job(
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
-        outcome = (
-            ComputeJobOutcome.TIMED_OUT
-            if timeout_like
-            else (
-                ComputeJobOutcome.SUCCESS
-                if status.status == ComputeJobStatus.SUCCEEDED
-                else ComputeJobOutcome.FAILURE
-            )
+        # A backend-reported SUCCEEDED that nonetheless emitted a fatal
+        # no-usable-GPU diagnostic is not a real success — the container never
+        # had a supported GPU and could not produce its metric. Reclassify it as
+        # a FAILURE so the GPU/image mismatch surfaces loudly.
+        no_usable_gpu = (
+            not timeout_like
+            and status.status == ComputeJobStatus.SUCCEEDED
+            and _status_reports_no_usable_gpu(status)
         )
+        if timeout_like:
+            outcome = ComputeJobOutcome.TIMED_OUT
+        elif no_usable_gpu:
+            outcome = ComputeJobOutcome.FAILURE
+        elif status.status == ComputeJobStatus.SUCCEEDED:
+            outcome = ComputeJobOutcome.SUCCESS
+        else:
+            outcome = ComputeJobOutcome.FAILURE
         await _apply_polled_compute_job_result(
             session_factory,
             job.id,
@@ -1962,7 +2006,11 @@ async def _process_single_compute_job(
             terminal_reason=(
                 "compute job exceeded runtime deadline"
                 if timeout_like
-                else status.message or _meta_message(job) or "compute job finished"
+                else (
+                    _NO_USABLE_GPU_TERMINAL_REASON
+                    if no_usable_gpu
+                    else status.message or _meta_message(job) or "compute job finished"
+                )
             ),
             exit_code=status.exit_code,
         )
