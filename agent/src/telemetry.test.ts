@@ -748,4 +748,30 @@ describe('resident turn latency telemetry', () => {
     resetResidentTurnLatencyTelemetry();
     expect(getResidentTurnLatencyTelemetry()).toBeNull();
   });
+
+  it('accumulates pickupLagMs and reports mean_pickup_lag_ms for operator turns', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 200 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 200, ttftMs: 80, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 400 });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.operator.mean_pickup_lag_ms).toBe(300); // (200+400)/2
+    expect(tel.autonomous.mean_pickup_lag_ms).toBeNull(); // none recorded
+  });
+
+  it('mean_pickup_lag_ms is null when no pickupLagMs provided', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: 50, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.operator.mean_pickup_lag_ms).toBeNull();
+  });
+
+  it('drops null and negative pickupLagMs values from accumulation', () => {
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: null });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: -5 });
+    recordResidentTurnLatency({ kind: 'operator', turnMs: 100, ttftMs: null, interrupted: false, toolCallCount: 0, toolCallDurationMs: 0, meanInterTokenMs: null, pickupLagMs: 150 });
+    const tel = getResidentTurnLatencyTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    // Only the 150ms lag is valid; null and negative are skipped
+    expect(tel.operator.mean_pickup_lag_ms).toBe(150);
+  });
 });

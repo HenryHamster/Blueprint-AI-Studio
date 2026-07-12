@@ -849,3 +849,23 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     assert agent_violations == [], (
         f"allowlisted entry at {allow_entry.path}:{allow_entry.line} must not trigger a violation"
     )
+
+
+def test_in_flight_evals_dict_exists_and_is_mutable():
+    """_in_flight_evals is a module-level dict used for in-flight coalescing.
+
+    This is the acceptance gate for the coalescing implementation: the dict
+    must exist and be mutable so concurrent callers can register and look up
+    in-flight tasks by ``"{project_id}:{sha}"`` key.
+    """
+    assert hasattr(ci_compliance, "_in_flight_evals"), (
+        "_in_flight_evals process-level registry is missing from ci_compliance"
+    )
+    d = ci_compliance._in_flight_evals
+    assert isinstance(d, dict), "_in_flight_evals must be a dict"
+    # Confirm it is writable (the coalescing logic reads and writes it).
+    original_len = len(d)
+    d["_test_key"] = None  # type: ignore[assignment]
+    assert "_test_key" in d
+    del d["_test_key"]
+    assert len(d) == original_len

@@ -5909,3 +5909,69 @@ def test_compute_evidence_health_exactly_50_percent_is_healthy():
     result = compute_evidence_health(model)
     # 1/2 == 0.5 — boundary is >=0.5, so this is healthy
     assert result["overall"] == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance evidence: evidence-primitive phase-1 integration
+# Named tests proving that Gap.evidence_refs and Capability.evidence_refs have
+# downstream consumers and that status is validated against evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_primitive_phase1_capability_status_validated_against_evidence():
+    """Capability.status is validated against its evidence_refs via
+    claim_contradicts_evidence — a 'working' capability with zero evidence_refs
+    is a contradiction, and one with a proven named_test is not.
+
+    Acceptance evidence for evidence-primitive design phase 1: the evidence
+    classification and contradiction check are wired into the problem model, not
+    advisory-only; capability_evidence_status delegates to classify_evidence and
+    claim_contradicts_evidence operates on the result.
+    """
+    from app.evidence_primitive import claim_contradicts_evidence
+
+    # A 'working' capability with no refs → evidence is 'unproven' → contradicts.
+    cap_no_evidence = Capability(name="dispatch", status="working")
+    ev_status = capability_evidence_status(cap_no_evidence)
+    assert ev_status == "unproven"
+    assert claim_contradicts_evidence("working", ev_status) is True
+
+    # A 'working' capability with a proven named_test → evidence is 'proven' → ok.
+    cap_proven = Capability(
+        name="dispatch",
+        status="working",
+        evidence_refs=[{"kind": "named_test", "ref": "test_dispatch.py", "proven": True}],
+    )
+    ev_status_proven = capability_evidence_status(cap_proven)
+    assert ev_status_proven == "proven"
+    assert claim_contradicts_evidence("working", ev_status_proven) is False
+
+
+def test_evidence_primitive_phase1_gap_evidence_refs_downstream_consumer():
+    """Gap.evidence_refs feeds gap_evidence_status which feeds claim_contradicts_evidence.
+
+    Acceptance evidence for evidence-primitive design phase 1: structured
+    evidence pointers on Gap are not inert storage — they flow through
+    gap_evidence_status into claim_contradicts_evidence, producing actionable
+    contradiction signals that the metrics_integrity_sweep reconciliation step
+    consumes. A 'closed' gap with no proven evidence is flagged; a 'closed'
+    gap with a proven named_test is clean.
+    """
+    from app.evidence_primitive import claim_contradicts_evidence
+
+    # Closed gap with no proven evidence → unproven → contradiction.
+    closed_gap_no_proof = Gap(id="g1", name="g1", status="closed")
+    ev = gap_evidence_status(closed_gap_no_proof)
+    assert ev == "unproven"
+    assert claim_contradicts_evidence("closed", ev) is True
+
+    # Closed gap with proven named_test → proven → no contradiction.
+    closed_gap_proven = Gap(
+        id="g2",
+        name="g2",
+        status="closed",
+        evidence_refs=[{"kind": "named_test", "ref": "test_g2.py", "proven": True}],
+    )
+    ev_proven = gap_evidence_status(closed_gap_proven)
+    assert ev_proven == "proven"
+    assert claim_contradicts_evidence("closed", ev_proven) is False
