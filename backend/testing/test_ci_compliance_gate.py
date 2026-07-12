@@ -357,3 +357,52 @@ def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
         "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
         "the updated module_size_limits.json."
     )
+
+
+def test_capped_backend_modules_within_cap_on_disk():
+    """Every capped backend module must be at or under its cap on the real tree.
+
+    This is the fleet-wide merge-test gate the cap-bump remediation exists to
+    satisfy: a violating automain HEAD is remediated by bumping the breached
+    cap in module_size_limits.json, and this test proves the bumped JSON is
+    consistent with the actual file sizes on disk. It exercises EVERY backend
+    cap entry (not just one hard-coded module), so a PR that bumps a cap below
+    the file's real size — or lets a capped module grow past its cap without a
+    bump — fails here against the real file tree before the invariant suite runs.
+
+    Concretely: the admin.py / release_scoring.py cap bumps this remediation
+    lands are validated here against the real files, closing the loop the
+    ci_compliance gate opens.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+    assert backend_caps, "module_size_limits.json must define backend caps"
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    breaches = []
+    for rel, cap in backend_caps.items():
+        target_path = os.path.join(backend_root, rel)
+        if not os.path.isfile(target_path):
+            # Absent at this ref: a missing file cannot have grown past its cap
+            # (mirrors classify_size_record's count-is-None semantics).
+            continue
+        actual_count = csl.count_lines(target_path)
+        result = csl.classify_size_record(
+            rel, actual_count, cap, "backend", with_verdict=False
+        )
+        if result["breach"]:
+            breaches.append((rel, actual_count, cap))
+
+    assert not breaches, (
+        "Capped backend modules exceed their caps on disk: "
+        + ", ".join(f"{rel} ({count} > {cap})" for rel, count, cap in breaches)
+        + ". Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
