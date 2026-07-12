@@ -24,7 +24,7 @@ from sqlalchemy import Index, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
 
-from app.landed_signal import has_landed_signal
+from app.landed_signal import has_landed_signal, has_merge_unblock_signal
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -316,9 +316,19 @@ async def compute_direction_drift(
             per_direction_claims[dir_id] = per_direction_claims.get(
                 dir_id, 0
             ) + _direction_claimed_changes(t)
-            # Merged PRs must also pass the canonical integration landing signal;
-            # merge-equivalent unblock markers are not counted as shipped.
-            if has_landed_signal(t):
+            # Count a shipped change when the PR actually merged — onto the
+            # integration branch (``has_landed_signal``) OR a rollup staging branch
+            # (``has_merge_unblock_signal``, the merge-equivalent rollup-unblock
+            # bit). Counting integration-only landings was credit-blind: a healthy
+            # direction whose children merge to staging (before the rollup lands and
+            # re-stamps ``landed_on_integration``) read as ``0 merged`` against a
+            # positive ``claimed`` count, producing false ``over_claim`` / ``stalled``
+            # drift flags — spending audit budget and poisoning strategist context.
+            # ``has_merge_unblock_signal`` subsumes integration landings (they also
+            # set the unblock bit) but the OR keeps a legacy row that carries only the
+            # explicit ``landed_on_integration=True`` marker counted too. Confirmed
+            # non-landings (stranded rollups clear ``pr_merged``) are excluded by both.
+            if has_merge_unblock_signal(t) or has_landed_signal(t):
                 per_direction_merged[dir_id] = per_direction_merged.get(dir_id, 0) + 1
 
     for d in directions:

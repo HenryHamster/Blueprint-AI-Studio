@@ -40,6 +40,8 @@ from app.compute_backends import (
     ComputeLaunchSpec,
     LocalSubprocessComputeBackend,
     ComputeStatusResult,
+    RunnerSubprocessBackend,
+    OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
 )
 from app.database import resolve_async_engine
 from app.models import (
@@ -1406,6 +1408,92 @@ async def test_gcp_poll_status_terminated_without_durable_record_still_fails(
     status = await backend.poll_status(job)
     assert status.status == ComputeJobStatus.FAILED
     assert status.message == "compute-job VM stopped without a terminal marker"
+
+
+# ── RunnerSubprocessBackend poll_cost: operator-hardware nominal accrual ──────
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_cost_accrues_nominal_operator_rate():
+    """A running operator-hardware (self-hosted runner) job accrues a small
+    NON-ZERO nominal cost over elapsed runtime — reporting a flat $0 zeroed the
+    cost/task denominator and made the spend_cap a no-op on GPU jobs."""
+    backend = RunnerSubprocessBackend()
+    started = datetime(2026, 7, 11, 0, 0, 0)
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        started_at=started,
+        accrued_cost_usd=0.0,
+        polling_metadata={"cost_rate_per_second": 0.0},
+    )
+    as_of = started + timedelta(seconds=3600)  # 1h elapsed
+    cost = await backend.poll_cost(job, as_of=as_of)
+    expected = 3600 * OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND
+    assert cost.total_cost_usd == pytest.approx(expected)
+    assert cost.total_cost_usd > 0  # the whole point: no longer silently zero
+    assert cost.measured_at == as_of
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_cost_is_monotonic_never_below_prior():
+    """poll_cost never reports below the cost already persisted on the row (so a
+    later poll with an earlier ``as_of`` cannot make accrued cost go backwards)."""
+    backend = RunnerSubprocessBackend()
+    started = datetime(2026, 7, 11, 0, 0, 0)
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        started_at=started,
+        accrued_cost_usd=5.0,  # already accrued more than a short elapse implies
+    )
+    cost = await backend.poll_cost(job, as_of=started + timedelta(seconds=10))
+    assert cost.total_cost_usd == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_cost_no_started_at_returns_prior():
+    """Before the job has a start time there is nothing to accrue against; return
+    the prior accrued cost rather than fabricating one."""
+    backend = RunnerSubprocessBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.STARTING,
+        started_at=None,
+        accrued_cost_usd=0.0,
+    )
+    cost = await backend.poll_cost(job, as_of=datetime(2026, 7, 11, 0, 0, 0))
+    assert cost.total_cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_cost_bounds_runtime_for_spend_cap():
+    """The nominal accrual eventually reaches any positive spend_cap, so the
+    monitor's ``accrued_cost_usd >= spend_cap_usd`` termination is reachable
+    (spend_cap is no longer a no-op on operator-hardware jobs)."""
+    backend = RunnerSubprocessBackend()
+    started = datetime(2026, 7, 11, 0, 0, 0)
+    spend_cap = 1.0
+    seconds_to_cap = spend_cap / OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        started_at=started,
+        accrued_cost_usd=0.0,
+        spend_cap_usd=spend_cap,
+    )
+    cost = await backend.poll_cost(
+        job, as_of=started + timedelta(seconds=seconds_to_cap + 1)
+    )
+    assert cost.total_cost_usd >= spend_cap
 
 
 @pytest.mark.asyncio

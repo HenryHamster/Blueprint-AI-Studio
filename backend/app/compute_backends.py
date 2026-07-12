@@ -127,6 +127,18 @@ GCP_BACKEND_NAME = "gcp"
 LOCAL_GPU_BACKEND_NAME = "local-gpu"
 RUNNER_SUBPROCESS_BACKEND_NAME = "runner-subprocess"
 
+# Nominal per-second cost attributed to operator-hardware (self-hosted runner)
+# compute jobs. Blueprint does not pay cloud rates for a runner's box, but
+# reporting EXACTLY $0 is itself a lie: it zeroes the cost/task denominator
+# (making GPU-job spend invisible in efficiency analytics) and turns the runtime
+# spend_cap into a no-op (nothing ever accrues toward the cap, so a runaway job
+# is bounded only by the wall-clock deadline). A small non-zero amortized rate
+# keeps cost/task honest and lets the spend_cap bound runtime. Default
+# ~$0.36/hr (electricity + wear approximation); override per operator via env.
+OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND = float(
+    os.getenv("COMPUTE_OPERATOR_HARDWARE_RATE_PER_SECOND", "0.0001")
+)
+
 
 def is_zero_cost_backend(name: str) -> bool:
     """Return True for backends that run on operator/local hardware Blueprint does not pay for."""
@@ -925,7 +937,26 @@ class RunnerSubprocessBackend:
     async def poll_cost(
         self, job: ComputeJob, *, as_of: datetime
     ) -> ComputeCostResult:
-        return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+        # Operator-hardware nominal accrual. Reporting a flat $0 here zeroed the
+        # cost/task denominator for every runner-subprocess (GPU) job AND made the
+        # spend_cap a no-op — the monitor terminates on ``accrued_cost_usd >=
+        # spend_cap_usd`` (compute_jobs.py), which never advanced while cost was 0.
+        # Accrue a small nominal rate over elapsed runtime so the cap bounds
+        # runtime and the job's cost is non-null. Monotonic: never below the value
+        # already persisted on the row. ``as_of`` is the authoritative stop time
+        # (the monitor passes ``finished_at`` for a terminal job), so a finished
+        # job is never billed past the moment it ended.
+        prior = float(job.accrued_cost_usd or 0.0)
+        if (
+            job.started_at is None
+            or OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND <= 0
+        ):
+            return ComputeCostResult(total_cost_usd=prior, measured_at=as_of)
+        elapsed = max(0.0, (as_of - job.started_at).total_seconds())
+        nominal = elapsed * OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND
+        return ComputeCostResult(
+            total_cost_usd=max(prior, nominal), measured_at=as_of
+        )
 
     async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
         # The runner observes the cancel signal when it gets back cancel_requested=True

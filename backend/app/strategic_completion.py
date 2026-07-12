@@ -2266,6 +2266,53 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     }
 
 
+def _cycle_landed_or_noop(entry: dict) -> bool:
+    """True when a single research_history cycle shows a genuine LANDING or a
+    genuine NO-OP completion — the only per-cycle signals that qualify a cycle to
+    hold the still-productive pause shield.
+
+    * **Landing** — a PR that actually merged, integration OR staging:
+      ``merged_prs_any_base`` (raw merge volume, staging-inclusive and safe
+      against rollup-landing credit-propagation lag), ``verified_merged_count``
+      (verified integration merge), or the legacy ``prs_merged`` count (a PR that
+      merged even if verification was later classified degraded — it still landed).
+    * **No-op completion** — an implementation task that correctly completed with
+      NO PR because the deliverable already existed (``tasks_completed_no_pr``).
+      Genuinely productive, and the shield's legitimate purpose to protect.
+
+    A cycle that merely SPAWNED children or emitted direction notes (no merge, no
+    no-op) is deliberately NOT shield-qualifying: that spawn-only-never-land shape
+    is exactly the churn the merge-rate pause family exists to catch.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return (
+        int(entry.get("merged_prs_any_base") or 0) > 0
+        or verified_merged_count(entry) > 0
+        or int(entry.get("prs_merged") or 0) > 0
+        or int(entry.get("tasks_completed_no_pr") or 0) > 0
+    )
+
+
+def _direction_consecutive_zero_landed_cycles(direction: dict) -> int:
+    """Count the most-recent consecutive research cycles that neither landed a
+    merge nor completed a genuine no-op (see :func:`_cycle_landed_or_noop`).
+
+    Trailing count from the newest history entry backward, stopping at the first
+    cycle that shows a landing/no-op. Drives the still-productive shield strip: a
+    direction that has been spawn-/notes-only for this many cycles running has
+    stopped shipping and must lose its shield so the merge-rate pause family can
+    finally evaluate it.
+    """
+    history = direction.get("research_history") or []
+    count = 0
+    for entry in reversed(history):
+        if _cycle_landed_or_noop(entry):
+            break
+        count += 1
+    return count
+
+
 def _direction_still_productive(direction: dict) -> bool:
     """True when a direction is demonstrably still producing useful work.
 
@@ -2275,20 +2322,33 @@ def _direction_still_productive(direction: dict) -> bool:
     correctly complete as no-ops ("deliverable already present") — no PR, no merge,
     yet genuinely productive.
 
-    We require BOTH signals rather than either alone (the task allows OR, but AND is
-    strictly more robust here):
+    Three conditions must ALL hold:
       * ``last_cycle_productive`` is True — the system's own per-cycle verdict that
-        the most recent cycle spawned actionable work. This is the authoritative,
-        already-computed contradiction to a "this direction is dead" pause.
+        the most recent cycle produced actionable work.
       * ``consecutive_unproductive_cycles < N`` — guards against a single stale True
         flag papering over a direction that has since gone quiet for several cycles.
         N defaults to 2 and is configurable to match the direction_* config style.
+      * The direction has NOT gone ``direction_productive_shield_max_zero_landed_cycles``
+        (default 3) consecutive most-recent cycles with neither a landed merge
+        (integration OR staging) nor a genuine no-op completion.
 
-    Using AND keeps existing behavior unchanged for directions that never set the
-    productivity flag (the common case in fixtures and legacy data): ``.get`` returns
-    falsy → not productive → the rules fire exactly as before. CODE-FAILURE rules
-    (3, 4) are intentionally NOT gated by this — a crashing direction must still
-    pause regardless of how productive its last cycle looked.
+    Signal-that-lies fix (3rd condition): ``last_cycle_productive`` is set True by a
+    cycle that merely SPAWNED a child or emitted notes. That is the right signal for
+    the cooldown cadence (``direction_refractory``) but a FALSE contradiction to a
+    merge-rate pause — a direction that spawns every cycle yet never lands anything
+    would otherwise keep this shield forever and never reach the churn / zero-merge /
+    lifetime-burn family (and would earn the fast productive cooldown on top). Mere
+    spawn/notes no longer qualify: once the direction stops landing merges AND stops
+    completing genuine no-ops for N cycles running, the shield is stripped. A
+    direction that is really shipping — or legitimately completing already-built
+    no-ops — resets that counter and keeps its shield, preserving the shield's
+    legitimate purpose.
+
+    Keeps existing behavior for directions that never set the productivity flag (the
+    common case in fixtures and legacy data): ``.get`` returns falsy → not productive
+    → the rules fire exactly as before. CODE-FAILURE rules (3, 4) are intentionally
+    NOT gated by this — a crashing direction must still pause regardless of how
+    productive its last cycle looked.
     """
     if not direction.get("last_cycle_productive"):
         return False
@@ -2296,7 +2356,17 @@ def _direction_still_productive(direction: dict) -> bool:
         _runtime_config.get("direction_productive_pause_skip_max_unproductive", 2) or 2
     )
     consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
-    return consecutive < skip_max
+    if consecutive >= skip_max:
+        return False
+    strip_max = int(
+        _runtime_config.get("direction_productive_shield_max_zero_landed_cycles", 3) or 3
+    )
+    # Shield holds unless the direction has gone strip_max consecutive most-recent
+    # cycles with neither a landed merge nor a genuine no-op completion.
+    return not (
+        strip_max > 0
+        and _direction_consecutive_zero_landed_cycles(direction) >= strip_max
+    )
 
 
 def _recent_merges_mostly_unproven(direction: dict) -> bool:

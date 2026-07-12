@@ -67,6 +67,38 @@ def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
     return ordered[:cap], len(ordered) - cap
 
 
+def _is_shared_runner_vm_id(vm_id) -> bool:
+    """True for the shared self-hosted-runner vm id (``runner:<id>``).
+
+    Every task pinned to the same operator runner carries this IDENTICAL
+    ``vm_instance_id``, so the per-VM ``vmcontact`` row is a RUNNER-level liveness
+    signal, not a per-TASK one — it cannot say which of the runner's tasks is
+    alive.
+    """
+    return isinstance(vm_id, str) and vm_id.startswith("runner:")
+
+
+def _runner_contact_within_cutoff(
+    task, cutoff: datetime, vm_contact_lookup: dict | None
+) -> bool:
+    """Runner-LEVEL liveness override: True iff the runner behind this task's
+    ``vm_instance_id`` was heard from within ``cutoff``.
+
+    Intended ONLY for the resident-session carve-out, whose reap question really
+    is "has the RUNNER gone silent" (a resident session is a 1:1 pin to a
+    dedicated runner). Unlike :func:`_vm_contact_within_cutoff` this DOES honour a
+    shared ``runner:<id>`` contact, because runner liveness is exactly the signal
+    that path wants.
+    """
+    if not vm_contact_lookup:
+        return False
+    vm_id = getattr(task, "vm_instance_id", None)
+    if not vm_id:
+        return False
+    last_contact = vm_contact_lookup.get(vm_id)
+    return last_contact is not None and last_contact >= cutoff
+
+
 def _vm_contact_within_cutoff(
     task, hb_cutoff: datetime, vm_contact_lookup: dict | None
 ) -> bool:
@@ -81,11 +113,24 @@ def _vm_contact_within_cutoff(
     dead agent (crashed / preempted / OOM — sends no requests) has a stale or
     absent contact row and is reaped exactly as before. Old / absent rows fall
     back to the existing ``last_heartbeat`` behaviour (no regression).
+
+    Per-task-death fix: a SHARED ``runner:<id>`` vm id keys the ``vmcontact`` row
+    on the RUNNER, not the task, so a live SIBLING task's heartbeat would mask a
+    dead task pinned to the same runner (false-negative → zombie that never gets
+    reaped). The shared runner contact therefore does NOT prove THIS task is
+    alive and must not override the per-task heartbeat-stale reap: for such ids we
+    fall back to the task's own on-row ``last_heartbeat`` (already evaluated by the
+    caller before this override is consulted). Resident sessions, whose reap
+    question genuinely IS runner liveness, use :func:`_runner_contact_within_cutoff`
+    instead. Cloud/GCE tasks (unique per-VM ids) are unaffected.
     """
     if not vm_contact_lookup:
         return False
     vm_id = getattr(task, "vm_instance_id", None)
     if not vm_id:
+        return False
+    if _is_shared_runner_vm_id(vm_id):
+        # Shared runner contact cannot attribute liveness to THIS specific task.
         return False
     last_contact = vm_contact_lookup.get(vm_id)
     return last_contact is not None and last_contact >= hb_cutoff
@@ -456,26 +501,33 @@ def _classify_resident_session(
     ``runtime_config['resident_session_heartbeat_stale_seconds']`` (see
     ``_resident_session_heartbeat_stale_cutoff``), not a hardcoded constant.
     """
+    # Resident sessions use the RUNNER-level contact override: the reap question
+    # here is "has the runner gone silent", and a resident session is a 1:1 pin to
+    # a dedicated runner, so honouring the shared ``runner:<id>`` contact is both
+    # safe and exactly the signal wanted (unlike the per-task orphan branches,
+    # which must NOT trust a shared runner contact — see _vm_contact_within_cutoff).
     resident_cutoff = _resident_session_heartbeat_stale_cutoff(task, now)
     if task.last_heartbeat is not None:
         if task.last_heartbeat < resident_cutoff:
-            return not _vm_contact_within_cutoff(
+            return not _runner_contact_within_cutoff(
                 task, resident_cutoff, vm_contact_lookup
             )
         return False
     if task.started_at is not None:
         if task.started_at < resident_cutoff:
-            return not _vm_contact_within_cutoff(
+            return not _runner_contact_within_cutoff(
                 task, resident_cutoff, vm_contact_lookup
             )
         return False
     # Degenerate row: neither a heartbeat nor a started_at was ever recorded.
     # Without this branch the carve-out returns False unconditionally and never
     # reaps a corrupt resident row. Reap it on the same created_at-based window
-    # (fresh off-row VM contact still overrides, like every other branch).
+    # (fresh off-row runner contact still overrides, like every other branch).
     created_at = getattr(task, "created_at", None)
     if created_at is not None and created_at < resident_cutoff:
-        return not _vm_contact_within_cutoff(task, resident_cutoff, vm_contact_lookup)
+        return not _runner_contact_within_cutoff(
+            task, resident_cutoff, vm_contact_lookup
+        )
     return False
 
 

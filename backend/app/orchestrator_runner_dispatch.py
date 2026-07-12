@@ -141,9 +141,32 @@ def _runner_handles_task_type(
     return True
 
 
+# Reserved capability key holding the AUTHORITATIVE active agent-task count that
+# _load_active_runners_cache computes from Task rows for the dispatch cycle. Kept
+# distinct from the heartbeat-reported ``active_task_ids`` so it can never be
+# overwritten by a runner heartbeat payload.
+_ACTIVE_AGENT_TASK_COUNT_KEY = "_active_agent_task_count"
+
+
 def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
-    """Best-effort current load, from the heartbeat-reported active task ids."""
-    active = (runner.capabilities or {}).get("active_task_ids") or []
+    """Current AGENT-task load for the runner.
+
+    Authoritative source: the count of the runner's own Task rows in an active
+    status (PROVISIONING/IN_PROGRESS pinned to ``runner:<id>``), computed ONCE per
+    dispatch cycle and injected as ``capabilities['_active_agent_task_count']`` by
+    :func:`_load_active_runners_cache`. The heartbeat-reported ``active_task_ids``
+    list is only a HINT: it can go stale-HIGH (still listing tasks that already
+    COMPLETED/FAILED), which inflates the load and falsely trips
+    :func:`_runner_at_capacity` — holding a pinned head while the runner is actually
+    idle. Falls back to the heartbeat list only when the authoritative count is
+    absent (a bare ``LocalRunner`` ORM outside the dispatch-cache path, or an old
+    snapshot), preserving backward-compatible behaviour.
+    """
+    caps = runner.capabilities or {}
+    authoritative = caps.get(_ACTIVE_AGENT_TASK_COUNT_KEY)
+    if isinstance(authoritative, int) and not isinstance(authoritative, bool):
+        return max(0, authoritative)
+    active = caps.get("active_task_ids") or []
     try:
         return len(active)
     except TypeError:
@@ -301,12 +324,26 @@ async def _load_active_runners_cache(
     except Exception:
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
+    runner_ids_for_load = [
+        runner_id for runner_id, _project_id, _capabilities, _failures, _hostname in rows
+    ]
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
-        session, [runner_id for runner_id, _project_id, _capabilities, _failures, _hostname in rows]
+        session, runner_ids_for_load
+    )
+    # Authoritative per-runner agent-task load from Task rows (heartbeat-independent).
+    active_task_count_by_runner = await _load_runner_active_task_counts(
+        session, runner_ids_for_load
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
     for runner_id, project_id, capabilities, consecutive_job_failures, hostname in rows:
         caps = dict(capabilities or {})
+        # Inject the authoritative active agent-task count so _runner_active_task_count
+        # / _runner_at_capacity size AGENT capacity off committed Task rows rather than
+        # the stale-prone heartbeat ``active_task_ids`` list (which can over-report and
+        # falsely pin-block an idle runner).
+        caps[_ACTIVE_AGENT_TASK_COUNT_KEY] = active_task_count_by_runner.get(
+            runner_id, 0
+        )
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
         seen_job_ids: set[str] = set()
@@ -380,6 +417,52 @@ async def _load_runner_compute_job_assignments(
         if runner_id is None:
             continue
         by_runner.setdefault(runner_id, []).append(str(job_id))
+    return by_runner
+
+
+async def _load_runner_active_task_counts(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, int]:
+    """Return the AUTHORITATIVE active agent-task count per runner id.
+
+    Counts committed Task rows pinned to each runner (``vm_instance_id ==
+    'runner:<id>'``) that are still in an active status (PROVISIONING or
+    IN_PROGRESS). This is the source of truth for a runner's agent load: unlike the
+    heartbeat-reported ``active_task_ids`` list — which can go stale-HIGH by still
+    listing tasks that already COMPLETED/FAILED and thus falsely trip
+    ``_runner_at_capacity`` — a Task row leaves the active set the instant it
+    reaches a terminal status. In-cycle pins made after this snapshot are covered
+    separately by the caller's ``runner_pins_this_cycle`` counter.
+
+    Returns ``{runner_id: count}`` (absent runners default to 0). Best-effort: on a
+    query error returns ``{}`` so callers fall back to the heartbeat hint.
+    """
+    if not runner_ids:
+        return {}
+    vm_id_by_runner = {f"runner:{runner_id}": runner_id for runner_id in runner_ids}
+    try:
+        rows = (
+            await session.execute(
+                select(Task.vm_instance_id)
+                .where(
+                    Task.vm_instance_id.in_(list(vm_id_by_runner.keys())),
+                    Task.status.in_(
+                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                    ),
+                )
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner active-task counts")
+        return {}
+
+    by_runner: dict[uuid.UUID, int] = {}
+    for (vm_instance_id,) in rows:
+        runner_id = vm_id_by_runner.get(vm_instance_id)
+        if runner_id is None:
+            continue
+        by_runner[runner_id] = by_runner.get(runner_id, 0) + 1
     return by_runner
 
 
