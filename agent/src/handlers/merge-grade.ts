@@ -457,7 +457,7 @@ ${goalSection}${mergedPrsSection}${categoriesSection}## Your task
 
 2. **Grade goal coverage.** Decompose the version goal into the concrete things it requires. For each, check the merged diff for code that actually delivers it (read the changed files; do not trust commit messages or PR titles). Decide how much of the goal the merged diff genuinely covers.
 ${hasCategories ? `
-3. **Grade EACH acceptance-criterion category.** For every category listed above, read the merged diff and decide \`met\` / \`partial\` / \`not_met\`. You MUST cite the concrete diff location(s) (file path, ideally file:line, that you actually read) that justify a \`met\` or \`partial\` verdict — an uncited "it looks fine" counts as \`not_met\`. For anything not fully \`met\`, write the specific gap. Echo the exact \`category_key\` for each.
+3. **Grade EACH acceptance-criterion category.** For every category listed above, read the merged diff and decide \`met\` / \`partial\` / \`not_met\`. You MUST cite the concrete diff location(s) (file path, ideally file:line, that you actually read) that justify a \`met\` or \`partial\` verdict — an uncited "it looks fine" counts as \`not_met\`. For anything not fully \`met\`, write the specific gap. Echo the exact \`category_key\` for each. When a specific AUTOMATED TEST in the merged diff actually proves a category is \`met\` (the test exercises the behaviour the criterion requires), ALSO add a \`{"kind": "test", "ref": "<test file path, e.g. backend/testing/test_foo.py, or a pytest node id path::test_name>"}\` citation for that category alongside the diff citation — the backend validates that the cited test really shipped and ran green under CI on this candidate and, if so, upgrades that category to a higher machine-verified tier. Only cite a test that genuinely covers the criterion; do NOT invent or pad test citations.
 
 4. **Answer the residual question.** After grading every category, ask: is there any part of the version goal that NONE of these categories captures? If yes, put that single uncaptured aspect in \`residual_uncaptured_gap\` (a non-empty sentence). If the categories fully decompose the goal, set \`residual_uncaptured_gap\` to null.
 
@@ -477,7 +477,7 @@ ${hasCategories ? `
       "category_key": "<echo the exact key from the category list>",
       "status": "met",
       "gap": null,
-      "citations": [{"kind": "diff", "ref": "path/to/file.py:42"}]
+      "citations": [{"kind": "diff", "ref": "path/to/file.py:42"}, {"kind": "test", "ref": "backend/testing/test_file.py"}]
     },
     {
       "category_key": "<another key>",
@@ -510,7 +510,7 @@ Field semantics:
 - \`coverage_score\`: float in [0, 1] — 0.0 = the merged diff does nothing toward the goal, 1.0 = the goal is fully delivered by the merged diff.
 - \`biggest_gap\`: REQUIRED, a single non-empty sentence naming the SINGLE biggest thing the goal still requires that the merged diff does not deliver. Must be specific (cite the missing capability), never empty.
 - \`rationale\`: a short justification citing the specific files/changes you read.${hasCategories ? `
-- \`category_verdicts\`: REQUIRED array — one entry per acceptance-criterion category above. Each entry: \`category_key\` (echo the exact key), \`status\` ("met" | "partial" | "not_met"), \`gap\` (a specific sentence when not fully met, else null), and \`citations\` (array of {"kind": "diff", "ref": "<file or file:line you actually read>"}). A \`met\` verdict MUST carry at least one citation.
+- \`category_verdicts\`: REQUIRED array — one entry per acceptance-criterion category above. Each entry: \`category_key\` (echo the exact key), \`status\` ("met" | "partial" | "not_met"), \`gap\` (a specific sentence when not fully met, else null), and \`citations\` (array of {"kind": "diff" | "test", "ref": "<file or file:line you actually read; for "test", the test file path or pytest node id>"}). A \`met\` verdict MUST carry at least one citation. Add a \`"kind": "test"\` citation ONLY when a real automated test in the diff proves the criterion — it earns that category the machine-verified tier when the backend confirms the test shipped and ran green under CI on this candidate.
 - \`residual_uncaptured_gap\`: a single sentence naming any goal aspect NO category captures, or null when the categories fully decompose the goal.` : ''}
 
 Rules:

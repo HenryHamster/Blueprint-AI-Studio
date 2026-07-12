@@ -337,3 +337,199 @@ class TestEvaluateMergeGradeCategories:
             )
         )
         assert result["blocker"] == "criterion_coverage_incomplete"
+
+
+# ---------------------------------------------------------------------------
+# evaluate_merge_grade — v2 MACHINE tier (validated test citation)
+# ---------------------------------------------------------------------------
+
+
+class TestMachineTierValidation:
+    """A ``met`` category earns ``tier="machine"`` ONLY when its ``test`` citation
+    is validated against the candidate's verified-merged test + seam files;
+    otherwise it fails toward ``tier="judged"``."""
+
+    _CATS: list[dict] = [  # noqa: RUF012 — read-only fixture data
+        {"category_key": "c-widget", "text": "adds the widget"},
+    ]
+    # A candidate whose verified merges shipped test_widget.py exercising widget.py.
+    _EVIDENCE = {  # noqa: RUF012 — read-only fixture data
+        "test_files": ["backend/testing/test_widget.py"],
+        "seam_files": ["backend/app/widget.py", "admin-ui/src/Widget.tsx"],
+    }
+
+    def _artifact(self, ref: str) -> dict:
+        return {
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "biggest_gap": "",
+            "category_verdicts": [
+                {
+                    "category_key": "c-widget",
+                    "status": "met",
+                    "citations": [
+                        {"kind": "diff", "ref": "backend/app/widget.py:12"},
+                        {"kind": "test", "ref": ref},
+                    ],
+                },
+            ],
+        }
+
+    def test_validated_test_citation_earns_machine_tier(self):
+        """Cited test IS among verified-merged tests AND semantically grounded to a
+        changed seam → machine tier."""
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_widget.py"),
+            self._CATS,
+            self._EVIDENCE,
+        )
+        assert out["category_verdicts"][0]["tier"] == "machine"
+
+    def test_pytest_node_id_ref_is_accepted(self):
+        """A pytest node id (path::test_name) validates on its file-path part."""
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_widget.py::test_renders"),
+            self._CATS,
+            self._EVIDENCE,
+        )
+        assert out["category_verdicts"][0]["tier"] == "machine"
+
+    def test_test_not_in_verified_merges_stays_judged(self):
+        """Cited test is NOT among the candidate's verified-merged tests (it may
+        never have run green on this candidate) → judged, not machine."""
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_other.py"),
+            self._CATS,
+            self._EVIDENCE,
+        )
+        assert out["category_verdicts"][0]["tier"] == "judged"
+
+    def test_ungrounded_test_stays_judged(self):
+        """Cited test shipped verified but maps to no changed production seam
+        (module-name mismatch) → judged."""
+        evidence = {
+            "test_files": ["backend/testing/test_widget.py"],
+            "seam_files": ["backend/app/unrelated.py"],  # no widget.py seam
+        }
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_widget.py"),
+            self._CATS,
+            evidence,
+        )
+        assert out["category_verdicts"][0]["tier"] == "judged"
+
+    def test_no_evidence_supplied_stays_judged(self):
+        """No candidate CI evidence at grade time → never granted machine tier."""
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_widget.py"),
+            self._CATS,
+            None,
+        )
+        assert out["category_verdicts"][0]["tier"] == "judged"
+
+    def test_diff_only_citation_stays_judged(self):
+        """A met category with only a diff citation (no test) stays judged even
+        when evidence is available."""
+        art = {
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "biggest_gap": "",
+            "category_verdicts": [
+                {
+                    "category_key": "c-widget",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "backend/app/widget.py:12"}],
+                },
+            ],
+        }
+        out = rs.evaluate_merge_grade(
+            "ship the widget", art, self._CATS, self._EVIDENCE
+        )
+        assert out["category_verdicts"][0]["tier"] == "judged"
+
+    def test_machine_tier_exempt_from_judged_penalty_end_to_end(self):
+        """A validated machine-tier met category flows through the ledger-shaped
+        gate input and incurs NO judged-tier confidence penalty."""
+        out = rs.evaluate_merge_grade(
+            "ship the widget",
+            self._artifact("backend/testing/test_widget.py"),
+            self._CATS,
+            self._EVIDENCE,
+        )
+        result = rs.compute_composite(
+            **_perfect_kwargs(category_verdicts=out["category_verdicts"])
+        )
+        assert result["blocker"] is None
+        assert result["confidence"] == 1.0  # no judged penalty
+        assert result["sub_scores"]["judged_tier_met_fraction"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _score_audit — fail-closed on an all-unverified (unscoreable) report
+# ---------------------------------------------------------------------------
+
+
+_VNOTE = "Read app/db.py lines 88-95: user input reaches cursor.execute unparameterised."
+
+
+class TestScoreAuditFailClosed:
+    def test_all_unverified_criticals_null_the_score(self):
+        """An all-unverified-critical report must NOT read clean 1.0 — nulled so
+        compute_composite routes to the audit_missing blocker."""
+        report = {
+            "findings": [
+                {"severity": "critical", "summary": "SQLi", "file": "app/db.py"},
+                {"severity": "high", "summary": "Auth bypass", "file": "app/a.py"},
+            ]
+        }
+        audit, _erosion = rs._score_audit(report)
+        assert audit is None
+        # And the gate rejects it as audit_missing rather than promoting.
+        result = rs.compute_composite(
+            **_perfect_kwargs(audit_score=audit, category_verdicts=None)
+        )
+        assert result["blocker"] == "audit_missing"
+
+    def test_verified_critical_still_scored(self):
+        """A substantiated critical keeps deducting normally (score preserved)."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQLi",
+                    "file": "app/db.py",
+                    "verification_note": _VNOTE,
+                },
+            ]
+        }
+        audit, _erosion = rs._score_audit(report)
+        assert audit == round(1.0 - 0.30, 4)
+
+    def test_one_verified_finding_keeps_report_scoreable(self):
+        """A mix (verified high + unverified critical) is NOT all-unverified → the
+        unverified critical is skipped but the score is kept, not nulled."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Real issue",
+                    "file": "app/auth.py",
+                    "verification_note": _VNOTE,
+                },
+                {"severity": "critical", "summary": "Speculative", "file": "app/db.py"},
+            ]
+        }
+        audit, _erosion = rs._score_audit(report)
+        assert audit == round(1.0 - 0.15, 4)  # only the verified high deducts
+
+    def test_low_only_report_not_nulled(self):
+        """A lone verified-by-default low finding has no higher-sev finding to be
+        unverified → scored (not nulled)."""
+        report = {"findings": [{"severity": "low", "summary": "nit", "file": ""}]}
+        audit, _erosion = rs._score_audit(report)
+        assert audit == round(1.0 - 0.02, 4)
