@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 # Lock for multi-key runtime config updates (prevents reading partial state between two assignments)
 runtime_config_lock = asyncio.Lock()
 
+_GATE_MODES = ("off", "observe", "enforce")
+
+
+def resolve_capability_proof_gate_mode_default(default: str = "observe") -> str:
+    """Resolve the boot-time ``capability_proof_gate_mode`` from the environment.
+
+    Reads ``CAPABILITY_PROOF_GATE_MODE`` and validates it against the three legal
+    modes, falling back to ``default`` (``"observe"`` — see the staged-rollout
+    note on the ``runtime_config`` entry) for an unset or unrecognized value.
+
+    Extracted as a named pure helper (rather than an inline dict-literal
+    expression) so the shipped default is directly unit-testable without reloading
+    this heavy module.
+    """
+    raw = os.getenv("CAPABILITY_PROOF_GATE_MODE", default).lower()
+    return raw if raw in _GATE_MODES else default
+
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
@@ -273,17 +290,29 @@ runtime_config: Dict = {
     else "observe",
     # Rollout mode for the capability proof gate — controls whether prerequisite
     # resolution gates on machine-verified proof (enforce) or allows self-reported
-    # working status (off/observe). Ships "off" so the gate is inert until an
-    # operator graduates it via PATCH /api/admin/settings.
+    # working status (off/observe).
     #   off     — proof status is advisory only; never blocks prerequisite resolution.
     #   observe — proof status is recorded and surfaced but does not block.
     #   enforce — unproven capabilities do not satisfy prerequisite resolution.
-    "capability_proof_gate_mode": os.getenv(
-        "CAPABILITY_PROOF_GATE_MODE", "off"
-    ).lower()
-    if os.getenv("CAPABILITY_PROOF_GATE_MODE", "off").lower()
-    in ("off", "observe", "enforce")
-    else "off",
+    #
+    # STAGED ROLLOUT (audit finding #4 — "default-off means none of this
+    # enforcement binds by default"): the gate now ships default **"observe"**,
+    # not "off". Observe is the safe first stage — it records and surfaces the
+    # unproven-capability delta and logs on every self-reported resolution WITHOUT
+    # changing any resolution or promotion behaviour, so the enforcement plumbing
+    # is exercised (and its blind spots become visible) the moment the platform
+    # boots, instead of lying inert until an operator remembers to flip it.
+    #   Operational risk of default-observe: NONE beyond extra WARNING logs and a
+    #   recorded (never-blocking) release dimension — observe cannot gate a spawn,
+    #   a blocked-resume, or a promotion.
+    #   Explicit flip criterion off/observe -> enforce (operator-gated, via
+    #   PATCH /api/admin/settings or the auto-graduation sweep): flip to "enforce"
+    #   only once fleet-wide proof coverage of *working* capabilities clears
+    #   ``capability_proof_gate_auto_graduation_enforce_threshold`` (0.95) — the
+    #   same ratio the auto-graduation sweep already tracks — so enforce does not
+    #   strand real work behind capabilities that are genuinely proven but simply
+    #   have not been through the earn loop yet.
+    "capability_proof_gate_mode": resolve_capability_proof_gate_mode_default(),
     # Auto-graduation sweep for the capability proof gate. When enabled, the
     # metrics-integrity sweep automatically advances the gate mode (off→observe→enforce)
     # based on fleet-wide proof coverage. Disabled by default — operators must opt in.

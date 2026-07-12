@@ -33761,10 +33761,19 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
     )
     assert version.last_qualification["promotion_failure_count"] == 2
 
-    # --- Capability-proof gate dimension unit tests --------------------------
-    # Tests for the capability_proof_blocked hard blocker in compute_composite.
-    # Advisory in OFF/OBSERVE mode (blocked=False, never blocks), gating only
-    # in ENFORCE mode when unproven capabilities exist (blocked=True).
+
+class TestComputeCompositeCapabilityProofGate:
+    """Unit tests for the capability_proof_blocked hard blocker in compute_composite.
+
+    Advisory in OFF/OBSERVE mode (blocked=False, never blocks), gating only in
+    ENFORCE mode when unproven capabilities exist (blocked=True).
+
+    NOTE: these three tests were previously nested INSIDE
+    ``test_record_promotion_failure_increments_count`` (indented as inner
+    ``def``s taking ``self``), so pytest never collected them — they were dead
+    code that silently exercised nothing. Un-nested here into a real module-level
+    test class so the capability-proof promotion-seam is actually verified.
+    """
 
     def test_compute_composite_capability_proof_not_blocked_does_not_gate(self):
         """capability_proof_blocked=False never blocks (OFF/OBSERVE mode)."""
@@ -33797,20 +33806,20 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
     def test_compute_composite_capability_proof_blocker_precedence(self):
         """capability_proof_gate_blocked fires AFTER criterion_coverage_incomplete
         but BEFORE smoketest_startup_failed in the hard-blocker ordering."""
-        # Trigger criterion coverage AND capability_proof_blocked — must report
-        # criterion_coverage_incomplete first (higher priority).
+        # Trigger the criterion-coverage gate (via category_verdicts — the actual
+        # blocking input; criterion_coverage is observability-only) AND
+        # capability_proof_blocked. Must report criterion_coverage_incomplete
+        # first (higher priority).
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 1,
-                "covered": 0,
-                "partial": 1,
-                "uncovered": 1,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "not_met", "tier": "judged",
+                 "gap": "not wired", "citations": []},
+            ],
             capability_proof_blocked=True,
         )
         assert result["blocker"] == "criterion_coverage_incomplete"
@@ -33824,12 +33833,10 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
             test_erosion=1.0,
             smoketest_score=None,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 1,
-                "covered": 1,
-                "partial": 0,
-                "uncovered": 0,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "met", "tier": "judged",
+                 "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+            ],
             capability_proof_blocked=True,
         )
         assert result2["blocker"] == "capability_proof_gate_blocked"

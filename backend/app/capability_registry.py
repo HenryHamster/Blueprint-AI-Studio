@@ -514,9 +514,41 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def _ledger_proof_status(
+    proof_records: object, cap_name: str
+) -> EvidenceStatus:
+    """Classify a capability's PLATFORM-recorded proof ledger into an EvidenceStatus.
+
+    Reads ``proof_records[cap_name]`` — the durable
+    ``project.capability_proof_records`` store written ONLY by the platform
+    recorders in :mod:`app.capability_proof` (never by an agent editing the
+    JSONB ``problem_model``) — and grades it with the tier-aware classifier.
+    A named_test/trial_adoption ledger entry grades ``proven``; a backing_path-only
+    ledger grades ``path_proven``; a missing/empty ledger grades ``unproven``.
+
+    This is the trust boundary the enforce gate uses to distinguish
+    platform-verified proof from an agent's self-reported ``evidence_refs`` /
+    ``proof_exempt`` claim on the problem_model.
+    """
+    if not isinstance(proof_records, dict):
+        return "unproven"
+    entries = proof_records.get(cap_name)
+    if not isinstance(entries, list) or not entries:
+        return "unproven"
+    synthetic = [
+        {"kind": e.get("proof_kind"), "proven": True}
+        for e in entries
+        if isinstance(e, dict)
+    ]
+    if not synthetic:
+        return "unproven"
+    return classify_evidence_tiered(synthetic)
+
+
 def capability_proof_gate_release_status(
     problem_model: object,
     mode: str | None,
+    proof_records: object = None,
 ) -> tuple[bool, dict]:
     """Derive the release-qualifier capability-proof dimension: ``(blocked, detail)``.
 
@@ -529,20 +561,35 @@ def capability_proof_gate_release_status(
     re-implementing the "unproven working capability blocks promotion" rule in
     the 5k-line qualifier where it can silently drift.
 
-    Behaviour (identical to the prior inline derivation it replaces):
+    Behaviour:
 
     * Returns ``blocked=False`` in ``"off"`` / ``"observe"`` mode (and for any
       unrecognized mode) — the dimension is recorded but never blocks promotion.
     * In ``"enforce"`` mode with a truthy ``problem_model``, ``blocked`` is
-      ``True`` iff at least one ``working`` capability has proof status other
-      than ``"proven"`` (``proof_exempt`` capabilities classify as ``"proven"``
-      via :func:`working_capability_proof_status`, so they never block).
+      ``True`` iff at least one ``working`` capability is not cleared.
     * In ``"enforce"`` mode with no ``problem_model``, returns
       ``blocked=False`` with ``detail["error"] == "no problem_model"``.
 
+    **Platform corroboration (audit finding #1).** The ``problem_model`` fields
+    the base proof map reads — a capability's ``evidence_refs`` (a ``proven=True``
+    entry) and its ``proof_exempt`` flag — are AGENT-WRITABLE: an agent editing
+    the JSONB problem_model can self-declare a capability proven or exempt and
+    clear the enforce gate without any platform verification. To close that hole,
+    when ``proof_records`` (the durable, platform-only
+    ``project.capability_proof_records`` ledger) is provided, the enforce gate
+    additionally requires that every capability the base map treats as cleared be
+    CORROBORATED by a machine-verified entry in that ledger
+    (:func:`_ledger_proof_status` grades ``"proven"``). A capability that reads
+    ``proven`` from a self-reported ``evidence_ref`` — or ``proof_exempt`` — but
+    carries no corroborating platform proof is NOT cleared: it is added to
+    ``unproven`` (and surfaced under ``uncorroborated``) so promotion blocks. When
+    ``proof_records`` is ``None`` (callers that do not supply the ledger), the
+    legacy problem_model-only derivation is used unchanged.
+
     ``detail`` always carries ``mode`` and, when the enforce branch runs against
     a problem model, the ``total_working`` / ``unproven_count`` / ``unproven`` /
-    ``exempt_count`` / ``exempt_names`` audit fields.
+    ``exempt_count`` / ``exempt_names`` audit fields, plus (when the ledger is
+    supplied) ``corroborated`` and ``uncorroborated`` for audit visibility.
     """
     mode_norm = str(mode or "off").strip().lower()
     detail: dict = {"mode": mode_norm}
@@ -553,10 +600,32 @@ def capability_proof_gate_release_status(
         return False, detail
     proof_map = working_capability_proof_status(problem_model)
     exempt_set = exempt_capability_names(problem_model)
-    # Exempt working capabilities classify as "proven" in the proof map and are
-    # therefore already excluded from the unproven list — the exempt set is
-    # surfaced only for audit visibility.
+    # Base (problem_model-only) unproven set: a capability the agent-authored view
+    # already reports as not-proven.
     unproven = [name for name, status in proof_map.items() if status != "proven"]
+
+    if proof_records is not None:
+        # Corroboration pass (finding #1): every capability the base map treats as
+        # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
+        # entry — not just a self-reported evidence_ref / proof_exempt flag on the
+        # problem_model. Uncorroborated "proven" caps are demoted to blocked.
+        already_unproven = set(unproven)
+        uncorroborated: list[str] = []
+        for name, status in proof_map.items():
+            if status != "proven" or name in already_unproven:
+                continue
+            if _ledger_proof_status(proof_records, name) != "proven":
+                uncorroborated.append(name)
+        if uncorroborated:
+            unproven = sorted(set(unproven) | set(uncorroborated))
+        corroborated = [
+            name
+            for name, status in proof_map.items()
+            if status == "proven" and name not in set(uncorroborated)
+        ]
+        detail["corroborated"] = sorted(corroborated)
+        detail["uncorroborated"] = sorted(uncorroborated)
+
     detail["total_working"] = len(proof_map)
     detail["unproven_count"] = len(unproven)
     detail["unproven"] = unproven

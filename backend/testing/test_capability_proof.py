@@ -2730,11 +2730,29 @@ class TestListHeadFiles:
 class TestRecordCapabilityNamedTestProof:
     """record_capability_named_test_proof: named_test-tier durable recording."""
 
+    def test_requires_execution_evidence(self):
+        """Finding #2: without execution_verified=True the recorder writes
+        NOTHING and returns False — a present test file is not proof it ran green.
+
+        Fails before the fix (the recorder credited a proven-tier named_test from
+        a bare test-path list); passes after (execution evidence is mandatory)."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            # No execution evidence supplied → refused.
+            ok = record_capability_named_test_proof(
+                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+            )
+        assert ok is False
+        assert project.capability_proof_records == {}
+
     def test_records_named_test_entry_with_correct_shape(self):
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
             ok = record_capability_named_test_proof(
-                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+                project,
+                "my-cap",
+                ["backend/testing/test_capability_proof.py"],
+                execution_verified=True,
             )
         assert ok is True
         entries = project.capability_proof_records["my-cap"]
@@ -2749,10 +2767,16 @@ class TestRecordCapabilityNamedTestProof:
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
             first = record_capability_named_test_proof(
-                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+                project,
+                "my-cap",
+                ["backend/testing/test_capability_proof.py"],
+                execution_verified=True,
             )
             second = record_capability_named_test_proof(
-                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+                project,
+                "my-cap",
+                ["backend/testing/test_capability_proof.py"],
+                execution_verified=True,
             )
         assert first is True
         assert second is False
@@ -2761,14 +2785,29 @@ class TestRecordCapabilityNamedTestProof:
     def test_empty_refs_returns_false(self):
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
-            assert record_capability_named_test_proof(project, "my-cap", []) is False
-            assert record_capability_named_test_proof(project, "my-cap", ["  "]) is False
+            assert (
+                record_capability_named_test_proof(
+                    project, "my-cap", [], execution_verified=True
+                )
+                is False
+            )
+            assert (
+                record_capability_named_test_proof(
+                    project, "my-cap", ["  "], execution_verified=True
+                )
+                is False
+            )
         assert project.capability_proof_records == {}
 
     def test_invalid_name_returns_false(self):
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
-            assert record_capability_named_test_proof(project, "", ["t.py"]) is False
+            assert (
+                record_capability_named_test_proof(
+                    project, "", ["t.py"], execution_verified=True
+                )
+                is False
+            )
 
     def test_appends_named_test_evidence_ref(self):
         project = _make_project()
@@ -2777,7 +2816,10 @@ class TestRecordCapabilityNamedTestProof:
         }
         with patch("app.capability_proof.flag_modified"):
             record_capability_named_test_proof(
-                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+                project,
+                "my-cap",
+                ["backend/testing/test_capability_proof.py"],
+                execution_verified=True,
             )
         refs = project.problem_model["capabilities"][0]["evidence_refs"]
         assert len(refs) == 1
@@ -2791,7 +2833,14 @@ class TestRecordCapabilityNamedTestProof:
 
 
 class TestEarnLoopNamedTestTier:
-    """commission_proof_earn_loop mints named_test proofs → status 'proven' reachable."""
+    """commission_proof_earn_loop earns only the structural ``backing_path`` tier.
+
+    Finding #2 correction: static coverage discovery (a conventionally-named test
+    file that imports the module, present at HEAD) is NOT execution evidence, so
+    the earn loop must NOT mint the machine-verified ``named_test`` tier (graded
+    ``proven``). It records at most ``backing_path`` (graded ``path_proven``),
+    which does not clear the enforce gate. The ``named_test`` tier is reachable
+    only via the acceptance-verdict path (already green-run verified)."""
 
     @staticmethod
     def _project_and_demand(cap_name, backing_paths):
@@ -2809,11 +2858,15 @@ class TestEarnLoopNamedTestTier:
         return project, demand
 
     @pytest.mark.asyncio
-    async def test_test_backed_capability_earns_named_test_and_becomes_proven(self):
-        """ACCEPTANCE EVIDENCE (c-e9ef1da6): a working capability whose backing
-        path is exercised by a real test earns a named_test proof, so
-        working_capability_proof_status returns 'proven' — auto-graduation
-        coverage can now move off 0."""
+    async def test_static_coverage_does_not_mint_named_test_proof(self):
+        """Finding #2: even when a conventionally-named, module-importing test
+        file exists at HEAD, the loop records only a ``backing_path`` proof
+        (``path_proven``) — NOT a ``named_test`` proof (``proven``). Static
+        presence is not execution evidence, so the capability stays below the
+        enforce-clearing tier.
+
+        Fails before the fix (the loop minted a named_test proof → ``proven``);
+        passes after (backing_path only → ``path_proven``)."""
         project, demand = self._project_and_demand(
             "capability-proof-gate", ["backend/app/capability_proof.py"]
         )
@@ -2837,19 +2890,20 @@ class TestEarnLoopNamedTestTier:
             )
 
         assert result["earned"] == 1
-        assert result["named_test_earned"] == ["capability-proof-gate"]
-        # The recorded proof is named_test tier.
+        # No named_test tier is ever earned from static coverage.
+        assert result["named_test_earned"] == []
+        # The recorded proof is the structural backing_path tier.
         entry = project.capability_proof_records["capability-proof-gate"][0]
-        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST
-        # And the capability now reads 'proven' — the graduation-reachable state.
+        assert entry["proof_kind"] == _PROOF_KIND_BACKING_PATH
+        # And the capability reads 'path_proven' — below the enforce-clearing tier.
         status = working_capability_proof_status(project.problem_model)
-        assert status["capability-proof-gate"] == "proven"
+        assert status["capability-proof-gate"] == "path_proven"
 
     @pytest.mark.asyncio
     async def test_no_test_coverage_falls_back_to_backing_path(self):
-        """When no covering test is discoverable, the loop still records the
-        structural-only backing_path proof (path_proven), preserving prior
-        behavior — it does NOT over-claim named_test."""
+        """When no covering test is discoverable, the loop records the
+        structural-only backing_path proof (path_proven) — same tier as the
+        test-covered case now that named_test minting is gated on execution."""
         project, demand = self._project_and_demand(
             "no-test-cap", ["backend/app/capability_proof.py"]
         )
@@ -2876,10 +2930,11 @@ class TestEarnLoopNamedTestTier:
         assert status["no-test-cap"] == "path_proven"
 
     @pytest.mark.asyncio
-    async def test_second_sweep_excludes_now_proven_capability(self):
-        """Once a named_test proof is earned, the capability reads 'proven' and
-        drops out of the demanded-unproven intersection — the second sweep finds
-        nothing to do and records no duplicate proof (graduation is terminal)."""
+    async def test_second_sweep_dedups_backing_path_and_stays_path_proven(self):
+        """A backing_path proof reads 'path_proven' (below proven), so the
+        capability stays in the demanded-unproven intersection on the next sweep,
+        but the recorder dedups — no duplicate entry and it is not re-counted as
+        newly earned."""
         project, demand = self._project_and_demand(
             "dedup-nt", ["backend/app/capability_proof.py"]
         )
@@ -2903,12 +2958,13 @@ class TestEarnLoopNamedTestTier:
                 verify_path=_verify, read_head=_read,
             )
 
-        assert first["named_test_earned"] == ["dedup-nt"]
-        # Now proven → excluded from the intersection on the next sweep.
-        assert second["total_demanded_unproven"] == 0
+        assert first["earned"] == 1
+        assert first["named_test_earned"] == []
+        # path_proven is still below 'proven' → the cap remains demanded-unproven.
+        assert second["total_demanded_unproven"] == 1
+        # Dedup: no new proof recorded on the second sweep.
         assert second["earned"] == 0
-        assert second["named_test_earned"] == []
-        # No duplicate proof entry was written.
+        assert "dedup-nt" in second["path_proven_stuck"]
         assert len(project.capability_proof_records["dedup-nt"]) == 1
 
     @pytest.mark.asyncio
@@ -2922,3 +2978,138 @@ class TestEarnLoopNamedTestTier:
             problem_model={"capabilities": [{"name": "c", "status": "working"}]},
         )
         assert result["named_test_earned"] == []
+
+
+class TestReleaseGateLedgerCorroboration:
+    """Finding #1: the release-qualifier enforce gate must clear a capability only
+    from PLATFORM-verified proof (the durable capability_proof_records ledger),
+    never from an agent-writable ``evidence_refs``/``proof_exempt`` self-report on
+    the problem_model.
+
+    ``capability_proof_gate_release_status(problem_model, "enforce", proof_records)``
+    corroborates each capability the problem_model view treats as cleared against
+    the ledger; an uncorroborated self-report blocks promotion.
+    """
+
+    @staticmethod
+    def _status(problem_model, proof_records):
+        from app.capability_registry import capability_proof_gate_release_status
+
+        return capability_proof_gate_release_status(
+            problem_model, "enforce", proof_records
+        )
+
+    def test_self_reported_evidence_ref_does_not_clear_enforce(self):
+        """A capability whose only ``proven`` evidence is an agent-authored
+        evidence_ref (no platform ledger entry) is BLOCKED once the ledger is
+        supplied. Fails before the fix (self-report cleared the gate); passes
+        after (ledger corroboration required)."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    # Agent-forged proven ref on the JSONB problem_model.
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # Empty platform ledger — nothing corroborates the self-report.
+        blocked, detail = self._status(model, {})
+        assert blocked is True
+        assert "forged-cap" in detail["unproven"]
+        assert detail["uncorroborated"] == ["forged-cap"]
+        assert detail["corroborated"] == []
+
+    def test_proof_exempt_does_not_clear_enforce(self):
+        """An agent-set ``proof_exempt=True`` with no platform ledger entry is
+        BLOCKED once the ledger is supplied — self-declared exemption must never
+        clear the enforce gate on its own."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "self-exempt",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                }
+            ]
+        }
+        blocked, detail = self._status(model, {})
+        assert blocked is True
+        assert "self-exempt" in detail["unproven"]
+        assert detail["uncorroborated"] == ["self-exempt"]
+
+    def test_platform_ledger_named_test_clears_enforce(self):
+        """A capability corroborated by a machine-verified ``named_test`` entry in
+        the platform ledger clears the enforce gate."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # Platform ledger carries a genuine named_test proof for this capability.
+        ledger = {
+            "real-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        blocked, detail = self._status(model, ledger)
+        assert blocked is False
+        assert detail["unproven"] == []
+        assert detail["corroborated"] == ["real-cap"]
+        assert detail["uncorroborated"] == []
+
+    def test_backing_path_ledger_does_not_clear_enforce(self):
+        """A platform ledger holding only a ``backing_path`` entry (structural,
+        graded ``path_proven``) does NOT corroborate a ``proven`` self-report —
+        the enforce gate still blocks."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "structural-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        ledger = {
+            "structural-cap": [
+                {"task_id": "backing:structural-cap", "proof_kind": "backing_path"}
+            ]
+        }
+        blocked, detail = self._status(model, ledger)
+        assert blocked is True
+        assert "structural-cap" in detail["uncorroborated"]
+
+    def test_legacy_no_ledger_preserves_problem_model_only_behaviour(self):
+        """When ``proof_records`` is omitted (None), the derivation is unchanged:
+        a ``proven`` evidence_ref clears and no corroboration keys are added."""
+        from app.capability_registry import capability_proof_gate_release_status
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "legacy-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        blocked, detail = capability_proof_gate_release_status(model, "enforce")
+        assert blocked is False
+        assert detail["unproven"] == []
+        assert "corroborated" not in detail
+        assert "uncorroborated" not in detail

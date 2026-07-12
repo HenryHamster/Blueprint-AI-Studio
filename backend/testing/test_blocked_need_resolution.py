@@ -680,6 +680,30 @@ def test_capability_proof_gate_mode_defaults_to_off():
     assert capability_proof_gate_mode(None) == "off"
 
 
+def test_runtime_config_gate_mode_default_is_observe(monkeypatch):
+    """Finding #4 (staged rollout): the boot-time runtime_config default is now
+    ``"observe"`` — the safe first stage that records/surfaces but never blocks —
+    not ``"off"`` (which left all enforcement inert). An explicit env override
+    still wins, and an unrecognized value falls back to observe.
+
+    Note: :func:`capability_registry.capability_proof_gate_mode` (the pure
+    no-override fail-safe validator) intentionally still defaults to ``"off"``;
+    this covers the DIFFERENT boot-time config default resolved from the env."""
+    from app.runtime_config_state import resolve_capability_proof_gate_mode_default
+
+    monkeypatch.delenv("CAPABILITY_PROOF_GATE_MODE", raising=False)
+    assert resolve_capability_proof_gate_mode_default() == "observe"
+
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "enforce")
+    assert resolve_capability_proof_gate_mode_default() == "enforce"
+
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "off")
+    assert resolve_capability_proof_gate_mode_default() == "off"
+
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "bogus")
+    assert resolve_capability_proof_gate_mode_default() == "observe"
+
+
 def test_capability_proof_gate_mode_no_env_fallback():
     """The env var path was removed — all consumers read from runtime_config;
     the function is a pure validator that defaults to 'off'."""

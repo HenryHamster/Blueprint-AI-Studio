@@ -5189,6 +5189,11 @@ async def _finalize_qualification(
     capability_proof_blocked, capability_proof_detail = _cp_release_status(
         getattr(_policy_project, "problem_model", None),
         _capability_proof_mode,
+        # Finding #1: pass the durable, platform-only proof ledger so the enforce
+        # gate corroborates each "cleared" capability against machine-verified
+        # evidence instead of trusting agent-writable problem_model evidence_refs
+        # / proof_exempt claims.
+        getattr(_policy_project, "capability_proof_records", None),
     )
 
     # --- Completion-debt snapshot (additive, informational, best-effort) ------
