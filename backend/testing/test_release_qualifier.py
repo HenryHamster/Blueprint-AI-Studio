@@ -19572,6 +19572,119 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
 
 
 @pytest.mark.asyncio
+async def test_infra_redrive_uses_per_dimension_cap_not_attempt_level(db_session, mocker):
+    """Phase 1b per-dimension cap: _redrive_infra_failure_qualification consults
+    the per-dimension infra streak from the QualificationDimensionResult ledger
+    instead of the attempt-global consecutive_infra_errors so one gate's flakiness
+    (e.g. migration_identity failing 3 times while audit passes) cannot exhaust the
+    redrive budget for other gates.
+
+    Scenario:
+    - version in infra_failure with attempt-level streak=3 (would block under old code)
+    - failing_dimension=migration_identity with per-dimension streak=2 (below cap)
+    - Expected: redrive fires (per-dimension streak 2 < cap 3)
+
+    Complementary scenario (per-dimension streak at cap):
+    - same setup but per-dimension streak=3
+    - Expected: redrive is blocked (per-dimension streak 3 >= cap 3)
+    """
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+    from app.models import QualificationDimensionResult
+
+    # --- Scenario A: attempt-level at cap but per-dimension below cap → should redrive ---
+    project_a, version_a = await _make_project_and_version(db_session, phase="stabilize")
+    sha_a = "cafecafe" * 5
+    version_a.goal = ""  # no merge-grade child needed
+    db_session.add(version_a)
+
+    # Seed migration_identity as 'unavailable' with per-dimension streak=2 (below cap 3).
+    row_a = QualificationDimensionResult(
+        project_id=version_a.project_id,
+        release_version_id=version_a.id,
+        candidate_sha=sha_a,
+        dimension="migration_identity",
+        status="unavailable",
+        detail={"consecutive_infra_errors": 2, "infra_error": "migration_identity_check_unavailable"},
+    )
+    db_session.add(row_a)
+
+    # attempt-level streak=3 (would block under old code)
+    version_a.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha_a,
+        "error": "migration_identity_check_unavailable",
+        "failing_dimension": "migration_identity",
+        "consecutive_infra_errors": 3,  # attempt-level: AT the cap
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version_a.qualification_attempts = 3
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    run_qual_a = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result_a = await _redrive_infra_failure_qualification(
+        version_a.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Per-dimension streak=2 < cap=3 → redrive should fire even though attempt-level is AT cap.
+    assert result_a is True, (
+        "per-dimension streak 2 is below the cap 3 — redrive must fire"
+    )
+    run_qual_a.assert_awaited_once()
+
+    # --- Scenario B: per-dimension streak AT cap → should be blocked ---
+    run_qual_a.reset_mock()
+    project_b, version_b = await _make_project_and_version(db_session, phase="stabilize")
+    sha_b = "deadbeef" * 5
+    version_b.goal = ""
+    db_session.add(version_b)
+
+    # Seed migration_identity with per-dimension streak=3 (AT cap).
+    row_b = QualificationDimensionResult(
+        project_id=version_b.project_id,
+        release_version_id=version_b.id,
+        candidate_sha=sha_b,
+        dimension="migration_identity",
+        status="unavailable",
+        detail={"consecutive_infra_errors": 3, "infra_error": "migration_identity_check_unavailable"},
+    )
+    db_session.add(row_b)
+
+    version_b.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha_b,
+        "error": "migration_identity_check_unavailable",
+        "failing_dimension": "migration_identity",
+        "consecutive_infra_errors": 3,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version_b.qualification_attempts = 3
+    await db_session.commit()
+    await db_session.refresh(version_b)
+
+    # reuse the same patch (already patched above); just check it's not called.
+    run_qual_b = run_qual_a
+
+    result_b = await _redrive_infra_failure_qualification(
+        version_b.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Per-dimension streak=3 >= cap=3 → redrive must be blocked.
+    assert result_b is False, (
+        "per-dimension streak 3 is at the cap 3 — redrive must be blocked"
+    )
+    run_qual_b.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA
