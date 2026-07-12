@@ -70,8 +70,10 @@ from app.reaper import (
 )
 from app.reaper_orphan_classify import (
     _RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS,
+    _RUNNER_REPORT_CLAIM_GRACE_SECONDS,
     _is_resident_session,
     _resident_session_heartbeat_stale_cutoff,
+    _runner_report_excludes_task,
 )
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
@@ -7150,6 +7152,7 @@ class _FakeClassifyTask:
         context=None,
         first_payload=None,
         vm_instance_id=None,
+        id=None,
     ):
         self.status = status
         self.started_at = started_at
@@ -7162,6 +7165,9 @@ class _FakeClassifyTask:
         self.context = context or {}
         self.first_payload = first_payload or {"type": "create"}
         self.vm_instance_id = vm_instance_id
+        # Stable id for the runner self-report membership check
+        # (_runner_report_excludes_task compares str(task.id)).
+        self.id = id if id is not None else _uuid_mod.uuid4()
 
 
 def test_classify_orphan_provisioning_absolute_ceiling():
@@ -7661,6 +7667,215 @@ def test_classify_orphan_fresh_contact_suppresses_provisioning_preclaim_death():
     lookup = {"vm-provisioning": now - timedelta(seconds=20)}
     assert (
         _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
+    )
+
+
+# ── Runner self-report defeats shared-VmContact zombie masking ───────────────
+# All tasks on one fleet runner share vm_instance_id='runner:<id>', so a live
+# sibling agent keeps the shared vmcontact row fresh and a per-task agent death
+# is suppressed forever (2026-07-12 incident: FATAL'd tasks sat IN_PROGRESS for
+# hours). A FRESH runner self-report that omits the task defeats the override.
+
+
+def _zombie_on_runner(now, *, started_minutes_ago=30):
+    """The incident shape: stale heartbeat on a runner-hosted task whose shared
+    contact row is kept fresh by a live sibling agent."""
+    return _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
+        started_at=now - timedelta(minutes=started_minutes_ago),
+        vm_instance_id="runner:aaaa-bbbb",
+    )
+
+
+def test_classify_orphan_runner_report_excluding_task_defeats_contact_mask():
+    """A fresh runner self-report that does NOT list the task proves its agent
+    is gone: the reap proceeds even though a sibling keeps the shared
+    vmcontact row fresh (the exact zombie shape)."""
+    now = _utcnow()
+    t = _zombie_on_runner(now)
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}  # sibling alive
+    # Without the runner report the shared contact masks the death (the bug).
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=contact)
+        is False
+    )
+    # Fresh report omitting the task → reaped despite the fresh shared contact.
+    report = {
+        "runner:aaaa-bbbb": (now - timedelta(seconds=30), frozenset({"other-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is True
+    )
+
+
+def test_classify_orphan_runner_report_including_task_still_suppresses():
+    """A fresh report that DOES list the task keeps the suppression: the agent
+    is alive and its heartbeat write was merely lock-starved."""
+    now = _utcnow()
+    t = _zombie_on_runner(now)
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}
+    report = {
+        "runner:aaaa-bbbb": (
+            now - timedelta(seconds=30),
+            frozenset({str(t.id), "other-task"}),
+        )
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+
+
+def test_classify_orphan_stale_runner_report_is_not_evidence():
+    """A report older than the heartbeat-stale cutoff (runner itself gone
+    quiet) must not be trusted to exclude — previous suppress behaviour holds."""
+    now = _utcnow()
+    t = _zombie_on_runner(now)
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}
+    report = {
+        "runner:aaaa-bbbb": (now - timedelta(minutes=9), frozenset({"other-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+
+
+def test_classify_orphan_runner_report_within_claim_grace_not_trusted():
+    """A report inside the post-claim grace window may simply predate the
+    runner learning about the claim — never distrust it into a reap-churn."""
+    now = _utcnow()
+    t = _zombie_on_runner(now, started_minutes_ago=2)  # claimed 2min ago
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}
+    report = {
+        "runner:aaaa-bbbb": (now - timedelta(seconds=30), frozenset({"other-task"}))
+    }
+    # started_at + 180s grace is still in the future relative to the report.
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+
+
+def test_classify_orphan_runner_report_absent_is_backcompat():
+    """No lookup / no row for this runner (older runner version without the
+    active_work_reported_at stamp) → previous suppress behaviour holds."""
+    now = _utcnow()
+    t = _zombie_on_runner(now)
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}
+    for report in (None, {}, {"runner:someone-else": (now, frozenset())}):
+        assert (
+            _classify_orphan(
+                t,
+                now,
+                has_open_pr=False,
+                vm_contact_lookup=contact,
+                runner_report_lookup=report,
+            )
+            is False
+        )
+
+
+def test_classify_orphan_runner_report_ignored_for_non_runner_vm():
+    """GCE-hosted tasks (non-'runner:' vm ids) are never affected by runner
+    self-reports — the contact override applies exactly as before."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=30),
+        vm_instance_id="agent-vm-123",
+    )
+    contact = {"agent-vm-123": now - timedelta(seconds=30)}
+    report = {"agent-vm-123": (now - timedelta(seconds=30), frozenset())}
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+
+
+def test_classify_orphan_runner_report_preclaim_death_on_pulled_pin():
+    """The exclusion also unmasks a claimed-then-died-pre-heartbeat task on a
+    busy runner (PROVISIONING, started_at set, no heartbeat), while a pin the
+    runner has not pulled yet (started_at IS NULL) is never distrusted."""
+    now = _utcnow()
+    pulled = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=8),
+        last_heartbeat=None,
+        started_at=now
+        - timedelta(seconds=_RUNNER_REPORT_CLAIM_GRACE_SECONDS + 300),
+        vm_instance_id="runner:aaaa-bbbb",
+    )
+    contact = {"runner:aaaa-bbbb": now - timedelta(seconds=30)}
+    report = {
+        "runner:aaaa-bbbb": (now - timedelta(seconds=30), frozenset({"other-task"}))
+    }
+    assert (
+        _classify_orphan(
+            pulled,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is True
+    )
+    awaiting_pull = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=30),
+        last_heartbeat=None,
+        started_at=None,
+        vm_instance_id="runner:aaaa-bbbb",
+    )
+    assert (
+        _classify_orphan(
+            awaiting_pull,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+    # Direct helper check: an unpulled pin is never "excluded".
+    assert (
+        _runner_report_excludes_task(
+            awaiting_pull, now - timedelta(minutes=5), report
+        )
+        is False
     )
 
 

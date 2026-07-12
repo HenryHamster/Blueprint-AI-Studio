@@ -78,7 +78,7 @@ async def _cleanup_stale_heartbeat_snapshots(session: AsyncSession) -> int:
     from app.models import RunnerHeartbeatSnapshot
 
     retention_days = int(
-        _runtime_config().get(
+        _runtime_config.get(
             "runner_heartbeat_retention_days",
             _RUNNER_HEARTBEAT_RETENTION_DAYS_DEFAULT,
         )
@@ -124,7 +124,7 @@ async def _check_post_update_silent_runners(session: AsyncSession) -> None:
     )
 
     window = int(
-        _runtime_config().get(
+        _runtime_config.get(
             "runner_post_update_silence_seconds",
             _RUNNER_POST_UPDATE_SILENCE_SECONDS_DEFAULT,
         )

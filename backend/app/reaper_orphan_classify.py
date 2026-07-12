@@ -6,14 +6,16 @@ dependency on the reaper service loop — extracting these makes
 _classify_orphan() unit-testable in isolation.
 """
 
+import uuid
 from datetime import datetime, timedelta
 
 from sqlmodel import select
 
 from app.failure_classification import RATE_LIMIT
-from app.models import Artifact, ArtifactType, TaskStatus
+from app.models import Artifact, ArtifactType, LocalRunner, TaskStatus
 from app.schemas import redact_command_log_text
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _coerce_naive_utc
 
 # Orphan-priority buckets (lower = processed first). Time-sensitive orphans are
 # reaped before the cap can truncate the tail.
@@ -152,12 +154,122 @@ def _is_runner_pinned_awaiting_pull(task) -> bool:
     )
 
 
+async def _build_runner_report_lookup(
+    session, candidate_vm_ids: set
+) -> dict[str, tuple[datetime, frozenset]]:
+    """Batch-fetch fleet-runner self-reports for ``runner:<uuid>`` vm ids.
+
+    Returns ``{vm_instance_id: (reported_at, frozenset(task_id_strs))}`` for
+    every candidate runner whose heartbeat has stamped
+    ``capabilities.active_work_reported_at`` (runner.py heartbeat handler).
+    ``_classify_orphan`` consults it (via ``_runner_report_excludes_task``) so
+    a runner's own fresh report that OMITS a task defeats the shared-VmContact
+    reap suppression — all tasks on one runner share the ``runner:<id>`` vm
+    id, so a live sibling agent's contact otherwise masks a per-task agent
+    death forever (2026-07-12 zombie incident). Runners without the stamp
+    (older versions) or with malformed values are skipped — those tasks keep
+    the previous suppress behaviour.
+    """
+    runner_uuids: dict[uuid.UUID, str] = {}
+    for vm_id in candidate_vm_ids:
+        if not isinstance(vm_id, str) or not vm_id.startswith("runner:"):
+            continue
+        try:
+            runner_uuids[uuid.UUID(vm_id.split(":", 1)[1])] = vm_id
+        except ValueError:
+            continue
+    if not runner_uuids:
+        return {}
+    rows = (
+        await session.execute(
+            select(LocalRunner.id, LocalRunner.capabilities).where(
+                LocalRunner.id.in_(runner_uuids.keys())
+            )
+        )
+    ).all()
+    lookup: dict[str, tuple[datetime, frozenset]] = {}
+    for runner_id, capabilities in rows:
+        caps = capabilities or {}
+        reported_raw = caps.get("active_work_reported_at")
+        active_ids = caps.get("active_task_ids")
+        if not isinstance(reported_raw, str) or not isinstance(active_ids, list):
+            continue
+        try:
+            reported_at = _coerce_naive_utc(datetime.fromisoformat(reported_raw))
+        except ValueError:
+            continue
+        lookup[runner_uuids[runner_id]] = (
+            reported_at,
+            frozenset(str(i) for i in active_ids),
+        )
+    return lookup
+
+
+# Grace after a runner pulls a task (started_at stamped) before its
+# self-reported active-work list is trusted to EXCLUDE that task: the
+# pull → agent-spawn → next-heartbeat cycle needs time to include a fresh
+# claim, and distrusting a report inside that window would reap-churn a
+# just-claimed task. Generous vs the ~30-60s runner heartbeat interval.
+_RUNNER_REPORT_CLAIM_GRACE_SECONDS = 180
+
+
+def _runner_report_excludes_task(
+    task, hb_cutoff: datetime, runner_report_lookup: dict | None
+) -> bool:
+    """True iff this task's own runner freshly self-reported an active-work
+    list that does NOT contain the task — proof its agent process is gone.
+
+    Closes the shared-VmContact zombie gap: every task on a fleet runner
+    shares ``vm_instance_id='runner:<id>'``, so ANY live sibling agent keeps
+    the shared ``vmcontact`` row fresh and the heartbeat-stale reap override
+    suppresses forever — a per-task agent death on a busy runner is invisible
+    (2026-07-12 incident: FATAL'd tasks sat IN_PROGRESS for hours, pinning
+    their parent lineages in EVALUATING). The runner already reports its
+    ground-truth ``active_task_ids`` on every heartbeat, stamped
+    ``active_work_reported_at``; a report that is fresh (within the same
+    ``hb_cutoff`` used for the heartbeat-stale check), postdates this task's
+    claim by a grace period, and omits the task means the runner is no longer
+    running it — the shared-contact override must not save it.
+
+    ``runner_report_lookup`` maps ``vm_instance_id`` →
+    ``(reported_at, frozenset(task_id_strs))``, batch-fetched per cycle by the
+    caller. Fail-safe: any missing piece — non-runner vm id, no lookup row
+    (older runner version without the stamp), report stale or not yet past
+    claim+grace, pin not yet pulled — returns False, preserving the previous
+    suppress behaviour.
+    """
+    if not runner_report_lookup:
+        return False
+    vm_id = getattr(task, "vm_instance_id", None)
+    if not isinstance(vm_id, str) or not vm_id.startswith("runner:"):
+        return False
+    report = runner_report_lookup.get(vm_id)
+    if report is None:
+        return False
+    reported_at, active_ids = report
+    # A pin the runner hasn't pulled yet (started_at IS NULL) can't be in its
+    # list; it is protected by _is_runner_pinned_awaiting_pull, never distrusted.
+    started_at = getattr(task, "started_at", None)
+    if started_at is None:
+        return False
+    if reported_at < hb_cutoff:
+        # Runner itself has gone quiet — the list is stale, not evidence.
+        return False
+    if reported_at < started_at + timedelta(
+        seconds=_RUNNER_REPORT_CLAIM_GRACE_SECONDS
+    ):
+        # Report may predate the runner learning about this task's claim.
+        return False
+    return str(task.id) not in active_ids
+
+
 def _classify_orphan(
     task,
     now: datetime,
     has_open_pr: bool,
     vm_contact_lookup: dict | None = None,
     vm_tool_use_lookup: dict | None = None,
+    runner_report_lookup: dict | None = None,
 ) -> bool:
     """Single source of truth for the orphan-detection state machine.
 
@@ -187,6 +299,15 @@ def _classify_orphan(
     mere contact (a hung agent still heartbeats), so genuine stall detection is
     preserved. Absent / stale tool-use → existing behaviour (reap).
 
+    ``runner_report_lookup`` is an optional ``{vm_instance_id: (reported_at,
+    frozenset(task_id_strs))}`` map of fleet-runner self-reports (see
+    ``_runner_report_excludes_task``). On the heartbeat-stale branches it
+    OVERRIDES the ``vm_contact_lookup`` suppression for runner-hosted tasks:
+    all tasks on one runner share a ``runner:<id>`` vm id, so a live sibling's
+    contact must not shield a task the runner's own fresh report says it is no
+    longer running. Absent / stale / pre-grace report → the vm_contact
+    override applies exactly as before.
+
     State machine (unchanged):
       PROVISIONING:
         - started_at > 15min ago                        → absolute provision ceiling
@@ -203,6 +324,13 @@ def _classify_orphan(
     ten_minutes_ago = now - timedelta(minutes=10)
     fifteen_minutes_ago = now - timedelta(minutes=15)
     hb_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=has_open_pr)
+    # Runner-hosted zombie override: when the task's own runner freshly reports
+    # it is NOT running this task, the shared-vm_id contact freshness below is a
+    # sibling's liveness, not this task's — the reap must proceed. Computed once
+    # so every heartbeat-stale branch applies the identical predicate.
+    runner_excluded = _runner_report_excludes_task(
+        task, hb_cutoff, runner_report_lookup
+    )
 
     # Resident strategic session carve-out: an IN_PROGRESS task pinned for the
     # life of an operator session (context["_resident_session"] == True). It is
@@ -224,7 +352,9 @@ def _classify_orphan(
             # claim_task also flips status to IN_PROGRESS), then went silent.
             # vm_contact override: a fresh contact within hb_cutoff means the VM
             # is alive (lock-starved last_heartbeat write) — don't reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, hb_cutoff, vm_contact_lookup
+            )
         if (
             task.vm_provisioned_at
             and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now)
@@ -244,14 +374,18 @@ def _classify_orphan(
             # caused surplus runner-pinned compute_experiments to churn
             # (requeue→repin→reap). It is bounded instead by the 6h local-runner
             # hold sweep (orchestrator.py _fail_stale_local_runner_holds).
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, hb_cutoff, vm_contact_lookup
+            )
         return False
 
     if task.status == TaskStatus.IN_PROGRESS:
         if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
             # Agent crashed mid-run — UNLESS we heard from the VM within the
             # same cutoff (lock-starved last_heartbeat write); then it's alive.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, hb_cutoff, vm_contact_lookup
+            )
         if (
             task.last_heartbeat is None
             and task.started_at
@@ -263,7 +397,9 @@ def _classify_orphan(
             # large/high-effort tasks aren't reaped prematurely. vm_contact
             # override: a fresh contact within hb_cutoff proves the VM is alive
             # (its last_heartbeat write was lock-starved), so don't reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, hb_cutoff, vm_contact_lookup
+            )
         if (
             task.last_heartbeat is None
             and task.started_at is None
@@ -274,7 +410,9 @@ def _classify_orphan(
             # forgot to set started_at. Reap as a catch-all. vm_contact override:
             # if the VM is demonstrably alive (fresh contact within hb_cutoff)
             # this is not a dead-VM orphan — suppress the reap.
-            return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
+            return runner_excluded or not _vm_contact_within_cutoff(
+                task, hb_cutoff, vm_contact_lookup
+            )
         if (
             task.last_heartbeat
             and task.last_heartbeat >= hb_cutoff

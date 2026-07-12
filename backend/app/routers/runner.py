@@ -565,6 +565,13 @@ async def heartbeat(
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
     caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
+    # Stamp WHEN this active-work list was reported. last_seen_at alone can't
+    # serve: other endpoints bump it without refreshing the list. The reaper's
+    # zombie-task reconcile (reaper_orphan_classify._runner_report_excludes_task)
+    # only trusts a list carrying a fresh stamp, so a task absent from a fresh
+    # report is reapable even while sibling agents keep the shared per-runner
+    # vmcontact row alive.
+    caps["active_work_reported_at"] = now.isoformat()
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).

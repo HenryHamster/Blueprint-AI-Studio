@@ -200,6 +200,7 @@ from app.reaper_orphan_classify import (
     _progress_stale_cutoff,
     _preclaim_stale_cutoff,  # noqa: F401
     _heartbeat_stale_cutoff,
+    _build_runner_report_lookup,
     _extract_tool_trace_tail,
     _task_has_open_pr,  # noqa: F401
 )
@@ -492,6 +493,13 @@ async def reaper_service():
                         for vm_id, _last_contact, last_tool in contact_rows
                         if last_tool is not None
                     }
+                # Fleet-runner self-reports: defeats the shared-VmContact
+                # suppression for a task whose OWN runner freshly reports it is
+                # no longer running it (zombie tasks on busy runners; see
+                # _runner_report_excludes_task). Batch-fetched once per sweep.
+                runner_report_lookup = await _build_runner_report_lookup(
+                    session, candidate_vm_ids
+                )
 
                 # State-machine invariants after the clock-separation fix:
                 #   - vm_provisioned_at: written by orchestrator when the VM is dispatched
@@ -522,6 +530,7 @@ async def reaper_service():
                         has_open_pr=has_pr,
                         vm_contact_lookup=vm_contact_lookup,
                         vm_tool_use_lookup=vm_tool_use_lookup,
+                        runner_report_lookup=runner_report_lookup,
                     ):
                         continue
                     orphaned_ids.append(task.id)
@@ -670,6 +679,14 @@ async def reaper_service():
                             for vm_id, _last_contact, last_tool in step2_contact_rows
                             if last_tool is not None
                         }
+                    # Re-fetch the runner self-reports with the refreshed clock
+                    # too: a runner heartbeat that landed during lock
+                    # acquisition and now INCLUDES the task (e.g. the claim
+                    # raced Step 1) must abort the reap, mirroring the
+                    # vm_contact re-fetch above.
+                    step2_runner_report_lookup = await _build_runner_report_lookup(
+                        session, step2_vm_ids
+                    )
                     verified = [
                         t
                         for t in orphaned_tasks
@@ -679,6 +696,7 @@ async def reaper_service():
                             has_open_pr=(t.id in tasks_with_pr),
                             vm_contact_lookup=step2_contact_lookup,
                             vm_tool_use_lookup=step2_tool_use_lookup,
+                            runner_report_lookup=step2_runner_report_lookup,
                         )
                     ]
                     orphaned_tasks = verified
