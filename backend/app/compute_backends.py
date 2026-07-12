@@ -1644,7 +1644,9 @@ async def store_runner_artifact(
 class ViewableArtifactCandidate:
     """One viewable file selected from a terminal job's artifacts for per-file store.
 
-    ``filename`` is the sanitized object basename (path-traversal safe),
+    ``filename`` is the sanitized object name derived from the file's path
+    *relative* to the artifact root (path-traversal safe, subdir context folded
+    to ``__`` so multi-arm same-named plots stay distinct),
     ``content_type`` / ``kind`` come from the extension classifier, ``data`` is
     the in-memory bytes (already size-capped), and ``size_bytes`` is ``len(data)``.
     """
@@ -1661,12 +1663,17 @@ def _extract_viewable_candidates_from_bundle(
 ) -> list[ViewableArtifactCandidate]:
     """Select viewable files from a ``.tar.gz`` bundle IN MEMORY (no extract-to-disk).
 
-    Mirrors the safe basename-matching pattern in
-    :func:`_extract_terminal_record_from_bundle`: iterate members, match on the
-    basename (never the crafted member path), and read each selected member's
-    bytes directly from the archive. Enforces the per-file size cap and the
-    total-count cap, dedupes by sanitized basename (first occurrence wins), and
-    classifies each as ``image``/``video``. Defensive by contract: a non-gzip/
+    Mirrors the safe path-matching pattern in
+    :func:`_extract_terminal_record_from_bundle`: iterate members, classify by
+    the file extension, and read each selected member's bytes directly from the
+    archive. The object name is derived from the sanitized *relative* member path
+    (via :func:`storage.sanitize_viewable_relpath`), NOT the bare basename, so a
+    multi-arm sweep whose arms each write a same-named plot
+    (``arm1/reward.png`` vs ``arm2/reward.png``) yields distinct candidates
+    instead of collapsing to one. Enforces the per-file size cap and the
+    total-count cap, dedupes by that sanitized relpath (first occurrence wins),
+    and classifies each as ``image``/``video``. A traversal/absolute member path
+    sanitizes to ``None`` and is skipped. Defensive by contract: a non-gzip/
     non-tar blob or ANY parse error yields ``[]``.
     """
     if not raw:
@@ -1676,18 +1683,15 @@ def _extract_viewable_candidates_from_bundle(
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
             for member in tar:
-                if len(out) >= _MAX_VIEWABLE_FILE_COUNT:
-                    break
                 if not member.isfile():
                     continue
-                name = os.path.basename(member.name)
-                classified = storage.viewable_content_type_for_filename(name)
+                classified = storage.viewable_content_type_for_filename(member.name)
                 if classified is None:
                     continue
                 if member.size <= 0 or member.size > _MAX_VIEWABLE_FILE_BYTES:
                     continue
-                basename = storage.sanitize_viewable_basename(name)
-                if basename is None or basename in seen:
+                relname = storage.sanitize_viewable_relpath(member.name)
+                if relname is None or relname in seen:
                     continue
                 extracted = tar.extractfile(member)
                 if extracted is None:
@@ -1696,10 +1700,10 @@ def _extract_viewable_candidates_from_bundle(
                 if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
                     continue
                 content_type, kind = classified
-                seen.add(basename)
+                seen.add(relname)
                 out.append(
                     ViewableArtifactCandidate(
-                        filename=basename,
+                        filename=relname,
                         content_type=content_type,
                         kind=kind,
                         data=data,
@@ -1717,9 +1721,13 @@ def _collect_viewable_candidates_from_dir(
     """Select viewable files by walking a local job's on-disk artifact dir.
 
     The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
-    same viewable-extension filter, per-file size cap, total-count cap, and
-    basename dedupe. Returns ``[]`` for a missing/empty/unreadable dir or on ANY
-    OS error — never raises.
+    same viewable-extension filter, per-file size cap, and total-count cap. The
+    object name (and dedupe key) is the sanitized path *relative to*
+    ``artifact_dir`` (via :func:`storage.sanitize_viewable_relpath`), NOT the
+    bare basename, so same-named plots under different arm subdirectories
+    (``arm1/reward.png`` vs ``arm2/reward.png``) stay distinct instead of
+    collapsing to one. Returns ``[]`` for a missing/empty/unreadable dir or on
+    ANY OS error — never raises.
     """
     if not artifact_dir or not os.path.isdir(artifact_dir):
         return []
@@ -1728,15 +1736,14 @@ def _collect_viewable_candidates_from_dir(
     try:
         for root, _dirs, files in os.walk(artifact_dir):
             for name in sorted(files):
-                if len(out) >= _MAX_VIEWABLE_FILE_COUNT:
-                    return out
                 classified = storage.viewable_content_type_for_filename(name)
                 if classified is None:
                     continue
-                basename = storage.sanitize_viewable_basename(name)
-                if basename is None or basename in seen:
-                    continue
                 path = os.path.join(root, name)
+                relpath = os.path.relpath(path, artifact_dir)
+                relname = storage.sanitize_viewable_relpath(relpath)
+                if relname is None or relname in seen:
+                    continue
                 try:
                     size = os.path.getsize(path)
                 except OSError:
@@ -1751,10 +1758,10 @@ def _collect_viewable_candidates_from_dir(
                 if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
                     continue
                 content_type, kind = classified
-                seen.add(basename)
+                seen.add(relname)
                 out.append(
                     ViewableArtifactCandidate(
-                        filename=basename,
+                        filename=relname,
                         content_type=content_type,
                         kind=kind,
                         data=data,
@@ -1768,56 +1775,70 @@ def _collect_viewable_candidates_from_dir(
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
-) -> list[ViewableArtifactCandidate]:
+) -> tuple[list[ViewableArtifactCandidate], int]:
     """Backend-aware selection of a terminal job's viewable files.
 
     Local/local-gpu jobs are read from the on-disk artifact dir that survives the
     subprocess; gcp and runner-subprocess jobs are read from the durable
-    ``bundle.tar.gz`` (downloaded once, iterated in memory). Returns ``[]`` for
-    an unrecognised backend or a missing bundle.
+    ``bundle.tar.gz`` (downloaded once, iterated in memory). Returns
+    ``([], 0)`` for an unrecognised backend or a missing bundle.
+
+    Candidates are sorted by sanitized filename for deterministic selection when
+    the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
+    ``dropped`` is the count of qualifying files exceeding ``_MAX_VIEWABLE_FILE_COUNT``.
     """
     if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
         meta = job.polling_metadata or {}
         artifact_dir = str(meta.get("artifact_dir") or "").strip()
         if not artifact_dir:
             artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
-        return await asyncio.to_thread(
+        all_candidates = await asyncio.to_thread(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
-    if job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
+    elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
         raw = await storage.download_compute_job_artifact_bundle(job.id)
         if not raw:
-            return []
-        return await asyncio.to_thread(_extract_viewable_candidates_from_bundle, raw)
-    return []
+            return [], 0
+        all_candidates = await asyncio.to_thread(
+            _extract_viewable_candidates_from_bundle, raw
+        )
+    else:
+        return [], 0
+    all_candidates.sort(key=lambda c: c.filename)
+    selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
+    dropped = len(all_candidates) - len(selected)
+    return selected, dropped
 
 
-async def persist_viewable_artifacts(job: ComputeJob) -> list[dict[str, Any]]:
+async def persist_viewable_artifacts(
+    job: ComputeJob,
+) -> tuple[list[dict[str, Any]], int]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
     Extracts the viewable files (png/jpg/jpeg/webp/gif/svg/mp4/webm) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
-    returns a manifest — a list of
-    ``{filename, storage_uri, content_type, size_bytes, kind}`` — for the objects
-    that were durably stored.
+    returns ``(manifest, dropped)`` — a list of
+    ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
+    files, and the count of qualifying files that exceeded ``_MAX_VIEWABLE_FILE_COUNT``
+    and were not persisted.
 
     Fail-soft by contract: an empty/corrupt bundle, a missing dir, or ANY
-    extraction/upload error degrades to ``[]`` ('no manifest') and NEVER raises,
+    extraction/upload error degrades to ``([], 0)`` and NEVER raises,
     so viewable-artifact persistence can never block a job's terminal completion.
     Individual per-file upload failures are skipped; only durably-stored files
     appear in the returned manifest.
     """
     try:
-        candidates = await _collect_viewable_artifact_candidates(job)
+        candidates, dropped = await _collect_viewable_artifact_candidates(job)
     except Exception:
         logger.warning(
             "Viewable-artifact extraction failed for compute job %s",
             getattr(job, "id", None),
             exc_info=True,
         )
-        return []
+        return [], 0
     if not candidates:
-        return []
+        return [], dropped
     manifest: list[dict[str, Any]] = []
     for candidate in candidates:
         try:
@@ -1846,7 +1867,7 @@ async def persist_viewable_artifacts(job: ComputeJob) -> list[dict[str, Any]]:
                 "kind": candidate.kind,
             }
         )
-    return manifest
+    return manifest, dropped
 
 
 def _count_files_in_tree(path: str) -> int:

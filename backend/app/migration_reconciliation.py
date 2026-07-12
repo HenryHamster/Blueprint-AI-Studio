@@ -66,8 +66,31 @@ AUTHORIZED_0143_DIVERGENCE = AuthorizedDivergence(
     integration_revision="0144",
 )
 
+# Revision 0458 duplicate: a prior PR added 0458_task_updated_at_vm_dispatched_at_indexes
+# onto automain with revision="0458", colliding with the already-deployed
+# 0458_add_perf_indexes migration. PR #14381 removes the duplicate by renaming it to
+# 0502_task_vm_dispatched_at_index (revision=0502, down_revision=0501). Until that PR
+# merges, the guard is authorized to pass this pre-existing divergence on automain.
+#
+# Field ordering note: integration_identity names the on-disk file at the collided
+# revision ({revision}_{integration_identity}.py must exist — test invariant). Since
+# the fix PR deletes 0458_task_updated_at_vm_dispatched_at_indexes.py but keeps
+# 0458_add_perf_indexes.py, integration_identity is set to "add_perf_indexes" so the
+# file-existence check passes. The _divergence_record_is_authorized guard uses a set
+# comparison and is order-agnostic. integration_revision is empty because the deployed
+# identity was not renumbered; the deployed-identity file check is skipped when empty.
+AUTHORIZED_0458_DIVERGENCE = AuthorizedDivergence(
+    revision="0458",
+    parent_revision="0457",
+    deployed_identity="task_updated_at_vm_dispatched_at_indexes",
+    integration_identity="add_perf_indexes",
+    created_table="",
+    integration_revision="",
+)
+
 AUTHORIZED_DIVERGENCES: tuple[AuthorizedDivergence, ...] = (
     AUTHORIZED_0143_DIVERGENCE,
+    AUTHORIZED_0458_DIVERGENCE,
 )
 
 _VERSIONS_DIR = Path(__file__).resolve().parent.parent / "alembic" / "versions"

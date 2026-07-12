@@ -2961,8 +2961,9 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     # the Artifact INSERT below succeeds so the manifest survives a linkage
     # rollback.
     viewable_files: list[dict[str, Any]] = []
+    viewable_files_dropped: int = 0
     try:
-        viewable_files = await persist_viewable_artifacts(job)
+        viewable_files, viewable_files_dropped = await persist_viewable_artifacts(job)
     except Exception:  # noqa: BLE001
         logger.warning(
             "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
@@ -2971,8 +2972,11 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
             exc_info=True,
         )
         viewable_files = []
+        viewable_files_dropped = 0
     if viewable_files:
         _set_meta(job, viewable_files=viewable_files)
+    if viewable_files_dropped:
+        _set_meta(job, viewable_files_dropped=viewable_files_dropped)
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():
@@ -2986,6 +2990,8 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
             }
             if viewable_files:
                 artifact_logs["viewable_files"] = viewable_files
+            if viewable_files_dropped:
+                artifact_logs["viewable_files_dropped"] = viewable_files_dropped
             command_log = (job.polling_metadata or {}).get("command_log")
             if command_log is not None:
                 if isinstance(command_log, dict) and isinstance(

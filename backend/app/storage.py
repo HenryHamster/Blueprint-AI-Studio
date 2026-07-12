@@ -321,6 +321,11 @@ _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
 # segment) is collapsed to ``_`` when sanitizing a viewable basename.
 _VIEWABLE_BASENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Path separators in a viewable *relative* path are folded to this joiner so the
+# arm-subdir context survives (``arm1/reward.png`` -> ``arm1__reward.png``) while
+# the object name stays a single path segment (no ``/``).
+_VIEWABLE_RELPATH_JOINER = "__"
+
 
 def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
     """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
@@ -351,6 +356,51 @@ def sanitize_viewable_basename(filename: str) -> str | None:
     if not base or set(base) <= {".", "_"}:
         return None
     return base[:128]
+
+
+def sanitize_viewable_relpath(relpath: str) -> str | None:
+    """Return a traversal-safe object name for a viewable file, keeping subdir context, or ``None``.
+
+    Unlike :func:`sanitize_viewable_basename` (which strips *every* directory
+    component down to the bare basename), this flattens the whole *relative* path
+    into a single safe object-name segment, so same-named files under different
+    arm subdirectories do NOT collide: ``arm1/reward.png`` and ``arm2/reward.png``
+    yield ``arm1__reward.png`` and ``arm2__reward.png`` respectively (a root-level
+    ``reward.png`` stays ``reward.png``).
+
+    Each path component is collapsed to the safe object-name subset and joined
+    with ``__``. Empty and ``.`` components are dropped; a component that
+    sanitizes to nothing meaningful (only dots/underscores) is dropped too. An
+    absolute path or any ``..`` (parent-directory traversal) component is
+    REJECTED — returns ``None`` rather than being silently flattened — so a
+    crafted archive member can never re-introduce a traversal or escape the
+    per-job prefix. A path with no usable component yields ``None``; the result
+    is capped at 192 chars.
+    """
+    if not isinstance(relpath, str):
+        return None
+    # An absolute path would escape the artifact root -- reject, don't flatten.
+    if relpath.startswith("/"):
+        return None
+    parts: list[str] = []
+    for raw_part in relpath.split("/"):
+        part = raw_part.strip()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            # Parent-directory traversal must never be folded into a name.
+            return None
+        safe = _VIEWABLE_BASENAME_RE.sub("_", part)
+        if not safe or set(safe) <= {".", "_"}:
+            # A component with no meaningful chars -- drop it, keep the rest.
+            continue
+        parts.append(safe)
+    if not parts:
+        return None
+    joined = _VIEWABLE_RELPATH_JOINER.join(parts)
+    if not joined or set(joined) <= {".", "_"}:
+        return None
+    return joined[:192]
 
 
 def compute_job_viewable_object_name(job_id, basename: str) -> str:

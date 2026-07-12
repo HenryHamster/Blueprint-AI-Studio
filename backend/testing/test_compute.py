@@ -14708,3 +14708,233 @@ async def test_build_project_compute_image_requires_repo():
             _clone_fn=lambda *a: None,
             _build_fn=lambda **k: None,
         )
+
+
+# --------------------------------------------------------------------------
+# Multi-arm viewable-plot collision: same-named plots across arm subdirs must
+# NOT collapse to a single object (regression for basename-only dedupe).
+# --------------------------------------------------------------------------
+
+# Minimal magic-byte-prefixed blobs; extension classification drives selection.
+_VIEW_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
+
+
+def _make_viewable_tar_gz(files: dict[str, bytes]) -> bytes:
+    """In-memory ``.tar.gz`` whose members mirror ``tar -C dir -czf - .`` naming."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_sanitize_viewable_relpath_preserves_arm_subdir_context():
+    # Same basename under distinct arm subdirs -> distinct, non-colliding names.
+    assert storage.sanitize_viewable_relpath("arm1/reward.png") == "arm1__reward.png"
+    assert storage.sanitize_viewable_relpath("arm2/reward.png") == "arm2__reward.png"
+    # Root-level file keeps its bare name (no spurious joiner).
+    assert storage.sanitize_viewable_relpath("reward.png") == "reward.png"
+    # Leading ``./`` and unsafe chars are normalized; nesting is folded.
+    assert storage.sanitize_viewable_relpath("./sweep/arm 1/fig.png") == "sweep__arm_1__fig.png"
+    # Absolute path and parent traversal are REJECTED, not silently flattened.
+    assert storage.sanitize_viewable_relpath("/etc/passwd.png") is None
+    assert storage.sanitize_viewable_relpath("../secrets/x.png") is None
+    assert storage.sanitize_viewable_relpath("arm1/../../x.png") is None
+    # Degenerate inputs.
+    assert storage.sanitize_viewable_relpath("") is None
+    assert storage.sanitize_viewable_relpath("./") is None
+    assert storage.sanitize_viewable_relpath(None) is None  # type: ignore[arg-type]
+
+
+def test_extract_viewable_candidates_keeps_multi_arm_same_basename_from_bundle():
+    """A sweep whose arms each write reward.png must yield one object PER arm."""
+    bundle = _make_viewable_tar_gz(
+        {
+            "./arm1/reward.png": _VIEW_PNG_BYTES + b"-a1",
+            "./arm2/reward.png": _VIEW_PNG_BYTES + b"-a2",
+            "./arm3/reward.png": _VIEW_PNG_BYTES + b"-a3",
+        }
+    )
+    cands = compute_backends_module._extract_viewable_candidates_from_bundle(bundle)
+    names = sorted(c.filename for c in cands)
+    # All three arms survive as distinct, individually-addressable objects
+    # (previously collapsed to a single "reward.png").
+    assert names == ["arm1__reward.png", "arm2__reward.png", "arm3__reward.png"]
+    # Each candidate carries its OWN arm's bytes, not the first arm's.
+    by_name = {c.filename: c for c in cands}
+    assert by_name["arm1__reward.png"].data == _VIEW_PNG_BYTES + b"-a1"
+    assert by_name["arm2__reward.png"].data == _VIEW_PNG_BYTES + b"-a2"
+    # Distinct object names -> distinct durable URIs (no bucket overwrite).
+    jid = uuid.uuid4()
+    uris = {storage.compute_job_viewable_uri(jid, c.filename) for c in cands}
+    assert len(uris) == 3
+
+
+def test_collect_viewable_candidates_keeps_multi_arm_same_basename_from_dir(tmp_path):
+    """On-disk (local backend) analogue: per-arm subdirs stay distinct."""
+    for arm in ("arm1", "arm2"):
+        arm_dir = tmp_path / arm
+        arm_dir.mkdir()
+        (arm_dir / "reward.png").write_bytes(_VIEW_PNG_BYTES + arm.encode())
+    # A root-level file keeps its bare name alongside the nested ones.
+    (tmp_path / "summary.png").write_bytes(_VIEW_PNG_BYTES + b"-root")
+
+    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    names = sorted(c.filename for c in cands)
+    assert names == ["arm1__reward.png", "arm2__reward.png", "summary.png"]
+    by_name = {c.filename: c for c in cands}
+    assert by_name["arm1__reward.png"].data == _VIEW_PNG_BYTES + b"arm1"
+    assert by_name["arm2__reward.png"].data == _VIEW_PNG_BYTES + b"arm2"
+
+
+# ---------------------------------------------------------------------------
+# Dropped-file recording: cap enforcement, deterministic ordering, tuple return
+# ---------------------------------------------------------------------------
+
+_MAX_COUNT = compute_backends_module._MAX_VIEWABLE_FILE_COUNT
+
+
+def test_extract_viewable_candidates_collects_beyond_cap_for_determinism():
+    """Bundle extractor collects ALL qualifying files (count cap removed from inner loop).
+
+    The cap is applied by _collect_viewable_artifact_candidates, not here, so
+    _extract_viewable_candidates_from_bundle returns every qualifying file.
+    """
+    files = {f"./file{i:03d}.png": _VIEW_PNG_BYTES + str(i).encode() for i in range(_MAX_COUNT + 5)}
+    bundle = _make_viewable_tar_gz(files)
+    cands = compute_backends_module._extract_viewable_candidates_from_bundle(bundle)
+    # Without the inner cap, all _MAX_COUNT+5 qualifying files are returned.
+    assert len(cands) == _MAX_COUNT + 5
+
+
+def test_collect_viewable_candidates_from_dir_collects_beyond_cap(tmp_path):
+    """Dir walker collects ALL qualifying files (count cap removed from inner loop)."""
+    for i in range(_MAX_COUNT + 3):
+        (tmp_path / f"file{i:03d}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
+    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    assert len(cands) == _MAX_COUNT + 3
+
+
+@pytest.mark.asyncio
+async def test_collect_viewable_artifact_candidates_sorts_and_caps(tmp_path):
+    """_collect_viewable_artifact_candidates sorts by filename, caps at MAX, returns dropped count."""
+    # Create files whose names sort in a different order than os.walk may return.
+    names = [f"zzz{i:02d}.png" for i in range(5)] + [f"aaa{i:02d}.png" for i in range(5)]
+    for name in names:
+        (tmp_path / name).write_bytes(_VIEW_PNG_BYTES + name.encode())
+
+    job = MagicMock()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+    job.external_compute_id = None
+
+    with patch.object(
+        compute_backends_module,
+        "_MAX_VIEWABLE_FILE_COUNT",
+        7,
+    ):
+        selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+
+    # 10 total, cap=7 → 3 dropped
+    assert len(selected) == 7
+    assert dropped == 3
+    # Selected must be the lexicographically first 7 (aaa00..aaa04, zzz00, zzz01)
+    selected_names = [c.filename for c in selected]
+    assert selected_names == sorted(selected_names)
+    assert selected_names[0].startswith("aaa")
+
+
+@pytest.mark.asyncio
+async def test_collect_viewable_artifact_candidates_no_drop_when_within_cap(tmp_path):
+    """When file count ≤ cap, dropped == 0."""
+    for i in range(3):
+        (tmp_path / f"img{i}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
+
+    job = MagicMock()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+    job.external_compute_id = None
+
+    selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+    assert len(selected) == 3
+    assert dropped == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_viewable_artifacts_returns_tuple_with_dropped_count(tmp_path):
+    """persist_viewable_artifacts returns (manifest, dropped) not a bare list."""
+    for i in range(_MAX_COUNT + 2):
+        (tmp_path / f"img{i:03d}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+    job.external_compute_id = None
+
+    async def _fake_upload(job_id, filename, data, content_type):
+        return f"gs://fake-bucket/compute-jobs/{job_id}/artifacts/files/{filename}"
+
+    with patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        side_effect=_fake_upload,
+    ):
+        result = await compute_backends_module.persist_viewable_artifacts(job)
+
+    assert isinstance(result, tuple) and len(result) == 2
+    manifest, dropped = result
+    assert len(manifest) == _MAX_COUNT
+    assert dropped == 2
+    # Each manifest entry has the required fields
+    entry = manifest[0]
+    assert {"filename", "storage_uri", "content_type", "size_bytes", "kind"} <= entry.keys()
+
+
+@pytest.mark.asyncio
+async def test_persist_viewable_artifacts_returns_zero_dropped_for_small_set(tmp_path):
+    """When files ≤ cap, persist_viewable_artifacts returns dropped == 0."""
+    (tmp_path / "plot.png").write_bytes(_VIEW_PNG_BYTES + b"-only")
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+    job.external_compute_id = None
+
+    async def _fake_upload(job_id, filename, data, content_type):
+        return f"gs://fake/{filename}"
+
+    with patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        side_effect=_fake_upload,
+    ):
+        manifest, dropped = await compute_backends_module.persist_viewable_artifacts(job)
+
+    assert dropped == 0
+    assert len(manifest) == 1
+
+
+def test_extract_viewable_candidates_from_bundle_deterministic_order():
+    """Bundle extractor returns files in the order they appear in the archive.
+
+    Deterministic selection (alphabetical) is applied upstream by
+    _collect_viewable_artifact_candidates; the extractor itself just returns all
+    qualifying candidates without reordering.
+    """
+    # Add files to the archive in reverse-alphabetical order.
+    files = {
+        "./zzz.png": _VIEW_PNG_BYTES + b"-z",
+        "./mmm.png": _VIEW_PNG_BYTES + b"-m",
+        "./aaa.png": _VIEW_PNG_BYTES + b"-a",
+    }
+    bundle = _make_viewable_tar_gz(files)
+    cands = compute_backends_module._extract_viewable_candidates_from_bundle(bundle)
+    assert len(cands) == 3
+    names = [c.filename for c in cands]
+    # Order matches archive insertion — NOT sorted (sorting is upstream's job)
+    assert names == ["zzz.png", "mmm.png", "aaa.png"]
+
