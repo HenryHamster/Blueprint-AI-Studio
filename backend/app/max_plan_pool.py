@@ -232,6 +232,39 @@ def infer_quality_tier_for_model(
     return None
 
 
+def reconcile_model_for_provider(
+    provider: str | LLMProviderName | None,
+    model: str | None,
+    quality_tier: str | None,
+    runtime_config: Mapping[str, Any],
+) -> str | None:
+    """Return a model valid for ``provider``, correcting a cross-provider mispair.
+
+    A task pinned to provider A's model can be dispatched to provider B when A is
+    unavailable (cooldown / no account). If the resolved ``model`` still carries
+    A's id while ``provider`` is B, the runtime is handed e.g.
+    ``provider=anthropic`` + ``model=deepseek-v4-pro`` and the anthropic CLI
+    rejects the foreign id → EXTERNAL_API failure → retries burned → task FAILED.
+
+    When ``model`` demonstrably belongs to a DIFFERENT known provider than
+    ``provider``, re-derive the model from ``provider``'s ``quality_tier`` map so
+    the pair is consistent. Left unchanged when: no provider/model given; the
+    model already belongs to ``provider``; the model infers to None (an
+    operator-custom id absent from every tier map — never clobber an explicit
+    unknown model); or re-derivation yields nothing (no regression vs. today).
+    """
+    normalized_provider = _normalize_provider_name(provider)
+    if not normalized_provider or not model:
+        return model
+    model_provider = infer_provider_for_model(model, runtime_config)
+    if model_provider is None or model_provider == normalized_provider:
+        return model
+    rederived = get_provider(normalized_provider).tier_to_model(
+        quality_tier or DEFAULT_QUALITY_TIER, runtime_config
+    )
+    return rederived or model
+
+
 ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
 _VALID_SELECTION_MODES: frozenset[str] = frozenset(
     {"balanced", "preferred", "exclusive"}

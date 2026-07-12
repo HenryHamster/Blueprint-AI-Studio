@@ -991,6 +991,8 @@ async def orchestrator_worker():
         apply_task_llm_runtime_context,
         clear_task_llm_runtime_context,
         get_task_llm_account_id,
+        reconcile_model_for_provider,
+        resolve_task_quality_tier,
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
@@ -3588,6 +3590,44 @@ async def orchestrator_worker():
                                     )
                                     _pending_warm_pin_clear = None
                                 continue
+
+                        # Cross-provider fallback model guard (EXTERNAL_API mispair
+                        # fix) — applied at the FINAL choke point where
+                        # runtime_provider / runtime_model have their settled values
+                        # from EVERY path (pool selection, account, env-credential
+                        # fallback), just before they are written to the payload,
+                        # context, and agent manifest. A task pinned to provider A's
+                        # model can be dispatched to provider B when A is unavailable;
+                        # if the model id isn't re-derived for B the runtime is handed
+                        # e.g. provider=anthropic + model=deepseek-v4-pro (selection.
+                        # model was None, so `or runtime_model` kept the task's stale
+                        # context.llm_model), and the anthropic CLI rejects the foreign
+                        # id → EXTERNAL_API failure → 3 retries burned → task FAILED
+                        # (and, in a rollup, review-fix iterations wasted). Re-derive a
+                        # model valid for the resolved provider; no-op when already
+                        # consistent or the model is operator-custom (infers to None).
+                        _reconciled_model = reconcile_model_for_provider(
+                            runtime_provider,
+                            runtime_model,
+                            (
+                                runtime_selection.quality_tier
+                                if runtime_selection
+                                else None
+                            )
+                            or resolve_task_quality_tier(task, _runtime_config),
+                            _runtime_config,
+                        )
+                        if _reconciled_model != runtime_model:
+                            logger.warning(
+                                "[ORCHESTRATOR] Cross-provider model mismatch for task "
+                                "%s: provider=%s but model=%s is foreign; re-derived "
+                                "to %s",
+                                task.id,
+                                runtime_provider,
+                                runtime_model,
+                                _reconciled_model,
+                            )
+                            runtime_model = _reconciled_model
 
                         if _sync_task_payload_runtime_fields(
                             task,

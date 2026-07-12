@@ -1422,3 +1422,88 @@ async def test_select_llm_runtime_no_fallback_marker_on_intended_provider(
     assert result is not None
     assert result.provider == "anthropic"
     assert "routing_fallback" not in task.context
+
+
+# ── Cross-provider model reconciliation (EXTERNAL_API mispair fix) ───────────
+# A task pinned to provider A's model can be dispatched to provider B when A is
+# unavailable; if the model id isn't re-derived for B, the runtime is handed a
+# foreign model (e.g. provider=anthropic + model=deepseek-v4-pro) and the CLI
+# rejects it → EXTERNAL_API failure → retries burned → task FAILED. These test
+# reconcile_model_for_provider, the pure guard the orchestrator dispatch applies.
+
+from app.max_plan_pool import (  # noqa: E402
+    infer_provider_for_model,
+    infer_quality_tier_for_model,
+    reconcile_model_for_provider,
+)
+from app.providers.registry import get_provider  # noqa: E402
+
+
+def test_reconcile_corrects_cross_provider_mispair_opus():
+    """provider=anthropic but model=deepseek-v4-pro (deepseek's opus tier) →
+    re-derived to anthropic's opus-tier model, preserving the requested tier."""
+    rc = {}
+    # Precondition: the foreign model really does belong to a different provider.
+    assert infer_provider_for_model("deepseek-v4-pro", rc) == "deepseek"
+    result = reconcile_model_for_provider("anthropic", "deepseek-v4-pro", "opus", rc)
+    assert result != "deepseek-v4-pro"
+    assert infer_provider_for_model(result, rc) == "anthropic"
+    assert infer_quality_tier_for_model("anthropic", result, rc) == "opus"
+
+
+def test_reconcile_preserves_tier_on_haiku_mispair():
+    """The re-derived model matches the resolved quality tier, not just any model
+    for the provider (haiku pin → haiku on the new provider)."""
+    rc = {}
+    assert infer_provider_for_model("deepseek-v4-flash", rc) == "deepseek"
+    result = reconcile_model_for_provider(
+        "anthropic", "deepseek-v4-flash", "haiku", rc
+    )
+    assert infer_provider_for_model(result, rc) == "anthropic"
+    assert infer_quality_tier_for_model("anthropic", result, rc) == "haiku"
+
+
+def test_reconcile_leaves_consistent_pair_untouched():
+    """When the model already belongs to the resolved provider, return it as-is
+    (no needless re-derivation)."""
+    rc = {}
+    assert (
+        reconcile_model_for_provider("deepseek", "deepseek-v4-pro", "opus", rc)
+        == "deepseek-v4-pro"
+    )
+    anthropic_opus = get_provider("anthropic").tier_to_model("opus", rc)
+    assert (
+        reconcile_model_for_provider("anthropic", anthropic_opus, "opus", rc)
+        == anthropic_opus
+    )
+
+
+def test_reconcile_never_clobbers_unknown_model():
+    """An operator-custom model id that infers to no provider is left untouched —
+    the guard only corrects models that demonstrably belong to a DIFFERENT known
+    provider, never an explicit unknown one."""
+    rc = {}
+    assert infer_provider_for_model("acme-custom-model-9000", rc) is None
+    assert (
+        reconcile_model_for_provider(
+            "anthropic", "acme-custom-model-9000", "opus", rc
+        )
+        == "acme-custom-model-9000"
+    )
+
+
+def test_reconcile_handles_missing_inputs():
+    """No provider / no model → return the model unchanged (defensive no-op)."""
+    rc = {}
+    assert reconcile_model_for_provider(None, "deepseek-v4-pro", "opus", rc) == (
+        "deepseek-v4-pro"
+    )
+    assert reconcile_model_for_provider("anthropic", None, "opus", rc) is None
+
+
+def test_reconcile_defaults_tier_when_none():
+    """A None quality_tier falls back to DEFAULT_QUALITY_TIER and still yields a
+    provider-valid model (no crash, no foreign id)."""
+    rc = {}
+    result = reconcile_model_for_provider("anthropic", "deepseek-v4-pro", None, rc)
+    assert infer_provider_for_model(result, rc) == "anthropic"
