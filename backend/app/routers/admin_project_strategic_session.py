@@ -857,27 +857,6 @@ async def _build_strategic_session_response(
     }
 
 
-async def _message_preview_for_session_response(
-    request: Request,
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    current_user: dict,
-    message: ProjectMessage,
-) -> Dict[str, Any]:
-    state_response = await get_project_strategic_state(
-        request,
-        project_id,
-        session=session,
-        current_user=current_user,
-    )
-    return await _message_preview_for_session_state(
-        session,
-        project_id,
-        state_response,
-        message,
-    )
-
-
 async def _message_preview_for_session_state(
     session: AsyncSession,
     project_id: uuid.UUID,

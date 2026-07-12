@@ -298,12 +298,6 @@ _PROVIDER_API_KEY_CONTEXT_MARKERS = {
 }
 
 
-def _has_provider_endpoint_context(provider: str, text: str) -> bool:
-    return any(
-        marker in text for marker in _PROVIDER_AUTH_ENDPOINT_MARKERS.get(provider, ())
-    )
-
-
 def _has_provider_api_key_context(provider: str, text: str) -> bool:
     return any(
         marker in text for marker in _PROVIDER_API_KEY_CONTEXT_MARKERS.get(provider, ())
