@@ -771,9 +771,9 @@ async def commission_proof_earn_loop(
             recorded = record_capability_backing_path_proof(project, raw_name or canonical)
             if recorded:
                 earned_names.append(canonical)
-            else:
-                # Dedup hit: already recorded, count as earned (not a failure).
-                earned_names.append(canonical)
+            # Dedup hit (recorded=False): already stamped in a prior sweep.
+            # Do NOT count as earned — the sweep must not commit on no-op re-runs,
+            # and the capability should not be reported as newly earning proof.
         else:
             still_unproven.append(canonical)
 

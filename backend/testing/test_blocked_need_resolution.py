@@ -1864,6 +1864,93 @@ def test_backing_path_only_capability_stays_gated_under_enforce():
 
 
 # ---------------------------------------------------------------------------
+# End-to-end enforce-gate tests: both consumer seams
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_gate_blocks_and_unblocks_at_blocked_resume_seam():
+    """ACCEPTANCE EVIDENCE (findings test:end-to-end-enforce-gate-blocking-on-both-consumers
+    and test:end-to-end-integration-test-for-capability-proof-gate-enforcement-cycle).
+
+    Blocked-resume seam: full proof-status transition under enforce mode.
+    Phase 1: an unproven working capability routes the need to residual (stays BLOCKED).
+    Phase 2: after proof is recorded (evidence_refs with proven=True), the same need
+    routes to completed_needs (task can resume).
+
+    This exercises _classify_blocker_needs end-to-end — the actual function called by
+    the reaper blocked-resume sweep — with a proof-status transition, not just a
+    predicate toggle.
+
+    The spawn-time seam is covered by
+    test_working_registry_capability_prerequisite_blocks_under_enforce in
+    test_research_completion.py.
+    """
+    import asyncio
+    from app import blocked_task_unblock_sweeps as btu
+    from app.capability_registry import working_capability_proof_status
+
+    # ── Phase 1: unproven working capability → residual (stays BLOCKED) ──
+    unproven_model = {
+        "capabilities": [
+            {"name": "my-cap", "status": "working"},
+        ]
+    }
+    proof_unproven = working_capability_proof_status(unproven_model)
+    assert proof_unproven.get("my-cap") == "unproven"
+
+    task = _capability_blocker_task("my-cap")
+    pid = task.project_id
+    disp_blocked = asyncio.run(
+        btu._classify_blocker_needs(
+            task,
+            None,
+            candidate_cache={pid: []},
+            completed_cache={pid: []},
+            dead_cache={pid: []},
+            knowledge_cache={pid: []},
+            registry_cache={pid: proof_unproven},
+            proof_gate_mode="enforce",
+        )
+    )
+    assert disp_blocked["residual"] == [{"kind": "capability", "ref": "my-cap"}], (
+        "unproven working capability must route to residual (stay BLOCKED) under enforce"
+    )
+    assert disp_blocked["completed_needs"] == []
+
+    # ── Phase 2: proof recorded → completed_needs (task resumes) ──
+    proven_model = {
+        "capabilities": [
+            {
+                "name": "my-cap",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "test_foo::test_bar", "proven": True}
+                ],
+            }
+        ]
+    }
+    proof_proven = working_capability_proof_status(proven_model)
+    assert proof_proven.get("my-cap") == "proven"
+
+    disp_resumed = asyncio.run(
+        btu._classify_blocker_needs(
+            task,
+            None,
+            candidate_cache={pid: []},
+            completed_cache={pid: []},
+            dead_cache={pid: []},
+            knowledge_cache={pid: []},
+            registry_cache={pid: proof_proven},
+            proof_gate_mode="enforce",
+        )
+    )
+    assert disp_resumed["completed_needs"] == [{"kind": "capability", "ref": "my-cap"}], (
+        "after proof is recorded, the need must route to completed_needs (task resumes)"
+    )
+    assert disp_resumed["residual"] == []
+
+
+# ---------------------------------------------------------------------------
 # Auto-graduation sweep integration tests (DB-backed)
 # ---------------------------------------------------------------------------
 

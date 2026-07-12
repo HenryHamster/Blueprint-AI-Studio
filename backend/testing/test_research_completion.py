@@ -8020,6 +8020,75 @@ async def test_working_registry_capability_prerequisite_does_not_block(
 
 
 @_pytest.mark.asyncio
+async def test_working_registry_capability_prerequisite_blocks_under_enforce(
+    db_session, mocker
+):
+    """ACCEPTANCE EVIDENCE (finding feat:enforce-gate-blocking-on-both-consumers).
+    Spawn-time seam: under enforce mode a finding declaring a capability prerequisite
+    that the registry marks 'working' but UNPROVEN must spawn the child BLOCKED
+    with the capability need recorded — the capability exists in the codebase
+    but without machine-verified proof the dependent must not proceed."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.task_blocked import get_blocker_needs
+    from app.shared_state import runtime_config as _rc
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prq09")
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": [
+            # Working but no evidence_refs → unproven
+            {"name": "Budgeted compute job substrate", "status": "working"},
+        ],
+    }
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is not None:
+            _rc["capability_proof_gate_mode"] = saved_mode
+        else:
+            _rc.pop("capability_proof_gate_mode", None)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.BLOCKED, (
+        "under enforce mode, a prerequisite on an unproven working capability "
+        "must park the dependent BLOCKED (spawn-time seam)"
+    )
+    needs = get_blocker_needs(child)
+    assert any(n.get("kind") == "capability" for n in needs), (
+        "BLOCKED task must record the capability need so the resume sweep can "
+        "unblock it once proof is earned"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_planned_registry_capability_prerequisite_still_blocks(
     db_session, mocker
 ):

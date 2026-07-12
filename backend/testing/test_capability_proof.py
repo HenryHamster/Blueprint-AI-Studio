@@ -1527,6 +1527,56 @@ class TestCommissionProofEarnLoop:
         assert result["total_demanded_unproven"] == 1
         assert result["earned"] == 1
 
+    @pytest.mark.asyncio
+    async def test_dedup_hit_not_counted_as_earned(self):
+        """ACCEPTANCE EVIDENCE (fix: earn loop masks no-progress, reports dedup as earned).
+
+        A second call to commission_proof_earn_loop for a capability that already
+        has a backing_path proof record (dedup hit from a prior sweep) must NOT
+        count the dedup as 'earned'. The fix ensures earned=0 so the reaper sweep
+        does not commit unnecessarily on no-op re-runs.
+        """
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {"capabilities": [
+            {"name": "my-cap", "status": "working",
+             "backing_paths": ["backend/app/capability_proof.py"]},
+        ]}
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        with patch("app.capability_proof.flag_modified"):
+            # First call: genuinely earns the proof.
+            result1 = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "my-cap", "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+            assert result1["earned"] == 1, "first call must earn the proof"
+
+            # Second call: dedup hit — must NOT count as earned.
+            result2 = await commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": [
+                    {"kind": "capability", "ref": "my-cap", "dependent_count": 2},
+                ]},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+            assert result2["earned"] == 0, (
+                "dedup hit (backing_path already recorded) must NOT be counted "
+                "as earned — the sweep must not commit on no-op re-runs"
+            )
+            # Not a failure either: the dedup is not in still_unproven.
+            assert "my-cap" not in result2["still_unproven"], (
+                "dedup hit must not be reported as still_unproven — "
+                "paths are present and a backing_path record already exists"
+            )
+
 
 # ── proof_exempt capability exemption ──────────────────────────────────────────
 
