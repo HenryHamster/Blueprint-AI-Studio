@@ -934,21 +934,6 @@ async def refresh_strategic_local_continuation_on_runner_heartbeat(
     return False
 
 
-async def upsert_strategic_workbench_state(
-    session: AsyncSession,
-    user_id: str,
-    project_id: uuid.UUID,
-    raw_state: dict[str, Any],
-) -> dict[str, Any]:
-    _previous, state = await upsert_strategic_workbench_state_with_previous(
-        session,
-        user_id,
-        project_id,
-        raw_state,
-    )
-    return state
-
-
 async def upsert_strategic_workbench_state_with_previous(
     session: AsyncSession,
     user_id: str,

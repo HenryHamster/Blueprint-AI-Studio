@@ -474,11 +474,6 @@ def _mutation_body(command: Mapping[str, Any]) -> Mapping[str, Any]:
     return body if isinstance(body, Mapping) else {}
 
 
-def _workbench_body(command: Mapping[str, Any]) -> Mapping[str, Any]:
-    workbench = _mutation_body(command).get("workbench")
-    return workbench if isinstance(workbench, Mapping) else {}
-
-
 def _project_id_text(project_id: Any | None, target: Mapping[str, Any]) -> str | None:
     if project_id is not None:
         return str(project_id)
