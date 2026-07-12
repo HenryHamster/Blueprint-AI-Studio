@@ -1568,6 +1568,77 @@ async def test_sweep_groups_endpoint_omits_incomplete_planned_sweep(
 
 
 @pytest.mark.asyncio
+async def test_single_job_arms_experiment_appears_in_sweep_groups(
+    client: AsyncClient, db_session
+):
+    """A completed single-job multi-arm experiment (no sweep_id in payload) must
+    appear in sweep_groups once its KnowledgeDocument carries the synthesized
+    sweep_id ('single-{task.id}') and per_arm_verdicts with >=2 arms."""
+    project = await _make_project(db_session, name="Single-Job Arms Sweep")
+    await _add_member(db_session, project.id, "viewer")
+
+    # Single-task arms experiment: payload has no sweep_id.
+    task = Task(
+        project_id=project.id,
+        title="single-job arms experiment",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "arms": [
+                    {"experiment": "control"},
+                    {"experiment": "treatment"},
+                ],
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # _persist_compute_knowledge_document now synthesizes this sweep_id for
+    # single-job arms experiments; we seed it directly to test the query path.
+    synthesized_sweep_id = f"single-{task.id}"
+
+    per_arm = {
+        "control": {"met": True, "value": 0.85, "cost_usd": 0.10},
+        "treatment": {"met": False, "value": 0.72, "cost_usd": 0.12},
+    }
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title="Single-job arms result",
+        summary="Comparison of control vs treatment.",
+        body="# Arms comparison\nControl won.",
+        topic="arms-sweep",
+        sweep_id=synthesized_sweep_id,
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "per_arm_verdicts": per_arm,
+        },
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups"
+    )
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert synthesized_sweep_id in groups, (
+        f"single-job arms sweep '{synthesized_sweep_id}' missing from sweep_groups"
+    )
+    entries = groups[synthesized_sweep_id]
+    assert len(entries) == 2
+    arm_labels = {e["arm_label"] for e in entries}
+    assert arm_labels == {"control", "treatment"}
+    criterion_map = {e["arm_label"]: e["criterion_met"] for e in entries}
+    assert criterion_map["control"] is True
+    assert criterion_map["treatment"] is False
+
+
+@pytest.mark.asyncio
 async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_session):
     """A user with no project membership receives 404 from the sweep-groups endpoint."""
     project = await _make_project(db_session, name="Sweep Groups No Access")
@@ -2588,6 +2659,69 @@ async def test_awaiting_local_runner_viewer_ok_non_member_404(
     )
     assert resp.status_code == 200
     assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_endpoint_surfaces_forced_runner_hold(
+    client: AsyncClient, db_session
+):
+    """A compute_experiment held for its FORCED runner (awaiting_forced_runner_since,
+    no awaiting_local_runner_since) is surfaced and distinguishable, exposing the
+    forced target runner id/hostname and the forced held-since stamp."""
+    from app.models import LocalRunner
+    from app import auth as auth_mod
+
+    project = await _make_project(db_session, name="Forced Hold Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        hostname="dgx-1",
+        status="active",
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        title="forced-held experiment",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python run.py",
+                "spend_cap_usd": 4.0,
+                "deadline_seconds": 600,
+            }
+        ],
+        context={
+            "forced_runner_target_id": str(runner.id),
+            "awaiting_forced_runner_since": "2026-07-05T12:00:00+00:00",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [e["id"] for e in body]
+    assert str(task.id) in ids, "forced hold must be surfaced by the awaiting endpoint"
+    entry = next(e for e in body if e["id"] == str(task.id))
+    # Distinguishable from a generic enforce-local hold.
+    assert entry["awaiting_local_runner_since"] is None
+    assert entry["awaiting_forced_runner_since"] == "2026-07-05T12:00:00+00:00"
+    assert entry["forced_runner_target_id"] == str(runner.id)
+    assert entry["forced_runner"] is not None
+    assert entry["forced_runner"]["hostname"] == "dgx-1"
+    assert entry["forced_runner"]["id"] == str(runner.id)
 
 
 @pytest.mark.asyncio

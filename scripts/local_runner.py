@@ -559,6 +559,39 @@ def _disk_free_bytes(root: str | None) -> int | None:
         return None
 
 
+def _gpu_free_vram_mib() -> list[int] | None:
+    """Per-GPU free VRAM in MiB for all GPUs on this host, best-effort/nullable.
+
+    Queries ``nvidia-smi --query-gpu=memory.free``. Returns a list with one entry
+    per GPU (index-aligned with gpu_names). Returns None on any failure.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    vals: list[int] = []
+    for line in result.stdout.splitlines():
+        tok = line.strip()
+        if not tok:
+            continue
+        try:
+            vals.append(max(0, int(float(tok))))
+        except ValueError:
+            continue
+    return vals if vals else None
+
+
 def _gpu_utilization_pct() -> int | None:
     """Max GPU utilization (0–100) across this host's GPUs, best-effort/nullable.
 
@@ -1556,6 +1589,7 @@ def _heartbeat_loop(
                 "cpu_load_avg": _cpu_load_avg(),
                 "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
+                "gpu_free_vram_mib": _gpu_free_vram_mib() if has_gpu else None,
                 **gpu_capabilities,
             }
             status, resp_body = _post(url, token, body)

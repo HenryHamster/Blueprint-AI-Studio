@@ -32,10 +32,16 @@ from app.compute_jobs_aggregation import (
     aggregate_criterion_summary,
 )
 from app.database import get_session
-from app.models import Artifact, ComputeJob, ComputeJobStatus, LocalRunner, Task
+from app.models import (
+    Artifact,
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    Task,
+    TaskStatus,
+)
 from app.schemas import serialize_compute_job_response_safe
 from app.strategic_runtime_work import (
-    local_runner_hold_task_filters,
     task_awaiting_local_runner_since,
 )
 from app.task_evaluators import (
@@ -227,6 +233,16 @@ async def _build_compute_job_payload(
                 runner_target_ids.add(uuid.UUID(str(raw_id)))
             except (ValueError, AttributeError):
                 pass
+        # An operator's forced runner pin lives on the launching task's context,
+        # not the job row; batch its hostname in the same query so the forced
+        # target is resolvable even when the job is held (no claimed pin yet).
+        _tmeta = task_meta.get(job.task_id)
+        _forced_raw = (_tmeta[4].context or {}).get("forced_runner_target_id") if _tmeta and _tmeta[4] is not None else None
+        if _forced_raw:
+            try:
+                runner_target_ids.add(uuid.UUID(str(_forced_raw)))
+            except (ValueError, AttributeError):
+                pass
     runner_map: Dict[uuid.UUID, LocalRunner] = {}
     if runner_target_ids:
         runner_rows = (
@@ -352,10 +368,36 @@ async def _build_compute_job_payload(
         # awaiting_local_runner_since lives on the launching task's context, not
         # the job row. The task_obj is already loaded in the batch above.
         awaiting: str | None = None
+        forced_runner_target_id: str | None = None
+        awaiting_forced: str | None = None
+        forced_runner_descriptor: Dict[str, Any] | None = None
         if task_obj is not None:
-            raw_awaiting = (task_obj.context or {}).get("awaiting_local_runner_since")
+            tctx = task_obj.context or {}
+            raw_awaiting = tctx.get("awaiting_local_runner_since")
             awaiting = str(raw_awaiting) if raw_awaiting else None
+            # Operator HARD runner pin (and its held-since stamp) so the UI can
+            # distinguish a forced-runner hold from a generic awaiting-local hold.
+            raw_forced = tctx.get("forced_runner_target_id")
+            forced_runner_target_id = str(raw_forced) if raw_forced else None
+            raw_awaiting_forced = tctx.get("awaiting_forced_runner_since")
+            awaiting_forced = (
+                str(raw_awaiting_forced) if raw_awaiting_forced else None
+            )
+            if forced_runner_target_id:
+                try:
+                    forced_obj = runner_map.get(uuid.UUID(forced_runner_target_id))
+                    if forced_obj is not None:
+                        forced_runner_descriptor = {
+                            "id": str(forced_obj.id),
+                            "hostname": forced_obj.hostname,
+                            "status": forced_obj.status,
+                        }
+                except (ValueError, AttributeError):
+                    pass
         data["awaiting_local_runner_since"] = awaiting
+        data["forced_runner_target_id"] = forced_runner_target_id
+        data["awaiting_forced_runner_since"] = awaiting_forced
+        data["forced_runner"] = forced_runner_descriptor
         payload.append(data)
     return payload
 
@@ -415,17 +457,26 @@ async def get_project_compute_jobs(
     }
 
 
-def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
-    """Serialize a compute_experiment task held awaiting a local runner.
+def _awaiting_local_runner_entry(
+    task: Task, runner_map: Dict[uuid.UUID, LocalRunner] | None = None
+) -> Dict[str, Any]:
+    """Serialize a compute_experiment task held awaiting a runner.
 
     These tasks have NO ComputeJob row (the orchestrator holds them QUEUED
     before any job is created), so this is the only surface that exposes them.
-    The response shape is a stable contract the compute-workspace UI depends on:
+    A hold is one of two kinds, distinguishable by which ``*_since`` stamp is set:
+    a generic enforce-local hold (``awaiting_local_runner_since``) or an operator
+    HARD-pin hold (``awaiting_forced_runner_since`` + ``forced_runner_target_id``,
+    which never falls back to another runner). The response shape is a stable
+    contract the compute-workspace UI depends on:
 
         {
           "id": str,                            # task id
           "title": str | None,
-          "awaiting_local_runner_since": str,   # ISO stamp from task.context
+          "awaiting_local_runner_since": str | None,   # ISO stamp from task.context
+          "awaiting_forced_runner_since": str | None,  # ISO stamp (forced-pin hold)
+          "forced_runner_target_id": str | None,       # resolved runner UUID
+          "forced_runner": {id,hostname,status} | None,# resolved forced runner
           "created_at": str | None,             # ISO
           "requires_approval": bool,
           "spend_cap_usd": float | None,        # launch essentials from payload
@@ -440,10 +491,30 @@ def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
     fp = task.first_payload
     raw_spend = fp.get("spend_cap_usd")
     raw_deadline = fp.get("deadline_seconds")
+    tctx = task.context or {}
+    raw_forced = tctx.get("forced_runner_target_id")
+    forced_runner_target_id = str(raw_forced) if raw_forced else None
+    raw_awaiting_forced = tctx.get("awaiting_forced_runner_since")
+    awaiting_forced = str(raw_awaiting_forced) if raw_awaiting_forced else None
+    forced_runner_descriptor: Dict[str, Any] | None = None
+    if forced_runner_target_id and runner_map:
+        try:
+            forced_obj = runner_map.get(uuid.UUID(forced_runner_target_id))
+            if forced_obj is not None:
+                forced_runner_descriptor = {
+                    "id": str(forced_obj.id),
+                    "hostname": forced_obj.hostname,
+                    "status": forced_obj.status,
+                }
+        except (ValueError, AttributeError):
+            pass
     return {
         "id": str(task.id),
         "title": task.title,
         "awaiting_local_runner_since": task_awaiting_local_runner_since(task),
+        "awaiting_forced_runner_since": awaiting_forced,
+        "forced_runner_target_id": forced_runner_target_id,
+        "forced_runner": forced_runner_descriptor,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "requires_approval": bool(task.requires_approval),
         "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
@@ -470,20 +541,37 @@ async def get_project_awaiting_local_runner_holds(
     ComputeJob row. The regular ``/compute-jobs`` listing only surfaces ComputeJob
     rows, so these blocked experiments are otherwise invisible in the workspace.
 
-    Returns a JSON list (newest ``created_at`` first). The filter is the shared
-    ``local_runner_hold_task_filters`` predicate: QUEUED, not archived,
-    ``requires_approval`` is not True, payload type ``compute_experiment``, and a
-    non-empty awaiting stamp. Each entry's shape is documented on
+    Returns a JSON list (newest ``created_at`` first). Two hold kinds are surfaced:
+    a generic enforce-local hold (``awaiting_local_runner_since``) AND an operator
+    HARD-pin hold (``awaiting_forced_runner_since``, which never falls back to
+    another runner). The base predicate mirrors ``local_runner_hold_task_filters``
+    (QUEUED, not archived, ``requires_approval`` is not True, payload type
+    ``compute_experiment``) but the awaiting stamp is an OR over both kinds so a
+    forced-pin hold is not silently dropped. Each entry's shape is documented on
     ``_awaiting_local_runner_entry`` and is a stable contract for the UI.
     """
+    from sqlalchemy import and_, or_
+
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
+    awaiting_local = Task.context["awaiting_local_runner_since"].as_string()
+    awaiting_forced = Task.context["awaiting_forced_runner_since"].as_string()
     rows = (
         (
             await session.execute(
                 select(Task)
-                .where(*local_runner_hold_task_filters(project_id))
+                .where(
+                    Task.project_id == project_id,
+                    Task.archived.is_(False),
+                    Task.status == TaskStatus.QUEUED,
+                    Task.requires_approval.is_not(True),
+                    Task.payloads[0]["type"].as_string() == "compute_experiment",
+                    or_(
+                        and_(awaiting_local.is_not(None), awaiting_local != ""),
+                        and_(awaiting_forced.is_not(None), awaiting_forced != ""),
+                    ),
+                )
                 .order_by(Task.created_at.desc())
                 .limit(500)
             )
@@ -491,7 +579,29 @@ async def get_project_awaiting_local_runner_holds(
         .scalars()
         .all()
     )
-    return [_awaiting_local_runner_entry(task) for task in rows]
+    # Batch-load the forced-target runners referenced by these holds so each entry
+    # can carry the resolved hostname/status (one query for the whole page).
+    forced_ids: set[uuid.UUID] = set()
+    for task in rows:
+        raw_forced = (task.context or {}).get("forced_runner_target_id")
+        if raw_forced:
+            try:
+                forced_ids.add(uuid.UUID(str(raw_forced)))
+            except (ValueError, AttributeError):
+                pass
+    runner_map: Dict[uuid.UUID, LocalRunner] = {}
+    if forced_ids:
+        runner_rows = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(LocalRunner.id.in_(forced_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        runner_map = {r.id: r for r in runner_rows}
+    return [_awaiting_local_runner_entry(task, runner_map) for task in rows]
 
 
 @router.get("/projects/{project_id}/compute-jobs/summary")

@@ -77,6 +77,14 @@ _SECTION_PREFIXES: dict[str, str] = {
 # order); older entries are evicted.
 _MAX_RECORDED_SHAS = 50
 
+# Process-level registry of in-flight CI-compliance evaluations keyed by
+# ``"{project_id}:{sha}"``. When a cache miss triggers a new evaluation, the
+# coroutine is wrapped in a task and registered here. Concurrent requests for
+# the SAME (project, SHA) pair await the SAME task rather than spawning duplicate
+# full-evaluation round-trips to GitHub (which are expensive: 200+ file reads).
+# Entries are removed once the task completes (success or exception).
+_in_flight_evals: dict[str, asyncio.Task[dict[str, Any]]] = {}
+
 # Maximum concurrent GitHub API requests for file reads. The three scan helpers
 # (_scan_capped_files, _scan_uncapped_files, _scan_branch_literals) parallelize
 # per-file fetches with asyncio.gather across potentially 200+ files. Without a
@@ -691,13 +699,29 @@ async def ensure_current_ci_compliance(
     stored = get_ci_compliance(project, head_sha)
     computed = False
     if not isinstance(stored, dict):
-        stored = await evaluate_ci_compliance_at_ref(
-            token=token,
-            owner=owner,
-            repo=repo,
-            ref=head_sha,
-            project_id=str(project.id),
-        )
+        flight_key = f"{project.id}:{head_sha}"
+        if flight_key in _in_flight_evals:
+            # Another coroutine is already computing this SHA — await its result
+            # instead of spawning a duplicate evaluation (coalescing).
+            try:
+                stored = await _in_flight_evals[flight_key]
+            except Exception:
+                stored = get_ci_compliance(project, head_sha) or {}
+        else:
+            task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+                evaluate_ci_compliance_at_ref(
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=head_sha,
+                    project_id=str(project.id),
+                )
+            )
+            _in_flight_evals[flight_key] = task
+            try:
+                stored = await task
+            finally:
+                _in_flight_evals.pop(flight_key, None)
         record_ci_compliance(project, stored)
         session.add(project)
         await session.flush()

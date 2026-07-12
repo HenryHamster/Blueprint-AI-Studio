@@ -475,6 +475,11 @@ export interface VersionCriterionCoverage {
   superseded?: number;
   inactive?: number;
   stuck_count?: number;
+  /** Per-reason merge-evidence gap accumulator.
+   *  Records counts per reason_key (no_criteria, verdict_not_proven, no_active_criteria,
+   *  no_open_version) and an optional list of criterion IDs that found no active row
+   *  (unmatched_criterion_ids). Null/undefined until the first gap is recorded. */
+  merge_evidence_gaps?: Record<string, number | string[]> | null;
   criteria: CriterionCoverageEntry[];
 }
 

@@ -1646,6 +1646,8 @@ export default function App() {
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
+          fleetRunners={s.fleetRunners}
+          fleetRunnersLoading={s.fleetRunnersLoading}
         />
         </Suspense>
       )}

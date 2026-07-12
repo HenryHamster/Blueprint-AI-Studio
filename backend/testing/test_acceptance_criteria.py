@@ -899,26 +899,25 @@ async def test_attestation_approaching_expiry_warns_before_lapse(db_session):
 
 def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
     """When NO criterion carries machine-verified evidence (covered=0, attested>0),
-    the attestation penalty is DOUBLED — escalation beyond the flat proportional penalty.
+    compute_composite HARD-BLOCKS with blocker='uncorroborated_attestation' and
+    confidence=0.0 — the one-coverage-gate policy ships a hard block rather than
+    a doubled penalty for entirely uncorroborated versions.
 
-    The flat penalty (ATTESTATION_PENALTY_WEIGHT * attested/total) applies when at
-    least one criterion has machine-verified coverage.  When ALL attested criteria
-    are uncorroborated (covered == 0), the penalty is multiplied by
-    UNCORROBORATED_PENALTY_MULTIPLIER so a version that relied entirely on operator
-    waivers scores visibly lower.
+    When at least one criterion has machine-verified coverage (covered>0), a flat
+    proportional penalty (ATTESTATION_PENALTY_WEIGHT * attested/total) applies
+    instead and promotion is allowed.
     """
     from app.release_scoring import (
         compute_composite,
         ATTESTATION_PENALTY_WEIGHT,
-        UNCORROBORATED_PENALTY_MULTIPLIER,
     )
 
     policy = {"threshold": 0.75}
 
     # Case 1: Uncorroborated — all criteria are attested-only, zero machine evidence.
-    # flat penalty = ATTESTATION_PENALTY_WEIGHT * (2/2) = 0.15
-    # escalated    = 0.15 * UNCORROBORATED_PENALTY_MULTIPLIER(2.0) = 0.30
-    # confidence   = 1.0 * (1 - 0.30) = 0.70
+    # Hard-blocks with blocker='uncorroborated_attestation' and confidence=0.0.
+    # The UNCORROBORATED_PENALTY_MULTIPLIER escalation path is unreachable dead code
+    # because the hard-block at release_scoring.py:607-615 fires first.
     result = compute_composite(
         ci_green=True,
         audit_score=1.0,
@@ -933,14 +932,14 @@ def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
             "uncovered": 0,
         },
     )
-    assert result["blocker"] is None
-    expected_penalty = ATTESTATION_PENALTY_WEIGHT * (2 / 2) * UNCORROBORATED_PENALTY_MULTIPLIER
-    assert result["confidence"] == pytest.approx(1.0 * (1.0 - expected_penalty))
+    assert result["blocker"] == "uncorroborated_attestation"
+    assert result["confidence"] == 0.0
+    assert result["promote"] is False
     assert result["sub_scores"].get("uncorroborated_attested") is True
 
     # Case 2: Corroborated — attestation exists alongside machine-verified evidence.
     # flat penalty = ATTESTATION_PENALTY_WEIGHT * (1/2) = 0.075
-    # NO escalation because covered=1 > 0.
+    # NO hard-block because covered=1 > 0.
     # confidence   = 1.0 * (1 - 0.075) = 0.925
     result2 = compute_composite(
         ci_green=True,
@@ -3186,7 +3185,7 @@ def test_timestampless_attestation_expires_by_recorded_at():
     expected = recent + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
     assert abs((expires_dt - expected).total_seconds()) < 2
 
-    # recorded_at=None → valid (no reference point) and expires_at=None.
+    # recorded_at=None → no reference point means NOT attested (not perpetual trust).
     ev_no_rec = CriterionEvidence(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -3195,8 +3194,49 @@ def test_timestampless_attestation_expires_by_recorded_at():
         detail=None,
         recorded_at=None,
     )
-    assert ac._evidence_is_attested(ev_no_rec) is True
+    assert ac._evidence_is_attested(ev_no_rec) is False
     assert ac._compute_attestation_expires_at([ev_no_rec]) is None
+
+
+def test_attestation_without_timestamps_not_perpetual():
+    """An operator_attestation with no timestamps must NOT grant perpetual trust.
+
+    When both attested_at (in detail) and recorded_at are absent, _evidence_is_attested
+    must return False — a missing timestamp cannot be treated as forever-valid.
+    This covers both the no-attested_at branch and the unparseable-attested_at branch.
+    """
+    # No attested_at in detail, no recorded_at → must NOT be treated as attested.
+    ev_no_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail=None,
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_no_ts) is False, (
+        "operator_attestation with no timestamps must not grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_no_ts]) == "partial"
+
+    # Unparseable attested_at, no recorded_at → also must NOT be attested.
+    ev_bad_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail={"attested_at": "not-a-date"},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_bad_ts) is False, (
+        "operator_attestation with unparseable attested_at and no recorded_at must not "
+        "grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_bad_ts]) == "partial"
+
+    # _compute_attestation_expires_at returns None (no reference point).
+    assert ac._compute_attestation_expires_at([ev_no_ts]) is None
+    assert ac._compute_attestation_expires_at([ev_bad_ts]) is None
 
 
 @pytest.mark.asyncio

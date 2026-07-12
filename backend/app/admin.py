@@ -46,6 +46,7 @@ from app.models import (
     TaskHistory,
     Project,
     ProjectMember,
+    LocalRunner,
     ProjectMessage,
     Artifact,
     ArtifactType,
@@ -2178,6 +2179,13 @@ class ComputeExperimentTaskPayload(BaseModel):
     require_live_release: bool = False
     require_durable_artifact: bool = False
     provisioning_model: str | None = None
+    # Operator HARD runner pin (distinct from the internal soft affinity hint):
+    # a LocalRunner UUID OR a runner hostname (the operator thinks in host names
+    # like ``dgx-1``). Resolved at launch against this project's registered,
+    # non-deleted runners and stamped into task.context['forced_runner_target_id'];
+    # dispatch then runs the job ONLY on that runner, holding QUEUED (never falling
+    # back to another runner or to cloud) whenever it is offline / ineligible.
+    runner_target_id: str | None = Field(default=None, max_length=255)
     # Container-aware runner fields (parity with the research/plan authoring path):
     # required for CUDA/NGC stacks (e.g. nvcr.io images) or the command runs bare.
     # The registry password is only ever persisted for runner-subprocess jobs.
@@ -2963,6 +2971,78 @@ async def compute_experiment_preflight(
     }
 
 
+async def _resolve_forced_runner_target(
+    session: AsyncSession, project_id: uuid.UUID, runner_target: str
+) -> str:
+    """Resolve an operator runner target (UUID or hostname) to a LocalRunner UUID.
+
+    The operator may pass either a LocalRunner UUID or a host name (e.g. ``dgx-1``).
+    Resolution is scoped to the project's own registered, non-deleted runners. A
+    runner that is currently OFFLINE still resolves — the operator may launch ahead
+    of the box coming up; only membership (belongs to this project) and non-deletion
+    are required. Returns the resolved runner UUID string. Raises HTTP 422 with a
+    clear message when the target does not resolve to a runner owned by this project.
+    """
+    target = (runner_target or "").strip()
+    if not target:
+        raise HTTPException(
+            status_code=422,
+            detail="runner_target_id must be a non-empty runner UUID or hostname",
+        )
+    # Prefer a UUID match (operator pasted a runner id) before a hostname match.
+    parsed: uuid.UUID | None = None
+    try:
+        parsed = uuid.UUID(target)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+    if parsed is not None:
+        runner = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(
+                        LocalRunner.id == parsed,
+                        LocalRunner.project_id == project_id,
+                        LocalRunner.status != "deleted",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if runner is not None:
+            return str(runner.id)
+    # Fall back to a hostname match; when several rows share a hostname (re-enroll),
+    # take the most recently seen so a live box wins over a stale duplicate.
+    matches = (
+        (
+            await session.execute(
+                select(LocalRunner)
+                .where(
+                    LocalRunner.project_id == project_id,
+                    LocalRunner.hostname == target,
+                    LocalRunner.status != "deleted",
+                )
+                .order_by(LocalRunner.last_seen_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if matches:
+        return str(matches[0].id)
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "error": "forced_runner_not_found",
+            "message": (
+                f"runner_target_id {target!r} does not resolve to a registered, "
+                "non-deleted runner belonging to this project"
+            ),
+            "requested": target,
+        },
+    )
+
+
 @router.post("/tasks/compute-experiment")
 @limiter.limit("60/minute")
 async def create_compute_experiment_task(
@@ -3009,6 +3089,15 @@ async def create_compute_experiment_task(
         await session.commit()
 
     await backfill_branch_columns(session, project_id=project.id)
+
+    # Resolve an operator HARD runner pin (UUID or hostname) against this project's
+    # own registered runners BEFORE persisting the task. A 422 here means the target
+    # is unknown/foreign — fail fast rather than create a task that can never run.
+    forced_runner_id: str | None = None
+    if payload.runner_target_id is not None and payload.runner_target_id.strip():
+        forced_runner_id = await _resolve_forced_runner_target(
+            session, project.id, payload.runner_target_id
+        )
 
     resolved_base_branch = (
         payload.base_branch or _get_project_promotion_target_for_task(project)
@@ -3239,6 +3328,9 @@ async def create_compute_experiment_task(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         idempotency_key=scoped_idempotency_key,
+        context=(
+            {"forced_runner_target_id": forced_runner_id} if forced_runner_id else {}
+        ),
     )
     session.add(new_task)
     try:
@@ -3306,6 +3398,10 @@ class RerunComputeExperimentPayload(BaseModel):
     success_criterion: ComputeSuccessCriterion | None = None
     spend_cap_usd: float | None = Field(default=None, gt=0)
     deadline_seconds: int | None = Field(default=None, gt=0)
+    # Optional forced runner pin override (UUID or hostname). When omitted the
+    # re-run INHERITS the source task's forced pin (if any); when supplied it
+    # replaces it (resolved against the project's registered runners).
+    runner_target_id: str | None = Field(default=None, max_length=255)
 
 
 @router.post("/tasks/{task_id}/rerun")
@@ -3370,6 +3466,20 @@ async def rerun_compute_experiment(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Forced runner pin: an explicit override resolves against the project's
+    # runners; otherwise inherit the source task's forced pin (if any).
+    if payload.runner_target_id is not None and payload.runner_target_id.strip():
+        forced_runner_id: str | None = await _resolve_forced_runner_target(
+            session, project.id, payload.runner_target_id
+        )
+    else:
+        raw_inherited = (source.context or {}).get("forced_runner_target_id")
+        forced_runner_id = (
+            str(raw_inherited).strip()
+            if isinstance(raw_inherited, str) and raw_inherited.strip()
+            else None
+        )
+
     requires_approval, _ = resolve_compute_spend_approval(
         runtime_config=_runtime_config,
         direction=None,
@@ -3388,6 +3498,9 @@ async def rerun_compute_experiment(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         parent_task_id=source.id,
+        context=(
+            {"forced_runner_target_id": forced_runner_id} if forced_runner_id else {}
+        ),
     )
     session.add(new_task)
     await session.commit()

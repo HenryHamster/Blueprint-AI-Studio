@@ -257,7 +257,7 @@ def _evidence_is_attested(e: CriterionEvidence) -> bool:
         # No attested_at key — fall back to recorded_at so the attestation is
         # still time-bounded (a missing timestamp cannot grant perpetual trust).
         if e.recorded_at is None:
-            return True
+            return False
         return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
             days=ATTESTATION_WINDOW_DAYS
         )
@@ -267,7 +267,7 @@ def _evidence_is_attested(e: CriterionEvidence) -> bool:
         # Unparseable timestamp — fall back to recorded_at so the attestation is
         # still time-bounded even when attested_at is corrupt.
         if e.recorded_at is None:
-            return True
+            return False
         return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
             days=ATTESTATION_WINDOW_DAYS
         )

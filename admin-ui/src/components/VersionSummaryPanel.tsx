@@ -117,6 +117,46 @@ function TypeCountBadge({ taskType, count }: { taskType: string; count: number }
   );
 }
 
+const GAP_REASON_LABELS: Record<string, string> = {
+  no_criteria: 'no criteria',
+  verdict_not_proven: 'verdict not proven',
+  no_active_criteria: 'no active criteria',
+  no_open_version: 'no open version',
+};
+
+function MergeEvidenceGapBreakdown({ gaps }: { gaps: Record<string, number | string[]> | null | undefined }): JSX.Element | null {
+  if (gaps == null) return null;
+  const entries = Object.entries(gaps)
+    .filter(([key, val]) => key !== 'unmatched_criterion_ids' && typeof val === 'number' && val > 0)
+    .map(([key, val]) => ({
+      key,
+      count: val as number,
+      label: GAP_REASON_LABELS[key] ?? key.replace(/_/g, ' '),
+    }));
+  if (entries.length === 0) return null;
+
+  const unmatchedIds: string[] = (Array.isArray(gaps.unmatched_criterion_ids) ? gaps.unmatched_criterion_ids : []) as string[];
+
+  return (
+    <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5" data-testid="merge-evidence-gap-breakdown">
+      {entries.map(e => (
+        <span key={e.key} className="text-ui-sm text-amber-400/70" data-testid={`gap-reason-${e.key}`}>
+          {e.count} {e.label}
+        </span>
+      ))}
+      {unmatchedIds.length > 0 && (
+        <span
+          className="text-ui-sm text-amber-400/50 cursor-default"
+          data-testid="gap-unmatched-ids"
+          title={`Unmatched criterion IDs: ${unmatchedIds.join(', ')}`}
+        >
+          {unmatchedIds.length} unmatched
+        </span>
+      )}
+    </span>
+  );
+}
+
 const BUCKET_META: Record<string, { label: string; className: string }> = {
   undeclared:                { label: 'no criteria',    className: 'text-amber-400' },
   declared_unsatisfied:      { label: 'criteria failed', className: 'text-red-400' },
@@ -145,6 +185,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
       <div className="mb-3" data-testid="criterion-coverage-panel">
         <div className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 mb-1">Version acceptance criteria</div>
         <div className="text-ui-sm text-slate-500 italic">No acceptance criteria defined for this version.</div>
+        <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       </div>
     );
   }
@@ -192,6 +233,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
           </span>
         )}
       </div>
+      <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       <ul className="space-y-1">
         {coverage.criteria.map((c) => {
           const badge = COVERAGE_BADGE[c.coverage];

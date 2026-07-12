@@ -540,7 +540,7 @@ export async function handleStrategicResident(
     return result;
   }
 
-  const runTurn = async (content: string | ContentBlock[], operator: boolean): Promise<ResidentTurnResult> => {
+  const runTurn = async (content: string | ContentBlock[], operator: boolean, pickupLagMs?: number | null): Promise<ResidentTurnResult> => {
     const full: string | ContentBlock[] = typeof content === 'string'
       ? (firstTurnSent ? content : `${bootstrapPrompt}\n\n---\n\n${content}`)
       : (firstTurnSent ? content : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...content]);
@@ -571,6 +571,7 @@ export async function handleStrategicResident(
       toolCallCount: r.toolCallCount,
       toolCallDurationMs: r.totalToolCallDurationMs,
       meanInterTokenMs: r.meanInterTokenMs,
+      pickupLagMs: pickupLagMs ?? null,
     });
     return r;
   };
@@ -871,7 +872,23 @@ export async function handleStrategicResident(
       const msgs = await pollMessages();
       if (msgs.length > 0) {
         streamer.status('operator message received — responding');
-        const r = await runTurn(combineOperatorMessages(msgs), true);
+        // Measure pickup lag: time from when the MOST RECENT operator message
+        // was created (server-side) to now. Uses server-absolute created_at
+        // timestamps so agent-VM / backend clock drift doesn't inflate the lag.
+        const pickupLagMs = (() => {
+          const now = Date.now();
+          let maxCreatedMs = 0;
+          for (const m of msgs) {
+            if (typeof m.created_at === 'string') {
+              const t = new Date(m.created_at).getTime();
+              if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
+            }
+          }
+          if (maxCreatedMs <= 0) return null;
+          const lag = now - maxCreatedMs;
+          return lag >= 0 ? lag : null;
+        })();
+        const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
         if (turnWedgedSession(r)) break;
         await persistReply(r);
         // Check context-window pressure after the turn: compact if needed.

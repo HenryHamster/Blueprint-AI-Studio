@@ -62,13 +62,6 @@ DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
 # machine evidence, not a hard block).  Configurable in one place.
 ATTESTATION_PENALTY_WEIGHT = 0.15
 
-#: Additional penalty multiplier applied when NO criterion carries machine-verified
-#: evidence (``coverage["covered"] == 0``) — i.e., every ``"attested"`` criterion
-#: is a pure operator waiver with zero machine corroboration.  The flat
-#: ATTESTATION_PENALTY_WEIGHT penalises the existence of attestations; this
-#: multiplier escalates when those attestations are completely uncorroborated.
-UNCORROBORATED_PENALTY_MULTIPLIER = 2.0
-
 # Confidence penalty applied when a version's acceptance criteria include
 # those covered ONLY by unverified-merge backfill evidence — the test file
 # shipped in the PR's changed files, but the merge was never CI-verified.
@@ -906,10 +899,6 @@ def compute_composite(
     # ``category_verdicts`` and take the judged-tier penalty above instead.
     if category_verdicts is None and attested_count > 0 and total_criteria > 0:
         penalty = ATTESTATION_PENALTY_WEIGHT * (attested_count / total_criteria)
-        covered_count = int(criterion_coverage.get("covered") or 0)
-        if covered_count == 0:
-            penalty *= UNCORROBORATED_PENALTY_MULTIPLIER
-            sub_scores["uncorroborated_attested"] = True
         confidence *= 1.0 - penalty
     if category_verdicts is None and backfilled_count > 0 and total_criteria > 0:
         penalty = BACKFILL_PENALTY_WEIGHT * (backfilled_count / total_criteria)

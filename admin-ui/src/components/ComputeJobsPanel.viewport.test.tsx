@@ -362,6 +362,7 @@ vi.mock('../api', async (importOriginal) => {
     fetchComputeJobsPaged: vi.fn(async () => ({ jobs: jobsToReturn, hasMore: false })),
     killComputeJob: vi.fn(async () => stressJobs[0]),
     analyzeComputeJob: vi.fn(),
+    resolveArtifactDownloadUrl: vi.fn(async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='),
   };
 });
 
@@ -504,6 +505,8 @@ describe('ComputeJobsPanel — viewport regression', () => {
       result_reference: null,
       task_title: 'compute_experiment: no source task',
       task_type: 'compute_experiment',
+      accelerator_type: null,
+      accelerator_count: null,
     };
     jobsToReturn = [jobWithoutTaskId];
     await expectFullViewportAt(
@@ -567,6 +570,59 @@ describe('ComputeJobsPanel — viewport regression', () => {
         if (!text.includes('unmet')) throw new Error('unmet criterion chip not rendered');
       },
       { waitMs: 60 },
+    );
+  });
+
+  test('renders plot gallery inline in job card at 1100px', async () => {
+    jobsToReturn = [
+      {
+        id: 'job-gallery',
+        project_id: 'proj-1',
+        task_id: 'task-gallery',
+        backend: 'local-gpu',
+        external_compute_id: null,
+        machine_type: 'a3-highgpu-1g',
+        status: 'SUCCEEDED',
+        terminal_reason: 'experiment completed',
+        outcome: 'SUCCESS',
+        spend_cap_usd: 5.0,
+        wall_clock_deadline: null,
+        created_at: new Date(Date.now() - 600_000).toISOString(),
+        updated_at: new Date(Date.now() - 300_000).toISOString(),
+        started_at: new Date(Date.now() - 590_000).toISOString(),
+        completed_at: new Date(Date.now() - 300_000).toISOString(),
+        last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+        accrued_cost_usd: 1.2,
+        final_cost_usd: 1.2,
+        result_reference: null,
+        task_title: 'compute_experiment: training loss curves',
+        task_type: 'compute_experiment',
+        accelerator_type: null,
+        accelerator_count: null,
+        viewable_artifacts: [
+          { storage_uri: 'gs://bucket/jobs/job-gallery/loss.png', filename: 'loss.png', kind: 'image' as const, content_type: 'image/png', size_bytes: 8192 },
+          { storage_uri: 'gs://bucket/jobs/job-gallery/acc.png', filename: 'acc.png', kind: 'image' as const, content_type: 'image/png', size_bytes: 7680 },
+        ],
+      },
+    ];
+    await expectFullViewportAt(
+      1100,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
+        const gallery = host.querySelector('[data-testid="compute-plot-gallery"]');
+        if (!gallery) throw new Error('compute-plot-gallery not rendered');
+        const slots = host.querySelectorAll('[data-testid="plot-gallery-slot"]');
+        if (slots.length < 2) throw new Error(`Expected 2 gallery slots, got ${slots.length}`);
+      },
+      { waitMs: 120 },
     );
   });
 

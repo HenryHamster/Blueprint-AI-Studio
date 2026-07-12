@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument, type ViewableArtifact } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -635,7 +635,7 @@ function AwaitingLocalRunnerSection({
       <div className="flex flex-col gap-1.5">
         {holds.map((hold) => {
           const capLabel = hold.spend_cap_usd != null ? ` · $${Number(hold.spend_cap_usd).toFixed(2)}` : '';
-          const waitingMs = Date.parse(hold.awaiting_local_runner_since);
+          const waitingMs = Date.parse(hold.awaiting_local_runner_since || hold.awaiting_forced_runner_since || '');
           const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
           return (
             <div
@@ -645,7 +645,10 @@ function AwaitingLocalRunnerSection({
             >
               <div className="text-xs font-semibold text-amber-200 break-words">{hold.title ?? hold.id}{capLabel}</div>
               <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="awaiting-local-runner-waiting">
-                waiting for local runner
+                {hold.forced_runner?.hostname
+                  ? <>waiting for forced runner <span className="font-semibold">{hold.forced_runner?.hostname}</span></>
+                  : 'waiting for local runner'
+                }
                 {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
               </div>
             </div>
@@ -946,6 +949,69 @@ function CompactJobsTable({
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function PlotGallery({ artifacts, projectId }: { artifacts: ViewableArtifact[]; projectId: string }) {
+  const [urls, setUrls] = useState<Record<string, string | 'error'>>({});
+
+  useEffect(() => {
+    const controller = new AbortController();
+    for (const artifact of artifacts) {
+      resolveArtifactDownloadUrl(projectId, artifact.storage_uri, controller.signal)
+        .then((url) => {
+          setUrls((prev) => ({ ...prev, [artifact.storage_uri]: url }));
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) {
+            setUrls((prev) => ({ ...prev, [artifact.storage_uri]: 'error' }));
+          }
+        });
+    }
+    return () => controller.abort();
+  }, [artifacts, projectId]);
+
+  return (
+    <div className="mt-2 flex flex-wrap gap-2" data-testid="compute-plot-gallery">
+      {artifacts.map((artifact) => {
+        const url = urls[artifact.storage_uri];
+        return (
+          <div
+            key={artifact.storage_uri}
+            className="relative w-28 h-28 rounded border border-neutral-700 bg-neutral-900 overflow-hidden flex items-center justify-center shrink-0"
+            data-testid="plot-gallery-slot"
+          >
+            {url === undefined && (
+              <div className="text-ui-xs text-neutral-500" data-testid="plot-gallery-loading">loading</div>
+            )}
+            {url === 'error' && (
+              <div className="text-ui-xs text-neutral-500 px-1 text-center" data-testid="plot-gallery-error">unavailable</div>
+            )}
+            {url && url !== 'error' && artifact.kind === 'image' && (
+              <a href={url} target="_blank" rel="noopener noreferrer" className="block w-full h-full">
+                <img
+                  src={url}
+                  alt={artifact.filename}
+                  className="w-full h-full object-cover"
+                  data-testid="plot-gallery-image"
+                />
+              </a>
+            )}
+            {url && url !== 'error' && artifact.kind === 'video' && (
+              <video
+                src={url}
+                controls
+                className="w-full h-full object-cover"
+                data-testid="plot-gallery-video"
+              />
+            )}
+            <div className="absolute bottom-0 left-0 right-0 px-1 py-0.5 bg-neutral-900/80 text-ui-xs text-neutral-400 truncate pointer-events-none">
+              {artifact.filename}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -2081,6 +2147,9 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <ExternalLink className="w-3 h-3 shrink-0" />
                   </ResolvedReferenceLink>
                 </div>
+              )}
+              {(job.viewable_artifacts?.length ?? 0) > 0 && projectId && (
+                <PlotGallery artifacts={job.viewable_artifacts!} projectId={projectId} />
               )}
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
