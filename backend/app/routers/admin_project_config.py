@@ -35,6 +35,7 @@ from app.vm_cost_rates import (
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
+    assess_ceiling_gate_trustworthiness,
     get_project_recent_spend_usd,
     resolve_project_hardware_policy,
     resolve_project_pause_on_ceiling_exceeded,
@@ -827,10 +828,35 @@ def _resource_envelope_response(
     *,
     active_vm_count: int,
     spend_breakdown: dict,
+    trustworthiness: dict | None = None,
 ) -> Dict[str, Any]:
     spend_ceiling_usd = resolve_project_spend_ceiling(project)
     recent_spend_usd = spend_breakdown["total"]
     allowed_machines, allowed_accels = resolve_project_hardware_policy(project)
+    # Additive, backward-compatible confidence signal for the weighted spend
+    # figure. Existing keys keep their meaning/type; enforcement still gates on
+    # ``ceiling_gate_total`` unchanged. ``coverage_fraction`` (the independent
+    # Anthropic probe coverage) comes from the optional trustworthiness verdict.
+    ceiling_gate_total = spend_breakdown.get(
+        "ceiling_gate_total", recent_spend_usd
+    )
+    spend_confidence = {
+        "confidence": spend_breakdown.get("confidence", "verified"),
+        "total_usd": float(recent_spend_usd),
+        "ceiling_gate_total_usd": float(ceiling_gate_total),
+        "llm_anthropic_usd": float(spend_breakdown.get("llm_anthropic", 0.0)),
+        "llm_non_anthropic_usd": float(
+            spend_breakdown.get("llm_non_anthropic", 0.0)
+        ),
+        "non_anthropic_share": float(
+            spend_breakdown.get("non_anthropic_share", 0.0)
+        ),
+        "coverage_fraction": (
+            trustworthiness.get("coverage_fraction")
+            if isinstance(trustworthiness, dict)
+            else None
+        ),
+    }
     return {
         "project_id": str(project.id),
         "max_concurrent_vms": resolve_project_vm_cap(project),
@@ -853,7 +879,25 @@ def _resource_envelope_response(
         "is_throttled": (
             spend_ceiling_usd is not None and recent_spend_usd >= spend_ceiling_usd
         ),
+        "spend_cap_confidence": spend_confidence,
     }
+
+
+async def _project_spend_trustworthiness(
+    session: AsyncSession, project_id: uuid.UUID, window_days: int
+) -> dict:
+    """Assess the weighted spend figure against the project's real window tasks.
+
+    Reconciles the Anthropic portion (the only independently-probed component)
+    over the SAME task window the ceiling gate aggregates, so the surfaced
+    ``coverage_fraction`` reflects real historical spend, not a synthetic set.
+    """
+    from app.resource_envelope import get_project_spend_window_tasks
+
+    tasks = await get_project_spend_window_tasks(
+        session, project_id=project_id, window_days=window_days
+    )
+    return assess_ceiling_gate_trustworthiness(tasks)
 
 
 async def _get_project_active_vm_count(
@@ -1281,16 +1325,21 @@ async def get_resource_envelope_config(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    window_days = resolve_project_spend_window_days(project)
     active_vm_count = await _get_project_active_vm_count(session, project_id)
     spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
-        window_days=resolve_project_spend_window_days(project),
+        window_days=window_days,
+    )
+    trustworthiness = await _project_spend_trustworthiness(
+        session, project_id, window_days
     )
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
         spend_breakdown=spend_breakdown,
+        trustworthiness=trustworthiness,
     )
 
 
@@ -1385,16 +1434,21 @@ async def update_resource_envelope_config(
     await session.commit()
     await session.refresh(project)
 
+    window_days = resolve_project_spend_window_days(project)
     active_vm_count = await _get_project_active_vm_count(session, project_id)
     spend_breakdown = await get_project_recent_spend_usd(
         session,
         project_id=project_id,
-        window_days=resolve_project_spend_window_days(project),
+        window_days=window_days,
+    )
+    trustworthiness = await _project_spend_trustworthiness(
+        session, project_id, window_days
     )
     return _resource_envelope_response(
         project,
         active_vm_count=active_vm_count,
         spend_breakdown=spend_breakdown,
+        trustworthiness=trustworthiness,
     )
 
 

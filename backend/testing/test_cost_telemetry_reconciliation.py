@@ -1539,3 +1539,107 @@ async def test_digest_payload_includes_provider_reported_reconciliation(db_sessi
     # Legacy reconciliation must also still be present.
     assert "cost_telemetry_reconciliation" in result
     assert result["cost_telemetry_reconciliation"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation COVERAGE: total_task_count / provider_reported_task_count /
+# coverage_fraction — distinguishes a 0%-coverage result from "nothing checked".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_full_when_all_tasks_have_provider_probe(db_session):
+    """When every task carries a provider-reported probe, coverage_fraction == 1.0."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=500,
+    )
+    t2 = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=2000, output_tokens=800,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    assert result.total_task_count == 2
+    assert result.provider_reported_task_count == 2
+    assert result.coverage_fraction == 1.0
+    # task_count (contributing tasks) stays consistent with the probed count.
+    assert result.task_count == 2
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_partial_when_some_tasks_lack_probe(db_session):
+    """Coverage is the probed fraction of the whole input window, not 100%."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    probed = _make_provider_reported_task(
+        project.id, provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=500,
+    )
+    # A task with api_call_summary but NO provider_reported_usage (self-reported).
+    unprobed = _make_cost_task(
+        project.id, provider="openai", model="gpt-5.5",
+        input_tokens=1000, output_tokens=500,
+    )
+    db_session.add_all([probed, unprobed])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([probed, unprobed])
+
+    assert result.total_task_count == 2
+    assert result.provider_reported_task_count == 1
+    assert result.coverage_fraction == 0.5
+
+
+@pytest.mark.asyncio
+async def test_coverage_fraction_zero_when_no_task_has_probe(db_session):
+    """A genuine 0%-coverage window reports coverage_fraction 0.0 (NOT None) so it
+    is distinguishable from an empty window."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_cost_task(
+        project.id, provider="openai", model="gpt-5.5",
+        input_tokens=1000, output_tokens=500,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    assert result.total_task_count == 1
+    assert result.provider_reported_task_count == 0
+    assert result.coverage_fraction == 0.0
+
+
+def test_coverage_fraction_none_on_empty_task_list():
+    """Zero tasks → coverage_fraction is None (no window to divide by)."""
+    result = reconcile_provider_reported_usage([])
+    assert result.total_task_count == 0
+    assert result.provider_reported_task_count == 0
+    assert result.coverage_fraction is None
+
+
+def test_coverage_fields_serialize_in_asdict():
+    """The three new coverage fields are present in asdict() and JSON round-trip."""
+    import json
+
+    result = reconcile_provider_reported_usage([])
+    d = result.asdict()
+    for key in ("total_task_count", "provider_reported_task_count", "coverage_fraction"):
+        assert key in d, f"asdict() must include {key}"
+    # None survives JSON round-trip as null.
+    assert json.loads(json.dumps(d))["coverage_fraction"] is None

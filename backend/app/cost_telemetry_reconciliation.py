@@ -131,7 +131,23 @@ class ReconciliationResult:
     provider_reported_tolerance: float = PROVIDER_REPORTED_TOLERANCE
 
     # ── Common fields ──────────────────────────────────────────────────────
+    # ``task_count`` is the number of tasks that CONTRIBUTED to this result:
+    # for the provider_reported path that is the number of tasks with a usable
+    # provider-reported probe (i.e. == ``provider_reported_task_count``), NOT
+    # the size of the input window. Kept unchanged for backward compatibility.
     task_count: int = 0
+
+    # ── Reconciliation coverage ────────────────────────────────────────────
+    # How much of the input task window carried an INDEPENDENT probe. For the
+    # provider_reported path a 0%-coverage result (no Anthropic task had a
+    # provider-reported usage object) is otherwise indistinguishable from
+    # "nothing needed checking" — these fields make that explicit so callers /
+    # operators can tell what fraction of a project's spend window is
+    # independently verified vs purely self-reported.
+    total_task_count: int = 0
+    provider_reported_task_count: int = 0
+    # provider_reported_task_count / total_task_count, or None when zero tasks.
+    coverage_fraction: float | None = None
 
     # Detailed per-task breakdown for diagnostics.
     per_task: List[Dict[str, Any]] = field(default_factory=list)
@@ -186,6 +202,9 @@ class ReconciliationResult:
             "provider_reported_within_tolerance": self.provider_reported_within_tolerance,
             "provider_reported_tolerance": self.provider_reported_tolerance,
             "task_count": self.task_count,
+            "total_task_count": self.total_task_count,
+            "provider_reported_task_count": self.provider_reported_task_count,
+            "coverage_fraction": self.coverage_fraction,
             "per_task": self.per_task,
         }
 
@@ -534,5 +553,8 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         provider_reported_within_tolerance=within_tolerance,
         provider_reported_tolerance=PROVIDER_REPORTED_TOLERANCE,
         task_count=checked_count,
+        total_task_count=len(tasks),
+        provider_reported_task_count=checked_count,
+        coverage_fraction=(checked_count / len(tasks)) if tasks else None,
         per_task=per_task,
     )
