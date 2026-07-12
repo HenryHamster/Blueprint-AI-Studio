@@ -2161,6 +2161,15 @@ async def _persist_compute_knowledge_document(
     payload = task.first_payload or {}
     raw_sweep_id = payload.get("sweep_id") or None
     sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+    # Single-job arms experiments omit sweep_id from their payload, so their
+    # KnowledgeDocument lands with sweep_id=None and is excluded from the
+    # sweep-groups query (which pre-filters to sweep_id IS NOT NULL).  Synthesize
+    # a stable, task-scoped sweep_id so the existing single-doc arms path in
+    # build_compute_sweep_groups becomes reachable for these documents.
+    if sweep_id_val is None:
+        _per_arm = (document.get("verdict_record") or {}).get("per_arm_verdicts")
+        if isinstance(_per_arm, dict) and len(_per_arm) >= 2:
+            sweep_id_val = f"single-{task.id}"
     arm_label_val = derive_compute_arm_label_from_payload(payload)
 
     title = document["title"]
