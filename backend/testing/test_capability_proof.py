@@ -482,7 +482,7 @@ class TestCapabilityProofViews:
         assert "proof_records" not in enriched["capabilities"][1]
 
     def test_enrich_backing_path_only_not_proven(self):
-        """A capability with only backing_path proof records must read 'partial', not 'proven'.
+        """A capability with only backing_path proof records must read 'path_proven', not 'proven'.
 
         backing_path proofs assert only that the declared files exist at HEAD —
         they are self-reported structural evidence, not machine-verified.
@@ -1841,14 +1841,14 @@ class TestBackingPathTieringInEnforceGate:
     """A backing_path-only proof must be tiered below machine-verified proof.
 
     ``classify_evidence_tiered`` demotes a proven set whose ONLY proof is
-    ``backing_path`` to ``partial``, so ``working_capability_proof_status`` reads
-    ``partial`` for such a capability and ``capability_need_blocked_by_proof_gate``
-    keeps the dependent BLOCKED under enforce mode — the exact self-report vector
-    the gate exists to close.
+    ``backing_path`` to ``path_proven`` (not ``proven``), so
+    ``working_capability_proof_status`` reads ``path_proven`` for such a capability
+    and ``capability_need_blocked_by_proof_gate`` keeps the dependent BLOCKED under
+    enforce mode — the exact self-report vector the gate exists to close.
     """
 
-    def test_classify_evidence_tiered_backing_path_only_returns_partial(self):
-        assert classify_evidence_tiered([_backing_path_ref()]) == "partial"
+    def test_classify_evidence_tiered_backing_path_only_returns_path_proven(self):
+        assert classify_evidence_tiered([_backing_path_ref()]) == "path_proven"
 
     def test_classify_evidence_tiered_mixed_returns_proven(self):
         assert (
@@ -1866,7 +1866,7 @@ class TestBackingPathTieringInEnforceGate:
 
     def test_backing_path_only_does_not_clear_enforce_gate(self):
         """ACCEPTANCE EVIDENCE. A working capability whose ONLY evidence is a
-        proven ``backing_path`` maps to ``partial`` in
+        proven ``backing_path`` maps to ``path_proven`` in
         ``working_capability_proof_status`` and stays BLOCKED under enforce."""
         problem_model = {
             "capabilities": [
@@ -1878,11 +1878,11 @@ class TestBackingPathTieringInEnforceGate:
             ]
         }
         proof = working_capability_proof_status(problem_model)
-        # The backing-only proof is tiered down to partial (NOT proven).
-        assert proof["backing-only-cap"] == "partial"
+        # The backing-only proof is tiered down to path_proven (NOT proven).
+        assert proof["backing-only-cap"] == "path_proven"
 
         need = {"kind": "capability", "ref": "backing-only-cap"}
-        # Enforce mode: partial does NOT clear the gate → blocked.
+        # Enforce mode: path_proven does NOT clear the gate → blocked.
         assert (
             capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
         )
@@ -1933,8 +1933,14 @@ class TestBackingPathTieringInEnforceGate:
         )
 
     def test_backing_paths_field_upgrade_still_partial(self):
-        """The separate ``backing_paths`` field → partial upgrade is preserved:
-        no evidence_refs but a declared backing_paths list still reads partial."""
+        """ACCEPTANCE EVIDENCE (finding design:capability-proof-earning-loop):
+        working_capability_proof_status now consults the capability's ``backing_paths``
+        field. Before the fix, any capability declaring backing_paths but carrying
+        zero evidence_refs was classified as ``unproven`` — the field was silently
+        ignored. The fix upgrades ``unproven`` to ``partial`` when backing_paths is
+        a non-empty list, so capabilities that declare where their code lives are no
+        longer penalised as having zero evidence.
+        """
         problem_model = {
             "capabilities": [
                 {
@@ -1946,6 +1952,64 @@ class TestBackingPathTieringInEnforceGate:
         }
         proof = working_capability_proof_status(problem_model)
         assert proof["paths-field-cap"] == "partial"
+
+
+# ── Earn loop is not flag-only: proof is written, not just computed ───────────
+
+
+@pytest.mark.asyncio
+async def test_commission_proof_earn_loop_writes_proof_not_flag_only():
+    """ACCEPTANCE EVIDENCE (finding design:capability-proof-earning-loop):
+    commission_proof_earn_loop WRITES proof records to project.capability_proof_records
+    when backing_paths resolve at HEAD, demonstrating the system is not flag-only.
+
+    Before the fix, check_capability_proof_gate_gap was the only pipeline mechanism
+    that observed the capability-proof gap — it computed the delta and wrote findings
+    but nothing in the system then commissioned work to actually earn the proof.
+    commission_proof_earn_loop (called by sweep_proof_earn_loop / Step 22b in the
+    reaper, and on-demand at spawn time in autonomous_research.py) closes this gap:
+    it verifies declared backing_paths at HEAD and records a ``backing_path`` proof
+    entry, so the capability advances from ``unproven`` to ``partial``.
+
+    The test asserts that after the earn loop runs with all paths present:
+    • ``earned == 1`` — one proof was committed, not merely noted
+    • The capability name appears in project.capability_proof_records
+    • ``no_backing_paths`` and ``still_unproven`` are both empty
+    """
+    project = MagicMock()
+    project.capability_proof_records = {}
+    problem_model = {
+        "capabilities": [
+            {
+                "name": "unproven-demanded",
+                "status": "working",
+                "backing_paths": ["backend/app/capability_proof.py"],
+            }
+        ]
+    }
+    project.problem_model = problem_model
+    demand_result = {
+        "total": 1,
+        "demands": [
+            {"kind": "capability", "ref": "unproven-demanded", "dependent_count": 3},
+        ],
+    }
+
+    async def _all_present(p: str) -> bool:
+        return True
+
+    with patch("app.capability_proof.flag_modified"):
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result=demand_result,
+            problem_model=problem_model,
+            verify_path=_all_present,
+        )
+
+    assert result["earned"] == 1, "earn loop must write proof, not just flag the gap"
+    assert "unproven-demanded" in project.capability_proof_records
+    assert result["no_backing_paths"] == []
+    assert result["still_unproven"] == []
 
 
 # ── TRIAL_DEFINITIONS disjointness from gating registry capabilities ──────────
