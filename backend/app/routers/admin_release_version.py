@@ -725,18 +725,19 @@ async def get_version_lifecycle(
             # it previously omitted: reuse the ``latest_audit`` already resolved above
             # for the audit-findings section, and let the helper backfill the newest
             # verdict so all four open-version surfaces agree.
+            # Resolve the ledger-backed dimension_states FIRST (also surfaced as
+            # this endpoint's own ``dimension_states`` response field below), then
+            # thread it into the seam so the shared ledger sub_score overlay is
+            # applied without a duplicate ledger query. The seam now GUARANTEES the
+            # overlay, so no separate patch call is needed here.
+            _open_dim_states = await resolve_dimension_states_from_ledger(session, open_row)
             qual_state, _ = await resolve_open_version_qualification_state(
                 session,
                 open_row,
                 project_row,
                 audit_child=latest_audit,
                 serving=(aggregate_serving, artifact_evidence),
-            )
-            # Hoist dimension_states so we can patch qual_state sub_scores from
-            # the ledger before assembling the response — one consistent story.
-            _open_dim_states = await resolve_dimension_states_from_ledger(session, open_row)
-            qual_state = patch_qualification_state_from_dimension_states(
-                qual_state, _open_dim_states
+                dimension_states=_open_dim_states,
             )
 
             # Fetch live current_focus from the project's problem_model

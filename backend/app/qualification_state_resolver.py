@@ -1,7 +1,7 @@
 """Shared effective-qualification-state resolution.
 
 Several read surfaces derive a single ``qualification_state`` from a release
-version's raw ``last_qualification`` record plus up to three optional
+version's raw ``last_qualification`` record plus up to four optional
 reconciliation *enrichments*:
 
 1. **serving aggregate** — the aggregated per-artifact serving verdict
@@ -14,6 +14,11 @@ reconciliation *enrichments*:
    ``pending`` + ``promotion_pending`` record for a
    :class:`~app.models.QualificationVerdict` row's finalized
    ``terminal_status`` when the verdict is already resolved.
+4. **ledger sub_score overlay** — overlay the QualificationDimensionResult
+   ledger's per-``(candidate_sha, dimension)`` scores onto the effective
+   state's ``sub_scores`` (via :func:`patch_qualification_state_from_dimension_states`)
+   so the top-level ``qualification_state`` cannot contradict the per-dimension
+   ledger the same surfaces show after a blob-overwriting re-qualification.
 
 Historically each surface (the strategic payload, the agent fetch verb, the
 admin release-version endpoints, the system-state snapshot) applied a
@@ -31,11 +36,11 @@ This module ALSO exposes two async DB-touching helpers,
 :func:`resolve_newest_qualification_verdict` and
 :func:`resolve_open_version_qualification_state`. The latter is the single seam
 every OPEN-version read surface routes through: given a session + open version,
-it GUARANTEES all three enrichments (serving aggregate, audit child, finalized
-verdict) are applied in the same fixed order so the surfaces cannot silently
-diverge. Callers may thread in enrichments they already resolved for other
-response fields to avoid a redundant query, but the helper backfills any they
-did not so the guarantee holds regardless of caller.
+it GUARANTEES all four enrichments (serving aggregate, audit child, finalized
+verdict, ledger sub_score overlay) are applied in the same fixed order so the
+surfaces cannot silently diverge. Callers may thread in enrichments they already
+resolved for other response fields to avoid a redundant query, but the helper
+backfills any they did not so the guarantee holds regardless of caller.
 """
 
 from __future__ import annotations
@@ -638,6 +643,7 @@ async def resolve_open_version_qualification_state(
     serving: Tuple[dict[str, Any], list[dict[str, Any]]] | None = None,
     audit_child: Any = _UNSET,
     latest_verdict: Any = _UNSET,
+    dimension_states: Any = _UNSET,
 ) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Resolve an OPEN version's ``qualification_state`` with ALL enrichments.
 
@@ -647,7 +653,7 @@ async def resolve_open_version_qualification_state(
     contradictory stories in the stale-pending / audit-crashed windows.
 
     Returns ``(qualification_state, disagreement)`` — the
-    :func:`resolve_effective_qualification_state` output — with all three
+    :func:`resolve_effective_qualification_state` output — with all FOUR
     reconciliation enrichments GUARANTEED applied in the fixed order:
 
     * ``serving`` — a pre-resolved ``(aggregate, artifacts)`` tuple (from
@@ -664,6 +670,20 @@ async def resolve_open_version_qualification_state(
       :func:`resolve_newest_qualification_verdict`. Passing an explicit value
       (including ``None``) skips the query so a caller that already loaded it can
       avoid a second round-trip.
+    * **ledger sub_score overlay** — after the effective state is computed, the
+      ledger-backed per-dimension facts are overlaid onto its ``sub_scores`` via
+      :func:`patch_qualification_state_from_dimension_states` so the top-level
+      ``qualification_state`` cannot contradict the per-dimension ledger the same
+      surfaces show (e.g. after a blob-overwriting infra-failure re-qualification
+      drops a resolved ``audit`` score the ledger preserved). The overlay is
+      idempotent and safe in the no-ledger fallback (blob-derived scores patched
+      back onto the same blob is a no-op), so it is applied unconditionally.
+      ``dimension_states`` — when left unset the ledger-backed states are resolved
+      here via :func:`resolve_dimension_states_from_ledger` (best-effort: a
+      failure logs and degrades to the un-patched effective state so a broken
+      ledger query never blocks payload/response assembly). Passing a
+      pre-resolved list (as the admin endpoint does for its own
+      ``dimension_states`` response field) skips the second query.
     """
     if audit_child is _UNSET:
         audit_child = None
@@ -683,10 +703,33 @@ async def resolve_open_version_qualification_state(
     if latest_verdict is _UNSET:
         latest_verdict = await resolve_newest_qualification_verdict(session, version)
 
-    return resolve_effective_qualification_state(
+    qual_state, disagreement = resolve_effective_qualification_state(
         version,
         project,
         latest_verdict=latest_verdict,
         audit_child=audit_child,
         serving=serving,
     )
+
+    # Fourth enrichment: overlay the ledger-backed per-dimension sub_scores onto
+    # the effective state so every open-version surface tells one story even when
+    # the last_qualification blob was overwritten by a re-qualification / infra
+    # failure the ledger survived. Idempotent + no-op in the no-ledger fallback.
+    dim_states = dimension_states
+    if dim_states is _UNSET:
+        dim_states = None
+        try:
+            dim_states = await resolve_dimension_states_from_ledger(session, version)
+        except Exception:
+            logger.exception(
+                "[QUAL_STATE] ledger dimension-state resolution failed for version "
+                "%s; resolving qualification_state without ledger sub_score overlay",
+                getattr(version, "id", None),
+            )
+            dim_states = None
+    if dim_states is not None:
+        qual_state = patch_qualification_state_from_dimension_states(
+            qual_state, dim_states
+        )
+
+    return qual_state, disagreement

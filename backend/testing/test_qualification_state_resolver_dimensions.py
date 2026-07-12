@@ -1004,3 +1004,224 @@ async def test_read_surface_prefers_ledger_over_stale_blob(db_session):
     assert patched_no_score["sub_scores"]["audit"] == pytest.approx(0.9), (
         "None score must not overwrite existing sub_scores value"
     )
+
+
+# ---------------------------------------------------------------------------
+# resolve_open_version_qualification_state — shared seam applies the ledger
+# sub_score overlay so EVERY open-version surface tells one consistent story.
+# ---------------------------------------------------------------------------
+
+
+async def _make_project_and_version(db_session, last_qualification):
+    from app.models import Project, ReleaseVersion
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification=last_qualification,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    return project, version
+
+
+# Neutral serving tuple that keeps the seam focused on the ledger overlay
+# without needing loaded artifacts (version_serving_summary would otherwise run).
+_NO_SERVING = ({"serving_status": None, "reason_code": None}, [])
+
+
+@pytest.mark.asyncio
+async def test_open_version_seam_applies_ledger_overlay(db_session):
+    """resolve_open_version_qualification_state ITSELF overlays the ledger
+    sub_scores onto the returned qualification_state, so an open-version surface
+    that does NOT apply its own patch still tells the ledger-backed story.
+
+    A blob-overwriting infra-failure re-qualification reset the audit sub_score
+    to 0.0, while the QualificationDimensionResult ledger preserved the resolved
+    pass at 0.95. The seam must surface the ledger score, not the stale blob."""
+    from app.models import QualificationDimensionResult
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+    )
+
+    project, version = await _make_project_and_version(
+        db_session,
+        {
+            "status": "infra_failure",
+            "candidate_sha": "sha-overwrite",
+            # Stale/reset sub_scores left by the infra-failure blob overwrite.
+            "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+            "error": "vm_timeout",
+        },
+    )
+
+    # Ledger preserved the resolved facts from before the infra-failure.
+    for dim, status, sub_score in [
+        ("audit", "passed", 0.95),
+        ("test_erosion", "passed", 0.87),
+        ("ci", "passed", None),
+    ]:
+        db_session.add(QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-overwrite",
+            dimension=dim,
+            status=status,
+            sub_score=sub_score,
+            blocker=None,
+        ))
+    await db_session.flush()
+
+    # audit_child / latest_verdict passed explicitly so the test isolates the
+    # NEW ledger sub_score overlay from the other three enrichments.
+    qual_state, _ = await resolve_open_version_qualification_state(
+        db_session,
+        version,
+        project,
+        serving=_NO_SERVING,
+        audit_child=None,
+        latest_verdict=None,
+    )
+
+    assert qual_state is not None
+    assert qual_state["state"] == "infra_failure"
+    # sub_scores reflect the LEDGER (0.95 / 0.87), NOT the stale blob (0.0 / 0.0).
+    assert qual_state["sub_scores"]["audit"] == pytest.approx(0.95), (
+        "seam must overlay the ledger audit score over the stale blob"
+    )
+    assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.87), (
+        "seam must overlay the ledger test_erosion score over the stale blob"
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_version_seam_no_ledger_matches_blob(db_session):
+    """With NO ledger rows for the candidate, the seam's ledger overlay is a
+    no-op: resolve_dimension_states_from_ledger falls back to the blob, so the
+    returned sub_scores reflect the blob-derived scores (no spurious mutation)."""
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+    )
+
+    project, version = await _make_project_and_version(
+        db_session,
+        {
+            "status": "not_promoted",
+            "candidate_sha": "sha-no-ledger",
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    # Deliberately NO ledger rows for this candidate_sha.
+
+    qual_state, _ = await resolve_open_version_qualification_state(
+        db_session,
+        version,
+        project,
+        serving=_NO_SERVING,
+        audit_child=None,
+        latest_verdict=None,
+    )
+
+    assert qual_state is not None
+    assert qual_state["state"] == "not_promoted"
+    # Overlay derives from the blob (no ledger), so sub_scores mirror the blob.
+    assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
+    assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)
+
+
+@pytest.mark.asyncio
+async def test_open_version_seam_none_state_untouched(db_session):
+    """An unqualified open version (no verdict yet → summarize returns None) is
+    returned as (None, ...); the ledger overlay does not fabricate a state."""
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+    )
+
+    project, version = await _make_project_and_version(
+        db_session,
+        # No 'status' → summarize_qualification_state returns None (unqualified).
+        {},
+    )
+
+    qual_state, _ = await resolve_open_version_qualification_state(
+        db_session,
+        version,
+        project,
+        serving=_NO_SERVING,
+        audit_child=None,
+        latest_verdict=None,
+    )
+
+    assert qual_state is None
+
+
+@pytest.mark.asyncio
+async def test_open_version_seam_threaded_dimension_states_equal_auto(db_session):
+    """Threading a pre-resolved dimension_states (as the admin endpoint does to
+    avoid a duplicate ledger query) yields the SAME overlaid qualification_state
+    as letting the seam resolve the ledger itself."""
+    from app.models import QualificationDimensionResult
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+        resolve_dimension_states_from_ledger,
+    )
+
+    project, version = await _make_project_and_version(
+        db_session,
+        {
+            "status": "infra_failure",
+            "candidate_sha": "sha-thread",
+            "sub_scores": {"audit": 0.0},
+            "error": "vm_timeout",
+        },
+    )
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-thread",
+        dimension="audit",
+        status="passed",
+        sub_score=0.91,
+        blocker=None,
+    ))
+    await db_session.flush()
+
+    # (a) let the seam resolve the ledger itself
+    auto_state, _ = await resolve_open_version_qualification_state(
+        db_session,
+        version,
+        project,
+        serving=_NO_SERVING,
+        audit_child=None,
+        latest_verdict=None,
+    )
+
+    # (b) thread a pre-resolved dimension_states in
+    pre_resolved = await resolve_dimension_states_from_ledger(db_session, version)
+    threaded_state, _ = await resolve_open_version_qualification_state(
+        db_session,
+        version,
+        project,
+        serving=_NO_SERVING,
+        audit_child=None,
+        latest_verdict=None,
+        dimension_states=pre_resolved,
+    )
+
+    assert auto_state is not None and threaded_state is not None
+    assert threaded_state["sub_scores"]["audit"] == pytest.approx(0.91)
+    assert auto_state["sub_scores"] == threaded_state["sub_scores"], (
+        "threading a pre-resolved dimension_states must match auto-resolution"
+    )
