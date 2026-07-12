@@ -670,9 +670,10 @@ async def commission_proof_earn_loop(
     -------
     A summary dict:
     ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
-      "still_unproven": list[str]}``.
+      "still_unproven": list[str], "path_proven_stuck": list[str]}``.
     Total entries found, count of newly-earned proofs, capability names with
-    no backing_paths, and remaining unproven names (failed path check).
+    no backing_paths, remaining unproven names (failed path check), and
+    already-recorded (stuck) names that were not newly recorded.
     """
     from app.capability_demand import compute_unproven_demanded_capabilities
     from app.source_ref_validation import (
@@ -692,6 +693,7 @@ async def commission_proof_earn_loop(
             "earned": 0,
             "no_backing_paths": [],
             "still_unproven": [],
+            "path_proven_stuck": [],
         }
 
     # Step 1b: defensive filter — skip exempt capabilities (they classify as
@@ -710,6 +712,7 @@ async def commission_proof_earn_loop(
                 "earned": 0,
                 "no_backing_paths": [],
                 "still_unproven": [],
+                "path_proven_stuck": [],
             }
 
     # Build a lookup: canonical-name -> (raw_name, backing_paths).
@@ -733,6 +736,7 @@ async def commission_proof_earn_loop(
     earned_names: list[str] = []
     no_backing_paths: list[str] = []
     still_unproven: list[str] = []
+    path_proven_stuck: list[str] = []
 
     for entry in demanded_unproven:
         ref = entry.get("ref", "")
@@ -771,9 +775,13 @@ async def commission_proof_earn_loop(
             recorded = record_capability_backing_path_proof(project, raw_name or canonical)
             if recorded:
                 earned_names.append(canonical)
-            # Dedup hit (recorded=False): already stamped in a prior sweep.
-            # Do NOT count as earned — the sweep must not commit on no-op re-runs,
-            # and the capability should not be reported as newly earning proof.
+            else:
+                # Dedup hit (recorded=False): already stamped in a prior sweep.
+                # Do NOT count as earned — the sweep must not commit on no-op
+                # re-runs, and the capability should not be reported as newly
+                # earning proof. Surface as path_proven_stuck so callers can
+                # distinguish genuinely-new from already-recorded.
+                path_proven_stuck.append(canonical)
         else:
             still_unproven.append(canonical)
 
@@ -791,4 +799,5 @@ async def commission_proof_earn_loop(
         "earned": len(earned_names),
         "no_backing_paths": no_backing_paths,
         "still_unproven": still_unproven,
+        "path_proven_stuck": path_proven_stuck,
     }

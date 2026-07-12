@@ -452,6 +452,16 @@ async def _classify_blocker_needs(
         # The first need that matched a terminally-dead foundation, recorded so the
         # foundation-died cancel can stamp it into the unresumable marker.
         "dead_need": None,
+        # Needs that DID match a ``working`` registry capability but were held back
+        # from ``completed_needs`` by the ENFORCE proof gate (the capability is only
+        # claimed, not proven). These are a subset of ``residual``. Recorded
+        # separately so the disposition can HOLD the dependent BLOCKED
+        # deterministically rather than letting it fall through to the legacy
+        # precondition machine — where a no-dep agent-source blocker would be
+        # optimistically requeued, silently defeating the enforce gate. A gate-held
+        # need is always observable (it resumes the instant proof is recorded), so
+        # holding it never trips the never-satisfiable termination bound.
+        "proof_gate_held": [],
     }
     if not needs:
         return disp
@@ -549,6 +559,10 @@ async def _classify_blocker_needs(
                     _proof_status,
                 )
                 disp["residual"].append(need)
+                # Also record it as gate-held (subset of residual) so the
+                # disposition holds the dependent BLOCKED deterministically
+                # instead of falling through to the optimistic-retry path.
+                disp["proof_gate_held"].append(need)
                 continue
             # OBSERVE mode: surface (never gate) a blocked-resume resolution backed
             # by a capability declared 'working' with no proven evidence. The need
@@ -824,8 +838,9 @@ async def _apply_needs_disposition(
     Returns one of:
       ``"resumed"``   — every need accounted for; task → QUEUED (caller counts it)
       ``"cancelled"`` — a dead foundation, or the parked re-eval cap was exceeded
-      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict);
-                        task stays BLOCKED, residual re-persisted, recheck re-armed
+      ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict /
+                        enforce-gate hold); task stays BLOCKED, residual
+                        re-persisted, recheck re-armed
       ``"escalate"``  — non-parked, residual needs remain, an edge is already wired
                         and the escalation deadline has passed; caller escalates
       ``"none"``      — non-parked, residual remains, no edge yet: caller falls
@@ -888,6 +903,14 @@ async def _apply_needs_disposition(
     residual = list(disp["residual"])
     edges = disp["edges"]
     completed_needs = disp["completed_needs"]
+    # Needs the ENFORCE proof gate held back (a subset of ``residual``). Their
+    # presence forces a deterministic HOLD below: a gate-held need matched a
+    # ``working`` registry capability, so it is NOT a genuinely-unprovided
+    # residual that may fall through to the legacy precondition machine (where a
+    # no-dep agent-source blocker would be optimistically requeued, defeating the
+    # gate). It resumes the instant proof is recorded, so holding it is bounded by
+    # that event — not the never-satisfiable termination cap.
+    gate_held = list(disp.get("proof_gate_held") or [])
 
     # 2) Verify the completed foundations are base-safe BEFORE treating them as
     #    accounted-for — on BOTH the partial- and full-resolution paths. A need
@@ -928,12 +951,17 @@ async def _apply_needs_disposition(
 
     # 3) Unresolved needs remain → cannot fully resume this tick.
     if unresolved:
-        if progressed or recut_pending:
-            # Partial resolution (or a need mid-recut): wire the resolvable edges,
-            # drop the resolved (and base-safe-verified completed) needs, keep ONLY
-            # the unresolved set, and stay BLOCKED so the next tick re-evaluates the
-            # remainder. A recut_pending need ALWAYS holds here — it matched a
-            # foundation, so it must never fall through to the precondition machine.
+        if progressed or recut_pending or gate_held:
+            # Partial resolution (or a need mid-recut, or an enforce-gate hold):
+            # wire the resolvable edges, drop the resolved (and base-safe-verified
+            # completed) needs, keep ONLY the unresolved set, and stay BLOCKED so
+            # the next tick re-evaluates the remainder. A recut_pending need ALWAYS
+            # holds here — it matched a foundation, so it must never fall through to
+            # the precondition machine. A ``gate_held`` need holds for the same
+            # reason: it matched a ``working`` registry capability but the enforce
+            # proof gate held it, so it must stay BLOCKED here rather than fall
+            # through ("none") where a no-dep agent-source blocker would be
+            # optimistically requeued — silently defeating the gate.
             # Progress resets the parked re-eval cap — but ONLY when no sibling need
             # is still stuck mid-recut. A base-safe need's progress must not erase
             # the give-up accounting while a conflicting sibling remains unresolved.

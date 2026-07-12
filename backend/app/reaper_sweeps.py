@@ -765,6 +765,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
         "earned": 0,
         "no_backing_paths": [],
         "still_unproven": [],
+        "path_proven_stuck": [],
     }
 
     for project in rows:
@@ -791,6 +792,7 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
                 combined["earned"] += result["earned"]
                 combined["no_backing_paths"].extend(result.get("no_backing_paths", []))
                 combined["still_unproven"].extend(result.get("still_unproven", []))
+                combined["path_proven_stuck"].extend(result.get("path_proven_stuck", []))
                 if result["earned"] > 0:
                     session.add(project)
                     await session.commit()
@@ -804,14 +806,15 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             with contextlib.suppress(Exception):
                 await session.rollback()
 
-    if combined["earned"] or combined["still_unproven"]:
+    if combined["earned"] or combined["still_unproven"] or combined["path_proven_stuck"]:
         logger.info(
             "[REAPER] Step 22b: proof-earn loop: total_demanded_unproven=%d "
-            "earned=%d no_backing_paths=%d still_unproven=%d",
+            "earned=%d no_backing_paths=%d still_unproven=%d path_proven_stuck=%d",
             combined["total_demanded_unproven"],
             combined["earned"],
             len(combined["no_backing_paths"]),
             len(combined["still_unproven"]),
+            len(combined["path_proven_stuck"]),
         )
     return combined
 

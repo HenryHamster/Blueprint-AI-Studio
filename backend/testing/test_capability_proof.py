@@ -1327,6 +1327,10 @@ class TestCommissionProofEarnLoop:
         )
         assert result["total_demanded_unproven"] == 0
         assert result["earned"] == 0
+        assert result.get("path_proven_stuck", None) is not None, (
+            "return dict must include path_proven_stuck key"
+        )
+        assert result["path_proven_stuck"] == []
 
     @pytest.mark.asyncio
     async def test_all_paths_present_records_proof(self):
@@ -1353,6 +1357,9 @@ class TestCommissionProofEarnLoop:
                 verify_path=_verify,
             )
         assert result["earned"] >= 1
+        assert result["path_proven_stuck"] == [], (
+            "first-earn path should not report stuck caps"
+        )
         # The proof should now be recorded on the project.
         records = project.capability_proof_records
         assert isinstance(records, dict)
@@ -1383,6 +1390,7 @@ class TestCommissionProofEarnLoop:
             )
         assert result["earned"] == 0
         assert "my-cap" in result["still_unproven"]
+        assert result.get("path_proven_stuck") == []
 
     @pytest.mark.asyncio
     async def test_path_indeterminate_no_proof(self):
@@ -1409,6 +1417,7 @@ class TestCommissionProofEarnLoop:
             )
         assert result["earned"] == 0
         assert "my-cap" in result["still_unproven"]
+        assert result.get("path_proven_stuck") == []
 
     @pytest.mark.asyncio
     async def test_no_backing_paths_reported(self):
@@ -1435,6 +1444,7 @@ class TestCommissionProofEarnLoop:
         assert result["earned"] == 0
         assert "no-backing-cap" in result["no_backing_paths"]
         assert result["no_backing_paths"] == ["no-backing-cap"]
+        assert result.get("path_proven_stuck") == []
 
     @pytest.mark.asyncio
     async def test_mixed_backing_paths_and_no_backing_paths(self):
@@ -1464,6 +1474,7 @@ class TestCommissionProofEarnLoop:
             )
         assert result["total_demanded_unproven"] == 2
         assert result["earned"] >= 1
+        assert result.get("path_proven_stuck") == []
         assert "has-paths" not in result["no_backing_paths"]
         assert "no-paths" in result["no_backing_paths"]
 
@@ -1495,6 +1506,9 @@ class TestCommissionProofEarnLoop:
                 verify_path=_verify,
             )
         assert result["earned"] == 1
+        assert result["path_proven_stuck"] == [], (
+            "first-earn path should not report stuck caps"
+        )
         assert "bad-cap" in result["still_unproven"]
 
     @pytest.mark.asyncio
@@ -1526,6 +1540,9 @@ class TestCommissionProofEarnLoop:
             )
         assert result["total_demanded_unproven"] == 1
         assert result["earned"] == 1
+        assert result.get("path_proven_stuck") == [], (
+            "first-earn path should not report stuck caps"
+        )
 
     @pytest.mark.asyncio
     async def test_dedup_hit_not_counted_as_earned(self):
@@ -1745,6 +1762,9 @@ def test_exempt_capability_skipped_in_earn_loop():
         "working_capability_proof_status classifies it as 'proven'"
     )
     assert result["earned"] == 0
+    assert result.get("path_proven_stuck") == [], (
+        "return dict must include empty path_proven_stuck"
+    )
 
     # Now test with a mix: one exempt unproven cap, one real unproven cap.
     # The exempt cap is never demanded (proven), the real one is.
@@ -2151,6 +2171,9 @@ async def test_earn_loop_demand_driven_intersection_and_proof():
 
     # demanded-unproven was earned (backing_paths present + all resolve).
     assert result["earned"] >= 1
+    assert result["path_proven_stuck"] == [], (
+        "first-earn path should not report stuck caps"
+    )
 
     # demanded-no-paths is reported as needing backing_paths.
     assert "demanded-no-paths" in result["no_backing_paths"]
@@ -2162,3 +2185,125 @@ async def test_earn_loop_demand_driven_intersection_and_proof():
 
     # Proof was recorded on the project for demanded-unproven.
     assert "demanded-unproven" in project.capability_proof_records
+
+
+class TestProofEarnLoopDedup:
+    """Test that dedup (already-recorded backing_path proof) is NOT counted as earned.
+
+    The load-bearing fix for the earn-loop bug: a capability whose backing_path
+    proof was already recorded on a previous sweep must NOT appear in ``earned``
+    on subsequent sweeps. It should appear in ``path_proven_stuck`` instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dedup_not_counted_as_earned(self):
+        """Call commission_proof_earn_loop twice with same verifiable cap.
+
+        First call: backing_path proof is recorded → earned=1.
+        Second call: proof already exists (dedup) → earned=0,
+        path_proven_stuck=[cap].
+        """
+        cap_name = "dedup-cap"
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {
+            "capabilities": [
+                {"name": cap_name, "status": "working",
+                 "backing_paths": ["backend/app/main.py"]},
+            ]
+        }
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        demand_result = {"total": 1, "demands": [
+            {"kind": "capability", "ref": cap_name, "dependent_count": 1},
+        ]}
+
+        with patch("app.capability_proof.flag_modified"):
+            # First call: should earn proof.
+            first = await commission_proof_earn_loop(
+                project, demand_result, project.problem_model,
+                verify_path=_verify,
+            )
+
+        assert first["earned"] == 1, (
+            f"first call should earn 1, got {first['earned']}"
+        )
+        assert first["path_proven_stuck"] == [], (
+            "first call should not report stuck caps"
+        )
+        assert cap_name in project.capability_proof_records, (
+            "proof should be recorded after first call"
+        )
+
+        with patch("app.capability_proof.flag_modified"):
+            # Second call: dedup — proof already recorded.
+            second = await commission_proof_earn_loop(
+                project, demand_result, project.problem_model,
+                verify_path=_verify,
+            )
+
+        assert second["earned"] == 0, (
+            f"second call must NOT count dedup as earned, got {second['earned']}"
+        )
+        assert second["path_proven_stuck"] == [cap_name], (
+            f"stuck cap should be in path_proven_stuck, got {second['path_proven_stuck']}"
+        )
+        # Proof records must still have exactly one entry (not duplicated).
+        assert len(project.capability_proof_records[cap_name]) == 1, (
+            "dedup must not create a second proof entry"
+        )
+
+    @pytest.mark.asyncio
+    async def test_path_proven_stuck_mixed_with_new_earned(self):
+        """Mixed scenario: one cap newly earned, one already recorded.
+
+        A project with two verifiable caps: one whose backing_path proof is
+        already recorded (stuck), one fresh (newly earned). The result must
+        correctly reflect both: earned=1, path_proven_stuck=[stuck-cap].
+        """
+        fresh_cap = "fresh-cap"
+        stuck_cap = "stuck-cap"
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {
+            "capabilities": [
+                {"name": fresh_cap, "status": "working",
+                 "backing_paths": ["backend/app/main.py"]},
+                {"name": stuck_cap, "status": "working",
+                 "backing_paths": ["backend/app/capability_proof.py"]},
+            ]
+        }
+
+        async def _verify(p: str) -> bool:
+            return True
+
+        demand_result = {"total": 2, "demands": [
+            {"kind": "capability", "ref": fresh_cap, "dependent_count": 1},
+            {"kind": "capability", "ref": stuck_cap, "dependent_count": 2},
+        ]}
+
+        with patch("app.capability_proof.flag_modified"):
+            # First call: both caps earn proof.
+            first = await commission_proof_earn_loop(
+                project, demand_result, project.problem_model,
+                verify_path=_verify,
+            )
+
+        assert first["earned"] == 2
+        assert first["path_proven_stuck"] == []
+
+        with patch("app.capability_proof.flag_modified"):
+            # Second call: both caps already recorded → both stuck.
+            second = await commission_proof_earn_loop(
+                project, demand_result, project.problem_model,
+                verify_path=_verify,
+            )
+
+        assert second["earned"] == 0, (
+            "second call must not count dedup as earned"
+        )
+        assert set(second["path_proven_stuck"]) == {fresh_cap, stuck_cap}, (
+            f"both caps should be in path_proven_stuck, got {second['path_proven_stuck']}"
+        )
