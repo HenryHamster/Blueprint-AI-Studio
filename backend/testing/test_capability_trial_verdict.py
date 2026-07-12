@@ -5078,3 +5078,203 @@ class TestSeedDeployProjectFutilityVerdicts:
 
         mock_flag.assert_not_called()
         assert other_project.capability_adoption_verdicts == {}
+
+
+class TestDisabledPilotAwaitingEnablement:
+    """Reconcile the review_fix_lane trial verdict/debt with the disabled-pilot state.
+
+    While the pilot ships default-off, no intent-to-treat arm key is ever written
+    (record_lane_arm_assignment is a no-op), so the trial stays at n=0 forever.
+    The off-state must be REPORTED as ``awaiting_enablement`` (not the generic
+    ``insufficient_data``) so the debt path defers to the dormant-knob obligation
+    instead of opening a duplicate, never-resolvable capability-trial debt.
+    """
+
+    def test_disabled_pilot_zero_sample_verdict_is_awaiting_enablement(self):
+        """(a) pilot_active=False + empty arms → awaiting_enablement CONTINUE + marker."""
+        verdict = evaluate_lane_pilot_verdict({}, pilot_active=False)
+        assert verdict["verdict"] == "CONTINUE"
+        assert verdict["verdict_reason"] == "awaiting_enablement"
+        assert verdict["awaiting_enablement"] is True
+        assert verdict["immediate_alert"] is False
+        assert verdict["n_lane"] == 0
+        assert verdict["n_control"] == 0
+
+    def test_active_pilot_zero_sample_stays_insufficient_data(self):
+        """(b) pilot_active=True + empty arms → legacy insufficient_data CONTINUE (no marker)."""
+        verdict = evaluate_lane_pilot_verdict({}, pilot_active=True)
+        assert verdict["verdict"] == "CONTINUE"
+        assert verdict["verdict_reason"] == "insufficient_data"
+        assert "awaiting_enablement" not in verdict
+
+    def test_default_none_preserves_legacy_insufficient_data(self):
+        """(b) default pilot_active=None must not change today's behavior at n=0."""
+        verdict = evaluate_lane_pilot_verdict({})
+        assert verdict["verdict"] == "CONTINUE"
+        assert verdict["verdict_reason"] == "insufficient_data"
+        assert "awaiting_enablement" not in verdict
+
+    def test_awaiting_enablement_never_masks_partial_traffic(self):
+        """Disabled pilot with SOME accrued arm traffic falls through to insufficient_data.
+
+        The awaiting-enablement branch requires BOTH arms empty; a trial that already
+        accrued traffic before being switched off is genuinely accumulating, not
+        awaiting first enablement.
+        """
+        verdict = evaluate_lane_pilot_verdict(
+            {"n_lane": 5, "n_control": 3}, pilot_active=False
+        )
+        assert verdict["verdict"] == "CONTINUE"
+        assert verdict["verdict_reason"] == "insufficient_data"
+        assert "awaiting_enablement" not in verdict
+
+    def test_awaiting_enablement_cannot_mask_gate_integrity_kill(self):
+        """A gate-integrity KILL must win even when pilot_active=False is passed."""
+        verdict = evaluate_lane_pilot_verdict(
+            {"gate_integrity_violations": 3}, pilot_active=False
+        )
+        assert verdict["verdict"] == "KILL"
+        assert verdict["verdict_reason"] == "gate_integrity_violations_exceeded"
+        assert verdict["immediate_alert"] is True
+
+    def test_should_record_capability_trial_debt_predicate(self):
+        """(c-predicate) awaiting-enablement entries suppress the capability-trial debt."""
+        from app.capability_trial_verdict import (
+            is_awaiting_enablement_entry,
+            should_record_capability_trial_debt,
+        )
+
+        awaiting = evaluate_lane_pilot_verdict({}, pilot_active=False)
+        assert is_awaiting_enablement_entry(awaiting) is True
+        assert should_record_capability_trial_debt(awaiting) is False
+
+        # A marker set without the reason string is also honored.
+        assert is_awaiting_enablement_entry({"awaiting_enablement": True}) is True
+
+        # An ordinary insufficient_data CONTINUE still records its debt.
+        ordinary = evaluate_lane_pilot_verdict({}, pilot_active=True)
+        assert is_awaiting_enablement_entry(ordinary) is False
+        assert should_record_capability_trial_debt(ordinary) is True
+
+    def _build_mock_db(self, prior_verdicts: dict | None = None):
+        """Return (mock_session, mock_project, mock_cm) mirroring the notice-emission suite."""
+        mock_project = MagicMock()
+        mock_project.capability_adoption_verdicts = dict(prior_verdicts or {})
+
+        mock_session = MagicMock()
+        mock_session.get = AsyncMock(return_value=mock_project)
+        mock_session.commit = AsyncMock()
+        mock_session.rollback = AsyncMock()
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = []
+        scalars_mock.first.return_value = mock_project
+        execute_result = MagicMock()
+        execute_result.scalars.return_value = scalars_mock
+        execute_result.scalar.return_value = None
+        mock_session.execute = AsyncMock(return_value=execute_result)
+        mock_session.add = MagicMock()
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_cm.return_value = mock_cm
+        return mock_session, mock_project, mock_cm
+
+    @pytest.mark.asyncio
+    async def test_disabled_pilot_zero_sample_trial_reports_awaiting_enablement_not_perpetual_debt(
+        self,
+    ):
+        """Acceptance: off-state lane trial resolves (not re-opens) the capability-trial debt.
+
+        (c-DB) An awaiting-enablement CONTINUE verdict for review_fix_lane must NOT
+        call arecord_completion_debt for capability_trial:{project}:review_fix_lane,
+        and MUST call aresolve_completion_debt for that key so any pre-existing
+        never-resolvable row is cleared. The single surviving obligation is the
+        dormant-knob debt owned elsewhere.
+        """
+        import uuid
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        awaiting_entry = evaluate_lane_pilot_verdict({}, pilot_active=False)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch("app.capability_trial_verdict.flag_modified"),
+            patch(
+                "app.completion_debt.arecord_completion_debt",
+                new_callable=AsyncMock,
+            ) as mock_record_debt,
+            patch(
+                "app.completion_debt.aresolve_completion_debt",
+                new_callable=AsyncMock,
+            ) as mock_resolve_debt,
+        ):
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[(LANE_PILOT_CAP_NAME, awaiting_entry)],
+            )
+
+        expected_key = f"capability_trial:{project_id}:{LANE_PILOT_CAP_NAME}"
+        # No new capability-trial debt for the awaiting-enablement verdict.
+        for call in mock_record_debt.call_args_list:
+            assert call.kwargs.get("dedupe_key") != expected_key
+        # Any pre-existing capability-trial debt is resolved with the reconcile reason.
+        mock_resolve_debt.assert_awaited()
+        resolved_keys = {
+            (c.args[1] if len(c.args) > 1 else c.kwargs.get("dedupe_key"))
+            for c in mock_resolve_debt.call_args_list
+        }
+        assert expected_key in resolved_keys
+        reasons = {c.kwargs.get("reason") for c in mock_resolve_debt.call_args_list}
+        assert "awaiting_enablement:dormant_knob_tracks_decision" in reasons
+
+    @pytest.mark.asyncio
+    async def test_active_pilot_zero_sample_still_records_capability_trial_debt(self):
+        """Regression: an ACTIVE-pilot insufficient_data CONTINUE still opens the debt."""
+        import uuid
+
+        from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+
+        project_id = uuid.uuid4()
+        _, _, mock_cm = self._build_mock_db(prior_verdicts={})
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        active_entry = evaluate_lane_pilot_verdict({}, pilot_active=True)
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch("app.capability_trial_verdict.flag_modified"),
+            patch(
+                "app.completion_debt.arecord_completion_debt",
+                new_callable=AsyncMock,
+            ) as mock_record_debt,
+            patch(
+                "app.completion_debt.aresolve_completion_debt",
+                new_callable=AsyncMock,
+            ) as mock_resolve_debt,
+        ):
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[(LANE_PILOT_CAP_NAME, active_entry)],
+            )
+
+        expected_key = f"capability_trial:{project_id}:{LANE_PILOT_CAP_NAME}"
+        recorded_keys = {
+            c.kwargs.get("dedupe_key") for c in mock_record_debt.call_args_list
+        }
+        assert expected_key in recorded_keys
+        # And it must NOT be resolved in the same pass.
+        resolved_keys = {
+            (c.args[1] if len(c.args) > 1 else c.kwargs.get("dedupe_key"))
+            for c in mock_resolve_debt.call_args_list
+        }
+        assert expected_key not in resolved_keys

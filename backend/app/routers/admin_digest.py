@@ -1769,11 +1769,25 @@ async def _compute_digest(
             apply_lane_pilot_kill_in_transaction,
             compute_lane_pilot_aggregates,
             compute_lane_arm_time_medians,
+            is_review_fix_lane_pilot_enabled,
+            is_review_fix_lane_pilot_shadow_mode_enabled,
         )
 
         if project_id is not None:
             _lane_aggs = await compute_lane_pilot_aggregates(session, project_id)
-            _lane_verdict = evaluate_lane_pilot_verdict(_lane_aggs)
+            # The lane trial can only accrue intent-to-treat arm traffic when the
+            # pilot is enabled OR in shadow mode — those are the exact conditions
+            # under which record_lane_arm_assignment writes the arm key.  When
+            # neither holds the pilot is awaiting enablement, so the verdict is
+            # annotated distinctly from generic insufficient_data and the debt
+            # path defers to the dormant-knob obligation instead of duplicating it.
+            _lane_pilot_active = bool(
+                is_review_fix_lane_pilot_enabled()
+                or is_review_fix_lane_pilot_shadow_mode_enabled()
+            )
+            _lane_verdict = evaluate_lane_pilot_verdict(
+                _lane_aggs, pilot_active=_lane_pilot_active
+            )
             _lane_verdict["evaluated_at"] = _verdict_evaluated_at
             # Materialize a compact lane-vs-relay comparison: relay medians from
             # the most recent closed version's persisted baseline plus lane-arm
