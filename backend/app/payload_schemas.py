@@ -20,6 +20,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.task_capabilities import ALL_TASK_TYPES, TaskType
+from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
 
 logger = logging.getLogger(__name__)
 
@@ -315,9 +316,13 @@ class AcceptanceEvidence(BaseModel):
     description: str | None = None
     # downstream_artifact
     artifact_id: str | None = None
-    # visual — width bounds mirror the upload endpoint (Field(ge=1, le=4096))
+    # visual — width bounds mirror the upload endpoint (Field(ge=1, le=4096)).
+    # Sourced from the canonical VIEWPORT_WIDTH_* constants in viewport_evidence
+    # so this declaration-time bound and the upload-endpoint bound cannot drift.
     component: str | None = None
-    viewport_width: int | None = Field(default=None, ge=1, le=4096)
+    viewport_width: int | None = Field(
+        default=None, ge=VIEWPORT_WIDTH_MIN, le=VIEWPORT_WIDTH_MAX
+    )
     assertion_type: str | None = None
     # coverage_delta — minimum coverage percentage (0-100)
     threshold: float | None = Field(default=None, ge=0, le=100)
@@ -370,7 +375,7 @@ class AcceptanceEvidence(BaseModel):
             if self.viewport_width is None:
                 raise ValueError(
                     "visual acceptance_evidence requires viewport_width to be set "
-                    "(must be an integer in 1–4096)"
+                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"
                 )
         elif self.kind == "coverage_delta":
             if self.threshold is None:

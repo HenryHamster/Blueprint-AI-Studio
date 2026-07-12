@@ -25,6 +25,7 @@ from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
+from app.review_fix_lane_pilot import PILOT_PROPAGATE_KEYS
 from app.shared_state import (
     runtime_config as _runtime_config,
     is_warm_continuity_suppressed,
@@ -530,18 +531,16 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 # rollup chain via ``_rollup_retries`` AND the propagated ``rollup_pr_number`` +
 # ``review_loop.pr_number`` lineage (see ``_is_rollup_chain_source``), both of
 # which children DO carry, so the elevated cap still holds across iterations.
-_PROPAGATE_UNDERSCORE_KEYS = frozenset(
-    {
-        "_rollup_retries",
-        # Review-fix lane pilot: the intent-to-treat arm assignment and the
-        # chain-private lane id must survive every fix/review iteration so the
-        # chain stays bound to its arm/lane. Both are inert to dispatch (unlike
-        # ``improvement_lane_id``, which is re-derived per fix phase) — see
-        # app.review_fix_lane_pilot.
-        "_review_fix_lane_arm",
-        "_review_fix_lane_id",
-    }
-)
+# Review-fix lane pilot: the intent-to-treat arm assignment (_review_fix_lane_arm)
+# and the chain-private lane id (_review_fix_lane_id) must survive every
+# fix/review iteration so the chain stays bound to its arm/lane. Both are inert
+# to dispatch (unlike ``improvement_lane_id``, which is re-derived per fix
+# phase). Reference the canonical PILOT_PROPAGATE_KEYS frozenset that owns these
+# keys (imported at the top of this module) rather than re-typing the literals,
+# so the propagation set and the pilot module can never silently drift apart (a
+# drifted key would de-populate the trial's arm/receipt subpopulations — see
+# app.review_fix_lane_pilot).
+_PROPAGATE_UNDERSCORE_KEYS = frozenset({"_rollup_retries"}) | PILOT_PROPAGATE_KEYS
 
 
 def _is_rollup_chain_source(source_task: "Task") -> bool:

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS, StrategicCycle, Task
+from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 from app.time_utils import _utcnow
 
@@ -256,7 +257,9 @@ async def mark_phase2_completed(
         return None
     cycle.phase2_completed_at = _utcnow()
     cycle.outcome = OUTCOME_COMPLETED
-    cycle.summary_text = summary_text
+    # Enforce the declared storage cap (STATUS/cycle strings are otherwise
+    # unbounded here, mirroring the cycle_reasoning cap on the next line).
+    cycle.summary_text = summary_text[:CYCLE_SUMMARY_MAX] if summary_text else summary_text
     cycle.cycle_reasoning = (cycle_reasoning or "")[:2000] if cycle_reasoning else None
     cycle.directions_created = directions_created
     cycle.directions_retired = directions_retired

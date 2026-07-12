@@ -762,14 +762,6 @@ def classify_failure_taxonomy(task: "Task") -> str:
 _INVESTIGATION_EXCLUDED_TYPES: frozenset[str] = frozenset({"investigate", "smoketest"})
 
 
-# Minimum number of review-quality failures (in the recent sliding window on a
-# direction) before the frequency-based review-quality investigation trigger
-# fires. Individual review-quality failures are retried in-place; the trigger
-# only fires once a pattern has formed (3+ in the window) suggesting a
-# systemic issue.
-REVIEW_QUALITY_STREAK_THRESHOLD = 3
-
-
 def should_trigger_review_quality_investigation(task: "Task") -> bool:
     """Return True if a failed task is a candidate for a review-quality pattern
     investigation (gating only — streak check is performed at the spawn site
