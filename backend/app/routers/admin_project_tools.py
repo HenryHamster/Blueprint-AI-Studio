@@ -1166,13 +1166,33 @@ async def serve_tool_asset(
         )
         raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
 
+    # Security headers for tokened, same-origin-reachable asset responses.
+    #
+    # A top-level navigation to a tokened asset URL would otherwise execute
+    # repo-authored (attacker-controllable) HTML with the full privileges of
+    # the admin-SPA origin.  Defense:
+    #   * Content-Security-Policy: sandbox allow-scripts — forces the served
+    #     document into an opaque origin (no allow-same-origin) even on a
+    #     top-level navigation, so it cannot touch admin-origin cookies /
+    #     storage / DOM.  This mirrors the iframe's own
+    #     ``sandbox="allow-scripts"`` attribute, so the legitimate embed path
+    #     is unaffected (scripts still run).
+    #   * X-Content-Type-Options: nosniff — prevents the browser from
+    #     MIME-sniffing an asset into an executable type.
+    #   * No ``Access-Control-Allow-Origin: *`` — tokened responses must not be
+    #     wildcard-CORS-readable by arbitrary origins.  The sandboxed iframe
+    #     loads its subresources as same-origin-of-document requests (no CORS
+    #     preflight), so dropping the wildcard does not break the embed path.
+    headers = {
+        "Cache-Control": "public, max-age=300",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox allow-scripts",
+    }
+
     return Response(
         content=body,
         media_type=content_type,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=300",
-        },
+        headers=headers,
     )
 
 

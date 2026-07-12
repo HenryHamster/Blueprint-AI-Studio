@@ -1598,10 +1598,17 @@ async def test_asset_serving_rejects_wrong_token(
 
 
 @pytest.mark.asyncio
-async def test_asset_serving_cors_headers(
+async def test_asset_serving_drops_wildcard_cors(
     client: AsyncClient, db_session,
 ):
-    """Successful asset responses include CORS headers."""
+    """Tokened asset responses must NOT be wildcard-CORS-readable.
+
+    Regression guard for gating finding e1a83674865343be: a tokened,
+    same-origin-reachable asset response previously carried
+    ``Access-Control-Allow-Origin: *``, making the repo-authored (untrusted)
+    body readable by arbitrary origins. The hardened endpoint drops the
+    wildcard entirely.
+    """
     from unittest.mock import AsyncMock, patch
 
     project = await _make_project_member(db_session)
@@ -1632,7 +1639,100 @@ async def test_asset_serving_cors_headers(
             f"?token={token}"
         )
         assert resp.status_code == 200
-        assert resp.headers.get("access-control-allow-origin") == "*"
+        assert resp.headers.get("access-control-allow-origin") != "*"
+        assert "access-control-allow-origin" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_asset_serving_security_headers(
+    client: AsyncClient, db_session,
+):
+    """Served HTML carries a CSP sandbox (allow-scripts only) and nosniff.
+
+    Guards gating finding e1a83674865343be. A top-level navigation to a
+    tokened asset URL must not execute repo-authored HTML with admin-origin
+    privileges: the ``Content-Security-Policy: sandbox allow-scripts`` header
+    forces the document into an opaque origin (no ``allow-same-origin``), and
+    ``X-Content-Type-Options: nosniff`` blocks MIME-sniffing.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value="<html><body>Hi</body></html>"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/assets/index.html"
+            f"?token={token}"
+        )
+        assert resp.status_code == 200
+
+        csp = resp.headers.get("content-security-policy", "")
+        assert "sandbox" in csp
+        assert "allow-scripts" in csp
+        # Must NOT re-grant same-origin privileges — that would defeat the
+        # sandbox and let a top-level navigation act as the admin origin.
+        assert "allow-same-origin" not in csp
+
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_asset_serving_binary_has_nosniff(
+    client: AsyncClient, db_session,
+):
+    """Non-text (binary) assets also carry X-Content-Type-Options: nosniff."""
+    from unittest.mock import AsyncMock, patch
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_bytes_at_ref",
+            AsyncMock(return_value=b"\x89PNG\r\n\x1a\n"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/assets/logo.png"
+            f"?token={token}"
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert "access-control-allow-origin" not in resp.headers
 
 
 @pytest.mark.asyncio
