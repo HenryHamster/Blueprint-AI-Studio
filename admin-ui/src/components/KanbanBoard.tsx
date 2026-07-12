@@ -363,6 +363,19 @@ export function KanbanBoard({
     return result;
   }, [columns, tasksByColumn]);
 
+  // Stable per-column handlers so TaskCard React.memo is not bypassed by a new
+  // function reference on every parent render. taskIdsByColumn is already memoized
+  // so the handlers only change when tasks or column membership actually changes.
+  const shiftClickHandlersByColumn = useMemo(() => {
+    if (!onShiftSelect) return {} as Record<string, (taskId: string) => void>;
+    const handlers: Record<string, (taskId: string) => void> = {};
+    for (const col of columns) {
+      const ids = taskIdsByColumn[col.id] ?? [];
+      handlers[col.id] = (taskId: string) => onShiftSelect(taskId, ids);
+    }
+    return handlers;
+  }, [onShiftSelect, taskIdsByColumn, columns]);
+
   return (
     <DndContext
       sensors={sensors}
@@ -404,9 +417,7 @@ export function KanbanBoard({
           const columnTasks = tasksByColumn[col.id] ?? [];
           const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
           const taskIds = taskIdsByColumn[col.id] ?? [];
-          const shiftClickHandler = onShiftSelect
-            ? (taskId: string) => onShiftSelect(taskId, taskIds)
-            : undefined;
+          const shiftClickHandler = shiftClickHandlersByColumn[col.id];
 
           const mobileContent = (
               <div className={compact ? 'space-y-1.5' : 'space-y-2'}>

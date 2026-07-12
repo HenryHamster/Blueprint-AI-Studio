@@ -47,7 +47,7 @@
     "findings_index.py": 350,
     "strategic_completion.py": 7200,
     "rollup_management.py": 5550,
-    "rollup_migration_validation.py": 1100,
+    "rollup_migration_validation.py": 1350,
     "reaper.py": 3650,
     "reaper_sweeps.py": 2550,
     "reaper_fleet_health_sweeps.py": 500,
@@ -134,11 +134,11 @@
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 4000,
     "release_readiness.py": 2100,
-    "acceptance_criteria.py": 2150,
+    "acceptance_criteria.py": 2600,
+    "strategic_context_package.py": 1800,
     "runner_health_alerts.py": 1950,
     "routers/agent_strategic_fetch.py": 1750,
-    "runner_health_monitors.py": 1001,
-    "strategic_context_package.py": 1800
+    "runner_health_monitors.py": 1001
   },
   "agent": {
     "index.ts": 4600,

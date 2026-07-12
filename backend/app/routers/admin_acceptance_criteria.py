@@ -530,10 +530,13 @@ async def reconcile_backfill(
         direction_keys.extend(batch)
         last_key = batch[-1]
 
+    # Single unified Task scan for all directions instead of one scan per direction.
+    totals_by_direction = await ac.backfill_all_directions_merge_evidence(
+        session, project_id, direction_keys
+    )
     results = []
     total = 0
-    for dk in direction_keys:
-        recorded = await ac.backfill_direction_merge_evidence(session, project_id, dk)
+    for dk, recorded in totals_by_direction.items():
         total += recorded
         if recorded:
             results.append({"direction_key": dk, "evidence_recorded": recorded})

@@ -7624,3 +7624,227 @@ async def test_merge_evidence_gaps_accumulate(db_session):
     assert gaps.get(MergeEvidenceReason.no_criteria.value, 0) >= 3, (
         f"Expected no_criteria >= 3 after three gap-producing merges; got {gaps}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _record_evidence_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_evidence_batch_inserts_all(db_session):
+    """_record_evidence_batch inserts multiple evidence rows in a single commit."""
+    project = await _make_project(db_session, "BatchEvidence")
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Batch criterion 1")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Batch criterion 2")
+
+    batch = [
+        CriterionEvidence(
+            criterion_id=c1.id,
+            project_id=project.id,
+            source_kind="task_merge",
+            source_id="task-batch-1",
+            detail={"proven": True},
+        ),
+        CriterionEvidence(
+            criterion_id=c2.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="task-batch-1",
+            detail={"proven": True},
+        ),
+    ]
+    recorded = await ac._record_evidence_batch(db_session, batch)
+    assert recorded == 2
+
+    ev1 = await ac.get_evidence_for_criterion(db_session, c1.id)
+    ev2 = await ac.get_evidence_for_criterion(db_session, c2.id)
+    assert len(ev1) == 1
+    assert ev1[0].source_kind == "task_merge"
+    assert len(ev2) == 1
+    assert ev2[0].source_kind == "reachability"
+
+
+@pytest.mark.asyncio
+async def test_record_evidence_batch_empty_is_noop(db_session):
+    """_record_evidence_batch with an empty list returns 0 and does nothing."""
+    recorded = await ac._record_evidence_batch(db_session, [])
+    assert recorded == 0
+
+
+# ---------------------------------------------------------------------------
+# backfill_all_directions_merge_evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_single_scan(db_session):
+    """backfill_all_directions_merge_evidence covers proven tasks across two directions."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BulkDirectionBackfill")
+    version = await _make_version(db_session, project)
+
+    dk1 = "d-bulk-1"
+    dk2 = "d-bulk-2"
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Bulk criterion 1")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Bulk criterion 2")
+
+    dir1 = Direction(
+        project_id=project.id,
+        direction_key=dk1,
+        data={"id": dk1, "text": "Dir 1", "status": "active"},
+        status="active",
+        criterion_keys=[c1.criterion_key],
+    )
+    dir2 = Direction(
+        project_id=project.id,
+        direction_key=dk2,
+        data={"id": dk2, "text": "Dir 2", "status": "active"},
+        status="active",
+        criterion_keys=[c2.criterion_key],
+    )
+    db_session.add(dir1)
+    db_session.add(dir2)
+
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "t1"}],
+        context={
+            "direction_id": dk1,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+            },
+        },
+        criterion_ids=[c1.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "t2"}],
+        context={
+            "direction_id": dk2,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+            },
+        },
+        criterion_ids=[c2.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=2),
+    )
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+
+    totals = await ac.backfill_all_directions_merge_evidence(
+        db_session, project.id, [dk1, dk2]
+    )
+
+    # Each direction should have 2 evidence rows (task_merge + reachability).
+    assert totals.get(dk1, 0) == 2, f"Expected 2 for {dk1}, got {totals}"
+    assert totals.get(dk2, 0) == 2, f"Expected 2 for {dk2}, got {totals}"
+
+    ev1 = await ac.get_evidence_for_criterion(db_session, c1.id)
+    ev2 = await ac.get_evidence_for_criterion(db_session, c2.id)
+    assert {e.source_kind for e in ev1} == {"task_merge", "reachability"}
+    assert {e.source_kind for e in ev2} == {"task_merge", "reachability"}
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_empty_list(db_session):
+    """backfill_all_directions_merge_evidence with an empty list returns {}."""
+    project = await _make_project(db_session, "BulkDirEmpty")
+    totals = await ac.backfill_all_directions_merge_evidence(db_session, project.id, [])
+    assert totals == {}
+
+
+@pytest.mark.asyncio
+async def test_backfill_all_directions_merge_evidence_ignores_other_directions(db_session):
+    """Tasks belonging to an unlisted direction are not processed."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BulkDirIgnore")
+    version = await _make_version(db_session, project)
+
+    dk_target = "d-target"
+    dk_other = "d-other"
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Target criterion"
+    )
+    other_criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Other criterion"
+    )
+
+    dir_target = Direction(
+        project_id=project.id,
+        direction_key=dk_target,
+        data={"id": dk_target, "text": "Target", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    dir_other = Direction(
+        project_id=project.id,
+        direction_key=dk_other,
+        data={"id": dk_other, "text": "Other", "status": "active"},
+        status="active",
+        criterion_keys=[other_criterion.criterion_key],
+    )
+    db_session.add(dir_target)
+    db_session.add(dir_other)
+
+    task_target = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "direction_id": dk_target,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    task_other = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "y"}],
+        context={
+            "direction_id": dk_other,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        criterion_ids=[other_criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=2),
+    )
+    db_session.add(task_target)
+    db_session.add(task_other)
+    await db_session.commit()
+
+    # Only pass dk_target — the other direction's task must not be processed.
+    totals = await ac.backfill_all_directions_merge_evidence(
+        db_session, project.id, [dk_target]
+    )
+
+    assert dk_target in totals
+    assert dk_other not in totals
+
+    other_ev = await ac.get_evidence_for_criterion(db_session, other_criterion.id)
+    assert other_ev == [], "task for unlisted direction must not have evidence"

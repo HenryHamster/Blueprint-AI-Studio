@@ -736,6 +736,23 @@ def _migration_file(path: str, revision: str, down_revision: str) -> dict:
     return {"filename": path, "status": "added", "patch": f"@@ -0,0 +1,7 @@\n{body}"}
 
 
+def _renamed_migration_file(
+    old_path: str,
+    new_path: str,
+    new_revision: str,
+    new_down_revision: str,
+) -> dict:
+    """Create a pr_files entry for a renamed migration file."""
+    src = _migration_source(new_revision, new_down_revision)
+    body = "".join(f"+{line}\n" for line in src.splitlines())
+    return {
+        "filename": new_path,
+        "previous_filename": old_path,
+        "status": "renamed",
+        "patch": f"@@ -0,0 +1,7 @@\n{body}",
+    }
+
+
 @pytest.mark.asyncio
 async def test_premerge_guard_blocks_cross_branch_reuse_vs_promotion_target(mocker):
     """The revision-0143 class: the rollup adds 0143_add_compute_job_persistence
@@ -1216,3 +1233,87 @@ async def test_premerge_guard_blocks_inplace_edit_of_deployed_migration(mocker):
     assert status == "block"
     assert "0143_vm_contact_last_tool_use.py" in reason
     assert "immutable" in reason or "deployed" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_allows_pr_that_removes_conflicting_integration_file(
+    mocker,
+):
+    """A PR that renames/removes the conflicting integration file resolves the
+    divergence via its merge — the guard must not block it.
+
+    Scenario: integration has BOTH 0458_add_perf_indexes.py (matches deployed
+    main) AND 0458_task_updated_at_vm_dispatched_at_indexes.py (an earlier
+    iteration of the PR that slipped in). The effective automain revision '0458'
+    maps to 'task_updated_at_vm_dispatched_at_indexes' (last alphabetically),
+    diverging from main's 'add_perf_indexes'. This PR renames the conflicting
+    file to a new revision 0502, which means the post-merge integration branch
+    will only carry 0458_add_perf_indexes.py — matching main. The guard must
+    pass ('ok') rather than blocking."""
+    old_path = f"{_VERSIONS_DIR}/0458_task_updated_at_vm_dispatched_at_indexes.py"
+    new_path = f"{_VERSIONS_DIR}/0502_task_vm_dispatched_at_index.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                _renamed_migration_file(old_path, new_path, "0502", "0501"),
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Integration has both 0458 files (the conflict) plus the new head.
+            integration=[
+                "0457_encrypt_github_pat.py",
+                "0458_add_perf_indexes.py",
+                "0458_task_updated_at_vm_dispatched_at_indexes.py",
+                "0459_no_op_head_marker.py",
+                "0501_add_releaseversion_merge_evidence_gaps.py",
+            ],
+            # Deployed main has 0458 as add_perf_indexes (no task index file).
+            promotion=[
+                "0457_encrypt_github_pat.py",
+                "0458_add_perf_indexes.py",
+                "0459_no_op_head_marker.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "ok", f"expected ok but got {status!r}: {reason}"
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_blocks_pre_pr_rename_not_removed_by_pr(mocker):
+    """Verify that the post-merge exclusion only applies when the PR actually
+    removes the conflicting file. A PR that adds an unrelated migration while
+    the integration branch carries a pre-existing unauthorized divergence (that
+    the PR does NOT remove) must still be blocked."""
+    # PR only adds an unrelated 0503 migration; it does NOT touch 0458.
+    new_path = f"{_VERSIONS_DIR}/0503_unrelated.py"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_migration_file(new_path, "0503", "0502")]),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=[
+                "0457_encrypt_github_pat.py",
+                "0458_add_perf_indexes.py",
+                "0458_task_updated_at_vm_dispatched_at_indexes.py",
+                "0502_something_else.py",
+            ],
+            promotion=[
+                "0457_encrypt_github_pat.py",
+                "0458_add_perf_indexes.py",
+            ],
+        ),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert "0458" in reason

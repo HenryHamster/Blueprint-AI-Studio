@@ -1154,6 +1154,8 @@ async def get_pr_files(
                 "deletions": f.get("deletions", 0),
                 "changes": f.get("changes", 0),
             }
+            if "previous_filename" in f:
+                entry["previous_filename"] = f["previous_filename"]
             if include_patch and "patch" in f:
                 entry["patch"] = f["patch"]
             result.append(entry)

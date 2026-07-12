@@ -2374,11 +2374,7 @@ async def _provision_gcp(
                 logger.warning(
                     f"All zones in cooldown — waiting {soonest_wait:.0f}s for {wait_zone} to exit cooldown"
                 )
-                import time as _time
-
-                _time.sleep(
-                    max(0, soonest_wait) + 1
-                )  # Safe to block — runs in a thread via asyncio.to_thread(_insert_instance)
+                time.sleep(max(0, soonest_wait) + 1)
                 # Retry the soonest zone
                 try:
                     instance_config.machine_type = (

@@ -382,8 +382,38 @@ async def _validate_rollup_migration_chain(
         # by the deploy-time reconciliation) are filtered out — they are already
         # safe and must not block new PRs on an integration branch that carries
         # the known renumber, mirroring the qual-time guard's behavior.
+        #
+        # Exception: if THIS PR itself removes or renames away the conflicting
+        # file, the post-merge integration branch will no longer carry the
+        # divergence — the PR is the FIX, not a new offender. Use effective
+        # post-merge integration filenames (current minus what the PR deletes)
+        # so such a PR is not blocked by the very conflict it resolves.
+        _pr_removed_version_basenames: set[str] = set()
+        for _f in files:
+            _fstatus = _f.get("status", "")
+            if _fstatus == "removed" and _touches_alembic_versions(
+                _f.get("filename", "")
+            ):
+                _pr_removed_version_basenames.add(
+                    _f["filename"].rsplit("/", 1)[-1]
+                )
+            elif _fstatus == "renamed" and _touches_alembic_versions(
+                _f.get("previous_filename", "")
+            ):
+                _pr_removed_version_basenames.add(
+                    _f["previous_filename"].rsplit("/", 1)[-1]
+                )
+        _effective_integration = (
+            [
+                fn
+                for fn in existing_filenames
+                if fn not in _pr_removed_version_basenames
+            ]
+            if _pr_removed_version_basenames
+            else existing_filenames
+        )
         full_branch_records = find_content_divergence_records(
-            promotion_filenames, existing_filenames
+            promotion_filenames, _effective_integration
         )
         unauthorized_full_branch = [
             r for r in full_branch_records if not _divergence_record_is_authorized(r)
