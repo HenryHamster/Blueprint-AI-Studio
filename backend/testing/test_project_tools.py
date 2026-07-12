@@ -1988,7 +1988,16 @@ async def test_end_to_end_manifest_discovery(
             assert asset_resp.status_code == 200
             assert "Analytics" in asset_resp.text
             assert asset_resp.headers["content-type"].startswith("text/html")
-            assert asset_resp.headers.get("access-control-allow-origin") == "*"
+            # Hardened serving model (gating finding e1a83674865343be): the
+            # tokened, same-origin-reachable HTML must NOT be wildcard-CORS
+            # readable, must carry a CSP sandbox that forces an opaque origin
+            # (no allow-same-origin), and must set nosniff.
+            assert "access-control-allow-origin" not in asset_resp.headers
+            csp = asset_resp.headers.get("content-security-policy", "")
+            assert "sandbox" in csp
+            assert "allow-scripts" in csp
+            assert "allow-same-origin" not in csp
+            assert asset_resp.headers.get("x-content-type-options") == "nosniff"
 
 
 # ===========================================================================
