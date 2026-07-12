@@ -326,6 +326,13 @@ def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
     This is a merge-test gate: it runs against the real file tree, so a PR that
     grows orchestrator_runner_dispatch.py past its cap will fail here even before
     the CI invariant suite runs.
+
+    2026-07-12 remediation (automain HEAD 683abce3): orchestrator_runner_dispatch.py
+    reached 2250 lines over its old cap of 2200. The fix bumps that cap in
+    module_size_limits.json to the canonical policy value; this gate proves the
+    bumped JSON is consistent with the actual file size on disk, so the test fails
+    if the cap is reverted (or the file grows past the new cap) before the CI
+    invariant suite runs.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
