@@ -20257,6 +20257,153 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     assert qual["merge_grade_task_id"] is not None
 
 
+@pytest.mark.asyncio
+async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_survive(
+    db_session, mocker,
+):
+    """Per-(candidate_sha, dimension) failure isolation (v25 criterion c-2d1be255).
+
+    A transient infra failure in ONE gate must redrive ONLY that gate's
+    dimension; every OTHER dimension's previously-passed per-dimension ledger
+    fact must survive the re-drive un-discarded and un-downgraded.  This is the
+    isolation guarantee the qualification ledger provides: a flapping audit gate
+    cannot silently throw away a smoketest 'passed' fact (or any other resolved
+    dimension) that already cost real compute to earn.
+
+    Covers the audit+smoketest pair (plus ci as a second surviving control):
+    audit hit a transient ``audit_task_failed`` while smoketest and ci had
+    already resolved 'passed' at the SAME candidate_sha.  On re-drive:
+      (a) ONLY the audit dimension is re-spawned (smoketest child is NOT), and
+      (b) the smoketest AND ci ``QualificationDimensionResult`` ledger rows are
+          still present with status 'passed' and their sub_scores intact — the
+          audit-gate failure did not discard or downgrade another dimension's
+          passed result.
+
+    Regression tripwire: if the re-drive ever discarded/downgraded a sibling
+    dimension's passed ledger fact (breaking isolation), the ledger-row survival
+    assertions below fail.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "1solat3d" * 5
+
+    # audit is the transiently-failed gate (left 'unavailable' by the infra
+    # failure); every other gate already resolved 'passed' at this candidate_sha.
+    await _seed_dimension_row(
+        db_session, project, version, "audit",
+        status="unavailable", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "smoketest",
+        status="passed", sub_score=0.91, candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "test_erosion",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "ci",
+        status="passed", sub_score=0.77, candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_identity",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_apply",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "challenge",
+        status="passed", candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "merge_grade",
+        status="passed", candidate_sha=sha,
+    )
+    await db_session.commit()
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha,
+        "error": "audit_task_failed",
+        "failing_dimension": "audit",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version.qualification_attempts = 1
+    version.goal = "Isolate a transient audit-gate failure from resolved dimensions"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    smoketest_spawn = mocker.patch(
+        "app.release_qualifier._spawn_qualifier_smoketest_task",
+        new=AsyncMock(),
+    )
+    merge_grade_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_merge_grade_task",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-1solat3d",
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert result is True
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["status"] == "pending"
+
+    # --- (a) ONLY the failing (audit) dimension is redriven -----------------
+    audit_spawn.assert_awaited_once()
+    # smoketest already 'passed' — NOT re-spawned by the audit-gate re-drive.
+    smoketest_spawn.assert_not_called()
+    # merge_grade already 'passed' — NOT re-spawned either.
+    merge_grade_spawn.assert_not_called()
+    assert qual["audit_task_id"] is not None
+    assert qual["smoketest_task_id"] is None
+    assert qual["merge_grade_task_id"] is None
+
+    # audit is being re-measured, so it is NOT in the carried-forward reuse set;
+    # the other resolved dimensions ARE carried forward.
+    resolved = qual.get("resolved_dimensions") or {}
+    assert "audit" not in resolved
+    assert resolved.get("smoketest", {}).get("status") == "passed"
+    assert resolved["smoketest"]["sub_score"] == 0.91
+    assert resolved.get("ci", {}).get("status") == "passed"
+
+    # --- (b) sibling dimensions' PASSED ledger facts survive un-discarded ----
+    # and un-downgraded: the audit-gate transient failure could not throw away
+    # or weaken another dimension's already-earned passed result.
+    ledger = await _dimension_rows_by_dim(db_session, version)
+    # The smoketest passed fact is still present, still 'passed', still 0.91.
+    assert "smoketest" in ledger, "smoketest passed ledger fact was discarded"
+    assert ledger["smoketest"].status == "passed"
+    assert ledger["smoketest"].sub_score == 0.91
+    # The ci passed fact is likewise intact (second surviving control).
+    assert "ci" in ledger, "ci passed ledger fact was discarded"
+    assert ledger["ci"].status == "passed"
+    assert ledger["ci"].sub_score == 0.77
+    # The failing dimension's own row is not spuriously promoted to 'passed'.
+    assert ledger["audit"].status != "passed"
+
+
 async def _seed_redrive_common_dimensions(db_session, project, version, sha):
     """Seed the non-audit gates as resolved 'passed' for a re-drive at ``sha``."""
     for dim in ("test_erosion", "smoketest", "ci", "migration_identity",
