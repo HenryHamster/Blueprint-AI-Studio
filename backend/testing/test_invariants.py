@@ -628,6 +628,104 @@ class TestSafetyConstants:
 # ── Schema Revision Sync ───────────────────────────────────────────────────
 
 
+# CREATE/DROP [UNIQUE] INDEX ... CONCURRENTLY in a raw SQL string. Postgres
+# forbids CONCURRENTLY inside a transaction block, so a migration issuing it
+# must first escape Alembic's per-migration transaction (env.py sets
+# ``transaction_per_migration=True``) via ``op.execute("COMMIT")``.
+_CONCURRENTLY_DDL_RE = re.compile(
+    r"\b(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b",
+    re.IGNORECASE,
+)
+
+
+def _ast_literal_text(node: ast.AST) -> str:
+    """Return the static text of a string literal node.
+
+    Handles a bare ``ast.Constant`` string, adjacent-concatenated literals
+    (collapsed to one Constant by the parser), and f-strings (``ast.JoinedStr``)
+    — for f-strings only the literal segments are returned; interpolated
+    ``{...}`` placeholders are ignored (the CONCURRENTLY keyword is always in a
+    literal segment). Non-string nodes yield ``""``.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value
+            for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        )
+    return ""
+
+
+def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]:
+    """Return violation strings for migration source that issues CONCURRENTLY
+    index DDL without first escaping the per-migration transaction.
+
+    A CONCURRENTLY event is either:
+      * ``op.execute(...)`` whose static string contains CREATE/DROP INDEX
+        CONCURRENTLY, or
+      * ``op.create_index(...)`` / ``op.drop_index(...)`` with the alembic
+        ``postgresql_concurrently=True`` kwarg (which itself emits CONCURRENTLY).
+
+    A COMMIT event is ``.execute("COMMIT")``. Within each ``upgrade`` /
+    ``downgrade`` function, a COMMIT must lexically precede the FIRST
+    CONCURRENTLY event; otherwise the DDL runs inside Alembic's transaction and
+    fails on Postgres (while passing silently on SQLite, which ignores
+    CONCURRENTLY entirely). Only executed statements are inspected, so a
+    CONCURRENTLY mention in a docstring or comment is never flagged.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return [f"{revision}: could not parse migration source"]
+
+    violations: list[str] = []
+    for func in tree.body:
+        if not isinstance(func, ast.FunctionDef) or func.name not in (
+            "upgrade",
+            "downgrade",
+        ):
+            continue
+
+        commits: list[tuple[int, int]] = []
+        concurrentlies: list[tuple[int, int]] = []
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
+                continue
+            attr = node.func.attr
+            pos = (node.lineno, node.col_offset)
+
+            if attr == "execute" and node.args:
+                text = _ast_literal_text(node.args[0])
+                if text.strip().upper() == "COMMIT":
+                    commits.append(pos)
+                elif _CONCURRENTLY_DDL_RE.search(text):
+                    concurrentlies.append(pos)
+            elif attr in ("create_index", "drop_index"):
+                for kw in node.keywords:
+                    if (
+                        kw.arg == "postgresql_concurrently"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                    ):
+                        concurrentlies.append(pos)
+
+        if not concurrentlies:
+            continue
+        first_concurrently = min(concurrentlies)
+        if not any(commit < first_concurrently for commit in commits):
+            violations.append(
+                f"{revision}.{func.name}: CONCURRENTLY index DDL is not preceded "
+                "by op.execute(\"COMMIT\") to escape the per-migration transaction"
+            )
+
+    return violations
+
+
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
         """EXPECTED_SCHEMA_REVISION must match the structural head of the alembic chain.
@@ -1860,6 +1958,44 @@ class TestSchemaRevisionSync:
             "an index name an earlier migration already created."
         )
 
+    def test_concurrently_index_migrations_escape_transaction(self):
+        """Any migration issuing CREATE/DROP INDEX CONCURRENTLY (or
+        ``op.create_index(..., postgresql_concurrently=True)``) must first
+        ``op.execute("COMMIT")`` to escape Alembic's per-migration transaction.
+
+        Postgres forbids CONCURRENTLY inside a transaction block, and
+        ``env.py`` sets ``transaction_per_migration=True`` so every migration
+        runs in its own transaction. Without the COMMIT escape the DDL raises
+        on Postgres — yet SQLite (the default test backend) ignores CONCURRENTLY
+        entirely, so the fault is invisible in CI and only surfaces in
+        production. This is exactly the SQLite-masks-Postgres class that shipped
+        broken twice (#14408, #14410) and needed fix-forward commits.
+        """
+        import glob as globmod
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+        assert files, "No migration files found"
+
+        violations: list[str] = []
+        for path in files:
+            revision = os.path.basename(path).split("_")[0]
+            with open(path) as f:
+                source = f.read()
+            violations.extend(_concurrently_txn_escape_violations(source, revision))
+
+        assert not violations, (
+            "Migration(s) issue CONCURRENTLY index DDL without first escaping "
+            "the per-migration transaction — this raises on Postgres but passes "
+            "silently on SQLite:\n  "
+            + "\n  ".join(sorted(violations))
+            + "\n\nInside the `if bind.dialect.name == \"postgresql\":` branch, "
+            'emit `op.execute("COMMIT")` BEFORE the first CREATE/DROP INDEX '
+            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern)."
+        )
+
 
 # ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
 
@@ -2010,6 +2146,76 @@ class TestChainInvariantSeedFixtures:
         errors = validate_standalone_chain(desync_sources)
         assert any("mismatch" in e for e in errors), (
             f"validate_standalone_chain did not report filename desync; got: {errors}"
+        )
+
+    def test_concurrently_escape_detector_fires_on_seeded_bad_migrations(self):
+        """Prove _concurrently_txn_escape_violations fires on unescaped CONCURRENTLY
+        DDL and stays silent on the correctly-escaped / docstring-only shapes.
+
+        The positive invariant
+        (test_concurrently_index_migrations_escape_transaction) asserts the real
+        chain is clean but never verifies the detector itself fires — so a
+        detector that silently returned [] for everything would pass forever.
+        These seeded in-memory sources (no I/O) self-certify the tooling.
+        """
+        # BAD 1: raw CREATE INDEX CONCURRENTLY with no preceding COMMIT.
+        bad_raw = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    op.execute('CREATE INDEX CONCURRENTLY ix_x ON task (a)')\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_raw, "9001")
+        assert v and "upgrade" in v[0], (
+            f"detector did not flag unescaped raw CONCURRENTLY DDL; got: {v}"
+        )
+
+        # BAD 2: alembic postgresql_concurrently=True kwarg with no COMMIT.
+        bad_kwarg = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    op.create_index('ix_y', 'task', ['b'], postgresql_concurrently=True)\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_kwarg, "9002")
+        assert v, (
+            f"detector did not flag postgresql_concurrently=True without COMMIT; got: {v}"
+        )
+
+        # BAD 3: DROP INDEX CONCURRENTLY in downgrade with no COMMIT.
+        bad_downgrade = (
+            "from alembic import op\n"
+            "def downgrade():\n"
+            "    op.execute('DROP INDEX CONCURRENTLY IF EXISTS ix_z')\n"
+        )
+        v = _concurrently_txn_escape_violations(bad_downgrade, "9003")
+        assert v and "downgrade" in v[0], (
+            f"detector did not flag unescaped DROP INDEX CONCURRENTLY; got: {v}"
+        )
+
+        # GOOD 1: COMMIT precedes the CONCURRENTLY DDL — no violation.
+        good = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    if op.get_bind().dialect.name == 'postgresql':\n"
+            "        op.execute('COMMIT')\n"
+            "        op.execute('CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_x ON task (a)')\n"
+            "    else:\n"
+            "        op.create_index('ix_x', 'task', ['a'])\n"
+        )
+        assert not _concurrently_txn_escape_violations(good, "9004"), (
+            "detector false-positived on correctly COMMIT-escaped CONCURRENTLY DDL"
+        )
+
+        # GOOD 2: CONCURRENTLY mentioned only in a docstring / comment and a plain
+        # (non-CONCURRENTLY) op.execute — the 0273 shape. Must NOT be flagged.
+        docstring_only = (
+            "from alembic import op\n"
+            "def upgrade():\n"
+            "    '''Prod already built this CREATE INDEX CONCURRENTLY in 0117.'''\n"
+            "    # DROP INDEX CONCURRENTLY handled elsewhere\n"
+            "    op.execute('CREATE INDEX IF NOT EXISTS ix_x ON task (a)')\n"
+        )
+        assert not _concurrently_txn_escape_violations(docstring_only, "9005"), (
+            "detector wrongly flagged a docstring/comment-only CONCURRENTLY mention"
         )
 
 

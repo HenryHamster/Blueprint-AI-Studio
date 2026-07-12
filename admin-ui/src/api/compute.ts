@@ -1879,6 +1879,20 @@ export interface RunnerStatsResponse {
   jobs_succeeded_count: number;
   /** succeeded / terminal, or null when no terminal jobs yet. */
   jobs_success_rate: number | null;
+  /** On-demand cloud VM cost the runner's terminal jobs would have incurred. */
+  cloud_cost_avoided_usd: number;
+  /** Number of terminal jobs with an honest runtime window backing the total. */
+  cloud_cost_avoided_basis: number;
+  /** Median claim latency (vm_cold_start_ms) across terminal tasks, ms. */
+  claim_latency_ms_p50: number | null;
+  /** 95th percentile claim latency, ms. */
+  claim_latency_ms_p95: number | null;
+  /** 99th percentile claim latency, ms. */
+  claim_latency_ms_p99: number | null;
+  /** Maximum claim latency, ms. */
+  claim_latency_ms_max: number | null;
+  /** Number of tasks with vm_cold_start_ms in the sample. */
+  claim_latency_sample_count: number;
   last_n_outcomes: RunnerOutcome[];
 }
 

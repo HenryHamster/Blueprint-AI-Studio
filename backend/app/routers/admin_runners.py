@@ -26,10 +26,12 @@ from app.models import (
     LocalRunner,
     RunnerHeartbeatSnapshot,
     Task,
+    TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
     _utcnow,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
+from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
@@ -790,6 +792,89 @@ async def runner_stats(
         else None
     )
 
+    # Cloud cost avoided — the on-demand cloud VM cost that terminal jobs run on
+    # this self-hosted runner *would* have incurred. We only have honest wall
+    # clock for jobs with both started_at and completed_at, so those are the
+    # basis. Runtime seconds are summed per (machine_type, accelerator) group and
+    # priced at the on-demand (non-spot) rate; unpriceable groups (unsupported
+    # accelerator names) contribute nothing rather than failing the whole read.
+    cost_rows = (
+        await session.execute(
+            select(
+                ComputeJob.machine_type,
+                ComputeJob.accelerator_type,
+                ComputeJob.accelerator_count,
+                ComputeJob.started_at,
+                ComputeJob.completed_at,
+            ).where(
+                *base_filter,
+                ComputeJob.status.in_(terminal_statuses),
+                ComputeJob.started_at.is_not(None),
+                ComputeJob.completed_at.is_not(None),
+            )
+        )
+    ).all()
+
+    # (machine_type, accelerator_type, accelerator_count) -> summed runtime secs
+    seconds_by_group: Dict[tuple, float] = {}
+    cloud_cost_avoided_basis = 0
+    for machine_type, accel_type, accel_count, started_at, completed_at in cost_rows:
+        runtime_secs = (completed_at - started_at).total_seconds()
+        if runtime_secs <= 0:
+            # Clock skew or zero-length window — no honest cost basis.
+            continue
+        key = (machine_type, accel_type, accel_count)
+        seconds_by_group[key] = seconds_by_group.get(key, 0.0) + runtime_secs
+        cloud_cost_avoided_basis += 1
+
+    cloud_cost_avoided_usd = 0.0
+    for (machine_type, accel_type, accel_count), total_secs in seconds_by_group.items():
+        try:
+            rate_per_second = get_compute_rate_per_second(
+                machine_type=machine_type,
+                accelerator=accel_type,
+                count=accel_count or 1,
+                spot=False,
+            )
+        except AcceleratorRejection:
+            # Unsupported/unknown accelerator shape — cannot price it, so it
+            # does not contribute to the avoided-cost total.
+            continue
+        cloud_cost_avoided_usd += total_secs * rate_per_second
+    cloud_cost_avoided_usd = round(cloud_cost_avoided_usd, 2)
+
+    # Claim-latency rollup from task-level cold-start telemetry.
+    # Tasks dispatched to this runner have vm_instance_id = "runner:{runner_id}".
+    # We query terminal tasks with a recorded vm_cold_start_ms to compute
+    # per-runner pickup-lag percentiles.
+    claim_latency_ms_values = (
+        (
+            await session.execute(
+                select(Task.vm_cold_start_ms).where(
+                    Task.vm_instance_id == f"runner:{runner_id_str}",
+                    Task.vm_cold_start_ms.is_not(None),
+                    Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    claim_latency_ms_p50: int | None = None
+    claim_latency_ms_p95: int | None = None
+    claim_latency_ms_p99: int | None = None
+    claim_latency_ms_max: int | None = None
+    claim_latency_sample_count = len(claim_latency_ms_values)
+
+    if claim_latency_ms_values:
+        sorted_vals = sorted(claim_latency_ms_values)
+        n = len(sorted_vals)
+        claim_latency_ms_max = sorted_vals[-1]
+        claim_latency_ms_p50 = sorted_vals[min(int(n * 0.5), n - 1)]
+        claim_latency_ms_p95 = sorted_vals[min(int(n * 0.95), n - 1)]
+        claim_latency_ms_p99 = sorted_vals[min(int(n * 0.99), n - 1)]
+
     # Recent outcomes — bounded fetch
     recent_jobs = (
         await session.execute(
@@ -820,6 +905,13 @@ async def runner_stats(
         "jobs_terminal_count": jobs_terminal_count,
         "jobs_succeeded_count": jobs_succeeded_count,
         "jobs_success_rate": success_rate,
+        "cloud_cost_avoided_usd": cloud_cost_avoided_usd,
+        "cloud_cost_avoided_basis": cloud_cost_avoided_basis,
+        "claim_latency_ms_p50": claim_latency_ms_p50,
+        "claim_latency_ms_p95": claim_latency_ms_p95,
+        "claim_latency_ms_p99": claim_latency_ms_p99,
+        "claim_latency_ms_max": claim_latency_ms_max,
+        "claim_latency_sample_count": claim_latency_sample_count,
         "last_n_outcomes": last_outcomes,
     }
 

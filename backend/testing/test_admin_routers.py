@@ -29015,3 +29015,272 @@ class TestRunnerStatusPatch:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "paused"
+
+
+class TestRunnerStatsCloudCostAvoided:
+    """Tests for the cloud-cost-avoided rollup on
+    GET /api/admin/projects/{project_id}/runners/{runner_id}/stats.
+
+    Cloud cost avoided = the on-demand cloud VM cost that terminal compute jobs
+    run on this self-hosted runner would otherwise have incurred, priced from
+    each job's honest runtime window and (machine_type, accelerator) shape.
+    """
+
+    def _pin(self, runner_id):
+        return {"runner_target_id": str(runner_id)}
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_sums_priced_runtime_across_shapes(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        project = await _make_project(db_session, name="CostAvoided Sum")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="1" * 64, hostname="cpu-gpu", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        # CPU job: 100s on the default machine type.
+        cpu_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=100),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        # GPU job: 200s on an L4 accelerator (bundled G2 shape).
+        gpu_job = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            accelerator_type="L4",
+            accelerator_count=1,
+            started_at=now - timedelta(seconds=200),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add_all([cpu_job, gpu_job])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        expected = round(
+            100 * get_compute_rate_per_second(machine_type=None, accelerator=None)
+            + 200 * get_compute_rate_per_second(accelerator="L4", count=1),
+            2,
+        )
+        assert body["cloud_cost_avoided_usd"] == pytest.approx(expected)
+        # Both jobs contribute an honest runtime window.
+        assert body["cloud_cost_avoided_basis"] == 2
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_zero_without_terminal_jobs(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+
+        project = await _make_project(db_session, name="CostAvoided Empty")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="2" * 64, hostname="idle", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        # A RUNNING (non-terminal) pinned job must not contribute cost.
+        running = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.RUNNING,
+            started_at=now - timedelta(seconds=300),
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add(running)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["cloud_cost_avoided_usd"] == 0.0
+        assert body["cloud_cost_avoided_basis"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cost_avoided_excludes_other_runner_and_missing_window(
+        self, client: AsyncClient, db_session
+    ):
+        from app.models import ComputeJobStatus
+        from app.vm_cost_rates import get_compute_rate_per_second
+
+        project = await _make_project(db_session, name="CostAvoided Isolation")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="3" * 64, hostname="mine", status="active"
+        )
+        other = LocalRunner(
+            project_id=project.id, token_hash="4" * 64, hostname="theirs", status="active"
+        )
+        db_session.add_all([runner, other])
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        mine = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=50),
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        # Pinned to a different runner — excluded.
+        theirs = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=now - timedelta(seconds=999),
+            completed_at=now,
+            polling_metadata=self._pin(other.id),
+        )
+        # Terminal but no started_at → no honest window, excluded from basis.
+        no_window = ComputeJob(
+            project_id=project.id,
+            backend="test",
+            status=ComputeJobStatus.FAILED,
+            completed_at=now,
+            polling_metadata=self._pin(runner.id),
+        )
+        db_session.add_all([mine, theirs, no_window])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        expected = round(
+            50 * get_compute_rate_per_second(machine_type=None, accelerator=None), 2
+        )
+        assert body["cloud_cost_avoided_usd"] == pytest.approx(expected)
+        assert body["cloud_cost_avoided_basis"] == 1
+
+
+class TestRunnerStatsClaimLatency:
+    """Tests for the per-runner claim-latency rollup on
+    GET /api/admin/projects/{project_id}/runners/{runner_id}/stats.
+
+    Claim latency = vm_cold_start_ms across terminal tasks dispatched to the
+    runner via vm_instance_id = "runner:{runner_id}". The endpoint returns
+    p50/p95/p99/max and a sample count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_claim_latency_returns_percentiles(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="ClaimLatency Pct")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="5" * 64, hostname="latency-test", status="active"
+        )
+        other = LocalRunner(
+            project_id=project.id, token_hash="6" * 64, hostname="other", status="active"
+        )
+        db_session.add_all([runner, other])
+        await db_session.commit()
+
+        runner_prefix = f"runner:{runner.id}"
+        other_prefix = f"runner:{other.id}"
+
+        # Tasks for this runner with known cold-start latencies: [100, 200, 500, 1000, 2000]
+        # p50 = 500, p95 = 2000, p99 = 2000, max = 2000, count = 5
+        tasks = [
+            Task(
+                project_id=project.id,
+                title=f"latency-{v}",
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=v,
+                payloads=[{"type": "test", "data": {}}],
+            )
+            for v in (100, 200, 500, 1000, 2000)
+        ]
+        # Task for a different runner — excluded from this runner's stats.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="other-runner",
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=other_prefix,
+                vm_cold_start_ms=99999,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        # Terminal task without vm_cold_start_ms — excluded from sample.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="no-cold-start",
+                status=TaskStatus.FAILED,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=None,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        # Non-terminal task (IN_PROGRESS) with vm_cold_start_ms — excluded from
+        # aggregation since TASK_OUTCOME_TERMINAL_STATUSES is the filter.
+        tasks.append(
+            Task(
+                project_id=project.id,
+                title="in-progress",
+                status=TaskStatus.IN_PROGRESS,
+                vm_instance_id=runner_prefix,
+                vm_cold_start_ms=500,
+                payloads=[{"type": "test", "data": {}}],
+            )
+        )
+        db_session.add_all(tasks)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["claim_latency_sample_count"] == 5
+        assert body["claim_latency_ms_p50"] == 500  # median of [100, 200, 500, 1000, 2000]
+        assert body["claim_latency_ms_p95"] == 2000  # int(5 * 0.95) = 4 → index 4
+        assert body["claim_latency_ms_p99"] == 2000  # int(5 * 0.99) = 4 → index 4
+        assert body["claim_latency_ms_max"] == 2000
+
+    @pytest.mark.asyncio
+    async def test_claim_latency_no_tasks_returns_nulls(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="ClaimLatency Empty")
+        runner = LocalRunner(
+            project_id=project.id, token_hash="7" * 64, hostname="empty", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["claim_latency_sample_count"] == 0
+        assert body["claim_latency_ms_p50"] is None
+        assert body["claim_latency_ms_p95"] is None
+        assert body["claim_latency_ms_p99"] is None
+        assert body["claim_latency_ms_max"] is None

@@ -1216,6 +1216,38 @@ function RunnerTelemetryDetail({ projectId, runnerId }: { projectId: string; run
               </span>
             )}
           </span>
+          <span className="text-neutral-400" title="On-demand cloud VM cost these self-hosted runs avoided">
+            Cloud cost avoided:{' '}
+            <span className="tabular-nums text-emerald-300">
+              ${(stats.cloud_cost_avoided_usd ?? 0).toFixed(2)}
+            </span>
+          </span>
+        </div>
+      )}
+      {stats && stats.claim_latency_sample_count > 0 && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui-md">
+          <span className="text-neutral-400" title="Dispatch-to-claim pickup latency across completed tasks">
+            Claim latency:{' '}
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p50 != null ? `${stats.claim_latency_ms_p50}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p50</span>
+          </span>
+          <span className="text-neutral-400">
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p95 != null ? `${stats.claim_latency_ms_p95}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p95</span>
+          </span>
+          <span className="text-neutral-400">
+            <span className="tabular-nums text-neutral-200">
+              {stats.claim_latency_ms_p99 != null ? `${stats.claim_latency_ms_p99}ms` : '—'}
+            </span>{' '}
+            <span className="text-neutral-600">p99</span>
+          </span>
+          <span className="text-neutral-600">
+            ({stats.claim_latency_sample_count} samples)
+          </span>
         </div>
       )}
       {stats && stats.last_n_outcomes.length > 0 && (

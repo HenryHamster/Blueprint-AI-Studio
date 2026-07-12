@@ -1658,6 +1658,20 @@ class Task(SQLModel, table=True):
             postgresql_where=text("status = 'COMPLETED'"),
             sqlite_where=text("status = 'COMPLETED'"),
         ),
+        # Partial index on (updated_at) for the EVALUATING CI-monitor scan
+        # (orchestrator_ci_monitor.py:289-303) which repeatedly selects
+        # EVALUATING rows on the leader's hot cycle. The full ix_task_updated_at
+        # spans every task; this partial index over only the (small) EVALUATING
+        # subset lets the planner walk just those rows — same partial-by-status
+        # shape as ix_task_blocked_recheck. Postgres-only via alembic 0525
+        # CONCURRENTLY DDL; the metadata Index registers the name + column for
+        # test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_evaluating_updated_at",
+            "updated_at",
+            postgresql_where=text("status = 'EVALUATING'"),
+            sqlite_where=text("status = 'EVALUATING'"),
+        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in
