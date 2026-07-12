@@ -316,6 +316,77 @@ def test_artifact_descriptor_video_no_preview():
     assert "unsupported_reason" in desc
 
 
+def test_artifact_descriptor_multi_image_populates_images_list():
+    """Image artifact with multiple viewable_previews populates both image (first) and images (all)."""
+    item = {
+        "id": "art-5",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "results/",
+        "label": "Training Plots",
+        "task_title": "Multi-arm run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/arm0/reward.png?sig=a1", "kind": "image", "filename": "arm0/reward.png"},
+            {"url": "https://signed.example.com/arm1/reward.png?sig=a2", "kind": "image", "filename": "arm1/reward.png"},
+            {"url": "https://signed.example.com/arm2/reward.png?sig=a3", "kind": "image", "filename": "arm2/reward.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["image"]["url"] == "https://signed.example.com/arm0/reward.png?sig=a1"
+    assert "unsupported_reason" not in desc
+    assert len(desc["images"]) == 3
+    assert desc["images"][0]["url"] == "https://signed.example.com/arm0/reward.png?sig=a1"
+    assert desc["images"][1]["url"] == "https://signed.example.com/arm1/reward.png?sig=a2"
+    assert desc["images"][2]["url"] == "https://signed.example.com/arm2/reward.png?sig=a3"
+    assert desc["images"][0]["filename"] == "arm0/reward.png"
+
+
+def test_artifact_descriptor_single_image_also_populates_images_list():
+    """Single-image artifact also emits images list for API consistency."""
+    item = {
+        "id": "art-6",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/plot.png?sig=abc", "kind": "image", "filename": "plot.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert len(desc["images"]) == 1
+    assert desc["images"][0]["url"] == "https://signed.example.com/plot.png?sig=abc"
+
+
+def test_artifact_descriptor_multi_video_populates_videos_list():
+    """Video artifact with multiple viewable_previews populates both video (first) and videos (all)."""
+    item = {
+        "id": "art-7",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "clips/",
+        "label": "Training Clips",
+        "task_title": "Video run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/clip0.mp4?sig=v1", "kind": "video", "filename": "clip0.mp4"},
+            {"url": "https://signed.example.com/clip1.mp4?sig=v2", "kind": "video", "filename": "clip1.mp4"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "video"
+    assert desc["video"]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
+    assert "unsupported_reason" not in desc
+    assert len(desc["videos"]) == 2
+    assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
+    assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
+    assert desc["videos"][0]["filename"] == "clip0.mp4"
+
+
 @pytest.mark.asyncio
 async def test_load_strategic_context_evidence_artifact_viewable_files(db_session):
     """An artifact with viewable_files in its logs yields viewable_previews with signed URLs."""

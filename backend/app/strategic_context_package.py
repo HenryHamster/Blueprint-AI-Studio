@@ -1215,22 +1215,26 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         descriptor["language"] = "text"
     elif kind == "image":
         previews = artifact.get("viewable_previews", [])
-        image_url = next(
-            (p["url"] for p in previews if p.get("kind") == "image"),
-            previews[0]["url"] if previews else None,
-        )
+        image_previews = [p for p in previews if p.get("kind") == "image"] or previews
+        image_url = image_previews[0]["url"] if image_previews else None
         descriptor["image"] = {"url": image_url, "alt": title}
+        descriptor["images"] = [
+            {"url": p.get("url"), "alt": p.get("filename") or title, "filename": p.get("filename")}
+            for p in image_previews
+        ]
         if not image_url:
             descriptor[
                 "unsupported_reason"
             ] = "Image artifact previews require a signed preview URL."
     elif kind == "video":
         previews = artifact.get("viewable_previews", [])
-        video_url = next(
-            (p["url"] for p in previews if p.get("kind") == "video"),
-            previews[0]["url"] if previews else None,
-        )
+        video_previews = [p for p in previews if p.get("kind") == "video"] or previews
+        video_url = video_previews[0]["url"] if video_previews else None
         descriptor["video"] = {"url": video_url, "alt": title}
+        descriptor["videos"] = [
+            {"url": p.get("url"), "alt": p.get("filename") or title, "filename": p.get("filename")}
+            for p in video_previews
+        ]
         if not video_url:
             descriptor[
                 "unsupported_reason"

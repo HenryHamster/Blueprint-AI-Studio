@@ -228,33 +228,69 @@ function DescriptorCard({
         )
       )}
 
-      {descriptor.kind === 'image' && (
-        <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-          {imageUrl ? (
-            <img
-              src={imageUrl}
-              alt={descriptor.image?.alt || descriptor.title}
-              className="max-h-48 w-full object-contain"
-            />
-          ) : (
-            <div className="px-2 py-2 text-xs text-neutral-500">
-              Image preview unavailable. Open the artifact for the source.
-            </div>
-          )}
-        </div>
-      )}
-
-      {descriptor.kind === 'video' && (() => {
-        const videoUrl = safeImageUrl(descriptor.video?.url);
+      {descriptor.kind === 'image' && (() => {
+        const allImages = descriptor.images?.filter(img => safeImageUrl(img.url)) ?? [];
+        const singleUrl = allImages.length === 1 ? safeImageUrl(allImages[0].url) : imageUrl;
         return (
           <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-            {videoUrl ? (
+            {allImages.length > 1 ? (
+              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+                {allImages.map((img, i) => {
+                  const url = safeImageUrl(img.url) ?? '';
+                  return (
+                    <img
+                      key={url}
+                      src={url}
+                      alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
+                      className="h-36 w-auto flex-shrink-0 object-contain"
+                    />
+                  );
+                })}
+              </div>
+            ) : singleUrl ? (
+              <img
+                src={singleUrl}
+                alt={descriptor.image?.alt || descriptor.title}
+                className="max-h-48 w-full object-contain"
+              />
+            ) : (
+              <div className="px-2 py-2 text-xs text-neutral-500">
+                Image preview unavailable. Open the artifact for the source.
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {descriptor.kind === 'video' && (() => {
+        const allVideos = descriptor.videos?.filter(v => safeImageUrl(v.url)) ?? [];
+        const singleVideoUrl = allVideos.length === 1 ? safeImageUrl(allVideos[0].url) : safeImageUrl(descriptor.video?.url);
+        return (
+          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+            {allVideos.length > 1 ? (
+              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+                {allVideos.map((v, i) => {
+                  const url = safeImageUrl(v.url) ?? '';
+                  return (
+                    <video
+                      key={url}
+                      controls
+                      className="h-36 w-auto flex-shrink-0"
+                      aria-label={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
+                    >
+                      <source src={url} />
+                      Your browser does not support the video element.
+                    </video>
+                  );
+                })}
+              </div>
+            ) : singleVideoUrl ? (
               <video
                 controls
                 className="max-h-48 w-full"
                 aria-label={descriptor.video?.alt || descriptor.title}
               >
-                <source src={videoUrl} />
+                <source src={singleVideoUrl} />
                 Your browser does not support the video element.
               </video>
             ) : (

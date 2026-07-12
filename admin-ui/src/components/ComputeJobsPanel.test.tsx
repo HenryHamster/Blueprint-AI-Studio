@@ -3590,3 +3590,90 @@ describe('ComputeJobsPanel — draft provenance', () => {
     expect(queryByTestId('compute-draft-provenance')).toBeNull();
   });
 });
+
+describe('ComputeJobsPanel — plot gallery', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test('renders plot gallery with image thumbnails for jobs with viewable_artifacts', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/plot.png');
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [
+          { storage_uri: 'gs://bucket/jobs/job-1/plot.png', filename: 'plot.png', kind: 'image', content_type: 'image/png', size_bytes: 12345 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const gallery = await findByTestId('compute-plot-gallery');
+    expect(gallery).toBeTruthy();
+    await waitFor(() => {
+      const img = gallery.querySelector('[data-testid="plot-gallery-image"]') as HTMLImageElement | null;
+      expect(img).toBeTruthy();
+      expect(img?.src).toBe('https://signed.example.com/plot.png');
+    });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', 'gs://bucket/jobs/job-1/plot.png', expect.anything());
+  });
+
+  test('renders video element for video viewable_artifacts', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/run.mp4');
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [
+          { storage_uri: 'gs://bucket/jobs/job-1/run.mp4', filename: 'run.mp4', kind: 'video', content_type: 'video/mp4', size_bytes: 99999 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const gallery = await findByTestId('compute-plot-gallery');
+    await waitFor(() => {
+      const video = gallery.querySelector('[data-testid="plot-gallery-video"]');
+      expect(video).toBeTruthy();
+    });
+  });
+
+  test('no plot gallery when viewable_artifacts is absent', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-plot-gallery')).toBeNull();
+  });
+
+  test('no plot gallery when viewable_artifacts is empty', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, viewable_artifacts: [] }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-plot-gallery')).toBeNull();
+  });
+
+  test('shows error state when resolveArtifactDownloadUrl rejects', async () => {
+    resolveArtifactDownloadUrl.mockRejectedValue(new Error('forbidden'));
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [
+          { storage_uri: 'gs://bucket/jobs/job-1/plot.png', filename: 'plot.png', kind: 'image' },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const gallery = await findByTestId('compute-plot-gallery');
+    await waitFor(() => {
+      const errSlot = gallery.querySelector('[data-testid="plot-gallery-error"]');
+      expect(errSlot).toBeTruthy();
+    });
+  });
+});

@@ -169,10 +169,20 @@ export interface StrategicContextRenderableDescriptor {
     width?: number | null;
     height?: number | null;
   } | null;
+  images?: Array<{
+    url?: string | null;
+    alt?: string | null;
+    filename?: string | null;
+  }> | null;
   video?: {
     url?: string | null;
     alt?: string | null;
   } | null;
+  videos?: Array<{
+    url?: string | null;
+    alt?: string | null;
+    filename?: string | null;
+  }> | null;
   chart?: {
     kind?: 'bar' | 'line' | string;
     x_label?: string | null;
