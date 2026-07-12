@@ -139,3 +139,82 @@ def rollback_flow_allowlist_within_ceiling() -> bool:
     to fail.
     """
     return len(ROLLBACK_FLOW_ALLOWLIST) <= ROLLBACK_FLOW_ALLOWLIST_CEILING
+
+
+# ---------------------------------------------------------------------------
+# Error-path commit-flow allowlist — functions that call session.commit()
+# from an ``except`` handler or a ``try/finally`` finalbody (the error-path
+# subset) and have a post-commit ORM attribute read that the flow-aware
+# scanner flags but that need per-function triage before the read can be
+# proven safe or fixed.
+#
+# ``session.commit()`` is the PRIMARY expiry trigger (``expire_on_commit``
+# semantics, documented in ``backend/conftest.py``): after commit ALL ORM
+# objects held by the session are expired, so the next synchronous attribute
+# access lazy-loads from async context and raises ``MissingGreenlet`` on
+# asyncpg — exactly like rollback.  A blanket commit gate is infeasible
+# (~hundreds of commit call sites), so the guard narrows to the tractable,
+# high-signal error-path subset where an already-failing/finalising branch
+# is most likely to read stale ORM state.
+#
+# Each entry is ``module_filename::function_name`` and carries an inline
+# comment.  Unlike the rollback-flow allowlist (whose entries are manually
+# confirmed safe), these are SEEDED acknowledged debt captured when the
+# error-path-commit coverage first landed: burning them down — proving each
+# read is safe and removing it, or fixing the production code — is tracked as
+# a separate follow-up under gap g-db-backend-test-fidelity.  The ceiling
+# keeps the set from silently growing in the meantime.
+# ---------------------------------------------------------------------------
+COMMIT_FLOW_ALLOWLIST: frozenset[str] = frozenset({
+    # FALSE POSITIVE (cross-session): the flagged commit (~L4908) is on a
+    # SEPARATE ``rescue_session`` (``AsyncSessionLocal()``) bound to a locally
+    # re-fetched ``db_parent`` — NOT the outer ``session`` that owns ``parent``.
+    # ``rescue_session.commit()`` cannot expire ``parent``, so the ``parent.context``
+    # read (~L4968) is unaffected. The scanner keys on the ``commit`` attr name
+    # regardless of the session object, so it cannot distinguish the two sessions.
+    # (The outer session's own rollback safety is separately covered by the
+    # rollback-flow guard, which does NOT flag this function.)
+    "rollup_management.py::_check_and_trigger_rollup",
+    # FALSE POSITIVE (scanner AST limits): the two flagged reads in the large
+    # post-commit driver are both non-lazy-loading. (1) ~L5565
+    # ``task.latest_status_message = ...`` is an assignment TARGET (``ast.Store``);
+    # setting a mapped column never emits a SELECT, but the scanner does not
+    # inspect ``ctx`` and treats every ``ast.Attribute`` as a read. (2) ~L5841
+    # ``_capability.completion_handler`` is read on a ``TaskCapability`` registry
+    # object returned by ``get_task_capability`` — a plain dataclass, not a
+    # session-bound ORM row. The nearby ``task.latest_status_message`` read
+    # (~L5844) returns an in-memory snapshot: ``AsyncSessionLocal`` sets
+    # ``expire_on_commit=False`` (database.py), so ``commit()`` does not expire
+    # the already-loaded ``task`` this driver threads into the completion handlers.
+    "task_lifecycle.py::_process_post_commit",
+})
+
+# Monotonic ceiling for the error-path commit-flow allowlist: can only shrink
+# as entries are triaged/fixed at the production code level. Bump when adding
+# a new entry (a deliberate, visible diff action).
+#
+# Burn-down 2026-07-12: lowered 6 -> 2. Four seeded entries were remediated in
+# production with the canonical pre-capture idiom (snapshot the scalars the
+# post-commit continuation needs into plain Python locals BEFORE the commit, or
+# explicitly re-fetch/refresh the row) so the flow-aware scanner can now verify
+# each statically: autonomous_research._spawn_research_task_inner (refresh the
+# expired ``project`` after the payload-bloat commit), orchestrator_ci_monitor.
+# _monitor_evaluating_tasks (broadcast from pre-captured id/project_id/status),
+# orchestrator_runner_dispatch._dispatch_compute_experiment_directly (broadcast/
+# log the blocked task from pre-captured id/project_id), and reaper.reaper_service
+# (snapshot the quarantine payload-type branch scalar + refresh ``_qtask`` before
+# the safeguard-gate helper). The two entries retained above are genuine scanner
+# false positives, not debt.
+COMMIT_FLOW_ALLOWLIST_CEILING: int = 2
+
+
+def commit_flow_allowlist_within_ceiling() -> bool:
+    """Return ``True`` when the error-path commit-flow allowlist has not grown
+    past its monotonic ceiling.
+
+    Mirrors ``rollback_flow_allowlist_within_ceiling``: adding an entry to
+    ``COMMIT_FLOW_ALLOWLIST`` without also raising
+    ``COMMIT_FLOW_ALLOWLIST_CEILING`` makes this return ``False``, causing
+    ``test_commit_flow_allowlist_cannot_grow_beyond_ceiling`` to fail.
+    """
+    return len(COMMIT_FLOW_ALLOWLIST) <= COMMIT_FLOW_ALLOWLIST_CEILING

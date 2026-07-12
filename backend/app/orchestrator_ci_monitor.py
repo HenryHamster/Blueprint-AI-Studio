@@ -626,13 +626,20 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         await _maybe_create_failure_alert(
                             ci_task, session, _pr_gone_msg
                         )
+                        # Snapshot the broadcast scalars into plain locals BEFORE
+                        # commit: session.commit() expires all ORM state, so reading
+                        # ci_task.project_id/.id/.status afterwards lazy-loads from
+                        # async context and raises MissingGreenlet on asyncpg.
+                        _bcast_project_id = str(ci_task.project_id)
+                        _bcast_task_id = str(ci_task.id)
+                        _bcast_status = ci_task.status
                         await session.commit()
                         await broadcast_to_project(
-                            str(ci_task.project_id),
+                            _bcast_project_id,
                             "task_updated",
                             {
-                                "task_id": str(ci_task.id),
-                                "status": ci_task.status,
+                                "task_id": _bcast_task_id,
+                                "status": _bcast_status,
                             },
                         )
                         continue

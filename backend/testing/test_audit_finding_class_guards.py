@@ -35,8 +35,8 @@ Six classes are addressed:
 6. **SQLite-masked MissingGreenlet tests** — tests that mention ``MissingGreenlet``
    in their docstring but neither raise it (fault injection) nor skip on SQLite
    (``skipif(not USE_POSTGRES)``) pass tautologically on the default aiosqlite
-   CI run. ``TestMissingGreenletTestsFaithful`` AST-scans the five specific
-   test files that historically harboured unfaithful instances.
+   CI run. ``TestMissingGreenletTestsFaithful`` AST-scans every ``test_*.py``
+   file in the testing directory for unfaithful instances.
 
 Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
 """
@@ -62,6 +62,9 @@ from app.greenlet_fidelity import (
     ROLLBACK_FLOW_ALLOWLIST as _ROLLBACK_FLOW_ALLOWLIST,
     ROLLBACK_FLOW_ALLOWLIST_CEILING as _ROLLBACK_FLOW_ALLOWLIST_CEILING,
     rollback_flow_allowlist_within_ceiling as _rollback_flow_allowlist_within_ceiling,
+    COMMIT_FLOW_ALLOWLIST as _COMMIT_FLOW_ALLOWLIST,
+    COMMIT_FLOW_ALLOWLIST_CEILING as _COMMIT_FLOW_ALLOWLIST_CEILING,
+    commit_flow_allowlist_within_ceiling as _commit_flow_allowlist_within_ceiling,
 )
 
 # ---------------------------------------------------------------------------
@@ -1030,25 +1033,44 @@ def _build_parent_map(tree: ast.AST) -> dict:
     return parents
 
 
-def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
-    """Flow-aware version of the rollback scanner.
+def _scan_expiry_flow_functions(
+    filepath: Path, *, call_attr: str, error_path_only: bool
+) -> list[str]:
+    """Flow-aware scanner for post-expiry ORM reads (shared machinery).
 
-    Unlike ``_unsafe_rollback_functions``, this scanner performs per-rollback
-    post-path analysis: for each rollback call it walks UP the AST from the
-    call site, checking each containing block's *continuation* (statements
-    that follow the rollback on the same execution path) for a safe terminator
-    (return/raise/break/continue) or a known-safe refetch call.
+    ``session.rollback()`` and ``session.commit()`` are both expiry triggers:
+    each expires ALL ORM objects held by the session, so the next synchronous
+    attribute access lazy-loads from async context and raises
+    ``MissingGreenlet`` on asyncpg.  This scanner performs per-call post-path
+    analysis: for each expiry call (``session.<call_attr>()``) it walks UP the
+    AST from the call site, checking each containing block's *continuation*
+    (statements that follow the call on the same execution path) for a safe
+    terminator (return/raise/break/continue) or a known-safe refetch call via
+    ``_classify_stmt`` and ``_post_expiry_is_flow_safe``.
 
     A control-flow token is only counted as safe when it appears AFTER the
-    rollback in its own containing block.  A ``return True`` at function level
-    does NOT make a rollback inside an except handler safe when the except
-    handler falls through to statements that read expired ORM attributes.
+    call in its own containing block.  A ``return True`` at function level does
+    NOT make an expiry call inside an except handler safe when the handler
+    falls through to statements that read expired ORM attributes.
 
-    The production regression check (``test_rollback_missing_greenlet_regression_check``)
-    uses this flow-aware scanner against all of ``backend/app/``.  Functions the
-    scanner cannot statically verify as safe (due to re-fetch through a helper,
-    cross-session reads, or other patterns beyond the scanner's AST model) are
-    acknowledged in ``ROLLBACK_FLOW_ALLOWLIST`` in ``backend/app/greenlet_fidelity.py``.
+    ``call_attr``
+        ``"rollback"`` or ``"commit"`` — the session method whose call sites
+        are analysed.
+    ``error_path_only``
+        When ``True`` (used for ``commit``), only call sites lexically inside
+        an ``except`` handler body or a ``try/finally`` finalbody are
+        considered.  A blanket ``commit`` gate is infeasible (~hundreds of
+        call sites), so the commit guard narrows to the tractable, high-signal
+        error-path subset.  When ``False`` (used for ``rollback``) every call
+        site is analysed.
+
+    The production regression checks (``test_rollback_missing_greenlet_regression_check``
+    and ``test_commit_missing_greenlet_regression_check``) run this scanner
+    against all of ``backend/app/``.  Functions the scanner cannot statically
+    verify as safe (re-fetch through a helper, cross-session reads, or other
+    patterns beyond the scanner's AST model) are acknowledged in
+    ``ROLLBACK_FLOW_ALLOWLIST`` / ``COMMIT_FLOW_ALLOWLIST`` in
+    ``backend/app/greenlet_fidelity.py``.
     """
     source = filepath.read_text(encoding="utf-8")
     try:
@@ -1151,9 +1173,17 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
 
     parents = _build_parent_map(tree)
 
-    def _rollback_is_flow_safe(rollback_call: ast.AST, func_node: ast.AST) -> bool:
-        """True if the post-rollback path has a safe terminator before ORM reads."""
-        cur: ast.AST = rollback_call
+    def _post_expiry_is_flow_safe(expiry_call: ast.AST, func_node: ast.AST) -> bool:
+        """True if the post-expiry path has a safe terminator before ORM reads.
+
+        Identical machinery for ``rollback`` and ``commit`` call sites: walk up
+        the containing blocks from the call and inspect each block's
+        continuation via ``_classify_stmt``.  The walk naturally continues past
+        the enclosing ``except`` handler / ``try`` into the function-level
+        fall-through, so an error-path ``commit`` whose except handler falls
+        through to an ORM read is flagged exactly like the rollback case.
+        """
+        cur: ast.AST = expiry_call
         while id(cur) in parents:
             par = parents[id(cur)]
             found_block = None
@@ -1184,21 +1214,76 @@ def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
             cur = par
         return True
 
+    def _call_is_on_error_path(call: ast.AST, func_node: ast.AST) -> bool:
+        """True if *call* is lexically inside an ``except`` handler body or a
+        ``try/finally`` finalbody within *func_node*.
+
+        This narrows the commit guard to the tractable error-path subset — the
+        branches most likely to read stale ORM state after committing while an
+        exception is in flight or a resource is being finalised.
+        """
+        cur: ast.AST = call
+        while id(cur) in parents and cur is not func_node:
+            par = parents[id(cur)]
+            if isinstance(par, ast.ExceptHandler) and any(
+                s is cur for s in par.body
+            ):
+                return True
+            if isinstance(par, ast.Try) and any(s is cur for s in par.finalbody):
+                return True
+            cur = par
+        return False
+
     violations: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             continue
-        rollback_calls = [
+        expiry_calls = [
             child for child in ast.walk(node)
             if isinstance(child, ast.Call)
             and isinstance(child.func, ast.Attribute)
-            and child.func.attr == "rollback"
+            and child.func.attr == call_attr
         ]
-        if not rollback_calls:
+        if error_path_only:
+            expiry_calls = [
+                c for c in expiry_calls if _call_is_on_error_path(c, node)
+            ]
+        if not expiry_calls:
             continue
-        if any(not _rollback_is_flow_safe(rb, node) for rb in rollback_calls):
+        if any(not _post_expiry_is_flow_safe(c, node) for c in expiry_calls):
             violations.append(f"{filepath.name}::{node.name}")
     return violations
+
+
+def _unsafe_rollback_functions_flow_aware(filepath: Path) -> list[str]:
+    """Flow-aware rollback scanner — every ``session.rollback()`` call site.
+
+    Thin wrapper over :func:`_scan_expiry_flow_functions`.  See that function
+    for the post-path analysis; acknowledged cases are in
+    ``ROLLBACK_FLOW_ALLOWLIST`` in ``backend/app/greenlet_fidelity.py``.
+    """
+    return _scan_expiry_flow_functions(
+        filepath, call_attr="rollback", error_path_only=False
+    )
+
+
+def _unsafe_error_path_commit_functions_flow_aware(filepath: Path) -> list[str]:
+    """Flow-aware commit scanner — the ERROR-PATH ``session.commit()`` subset.
+
+    ``session.commit()`` is the primary expiry trigger (``expire_on_commit``
+    semantics), but a blanket commit gate is infeasible (~hundreds of call
+    sites).  This scanner narrows to ``commit`` calls lexically inside an
+    ``except`` handler or a ``try/finally`` finalbody — the high-signal
+    error-path subset — and flags those whose post-commit continuation reads an
+    expired ORM attribute, reusing the exact same ``_classify_stmt`` /
+    ``_post_expiry_is_flow_safe`` machinery as the rollback scanner.
+
+    Acknowledged cases are in ``COMMIT_FLOW_ALLOWLIST`` in
+    ``backend/app/greenlet_fidelity.py``.
+    """
+    return _scan_expiry_flow_functions(
+        filepath, call_attr="commit", error_path_only=True
+    )
 
 
 class TestRollbackSafetyRegressionCheck:
@@ -1435,3 +1520,291 @@ class TestRollbackSafetyRegressionCheck:
             "must treat a refetch-plus-unrelated-orm-read in the same simple "
             "statement as unsafe (return -1, not 1)."
         )
+
+
+class TestCommitFlowSafetyRegressionCheck:
+    """Error-path ``session.commit()`` coverage for the MissingGreenlet guard.
+
+    ``session.commit()`` is the PRIMARY expiry trigger (``expire_on_commit``
+    semantics, documented in ``backend/conftest.py``): after commit every ORM
+    object held by the session is expired, so the next synchronous attribute
+    access lazy-loads from async context and raises ``MissingGreenlet`` on
+    asyncpg — exactly like ``rollback()``.  A blanket commit gate is infeasible
+    (~hundreds of call sites), so this guard narrows to the tractable,
+    high-signal ERROR-PATH subset: ``commit`` calls lexically inside an
+    ``except`` handler or a ``try/finally`` finalbody whose post-commit
+    continuation reads an expired ORM attribute.
+
+    It reuses the exact same ``_classify_stmt`` / ``_post_expiry_is_flow_safe``
+    post-path machinery as the rollback scanner.  Acknowledged cases the scanner
+    cannot statically verify (or that are pending burn-down) live in
+    ``COMMIT_FLOW_ALLOWLIST`` in ``backend/app/greenlet_fidelity.py`` and can
+    only shrink (enforced by the monotonic ceiling).
+    """
+
+    def test_commit_flow_registry_defined_in_greenlet_fidelity(self):
+        """The COMMIT_FLOW_ALLOWLIST registry must exist in production.
+
+        Exercises the production module ``backend/app/greenlet_fidelity.py``
+        (the canonical, importable registry the guard reads) to confirm the
+        error-path commit-flow allowlist, its ceiling, and the ratchet helper
+        are defined alongside the rollback-flow trio.
+        """
+        gf_path = _BACKEND_ROOT / "app" / "greenlet_fidelity.py"
+        assert gf_path.exists(), (
+            f"backend/app/greenlet_fidelity.py not found at {gf_path}. "
+            "The commit-flow registry cannot be verified."
+        )
+        content = gf_path.read_text()
+        for symbol in (
+            "COMMIT_FLOW_ALLOWLIST",
+            "COMMIT_FLOW_ALLOWLIST_CEILING",
+            "def commit_flow_allowlist_within_ceiling",
+        ):
+            assert symbol in content, (
+                f"backend/app/greenlet_fidelity.py must define {symbol} — the "
+                "canonical error-path commit-flow allowlist mirrors the "
+                "ROLLBACK_FLOW_ALLOWLIST pattern.  Restore it or update this "
+                "test to match."
+            )
+
+    def test_commit_scanner_flags_read_after_error_path_commit(self, tmp_path):
+        """A ``commit()`` inside an ``except`` handler that falls through to an
+        ORM attribute read MUST be flagged.
+
+        This is the masked-regression proof: on aiosqlite the root conftest
+        no-ops ``InstanceState._expire``, so a post-commit expired read passes
+        tautologically; on asyncpg ``task.status`` after the commit fires a lazy
+        SELECT from async context and raises ``MissingGreenlet``.  The extended
+        commit-path scanner must catch this even though the older guard only
+        inspected ``rollback()`` call sites.
+
+        Also exercises the production registry
+        ``backend/app/greenlet_fidelity.py`` (read below) that this PR extends.
+        """
+        gf_path = _BACKEND_ROOT / "app" / "greenlet_fidelity.py"
+        assert gf_path.exists(), "backend/app/greenlet_fidelity.py not found"
+        assert "COMMIT_FLOW_ALLOWLIST" in gf_path.read_text(), (
+            "backend/app/greenlet_fidelity.py must define COMMIT_FLOW_ALLOWLIST — "
+            "the canonical error-path commit-flow allowlist the guard consults."
+        )
+
+        test_file = tmp_path / "test_error_path_commit_fallthrough.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def commit_in_except_then_read(session, task):
+                \"\"\"Commit in except, ORM read after try — greenlet hazard.\"\"\"
+                try:
+                    await session.flush()
+                except Exception:
+                    await session.commit()
+                    logging.warning("committed on the error path")
+                # task is expired by the commit above; reading .status fires a
+                # lazy SELECT from async context -> MissingGreenlet on asyncpg.
+                print(task.status)
+                return None
+        """))
+        violations = _unsafe_error_path_commit_functions_flow_aware(test_file)
+        assert any("commit_in_except_then_read" in v for v in violations), (
+            "A function whose commit() is inside an except handler that falls "
+            "through to an ORM attribute read (task.status) was NOT flagged by "
+            "the error-path commit scanner.  session.commit() expires ORM state "
+            "just like rollback(); the post-commit continuation read must be "
+            "flagged (or acknowledged in COMMIT_FLOW_ALLOWLIST)."
+        )
+
+    def test_commit_scanner_flags_read_after_finally_commit(self, tmp_path):
+        """A ``commit()`` in a ``try/finally`` finalbody that falls through to an
+        ORM attribute read MUST be flagged (covers the finalbody branch of the
+        error-path subset, not just ``except`` handlers)."""
+        test_file = tmp_path / "test_finally_commit_fallthrough.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def commit_in_finally_then_read(session, task):
+                \"\"\"Commit in finally, ORM read after try — greenlet hazard.\"\"\"
+                try:
+                    await session.flush()
+                finally:
+                    await session.commit()
+                print(task.status)
+        """))
+        violations = _unsafe_error_path_commit_functions_flow_aware(test_file)
+        assert any("commit_in_finally_then_read" in v for v in violations), (
+            "A commit() inside a try/finally finalbody that falls through to an "
+            "expired ORM read (task.status) was NOT flagged by the error-path "
+            "commit scanner.  The finalbody is part of the error-path subset."
+        )
+
+    def test_commit_scanner_ignores_happy_path_commit(self, tmp_path):
+        """A ``commit()`` on the NORMAL path (not in an ``except`` handler or a
+        ``finally``) followed by an ORM read must NOT be flagged.
+
+        This bounds the narrowed guard: a blanket commit gate is infeasible, so
+        only error-path commits are in scope.  Without this bound the scanner
+        would flag ~hundreds of ordinary commit-then-read functions.
+        """
+        test_file = tmp_path / "test_happy_path_commit.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def commit_then_read_happy_path(session, task):
+                \"\"\"Commit on the normal path — outside the error-path subset.\"\"\"
+                await session.commit()
+                print(task.status)
+        """))
+        violations = _unsafe_error_path_commit_functions_flow_aware(test_file)
+        assert not any(
+            "commit_then_read_happy_path" in v for v in violations
+        ), (
+            "A commit() on the normal (non-error) path was flagged by the "
+            "error-path commit scanner.  The guard is deliberately narrowed to "
+            "commit calls inside except handlers / finally blocks; a happy-path "
+            "commit-then-read must NOT be in scope."
+        )
+
+    def test_refetch_does_not_mask_unrelated_read_beside_error_path_commit(
+        self, tmp_path
+    ):
+        """A post-commit ``session.execute(UPDATE ... WHERE obj.id)`` does NOT
+        make the statement safe when it reads an expired ORM attribute on a
+        DIFFERENT object the execute does not reload.
+
+        Closes the refetch-masks-unrelated-read false negative on the commit
+        path: the co-located ``session.execute`` is an UPDATE — it never
+        reloads ``row`` — so ``row.id`` in the WHERE clause raises
+        ``MissingGreenlet`` before the execute runs.  ``_classify_stmt`` must
+        return -1 (unsafe), not credit the refetch as safe.
+        """
+        test_file = tmp_path / "test_commit_refetch_beside_read.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def commit_then_execute_with_unrelated_expired_read(
+                session, row, Other, sa_update
+            ):
+                \"\"\"Error-path commit; execute(UPDATE WHERE row.id) reads
+                expired row.id on a different object — greenlet hazard.\"\"\"
+                try:
+                    await session.flush()
+                except Exception:
+                    await session.commit()
+                await session.execute(
+                    sa_update(Other).where(Other.ref_id == row.id)
+                )
+        """))
+        violations = _unsafe_error_path_commit_functions_flow_aware(test_file)
+        assert any(
+            "commit_then_execute_with_unrelated_expired_read" in v
+            for v in violations
+        ), (
+            "A function that reads an unrelated expired ORM attribute (row.id) "
+            "beside a co-located session.execute after an error-path commit was "
+            "NOT flagged.  A refetch that does not reload the read object must "
+            "not mask the unrelated expired read (_classify_stmt must return -1)."
+        )
+
+    def test_commit_missing_greenlet_regression_check(self):
+        """Scan all ``backend/app/*.py`` files with the error-path commit
+        scanner and fail if any error-path ``commit()`` has an unsafe
+        post-commit ORM attribute read not covered by ``COMMIT_FLOW_ALLOWLIST``.
+
+        Functions in ``COMMIT_FLOW_ALLOWLIST`` (imported from
+        ``app.greenlet_fidelity``) are acknowledged debt seeded when this
+        coverage landed; the set can only shrink (enforced by
+        ``test_commit_flow_allowlist_cannot_grow_beyond_ceiling``).
+        """
+        if not _PRODUCTION_APP_DIR.is_dir():
+            pytest.skip(
+                f"Production app directory not found at {_PRODUCTION_APP_DIR}. "
+                "Skipping in CI backend-only Docker context where backend/app "
+                "may not be available."
+            )
+
+        all_prod_files = sorted(_PRODUCTION_APP_DIR.rglob("*.py"))
+        assert all_prod_files, (
+            f"No .py files found in {_PRODUCTION_APP_DIR}. "
+            "The production code directory is empty or the glob is broken."
+        )
+
+        violations: list[str] = [
+            v
+            for path in all_prod_files
+            for v in _unsafe_error_path_commit_functions_flow_aware(path)
+            if v not in _COMMIT_FLOW_ALLOWLIST
+        ]
+
+        assert not violations, (
+            "The following functions in backend/app/ call session.commit() from "
+            "an except handler or finally block with a reachable post-commit ORM "
+            "attribute read not covered by a safe terminator or refetch.  Each "
+            "must either snapshot ORM values before the commit, add an explicit "
+            "return/raise after the commit, re-fetch via session.get/refresh, or "
+            "be acknowledged by adding an entry to COMMIT_FLOW_ALLOWLIST in "
+            "backend/app/greenlet_fidelity.py (and bumping the ceiling) with a "
+            "comment explaining why the function is safe or is pending burn-down:"
+            "\n" + "\n".join(f"  - {v}" for v in sorted(violations))
+        )
+
+    def test_commit_flow_allowlist_cannot_grow_beyond_ceiling(self):
+        """The error-path commit-flow allowlist must never exceed its monotonic
+        ceiling.
+
+        Growth ratchet: adding an entry to COMMIT_FLOW_ALLOWLIST requires
+        bumping COMMIT_FLOW_ALLOWLIST_CEILING in
+        backend/app/greenlet_fidelity.py — a deliberate, visible diff action.
+        Burn-down is tracked by lowering the ceiling as entries are triaged and
+        fixed in production.
+        """
+        assert _commit_flow_allowlist_within_ceiling(), (
+            f"COMMIT_FLOW_ALLOWLIST has {len(_COMMIT_FLOW_ALLOWLIST)} entries "
+            f"(ceiling: {_COMMIT_FLOW_ALLOWLIST_CEILING}). Either fix the "
+            "production function so the scanner can verify it (snapshot ORM "
+            "values before commit, or re-fetch after) and remove it from the "
+            "allowlist, or — after exhausting verifiable options — deliberately "
+            "bump COMMIT_FLOW_ALLOWLIST_CEILING in "
+            "backend/app/greenlet_fidelity.py."
+        )
+
+        # Burn-down ratchet: the ceiling is monotonic *downward*. The four
+        # functions remediated in the 2026-07-12 burn-down (pre-capture idiom /
+        # post-commit re-fetch, all behaviour-preserving) must stay removed from
+        # the allowlist — re-adding any of them without first re-lowering the
+        # ceiling would silently re-inflate the acknowledged-debt set. Pinning
+        # them here makes the named test exercise the production burn-down rather
+        # than only the abstract len<=ceiling invariant.
+        _remediated = {
+            "autonomous_research.py::_spawn_research_task_inner",
+            "orchestrator_ci_monitor.py::_monitor_evaluating_tasks",
+            "orchestrator_runner_dispatch.py::_dispatch_compute_experiment_directly",
+            "reaper.py::reaper_service",
+        }
+        _regressed = _remediated & _COMMIT_FLOW_ALLOWLIST
+        assert not _regressed, (
+            "These functions were burned down out of COMMIT_FLOW_ALLOWLIST but "
+            "have reappeared: " + ", ".join(sorted(_regressed)) + ". A burn-down "
+            "is a monotonic-downward step: re-acknowledging a remediated function "
+            "requires re-raising COMMIT_FLOW_ALLOWLIST_CEILING deliberately."
+        )
+        assert _COMMIT_FLOW_ALLOWLIST_CEILING <= 2, (
+            "COMMIT_FLOW_ALLOWLIST_CEILING regressed above the post-burn-down "
+            f"value (now {_COMMIT_FLOW_ALLOWLIST_CEILING}, expected <= 2). The "
+            "ceiling is a downward ratchet; raising it re-opens headroom for the "
+            "acknowledged-debt set to grow again."
+        )
+
+        # The burn-down is a real production fix, not a bookkeeping edit: the
+        # flow-aware scanner must actually verify each remediated function clean
+        # against live backend/app source. (Skipped only where backend/app is not
+        # mounted — the CI backend-only Docker context — mirroring the sibling
+        # regression check.)
+        if _PRODUCTION_APP_DIR.is_dir():
+            for _selector in sorted(_remediated):
+                _module = _selector.split("::", 1)[0]
+                _path = _PRODUCTION_APP_DIR / _module
+                assert _path.is_file(), (
+                    f"Remediated module {_module} not found at {_path}; the "
+                    "burn-down assertion cannot be verified."
+                )
+                _still_flagged = _unsafe_error_path_commit_functions_flow_aware(
+                    _path
+                )
+                assert _selector not in _still_flagged, (
+                    f"{_selector} was removed from COMMIT_FLOW_ALLOWLIST but the "
+                    "flow-aware scanner still flags an unsafe post-commit ORM read "
+                    "in it — the production remediation was reverted or is "
+                    "incomplete. Restore the pre-capture / re-fetch fix."
+                )

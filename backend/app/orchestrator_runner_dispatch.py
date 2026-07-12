@@ -1354,23 +1354,29 @@ async def _dispatch_compute_experiment_directly(
                 source="agent",
             )
             session.add(task)
+            # Snapshot the broadcast/log scalars into plain locals BEFORE commit:
+            # session.commit() expires all ORM state, so reading task.project_id/.id
+            # afterwards lazy-loads from async context and raises MissingGreenlet on
+            # asyncpg, quarantining a task that was correctly BLOCKED.
+            _blocked_project_id = str(task.project_id)
+            _blocked_task_id = str(task.id)
             await session.commit()
             try:
                 await broadcast_to_project(
-                    str(task.project_id),
+                    _blocked_project_id,
                     "task_updated",
-                    {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
+                    {"task_id": _blocked_task_id, "status": TaskStatus.BLOCKED},
                 )
             except Exception:
                 logger.exception(
                     "[ORCHESTRATOR] task_updated broadcast failed for blocked "
                     "compute_experiment %s",
-                    task.id,
+                    _blocked_task_id,
                 )
             logger.info(
                 "[ORCHESTRATOR] compute_experiment %s BLOCKED on live-release "
                 "precondition (recoverable): %s",
-                task.id,
+                _blocked_task_id,
                 msg[:200],
             )
             return "blocked"

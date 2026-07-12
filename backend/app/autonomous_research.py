@@ -1632,6 +1632,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
             await with_vision_locked(session, project.id, _mark_payload_bloat_skip)
             await session.commit()
+            # session.commit() expired `project`; the notify helper and the
+            # fall-through `if spawned:` block below both read project.vision/.id.
+            # Re-load it so those reads do not lazy-load from async context and
+            # raise MissingGreenlet on asyncpg.
+            await session.refresh(project)
             # A pending operator steering marker survives this skip (the spawn
             # never happened, so it is not consumed). Tell the operator their
             # steering is paused on payload bloat rather than leaving it silent.
