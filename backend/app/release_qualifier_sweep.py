@@ -487,9 +487,26 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         backfilled,
                     )
 
-            # Mirror release_scoring.compute_composite: 'backfilled' criteria clear
-            # the coverage gate alongside covered/attested.
-            if not (total == 0 or (covered + attested + backfilled) >= total):
+            # Goal-verification redesign — LOCKSTEP with run_qualification's
+            # ``criterion_coverage_recovered_same_sha`` guard (they are a matched
+            # pair: this is the scheduled trigger, that is the on-entry gate).  The
+            # coverage-count arithmetic (``covered + attested + backfilled >=
+            # total``) is retired; the gate now clears iff the sha-keyed ledger
+            # reports the candidate FULLY MET — every active category ``met`` AND
+            # the residual clean.  The evidence-recording machinery above is now
+            # vestigial (a criterion retraction/supersession or a merge-grade
+            # re-grade is what flips a ledger verdict), but is left in place as a
+            # no-op for the integrator to prune.  When the sibling ledger module is
+            # absent in this checkout, stay cached (safe: never a wrong re-drive).
+            try:
+                from app import category_verdict_ledger as _cvl
+            except Exception:  # noqa: BLE001 — sibling ledger not yet landed
+                _cvl = None
+            if _cvl is None:
+                return False
+            if not await _cvl.is_candidate_fully_met(
+                session, version.id, candidate_sha
+            ):
                 return False
 
             project = await session.get(Project, version.project_id)
