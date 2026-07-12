@@ -56,9 +56,12 @@ from app.efficiency_snapshot import (
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
     _compute_cold_start_breakdown_p50,
+    _compute_job_cost_usd,
+    _compute_job_is_priced,
     _compute_prompt_static_bytes,
     _compute_total_cost_per_verified_task,
     _compute_verified_merge_count,
+    _load_compute_job_costs,
     _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
     _last_run_due,
@@ -76,6 +79,8 @@ from app.efficiency_snapshot import (
     write_snapshot,
 )
 from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
     ImprovementLane,
     ImprovementLaneStatus,
     TaskStatus,
@@ -1541,6 +1546,214 @@ def test_total_cost_per_verified_task_in_all_axes():
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in ALL_AXES
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK == "total_cost_per_verified_task"
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in AXIS_CONSUMERS
+
+
+# ---------------------------------------------------------------------------
+# ComputeJob (GPU experiment) cost grounding
+# ---------------------------------------------------------------------------
+
+
+def _make_compute_job(project_id, **overrides):
+    """Create a ComputeJob with test defaults; pass kwargs to override."""
+    now = _utcnow()
+    defaults = {
+        "project_id": project_id,
+        "backend": "gcp",
+        "status": ComputeJobStatus.SUCCEEDED,
+        "started_at": now - timedelta(minutes=5),
+        "completed_at": now,
+        "polling_metadata": {},
+    }
+    defaults.update(overrides)
+    return ComputeJob(**defaults)
+
+
+def test_compute_job_is_priced_classification():
+    """A $0 compute job is PRICED only when it has a real rate basis (recorded
+    cost, a cloud rate stamped at launch, or the operator nominal rate for
+    runner-subprocess); otherwise it is genuinely UNPRICED, not free."""
+    import uuid
+
+    pid = uuid.uuid4()
+
+    # Recorded positive final cost → priced.
+    assert _compute_job_is_priced(
+        _make_compute_job(pid, backend="gcp", final_cost_usd=3.0)
+    )
+    # Positive cloud rate stamped at launch, $0 so far → priced.
+    assert _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="gcp",
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+            polling_metadata={"cost_rate_per_second": 0.0002},
+        )
+    )
+    # Runner-subprocess (operator hardware) with the nominal rate active → priced
+    # even at $0 (the nominal rate is the pricing basis).
+    assert _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="runner-subprocess",
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    # local-gpu ran for $0 with no rate and no operator nominal → UNPRICED.
+    assert not _compute_job_is_priced(
+        _make_compute_job(
+            pid,
+            backend="local-gpu",
+            final_cost_usd=0.0,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    # _compute_job_cost_usd prefers settled final over accrued.
+    assert _compute_job_cost_usd(
+        _make_compute_job(pid, final_cost_usd=7.5, accrued_cost_usd=2.0)
+    ) == 7.5
+    assert _compute_job_cost_usd(
+        _make_compute_job(pid, final_cost_usd=None, accrued_cost_usd=2.0)
+    ) == 2.0
+
+
+@pytest.mark.asyncio
+async def test_compute_job_cost_included_in_total_cost_per_verified_task(db_session):
+    """ComputeJob (GPU) cost attributed to a verified-merge task must appear in
+    the total_cost_per_verified_task numerator AND the compute_cost_attribution
+    honesty block — it was previously invisible to the cost/efficiency ranking."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A verified merge with NO VM/LLM cost so the axis reduces to compute cost.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Baseline: no compute job yet → axis is 0.0 (verified=1, cost=0).
+    axes_before = await compute_current_axes(db_session, project.id)
+    assert axes_before[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 0.0
+    assert axes_before["compute_cost_attribution"]["total_compute_cost_usd"] == 0.0
+    assert axes_before["compute_cost_attribution"]["job_count"] == 0
+
+    # Attribute a priced GPU compute job costing $12.50 to that task.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            task_id=task.id,
+            machine_type="g2-standard-4",
+            accelerator_type="L4",
+            final_cost_usd=12.5,
+        )
+    )
+    await db_session.commit()
+
+    axes_after = await compute_current_axes(db_session, project.id)
+    # verified merge count is 1, so the axis equals the compute cost.
+    assert axes_after[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 12.5
+    attr = axes_after["compute_cost_attribution"]
+    assert attr["total_compute_cost_usd"] == 12.5
+    assert attr["attributed_cost_usd"] == 12.5
+    assert attr["unattributed_cost_usd"] == 0.0
+    assert attr["job_count"] == 1
+    assert attr["priced_job_count"] == 1
+    assert attr["unpriced_job_count"] == 0
+    assert attr["unpriced_coverage_fraction"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_cost_attribution_surfaces_unpriced_job(db_session):
+    """A compute job that ran for $0 with no cloud/operator rate must surface as
+    UNPRICED (coverage < 1, combo recorded) so a $0 that means 'unpriced' is not
+    mistaken for 'free' in the ranking."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    # Ran (started_at set) on local-gpu, $0, no rate → genuinely unpriced.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            task_id=task.id,
+            backend="local-gpu",
+            machine_type="g2-standard-4",
+            final_cost_usd=0.0,
+            accrued_cost_usd=0.0,
+            polling_metadata={},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    attr = axes["compute_cost_attribution"]
+    assert attr["job_count"] == 1
+    assert attr["unpriced_job_count"] == 1
+    assert attr["priced_job_count"] == 0
+    assert attr["unpriced_coverage_fraction"] == 0.0
+    assert "local-gpu:g2-standard-4" in attr["unpriced_combos"]
+    # Unpriced $0 contributes 0 to the numerator — the axis is not inflated, but
+    # the honesty block makes the $0 legible rather than silently "free".
+    assert axes[AXIS_TOTAL_COST_PER_VERIFIED_TASK] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_load_compute_job_costs_skips_not_started_zero_cost(db_session):
+    """A not-yet-started $0 job is not cost-bearing (excluded from job_count and
+    coverage); a job that ran or spent is counted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # QUEUED, never started, $0 → skipped entirely.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            backend="gcp",
+            status=ComputeJobStatus.QUEUED,
+            started_at=None,
+            completed_at=None,
+            final_cost_usd=None,
+            accrued_cost_usd=0.0,
+        )
+    )
+    # RUNNING, started, accrued $4 → counted.
+    db_session.add(
+        _make_compute_job(
+            project.id,
+            backend="gcp",
+            status=ComputeJobStatus.RUNNING,
+            completed_at=None,
+            final_cost_usd=None,
+            accrued_cost_usd=4.0,
+            polling_metadata={"cost_rate_per_second": 0.0002},
+        )
+    )
+    await db_session.commit()
+
+    by_task, attr = await _load_compute_job_costs(db_session, project.id)
+    assert attr["job_count"] == 1
+    assert attr["priced_job_count"] == 1
+    assert attr["total_compute_cost_usd"] == 4.0
+    # Neither job carried a task_id, so nothing is attributed per-task.
+    assert by_task == {}
+    assert attr["unattributed_cost_usd"] == 4.0
 
 
 @pytest.mark.asyncio
