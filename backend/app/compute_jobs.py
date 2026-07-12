@@ -71,6 +71,7 @@ from app.models import (
     Project,
     ReleaseVersion,
     Task,
+    TaskHistory,
     TaskStatus,
 )
 from app.compute_experiment_contract import resolve_compute_spend_approval
@@ -1479,6 +1480,7 @@ async def _apply_operator_kill_result(
         now=now,
         terminate_ok=terminate_ok,
     )
+    _record_terminal_reason_history(session, live)
     await _link_terminal_artifact(session, live)
     await _extract_viewable_files_for_job(session, live)
     if live.task_id is not None:
@@ -1842,6 +1844,7 @@ async def _run_and_apply_preflight_smoke(
             terminal_reason=reason,
             now=now,
         )
+        _record_terminal_reason_history(session, live)
         await _link_terminal_artifact(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes  # noqa: PLC0415
@@ -2653,6 +2656,7 @@ async def _apply_polled_compute_job_result(
                 terminate_ok=terminate_ok,
                 terminal_kind=terminal_kind,
             )
+            _record_terminal_reason_history(session, live)
             if compute_rpc_diagnostic is not None:
                 _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
             await _link_terminal_artifact(session, live)
@@ -2700,6 +2704,7 @@ async def _apply_task_terminal_cancellation(
             now=now,
             terminate_ok=terminate_ok,
         )
+        _record_terminal_reason_history(session, live)
         if compute_rpc_diagnostic is not None:
             _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
         else:
@@ -3109,6 +3114,43 @@ def _finalize_terminal_job(
         auth.pop("password", None)
         meta["container_registry_auth"] = auth
         job.polling_metadata = meta
+
+
+def _record_terminal_reason_history(session, job: ComputeJob) -> None:
+    """Append a durable TaskHistory row carrying WHY the compute job ended.
+
+    ``terminal_reason`` otherwise lives only in mutable channels
+    (``latest_status_message`` / ``polling_metadata.status_message``) that the
+    next reap or status update overwrites. Every non-success terminal (deadline
+    kill, spend cap, provisioning timeout, runner-reported failure,
+    cancellation) gets a history row so operators and follow-on agents can
+    always recover the reason, not just the FAILED state. SUCCESS is skipped —
+    this is the failure-reason channel, not a completion log.
+
+    Add-only (``session.add``); the caller owns the commit alongside the
+    terminal transition itself.
+    """
+    if job.task_id is None:
+        return
+    outcome = getattr(job.outcome, "value", job.outcome)
+    if outcome == ComputeJobOutcome.SUCCESS.value:
+        return
+    details: dict[str, Any] = {
+        "compute_job_id": str(job.id),
+        "status": getattr(job.status, "value", job.status),
+        "outcome": outcome,
+        "terminal_reason": job.terminal_reason,
+    }
+    exit_code = (job.polling_metadata or {}).get("exit_code")
+    if exit_code is not None:
+        details["exit_code"] = exit_code
+    session.add(
+        TaskHistory(
+            task_id=job.task_id,
+            action="COMPUTE_TERMINATED",
+            details=details,
+        )
+    )
 
 
 def _is_durable_artifact_uri(reference: str) -> bool:

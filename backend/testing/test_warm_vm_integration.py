@@ -1477,6 +1477,11 @@ async def test_checkpoint_sha_verification_false_increments_phase_requeues(
         )
 
         assert result is False
+        # Persist the pending mark_checkpoint_missing increment before the
+        # refresh, mirroring the production review-spawn caller which commits
+        # the session — refresh() discards pending (unflushed) changes under
+        # real ORM expiry.
+        await db_session.commit()
         await db_session.refresh(lane)
         assert lane.phase_requeues == 1, (
             "Genuine SHA unreachability (is_ancestor_of=False) must increment phase_requeues"

@@ -106,6 +106,41 @@ class TestFailStaleLocalRunnerHolds:
         assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
 
     @pytest.mark.asyncio
+    async def test_strict_pin_hold_timeout_names_pinned_runner(self, db_session):
+        """A timed-out strict runner_target hold fails with a truthful reason
+        naming the pinned runner and the last diagnosed why — never the generic
+        require_local_runner wording (which would lie about why it was held)."""
+        project = await _make_project(db_session)
+        pinned_runner_id = str(uuid.uuid4())
+        task = await _make_held_task(
+            db_session,
+            project.id,
+            held_ago_seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600,
+        )
+        ctx = dict(task.context or {})
+        ctx["runner_pin_hold"] = {
+            "runner_id": pinned_runner_id,
+            "strict": True,
+            "reason_code": "offline",
+            "detail": "runner (host dgx-1) is not live",
+        }
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 1
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        message = task.latest_status_message or ""
+        assert "runner_target" in message
+        assert pinned_runner_id in message
+        assert "offline" in message
+        assert "require_local_runner" not in message
+        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
     async def test_keeps_recent_hold(self, db_session):
         project = await _make_project(db_session)
         task = await _make_held_task(

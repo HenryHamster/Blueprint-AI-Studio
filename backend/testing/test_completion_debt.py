@@ -549,14 +549,17 @@ async def test_capability_trial_writer_opens_debt(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    key = f"capability_trial:{project.id}:cap_widget"
+    # Snapshot the scalar BEFORE expire_all() below: an expired sync read on an
+    # async session raises MissingGreenlet under real ORM expiry.
+    project_id = project.id
+    key = f"capability_trial:{project_id}:cap_widget"
 
     # Observe/trial verdict → open debt. ``persist_trial_verdicts_in_transaction``
     # opens its OWN committing session; we only read AFTER it returns so this
     # session holds no in-flight transaction on the shared test connection.
     await persist_trial_verdicts_in_transaction(
         db_session,
-        project.id,
+        project_id,
         pending_verdicts=[
             ("cap_widget", {"verdict": "continue-trial", "verdict_reason": "insufficient_data"})
         ],
@@ -569,7 +572,7 @@ async def test_capability_trial_writer_opens_debt(db_session):
     ).scalar_one()
     assert row.kind == cd.KIND_CAPABILITY_TRIAL
     assert row.status == cd.STATUS_OPEN
-    assert row.project_id == project.id
+    assert row.project_id == project_id
     # Idempotent across writes — still exactly one row.
     assert await _acount(db_session, dedupe_key=key) == 1
 

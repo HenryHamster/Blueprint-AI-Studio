@@ -10015,6 +10015,11 @@ async def test_qualify_request_failure_recorded_on_release_version(
         db_session,
         path="test",
     )
+    # _apply_qualify_request does not commit — its production caller
+    # (_apply_qualify_request_post_commit) commits after it returns. Mirror that
+    # here: refresh() re-reads committed DB state under real ORM expiry, so an
+    # uncommitted pending write would be (correctly) discarded.
+    await db_session.commit()
 
     # The failure must be recorded on the ReleaseVersion row, not just logged.
     await db_session.refresh(version)

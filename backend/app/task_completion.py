@@ -287,6 +287,111 @@ async def _load_release_echo_for_criterion(
     return echo_sha, expected_sha
 
 
+def _summarize_progress_records(
+    progress: Any, criterion: dict | None
+) -> dict[str, Any] | None:
+    """Compact trajectory summary from a job's ``polling_metadata["progress"]``.
+
+    Returns ``{metric, count, first, last, best, best_direction}`` (each record
+    compacted to ``{value, step?, ts?}``) or None when no usable records exist.
+    The summary is scoped to the metric of the LAST record (mixed-metric files
+    summarize the most recent series). ``best`` direction comes from the
+    declared success-criterion operator when it names the same metric
+    (``<``/``<=`` ⇒ minimize); otherwise it defaults to maximize and says so
+    via ``best_direction`` — a hint, not a verdict. Records were validated at
+    the report endpoint but are re-checked here (fail-soft) since
+    polling_metadata is plain JSONB.
+    """
+    if not isinstance(progress, dict):
+        return None
+    records = progress.get("records")
+    if not isinstance(records, list):
+        return None
+
+    def _valid(rec: Any) -> bool:
+        if not isinstance(rec, dict):
+            return False
+        value = rec.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if value != value or value in (float("inf"), float("-inf")):
+            return False
+        return isinstance(rec.get("metric"), str) and bool(rec.get("metric"))
+
+    valid = [rec for rec in records if _valid(rec)]
+    if not valid:
+        return None
+    metric = valid[-1]["metric"]
+    series = [rec for rec in valid if rec.get("metric") == metric]
+
+    minimize = False
+    if isinstance(criterion, dict) and criterion.get("metric") == metric:
+        minimize = criterion.get("operator") in ("<", "<=")
+    best = min(series, key=lambda rec: rec["value"]) if minimize else max(
+        series, key=lambda rec: rec["value"]
+    )
+
+    def _compact(rec: dict) -> dict[str, Any]:
+        out: dict[str, Any] = {"value": rec["value"]}
+        if isinstance(rec.get("step"), int) and not isinstance(rec.get("step"), bool):
+            out["step"] = rec["step"]
+        if isinstance(rec.get("ts"), str) and rec.get("ts"):
+            out["ts"] = rec["ts"]
+        return out
+
+    raw_count = progress.get("count")
+    count = (
+        raw_count
+        if isinstance(raw_count, int)
+        and not isinstance(raw_count, bool)
+        and raw_count >= len(valid)
+        else len(valid)
+    )
+    return {
+        "metric": metric,
+        "count": count,
+        "first": _compact(series[0]),
+        "last": _compact(series[-1]),
+        "best": _compact(best),
+        "best_direction": "min" if minimize else "max",
+    }
+
+
+async def _build_compute_progress_summary(
+    session: AsyncSession, task: Task, logs: str, criterion: dict | None
+) -> dict[str, Any] | None:
+    """Load the task's compute job and summarize its interim-progress trail.
+
+    Gives follow-on agents the trained trajectory ("loss plateaued at 2.31
+    after step 1400"), not just the terminal state. Fail-soft by contract: no
+    job, no progress records (old runner / GCP backend / job that never wrote
+    the file), or any load error returns None and the compute_result simply
+    omits ``progress_summary``.
+    """
+    try:
+        job: ComputeJob | None = None
+        job_id = _extract_compute_job_id(logs or "")
+        if job_id is not None:
+            job = await get_compute_job_for_task(session, job_id=job_id, task_id=task.id)
+        if job is None:
+            result = await session.execute(
+                select(ComputeJob)
+                .where(ComputeJob.task_id == task.id)
+                .order_by(ComputeJob.created_at.desc())
+            )
+            job = result.scalars().first()
+        if job is None or not isinstance(job.polling_metadata, dict):
+            return None
+        return _summarize_progress_records(
+            job.polling_metadata.get("progress"), criterion
+        )
+    except Exception:  # noqa: BLE001 — fail-soft: never block terminal completion
+        logger.warning(
+            "Progress-summary extraction failed for task %s", task.id, exc_info=True
+        )
+        return None
+
+
 def _derive_artifact_delivery_record(resource: dict) -> dict:
     """Derive artifact delivery classification from a stamped compute resource dict.
 
@@ -2792,6 +2897,32 @@ _ACT_ON_VERDICT_SOURCE_KEY = "act_on_verdict_source_task_id"
 _ACT_ON_VERDICT_LOG_CHARS = 16000
 
 
+def _parse_compute_result_record(logs: str) -> dict[str, Any] | None:
+    """Best-effort parse of the COMPUTE_RESULT record (``build_compute_result_logs``).
+
+    Returns the record dict — carrying ``terminal_reason`` and the readable
+    ``command_log_text`` — or ``None`` when ``logs`` is not the JSON record
+    (legacy free-form logs, raw crash output).
+    """
+    try:
+        parsed = json.loads(logs) if logs else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _compute_terminal_reason_of(
+    compute_result: dict[str, Any] | None, logs: str
+) -> str | None:
+    """The job's ``terminal_reason``, from the handler result or the raw record."""
+    reason = (compute_result or {}).get("terminal_reason")
+    if not (isinstance(reason, str) and reason.strip()):
+        reason = (_parse_compute_result_record(logs) or {}).get("terminal_reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return None
+
+
 def _build_act_on_verdict_prompt(
     task: Task,
     compute_result: dict[str, Any],
@@ -2857,9 +2988,26 @@ def _build_act_on_verdict_prompt(
         )
     lines.append("")
     if failure_mode:
+        record = _parse_compute_result_record(logs)
+        terminal_reason = _compute_terminal_reason_of(compute_result, logs)
+        log_tail = (record or {}).get("command_log_text")
+        log_tail = (
+            log_tail.strip()
+            if isinstance(log_tail, str) and log_tail.strip()
+            else None
+        )
+        # Reason first: WHY the job went terminal (deadline kill, spend cap,
+        # provisioning timeout, runner failure) — not just that it FAILED.
+        if terminal_reason:
+            lines.append(f"Terminal reason (why the job ended): {terminal_reason}")
+            lines.append("")
         # The traceback/stderr tail is the key visibility fix — show it FIRST and
-        # prominently so the diagnosing agent does not have to fetch the GCS bundle.
-        raw = (logs or "").strip()
+        # prominently so the diagnosing agent does not have to fetch the GCS
+        # bundle. When ``logs`` is the structured record, its command_log_text
+        # (unescaped) IS the captured output; otherwise fall back to the raw
+        # logs (crash traceback / legacy free-form output).
+        raw = (log_tail or "") if record is not None else (logs or "")
+        raw = raw.strip()
         if raw:
             if len(raw) > _ACT_ON_VERDICT_LOG_CHARS:
                 raw = raw[-_ACT_ON_VERDICT_LOG_CHARS:]
@@ -2873,10 +3021,19 @@ def _build_act_on_verdict_prompt(
                 "No stderr/traceback was captured for this failure — the "
                 "experiment may have died before emitting any output."
             )
-        if compute_result:
+        # Merge the parsed terminal record (minus the log text shown above)
+        # under the handler-derived compute_result so gate-fail spawns — which
+        # pass compute_result={} — still forward outcome/cost/terminal metadata.
+        record_view = {
+            k: v
+            for k, v in (record or {}).items()
+            if k not in ("command_log_text", "command_log_truncated")
+        }
+        merged_record = {**record_view, **(compute_result or {})}
+        if merged_record:
             lines.append(
                 "\nPartial / terminal result record (may be incomplete):\n"
-                + json.dumps(compute_result, indent=2, default=str)
+                + json.dumps(merged_record, indent=2, default=str)
             )
         lines.append("")
         lines.append(
@@ -3007,6 +3164,13 @@ async def _spawn_act_on_verdict_followon(
     )
 
     context: dict[str, Any] = {_ACT_ON_VERDICT_SOURCE_KEY: str(task.id)}
+    # Machine-readable WHY for the follow-on: forward the job's terminal_reason
+    # (the existing vocabulary — deadline kill, spend cap, provisioning timeout,
+    # runner failure) so iteration agents and tooling read the reason without
+    # re-parsing the prompt.
+    _terminal_reason = _compute_terminal_reason_of(compute_result, logs)
+    if _terminal_reason:
+        context["compute_terminal_reason"] = _terminal_reason[:500]
     # Pillar 5 spawn-forward: when a durable COMPUTE_RESULT artifact exists, stamp
     # its canonical pointer onto the follow-on so the fresh agent can mint a signed
     # URL. Best-effort: a missing/unresolvable artifact must not block the spawn.
@@ -3553,6 +3717,21 @@ async def _handle_compute_experiment_completion(
         compute_result: dict[str, Any] = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        # Non-success terminals carry WHY (the job's terminal_reason) so
+        # plan_output.compute_result — the durable record downstream prompts
+        # read — surfaces the reason, not just the outcome state.
+        if outcome != "SUCCESS":
+            _term_reason = _compute_terminal_reason_of(None, logs)
+            if _term_reason:
+                compute_result["terminal_reason"] = _term_reason
+        # Interim-progress trajectory (first/last/best + count) when the job
+        # self-reported progress records — follow-on agents see the CURVE, not
+        # just the terminal number.
+        _progress_summary = await _build_compute_progress_summary(
+            session, task, logs, criterion
+        )
+        if _progress_summary is not None:
+            compute_result["progress_summary"] = _progress_summary
         resource = await _stamp_compute_result_resource(session, task, logs)
         compute_result.update(resource)
         compute_result["artifact_delivery"] = _derive_artifact_delivery_record(resource)
@@ -3650,6 +3829,20 @@ async def _handle_compute_experiment_completion(
         compute_result: dict = {"outcome": outcome, "final_cost_usd": cost}
         if criterion is not None:
             compute_result["criterion"] = criterion
+        # Mirror the prerequisite path: non-success terminals carry WHY so the
+        # follow-on spawn and the sweep aggregate prompt (which read
+        # plan_output.compute_result) surface the reason, not just the state.
+        if outcome != "SUCCESS":
+            _term_reason = _compute_terminal_reason_of(None, logs)
+            if _term_reason:
+                compute_result["terminal_reason"] = _term_reason
+        # Mirror the prerequisite path: attach the self-reported progress
+        # trajectory so the act-on-verdict follow-on reads the curve too.
+        _progress_summary = await _build_compute_progress_summary(
+            session, task, logs, criterion
+        )
+        if _progress_summary is not None:
+            compute_result["progress_summary"] = _progress_summary
         resource = await _stamp_compute_result_resource(session, task, logs)
         compute_result.update(resource)
         delivery = _derive_artifact_delivery_record(resource)

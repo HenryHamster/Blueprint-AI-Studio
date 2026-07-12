@@ -2255,6 +2255,10 @@ class TestDeleteProject:
         )
         await db_session.commit()
 
+        # Snapshot the id BEFORE deleting: expire_all() below expires the
+        # (now-deleted) project row, so a later ``project.id`` lazy-load would
+        # raise MissingGreenlet under real ORM expiry.
+        project_id = project.id
         resp = await client.delete(f"/api/admin/projects/{project.id}")
         assert resp.status_code == 200, resp.text
 
@@ -2268,7 +2272,7 @@ class TestDeleteProject:
             rows = (
                 (
                     await db_session.execute(
-                        _select(_model).where(_model.project_id == project.id)
+                        _select(_model).where(_model.project_id == project_id)
                     )
                 )
                 .scalars()
@@ -12914,6 +12918,7 @@ class TestAcceptanceCriteriaRouter:
             "total": 0,
             "covered": 0,
             "attested": 0,
+            "backfilled": 0,
             "partial": 0,
             "uncovered": 0,
             "inactive": 0,
@@ -12921,6 +12926,8 @@ class TestAcceptanceCriteriaRouter:
             "superseded": 0,
             "stuck_count": 0,
             "criteria": [],
+            "failed_corroboration_keys": [],
+            "merge_evidence_gaps": None,
         }
 
         create_resp = await client.post(
@@ -21768,6 +21775,146 @@ class TestComputeExperimentTaskLaunch:
 
         assert resp.status_code == 422, resp.text
         assert expected_detail in resp.text
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    async def _enrolled_runner(self, session, project_id, hostname="dgx-1"):
+        runner = LocalRunner(
+            project_id=project_id,
+            token_hash="r" * 64,
+            hostname=hostname,
+            status="active",
+            last_seen_at=_utcnow(),
+        )
+        session.add(runner)
+        await session.commit()
+        await session.refresh(runner)
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_runner_target_persists_and_stamps_preferred_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """runner_target survives request → launch_contract → stored payload and
+        stamps the existing preferred_runner_target_id dispatch seam."""
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(runner.id), "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["runner_target"] == {
+            "runner_id": str(runner.id),
+            "strict": True,
+        }
+        # The pin rides the existing soft-preference seam; strictness is read
+        # from the payload at dispatch time.
+        assert (task.context or {}).get("preferred_runner_target_id") == str(
+            runner.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_target_defaults_to_soft_pin(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(runner_target={"runner_id": str(runner.id)}),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["runner_target"] == {
+            "runner_id": str(runner.id),
+            "strict": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_runner_target_unknown_runner_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(uuid.uuid4()), "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        # The app-level HTTPException handler wraps the dict detail as
+        # {"error": {"code": 422, "message": <detail dict>}}.
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "runner_target_invalid"
+        assert detail["reason_code"] == "not_found"
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_runner_target_cross_project_runner_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner enrolled in a DIFFERENT project is rejected at authoring time
+        (review-verdict requirement: validate against the task's project's
+        enrolled runners)."""
+        await self._project_with_repo(db_session)
+        other = Project(name="other/project", user_id=TEST_USER_ID)
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        foreign_runner = await self._enrolled_runner(db_session, other.id)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": str(foreign_runner.id), "strict": False}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "runner_target_invalid"
+        assert detail["reason_code"] == "not_enrolled"
+        assert detail["runner_id"] == str(foreign_runner.id)
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_runner_target_invalid_uuid_rejected_422(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                runner_target={"runner_id": "not-a-uuid", "strict": True}
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "not a valid UUID" in resp.text
         tasks = (await db_session.execute(select(Task))).scalars().all()
         assert tasks == []
 

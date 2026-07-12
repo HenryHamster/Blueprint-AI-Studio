@@ -886,7 +886,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 className="rounded-md border border-neutral-800 bg-[#0d1218]"
               >
               <div
-                className="flex items-start gap-2.5 p-2.5"
+                className="flex flex-wrap items-start gap-2.5 p-2.5"
                 data-testid="fleet-runner-row"
               >
                 <div className="mt-0.5 shrink-0">
@@ -894,7 +894,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <Cpu className="h-3.5 w-3.5 text-neutral-400" />
                   </div>
                 </div>
-                <div className="flex-1 min-w-0">
+                {/* basis-[14rem] (not flex-1's basis 0) keeps the info column readable:
+                    when the per-runner action strip doesn't fit beside it (narrow
+                    viewports), the strip wraps to its own line instead of crushing
+                    the status text into a sliver that silently clips. */}
+                <div className="min-w-0 grow shrink basis-[14rem]">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={`shrink-0 text-sm leading-none ${livCls}`} aria-hidden="true">●</span>
                     <span className="text-sm font-medium text-neutral-200 truncate">
@@ -949,6 +953,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                               className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
                               title="Save"
                               aria-label="Save max concurrent"
+                              data-viewport-allow-small-target
                             >
                               <Check className="w-3 h-3" />
                             </button>
@@ -957,6 +962,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                               className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
                               title="Cancel"
                               aria-label="Cancel"
+                              data-viewport-allow-small-target
                             >
                               <span className="text-xs">✕</span>
                             </button>
@@ -977,6 +983,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                             className="text-neutral-500 hover:text-neutral-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
                             title="Edit max concurrent"
                             aria-label="Edit max concurrent"
+                            data-viewport-allow-small-target
                           >
                             <Edit2 className="w-3 h-3" />
                           </button>
@@ -1132,6 +1139,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     Next: {readiness.nextAction}
                   </div>
                 </div>
+                <div className="flex shrink-0 items-center gap-2.5">
                 {(isActive || isDraining) && (
                   <button
                     onClick={() => void handleUpdateStatus(runner, 'paused')}
@@ -1192,6 +1200,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
+                </div>
               </div>
               {telemetryOpen && (
                 <RunnerTelemetryDetail projectId={projectId} runnerId={runner.id} />

@@ -418,6 +418,14 @@ async def maybe_spawn_smoketest_fix(
                 f"[SMOKETEST] Failed to spawn plan task after smoketest failure for task {task_id_str}: {e}",
                 exc_info=True,
             )
+            # Snapshot scalars BEFORE the rollback below: rollback expires
+            # every loaded attribute on ``task``, so a later ``task.id`` /
+            # ``task.project_id`` read (the spawn-failed alert path) would
+            # trigger a sync lazy-load — MissingGreenlet under the async
+            # engine. ``__dict__`` reads only — never attribute access — so
+            # this can't itself trip a load on a poisoned session.
+            _task_pk = task.__dict__.get("id")
+            _project_pk = task.__dict__.get("project_id")
             # If the failure was the session.flush() at line ~905 (FK violation,
             # serialization conflict), the session is now in pending-rollback
             # state and any subsequent session op (including session.add below
@@ -426,6 +434,23 @@ async def maybe_spawn_smoketest_fix(
             # status-update block (lines ~623-671).
             _rolled_back = await _recover_poisoned_session(session, task_id_str)
             if _rolled_back:
+                # The rollback expired EVERY loaded attribute on ``task``. The
+                # state re-apply just below (and the retry flush after it) then
+                # operate on an expired instance: the first attribute
+                # read/mutation that needs a value triggers a SYNC lazy-load,
+                # which autoflushes OUTSIDE the greenlet and poisons the retry
+                # flush (MissingGreenlet → PendingRollbackError, no plan task
+                # ever spawned). Re-populate ``task`` from its DB row first so
+                # every downstream read/mutation and the flush see a live
+                # instance. populate_existing refreshes the same identity-map
+                # object in place, so the ``task`` reference stays valid.
+                if _task_pk is not None:
+                    with contextlib.suppress(Exception), session.no_autoflush:
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == _task_pk)
+                            .execution_options(populate_existing=True)
+                        )
                 task.status = payload.status
                 if payload.logs and (
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
@@ -499,7 +524,7 @@ async def maybe_spawn_smoketest_fix(
             if not _spawn_retry_succeeded:
                 try:
                     spawn_alert = Alert(
-                        project_id=task.project_id,
+                        project_id=_project_pk,
                         severity=AlertSeverity.ERROR,
                         title=f"Smoketest fix-plan spawn failed for task {task_id_str}",
                         message=(
@@ -507,11 +532,11 @@ async def maybe_spawn_smoketest_fix(
                             f"follow-up plan task could not be spawned: {type(e).__name__}: {e!r}. "
                             f"Operator must manually create a plan task to address the smoketest failures."
                         )[:1000],
-                        task_id=task.id,
+                        task_id=_task_pk,
                     )
                     session.add(spawn_alert)
                     await broadcast_to_project(
-                        str(task.project_id),
+                        str(_project_pk),
                         "alert_created",
                         {
                             "alert_id": str(spawn_alert.id),

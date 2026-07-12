@@ -733,12 +733,18 @@ export interface ComputeJobLiveOutput {
   truncated: boolean;
 }
 
+/** One directly viewable output file (plot/render/video) from a compute job's
+ *  artifacts, surfaced as the first-class `viewable_artifacts` field on the
+ *  job response (normalized server-side from the job's `viewable_files`
+ *  manifest). `storage_uri` is a durable `gs://` reference — resolve it to a
+ *  transient signed URL via `resolveArtifactDownloadUrl` before rendering;
+ *  signed URLs expire and must never be persisted. */
 export interface ViewableArtifact {
   storage_uri: string;
-  filename: string;
-  content_type?: string;
-  size_bytes?: number;
-  kind: 'image' | 'video';
+  filename: string | null;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  kind: 'image' | 'video' | null;
 }
 
 export interface ComputeJob {

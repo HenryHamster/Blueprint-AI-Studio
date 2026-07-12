@@ -5904,4 +5904,3 @@ async def test_strategic_context_evidence_orders_by_oldest_pending_first(db_sess
     assert returned_titles == titles[:4], (
         f"expected oldest 4 docs {titles[:4]}, got {returned_titles}"
     )
-

@@ -8,7 +8,15 @@ import pytest
 from sqlalchemy import func
 from sqlmodel import select
 
-from app.models import Artifact, KnowledgeDocument, Project, Task
+import app.strategic_context_package as scp
+from app.models import (
+    Artifact,
+    ArtifactType,
+    KnowledgeDocument,
+    Project,
+    Task,
+)
+from app.storage import ARTIFACT_BUCKET_NAME
 from app.strategic_context_package import (
     _artifact_descriptor,
     _artifact_renderable_kind,
@@ -217,6 +225,275 @@ async def test_load_strategic_context_evidence_staleness_reflects_oldest_pending
     # The oldest doc was created ~72 hours ago, so the staleness should be near 72.
     assert knowledge["oldest_pending_age_hours"] >= 70
     assert knowledge["oldest_pending_age_hours"] <= 74
+
+
+# ── Viewable artifact previews (signed at the async load boundary) ───────────
+
+
+async def _make_project_task(db_session, name="PreviewTest"):
+    project = Project(name=name, user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="experiment",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+def _fake_signer(calls=None):
+    async def fake(storage_uri, expiration_minutes=60):
+        if calls is not None:
+            calls.append((storage_uri, expiration_minutes))
+        return f"https://signed.example/{storage_uri.rsplit('/', 1)[-1]}"
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_artifact_image_preview_signed_at_load(db_session, monkeypatch):
+    """An Artifact whose own storage_uri is an allowlisted image gets a signed,
+    transient viewable_previews entry minted inside
+    load_strategic_context_evidence, and the descriptor renders it (no more
+    unsupported_reason stub)."""
+    project, task = await _make_project_task(db_session)
+    image_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/loss_curve.png"
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=image_uri,
+        )
+    )
+    await db_session.commit()
+
+    calls: list = []
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    # No-leak contract (test_strategic_state.py): the raw gs:// reference must
+    # never appear in the package — only the signed, transient URL does.
+    assert "storage_uri" not in item
+    previews = item["viewable_previews"]
+    assert previews == [
+        {
+            "url": "https://signed.example/loss_curve.png",
+            "kind": "image",
+            "filename": "loss_curve.png",
+        }
+    ]
+    assert calls == [(image_uri, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] == "https://signed.example/loss_curve.png"
+    assert "storage_uri" not in descriptor["image"]
+    assert "unsupported_reason" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_bundle_artifact_resolves_manifest_viewable_video(
+    db_session, monkeypatch
+):
+    """A compute-job bundle Artifact resolves through its logs' viewable_files
+    manifest; entries failing the per-file ownership check are never signed,
+    and a resolved video preview promotes the descriptor kind to video."""
+    project, task = await _make_project_task(db_session, name="PreviewVideo")
+
+    own_video = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/viewable/rollout.mp4"
+    )
+    foreign = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "00000000-0000-0000-0000-000000000001/artifacts/viewable/evil.png"
+    )
+    bundle_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/bundle.tar.gz"
+    )
+    logs = {
+        "viewable_files": [
+            # Foreign entry listed FIRST: ownership check fails, never signed.
+            {"filename": "evil.png", "storage_uri": foreign, "kind": "image"},
+            {"filename": "rollout.mp4", "storage_uri": own_video, "kind": "video"},
+        ]
+    }
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=bundle_uri,
+            logs=json.dumps(logs),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        if storage_uri == foreign:
+            raise Exception("ownership violation")
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    # No-leak contract: raw gs:// never rides in the package payload; the
+    # signing-call record below proves WHICH object was resolved instead.
+    assert "storage_uri" not in item
+    previews = item["viewable_previews"]
+    assert previews == [
+        {
+            "url": "https://signed.example/rollout.mp4",
+            "kind": "video",
+            "filename": "rollout.mp4",
+        }
+    ]
+    # Only the owned object was ever signed — the foreign entry was skipped.
+    assert calls == [(own_video, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "video"
+    assert descriptor["video"]["url"] == "https://signed.example/rollout.mp4"
+    assert "storage_uri" not in descriptor["video"]
+
+
+@pytest.mark.asyncio
+async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
+    """Fail-soft: a signing error yields the pre-existing metadata-only stub."""
+    project, task = await _make_project_task(db_session, name="PreviewFail")
+    image_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/plot.png"
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=image_uri,
+            logical_key="plot.png",
+        )
+    )
+    await db_session.commit()
+
+    async def broken_signer(storage_uri, expiration_minutes=60):
+        raise RuntimeError("storage outage")
+
+    monkeypatch.setattr(scp, "generate_download_signed_url", broken_signer)
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    assert "viewable_previews" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"] == {"url": None, "alt": descriptor["title"]}
+    assert "unsupported_reason" in descriptor
+
+
+@pytest.mark.asyncio
+async def test_svg_is_never_previewable(db_session, monkeypatch):
+    """svg is excluded from the viewable allowlist (script execution via a
+    signed URL) — no preview and no signing call, whether the svg is the
+    artifact's own storage_uri or a stamped manifest entry."""
+    project, task = await _make_project_task(db_session, name="PreviewSvg")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.SCREENSHOT,
+            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/chart.svg",
+            logs=json.dumps(
+                {
+                    "viewable_files": [
+                        {
+                            "filename": "diagram.svg",
+                            "storage_uri": f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/diagram.svg",
+                            "kind": "image",
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    verify_calls: list = []
+
+    async def fake_verify(storage_uri, project_id, session):
+        verify_calls.append(storage_uri)
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    item = evidence["artifacts"]["items"][0]
+    assert "viewable_previews" not in item
+    assert calls == []
+    assert verify_calls == []
+
+
+def test_snapshot_sanitizer_strips_signed_preview_urls():
+    """NEVER-PERSIST invariant: the strategic-session snapshot seam
+    (message.context['strategic_session'] via sanitize_strategic_session_snapshot)
+    is a field allowlist that structurally drops image/video/preview payloads,
+    so a signed URL can never reach a durable row through it."""
+    from app.workbench_state import sanitize_strategic_session_snapshot
+
+    leaky_descriptor = {
+        "kind": "image",
+        "id": "artifact:abc",
+        "label": "Loss curve",
+        "summary": "training run",
+        "status": "ready",
+        "target": {"surface": "task", "task_id": "t-1"},
+        "image": {"url": "https://signed.example/leak.png"},
+        "video": {"url": "https://signed.example/leak.mp4"},
+        "preview": {"url": "https://signed.example/leak2.png"},
+        "viewable_previews": [
+            {
+                "url": "https://signed.example/leak3.png",
+                "kind": "image",
+                "filename": "leak3.png",
+            }
+        ],
+    }
+    snapshot = sanitize_strategic_session_snapshot(
+        {
+            "selected_ref_descriptors": [leaky_descriptor],
+            "context_package_descriptor": leaky_descriptor,
+            "context_package_id": "strategic-context:p-1",
+        }
+    )
+
+    def _assert_no_urls(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                assert key not in (
+                    "image",
+                    "video",
+                    "preview",
+                    "viewable_previews",
+                    "url",
+                ), f"signed-url field {key!r} leaked into the persisted snapshot"
+                _assert_no_urls(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                _assert_no_urls(value)
+        elif isinstance(obj, str):
+            assert "signed.example" not in obj
+
+    _assert_no_urls(snapshot)
+    # The pointer fields themselves survive (the snapshot stays useful).
+    assert snapshot["selected_ref_descriptors"][0]["id"] == "artifact:abc"
+    assert snapshot["context_package_descriptor"]["id"] == "artifact:abc"
 
 
 # ── viewable-artifact preview URL tests ──────────────────────────────────
@@ -438,7 +715,9 @@ async def test_load_strategic_context_evidence_artifact_viewable_files(db_sessio
     artifacts = result["artifacts"]["items"]
     assert len(artifacts) == 1
     item = artifacts[0]
-    assert item["storage_uri"] == "gs://bucket/result"
+    # No-leak contract (test_strategic_state.py): the raw gs:// reference must
+    # never ride on the item — only the signed, transient URLs do.
+    assert "storage_uri" not in item
     assert "viewable_previews" in item
     assert len(item["viewable_previews"]) == 2
     assert item["viewable_previews"][0] == {
@@ -541,5 +820,6 @@ async def test_load_strategic_context_evidence_artifact_no_logs(db_session):
     artifacts = result["artifacts"]["items"]
     assert len(artifacts) == 1
     item = artifacts[0]
-    assert item["storage_uri"] == "gs://bucket/result"
+    # No-leak contract: the raw gs:// reference never rides on the item.
+    assert "storage_uri" not in item
     assert "viewable_previews" not in item

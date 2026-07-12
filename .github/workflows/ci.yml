@@ -533,7 +533,13 @@ jobs:
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
           run_shard() {
+            # /repo mount + CI env: the runner-script invariant tests
+            # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
+            # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
+            # they enforce in the promotion gate instead of silently skipping.
             docker run --rm --network host -v "$PWD/backend:/app" \
+              -v "$PWD:/repo:ro" \
+              -e CI=true \
               -e DATABASE_URL=${{ env.TEST_DB_URL }} \
               -e USE_TEST_POSTGRES=true \
               -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \

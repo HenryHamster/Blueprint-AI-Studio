@@ -4259,12 +4259,18 @@ async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id: the dedup path releases its project row lock via
+    # session.rollback(), which (under real Postgres expiry) expires every
+    # loaded instance — touching project.id afterwards would lazy-load and
+    # raise MissingGreenlet. Production (lifecycle.py) likewise passes a
+    # scalar project_id and never reads the ORM instance across the call.
+    project_id = project.id
 
-    first = await maybe_alert_pool_payoff_transition(db_session, project.id)
-    second = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    first = await maybe_alert_pool_payoff_transition(db_session, project_id)
+    second = await maybe_alert_pool_payoff_transition(db_session, project_id)
     assert first == POOL_PAYOFF_COST_REGRESSION
     assert second is None  # deduped on the persisted marker
-    alerts = await _payoff_alerts(db_session, project.id)
+    alerts = await _payoff_alerts(db_session, project_id)
     assert len(alerts) == 1
 
 
@@ -4517,12 +4523,16 @@ async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id — the dedup path rollback-releases its row lock, which
+    # expires loaded instances under real Postgres expiry (see the payoff
+    # dedup test above). Mirrors production, which passes a scalar id.
+    project_id = project.id
 
-    first = await maybe_alert_provider_routing_transition(db_session, project.id)
-    second = await maybe_alert_provider_routing_transition(db_session, project.id)
+    first = await maybe_alert_provider_routing_transition(db_session, project_id)
+    second = await maybe_alert_provider_routing_transition(db_session, project_id)
     assert first == PROVIDER_ROUTING_ADOPT
     assert second is None  # deduped on the persisted marker
-    alerts = await _routing_alerts(db_session, project.id)
+    alerts = await _routing_alerts(db_session, project_id)
     assert len(alerts) == 1
 
 
@@ -5338,7 +5348,8 @@ def test_axis_llm_cost_constant_value():
     assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
 
 
-def test_code_change_prompt_static_bytes():
+@pytest.mark.asyncio
+async def test_code_change_prompt_static_bytes():
     """AXIS_PROMPT_STATIC_BYTES is registered in ALL_AXES and AXIS_CONSUMERS, and
     _compute_prompt_static_bytes() returns a value within a meaningful range when
     agent/src/prompt.ts is available.
@@ -5367,7 +5378,7 @@ def test_code_change_prompt_static_bytes():
         "AXIS_CONSUMERS entry for prompt_static_bytes must have a 'pending' or 'consumer' key"
     )
 
-    result = _compute_prompt_static_bytes()
+    result = await _compute_prompt_static_bytes()
     if result is None:
         pytest.skip("agent/src/prompt.ts not available in this environment")
 
@@ -5387,12 +5398,14 @@ def test_code_change_prompt_static_bytes():
 
 
 def test_playbook_guidance_trigger_bullets_condensed():
-    """PLAYBOOK_GUIDANCE must use at most 5 trigger-condition bullets.
+    """PLAYBOOK_GUIDANCE must stay condensed (no trigger-bullet re-expansion).
 
-    PR #11033 condensed the 10 original bullets to 5 by merging overlapping
-    categories (error-fixes + linting rules; workarounds + wrong-approaches;
-    build-commands + env-setup; test-setup + test-patterns; module-deps +
-    architecture). This test guards against re-expansion.
+    PR #11033 condensed the 10 original trigger bullets to 5; the guidance was
+    later condensed further into a single-paragraph "**When to save:**" form
+    (mirrored by the agent-side guard in prompt.test.ts, which caps the
+    constant under 800 bytes). This test guards against re-expansion of the
+    prompt-budget-sensitive constant from the backend side, using the same
+    template-literal extraction the prompt_static_bytes axis uses.
     """
     import os
 
@@ -5406,22 +5419,21 @@ def test_playbook_guidance_trigger_bullets_condensed():
     with open(prompt_ts, encoding="utf-8") as fh:
         src = fh.read()
 
-    # Extract the PLAYBOOK_GUIDANCE template literal body
-    marker = "**When to save (trigger conditions):**"
-    start = src.find(marker)
-    assert start != -1, (
-        "PLAYBOOK_GUIDANCE trigger conditions section not found in prompt.ts"
-    )
-    end_marker = "\n\n**What NOT to save:**"
-    end = src.find(end_marker, start)
-    assert end != -1, "'What NOT to save' section not found after trigger conditions"
+    from app.efficiency_snapshot import _extract_ts_template_literal_length
 
-    trigger_section = src[start:end]
-    bullet_count = trigger_section.count("\n- ")
-    assert bullet_count <= 5, (
-        f"PLAYBOOK_GUIDANCE has {bullet_count} trigger bullets (max 5). "
-        "Consolidate overlapping categories rather than expanding the list. "
-        "See PR #11033 for the canonical 5-bullet grouping."
+    length = _extract_ts_template_literal_length(src, "PLAYBOOK_GUIDANCE")
+    assert length is not None, (
+        "PLAYBOOK_GUIDANCE template literal not found in prompt.ts"
+    )
+    assert "**When to save:**" in src, (
+        "PLAYBOOK_GUIDANCE condensed '**When to save:**' paragraph not found "
+        "in prompt.ts — the trigger guidance was removed or restructured; "
+        "update this guard alongside it."
+    )
+    assert length < 800, (
+        f"PLAYBOOK_GUIDANCE is {length} bytes (max 800, matching the agent-side "
+        "guard in prompt.test.ts). Keep the trigger guidance condensed rather "
+        "than re-expanding it — see PR #11033 for the original consolidation."
     )
 
 
@@ -10081,7 +10093,8 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 # ── _compute_prompt_static_bytes tests ───────────────────────────────────────
 
 
-def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     """When all template-literal and plain-string constants are found the result
     is a positive integer equal to the sum of all their body lengths.
 
@@ -10125,13 +10138,14 @@ def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result == expected_total
     assert result > 0
 
 
-def test_compute_prompt_static_bytes_missing_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_constant_returns_none():
     """Returns None when any one of _PROMPT_STATIC_CONST_NAMES is absent."""
     from unittest.mock import mock_open, patch
 
@@ -10152,12 +10166,13 @@ def test_compute_prompt_static_bytes_missing_constant_returns_none():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
     """Returns None when any plain-string constant in _PROMPT_STATIC_PLAIN_CONST_NAMES
     is absent from the source."""
     from unittest.mock import mock_open, patch
@@ -10174,7 +10189,7 @@ def test_compute_prompt_static_bytes_missing_plain_constant_returns_none():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
@@ -10197,19 +10212,21 @@ def test_extract_ts_plain_string_length_missing_returns_none():
     assert _extract_ts_plain_string_length(src, "MY_CONST") is None
 
 
-def test_compute_prompt_static_bytes_no_agent_src_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_no_agent_src_returns_none():
     """Returns None when _find_agent_src cannot locate the agent/src directory."""
     from unittest.mock import patch
 
     import app.efficiency_snapshot as es_mod
 
     with patch.object(es_mod, "_find_agent_src", return_value=None):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
     """Returns None when prompts/task-type-focus.ts is absent even if prompt.ts is present."""
     from unittest.mock import mock_open, patch
 
@@ -10233,12 +10250,13 @@ def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none()
         patch("os.path.exists", side_effect=_fake_exists),
         patch("builtins.open", mock_open(read_data=prompt_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
     """Returns None when a constant in _TASK_TYPE_FOCUS_CONST_NAMES is absent from
     prompts/task-type-focus.ts even if all prompt.ts constants are present."""
     from unittest.mock import mock_open, patch
@@ -10264,12 +10282,13 @@ def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_no
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=synthetic_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is None
 
 
-def test_compute_prompt_static_bytes_task_type_focus_additive():
+@pytest.mark.asyncio
+async def test_compute_prompt_static_bytes_task_type_focus_additive():
     """task-type-focus constants add to the total beyond prompt.ts-only constants."""
     from unittest.mock import mock_open, patch
 
@@ -10305,7 +10324,7 @@ def test_compute_prompt_static_bytes_task_type_focus_additive():
         patch("os.path.exists", return_value=True),
         patch("builtins.open", mock_open(read_data=combined_src)),
     ):
-        result = _compute_prompt_static_bytes()
+        result = await _compute_prompt_static_bytes()
 
     assert result is not None
     assert isinstance(result, int)
@@ -10316,7 +10335,8 @@ def test_compute_prompt_static_bytes_task_type_focus_additive():
     assert result == prompt_only_total + ttf_total
 
 
-def test_prompt_static_bytes_covers_task_type_focus():
+@pytest.mark.asyncio
+async def test_prompt_static_bytes_covers_task_type_focus():
     """_TASK_TYPE_FOCUS_CONST_NAMES lists the six per-task-type focus blocks and
     _compute_prompt_static_bytes() includes their byte counts in the total.
 
@@ -10338,7 +10358,7 @@ def test_prompt_static_bytes_covers_task_type_focus():
 
     import app.efficiency_snapshot as es_mod
 
-    result = _compute_prompt_static_bytes()
+    result = await _compute_prompt_static_bytes()
     if result is None:
         pytest.skip(
             "agent/src/prompt.ts or agent/src/prompts/task-type-focus.ts not "
@@ -10590,6 +10610,14 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     # Alert should not fire while below threshold
     fired3 = await maybe_alert_self_repair_burn_share(db_session, project.id)
     assert fired3 is None  # marker advanced to "healthy", no alert
+
+    # The function's contract is caller-commits (with_design_doc_locked:
+    # "Caller is responsible for committing"; the production caller in
+    # lifecycle.py commits after every maybe_alert_* call). The recovery
+    # re-arm path writes the marker but does not fire, so without this commit
+    # the write is still pending and refresh() would discard it (refresh
+    # expires the instance first) and reload the stale committed value.
+    await db_session.commit()
 
     # Verify the marker was set to "healthy"
     await db_session.refresh(project)

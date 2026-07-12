@@ -44,6 +44,7 @@ from app.models import (
     ArtifactType,
     Project,
     Task,
+    TaskHistory,
     TaskStatus,
     VmContact,
     bank_task_current_attempt,
@@ -343,6 +344,36 @@ async def _mark_landed_parent_dependents(parent_id, session) -> None:
         logger.warning(
             f"[REAPER] Dependent warm-claim marking failed for parent {parent_id}: {e}",
         )
+
+
+def _record_reap_reason_history(
+    session,
+    task_id,
+    *,
+    reap_reason: str,
+    reap_reason_code: str,
+    vm_instance_id: str | None = None,
+) -> None:
+    """Append a durable TaskHistory row carrying WHY the reaper acted.
+
+    ``reap_reason`` otherwise lives only in mutable channels
+    (``latest_status_message``, context meta) that the NEXT reap or status
+    update overwrites — a task reaped three times keeps only the last reason.
+    Mirrors ``compute_jobs._record_terminal_reason_history``: add-only
+    (``session.add``); the caller owns the commit alongside the reap mutation
+    itself, so an aborted iteration rolls the row back with it.
+    """
+    session.add(
+        TaskHistory(
+            task_id=task_id,
+            action="REAPED",
+            details={
+                "reap_reason": reap_reason,
+                "code": reap_reason_code,
+                "vm_instance_id": vm_instance_id,
+            },
+        )
+    )
 
 
 async def reaper_service():
@@ -1240,6 +1271,19 @@ async def reaper_service():
                             continue
                         task = relocked
                         fresh_task = relocked
+
+                        # Durable reason trail: the reap is now committed-to (the
+                        # relock confirmed no peer/revival), so record WHY before
+                        # any branch below (retry, requeue, PR handoff, terminal
+                        # fail) overwrites the mutable status message. Rides the
+                        # same commit as the reap mutation itself.
+                        _record_reap_reason_history(
+                            session,
+                            task.id,
+                            reap_reason=reap_reason,
+                            reap_reason_code=reap_reason_code,
+                            vm_instance_id=fresh_task.vm_instance_id,
+                        )
 
                         # Apply the in-memory account-slot release marker. Re-check
                         # the flag from the FRESH (post-relock) context to avoid a

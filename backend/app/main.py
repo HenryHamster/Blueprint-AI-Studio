@@ -709,33 +709,42 @@ async def _init_deployment_state():
             state.current_revision = _current_revision
             state.current_sha = _current_sha
             state.deployed_at = _utcnow()
+            # Snapshot the scalars read after the commit attempts below: a
+            # contended commit degrades via rollback inside
+            # _best_effort_deploy_state_commit, which expires ``state`` — a
+            # subsequent attribute read would raise MissingGreenlet (#14328
+            # snapshot-before-rollback pattern).
+            rolled_back_from_sha = state.rolled_back_from_sha
+            rollback_count = state.rollback_count
+            last_known_good_revision = state.last_known_good_revision
             session.add(state)
             await _best_effort_deploy_state_commit(session)
 
             logger.warning(
-                f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
-                f"(consecutive rollbacks: {state.rollback_count})"
+                f"[DEPLOY] ROLLBACK DETECTED — reverted from {(rolled_back_from_sha or '')[:8]} to {_current_sha[:8]} "
+                f"(consecutive rollbacks: {rollback_count})"
             )
 
             await _create_rollback_alerts(
-                session, state.rolled_back_from_sha or "", _current_sha
+                session, rolled_back_from_sha or "", _current_sha
             )
             await _best_effort_deploy_state_commit(session)
 
-            if state.rollback_count >= 3:
+            if rollback_count >= 3:
+                halted_at = _utcnow()
                 state.status = DeploymentStatus.HALTED
-                state.halted_at = _utcnow()
+                state.halted_at = halted_at
                 session.add(state)
                 await _best_effort_deploy_state_commit(session)
                 logger.error(
-                    f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required"
+                    f"[DEPLOY] HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
                 )
                 _runtime_config["max_concurrent_vms"] = 0
                 await _create_halted_alerts(
                     session,
-                    state.rollback_count,
-                    state.last_known_good_revision,
-                    state.halted_at,
+                    rollback_count,
+                    last_known_good_revision,
+                    halted_at,
                 )
                 await _best_effort_deploy_state_commit(session)
             return
@@ -801,9 +810,14 @@ async def _init_deployment_state():
             deploy_monitoring["window_start"] = _utcnow()
             state.status = DeploymentStatus.MONITORING
         session.add(state)
+        # Snapshot before the commit attempt: a contended commit degrades via
+        # rollback inside _best_effort_deploy_state_commit, which expires
+        # ``state`` — reading state.status afterwards would raise
+        # MissingGreenlet (#14328 snapshot-before-rollback pattern).
+        status_snapshot = state.status
         await _best_effort_deploy_state_commit(session)
         logger.info(
-            f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window"
+            f"[DEPLOY] New deploy detected — revision={_current_revision}, status={status_snapshot}, starting monitoring window"
         )
 
 

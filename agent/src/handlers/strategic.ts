@@ -132,7 +132,11 @@ export function buildStagedDirectionsSection(staged: Array<Record<string, unknow
  * author GPU `compute_experiment` tasks. The backend ships this object only when
  * the project has registered a self-hosted runner OR declares the enforce-local
  * policy (require_local_runner). Shape:
- * `{ever_registered, active_total, active_gpu, require_local_runner}`.
+ * `{ever_registered, active_total, active_gpu, require_local_runner}` plus an
+ * optional bounded `devices` list (one entry per live runner: `{runner_name,
+ * gpu_count, gpu_models, gpu_vram_mib?, container_ok, gpu_in_container_ok,
+ * active_tasks, active_compute_jobs}`) rendered so the strategist can size
+ * experiments to actual VRAM/device counts and container capability.
  *
  * When no GPU runner is live the strategist should AVOID authoring GPU
  * experiments: with require_local_runner they are held then terminally fail;
@@ -170,6 +174,33 @@ export function buildLocalRunnerSection(status: unknown): string {
   } else {
     lines.push(
       '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
+    );
+  }
+  // Per-device hardware detail (backend-bounded per-runner AND in total under
+  // the experiment-authoring shared budget) so the strategist can reason about
+  // VRAM fit, device counts, and container capability when sizing experiments.
+  const devices = Array.isArray(s.devices) ? (s.devices as Array<Record<string, unknown>>) : [];
+  if (devices.length > 0) {
+    lines.push('- Devices (live runners — size experiments to fit this hardware):');
+    for (const d of devices.slice(0, 8)) {
+      if (!d || typeof d !== 'object') continue;
+      const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
+      const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
+      const models = Array.isArray(d.gpu_models) ? d.gpu_models.filter((m) => typeof m === 'string').join(', ') : '';
+      const vramVals = Array.isArray(d.gpu_vram_mib)
+        ? (d.gpu_vram_mib as unknown[]).filter((v): v is number => typeof v === 'number' && v > 0)
+        : [];
+      const vram = vramVals.length > 0 ? `, ${Math.min(...vramVals)} MiB VRAM/GPU` : '';
+      const gpuBit = gpuCount > 0 ? `${gpuCount}x GPU${models ? ` (${models})` : ''}${vram}` : 'no GPU';
+      const containerBit = d.container_ok === true
+        ? (d.gpu_in_container_ok === true ? 'containers OK (GPU-in-container OK)' : 'containers OK (no GPU passthrough)')
+        : 'NO container runtime (container_image would be discarded)';
+      const tasks = typeof d.active_tasks === 'number' ? d.active_tasks : 0;
+      const jobs = typeof d.active_compute_jobs === 'number' ? d.active_compute_jobs : 0;
+      lines.push(`  - ${name}: ${gpuBit}; ${containerBit}; load ${tasks} task(s) + ${jobs} compute job(s)`);
+    }
+    lines.push(
+      '  When per-GPU VRAM is listed, author experiments whose model + batch fit within it (a job needing more VRAM than any device has can NEVER run locally); target `container_image` only at devices with containers OK.',
     );
   }
   return lines.join('\n');
@@ -1152,6 +1183,17 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       $BLUEPRINT_RESULT_FILE (or print it as the last stdout line)
 #                       — a run that exits 0 without it loses the metric and the
 #                       criterion fails unmeasured (compute_unmeasured_criterion).
+#                       Reliability conventions (experiments die from env drift and
+#                       lost metrics, not wrong hypotheses): PIN dependency versions
+#                       in the command (e.g. jax==0.6.2 — an unpinned brax install
+#                       once pulled an incompatible jax and killed the run); write
+#                       the metric EARLY (provisional value at first measurement)
+#                       and overwrite with the final value so a timeout still
+#                       measures; structure long training as short gated stages
+#                       (bounded first stage gates a longer follow-on) instead of
+#                       one deadline-sized run; keep the artifact dir small (~25 MiB
+#                       upload cap); prefer a repo harness/experiment entrypoint
+#                       when one exists over inlining a bespoke pipeline.
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:

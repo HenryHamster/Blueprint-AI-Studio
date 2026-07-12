@@ -559,39 +559,6 @@ def _disk_free_bytes(root: str | None) -> int | None:
         return None
 
 
-def _gpu_free_vram_mib() -> list[int] | None:
-    """Per-GPU free VRAM in MiB for all GPUs on this host, best-effort/nullable.
-
-    Queries ``nvidia-smi --query-gpu=memory.free``. Returns a list with one entry
-    per GPU (index-aligned with gpu_names). Returns None on any failure.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    vals: list[int] = []
-    for line in result.stdout.splitlines():
-        tok = line.strip()
-        if not tok:
-            continue
-        try:
-            vals.append(max(0, int(float(tok))))
-        except ValueError:
-            continue
-    return vals if vals else None
-
-
 def _gpu_utilization_pct() -> int | None:
     """Max GPU utilization (0–100) across this host's GPUs, best-effort/nullable.
 
@@ -625,6 +592,48 @@ def _gpu_utilization_pct() -> int | None:
     if not vals:
         return None
     return max(0, min(100, max(vals)))
+
+
+def _gpu_memory_mib() -> tuple[list[int], list[int]] | None:
+    """Per-GPU (total, free) VRAM in MiB, best-effort/nullable.
+
+    Queries ``nvidia-smi --query-gpu=memory.total,memory.free`` so dispatch and
+    authoring can reason about VRAM fit (a ``has_gpu`` boolean cannot tell a
+    16 GiB V100 from a 46 GiB L40S). Any failure (no GPU, no nvidia-smi,
+    timeout, unparseable output) returns None and the heartbeat simply omits
+    the fields — old-runner-identical behavior.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    totals: list[int] = []
+    frees: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = [tok.strip() for tok in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            total = int(float(parts[0]))
+            free = int(float(parts[1]))
+        except ValueError:
+            continue
+        totals.append(max(0, total))
+        frees.append(max(0, free))
+    if not totals:
+        return None
+    return totals, frees
 
 
 def _cpu_load_avg() -> float | None:
@@ -1046,10 +1055,138 @@ _REPORT_MAX_RETRIES = 4
 _REPORT_RETRY_BASE_SLEEP = 2.0
 _REPORT_RETRY_MAX_SLEEP = 30.0
 
+# Interim-progress protocol (BLUEPRINT_PROGRESS_FILE). The experiment appends
+# JSONL records like {"step": int, "metric": str, "value": float, "ts": "..."};
+# the runner tails the file between report heartbeats and attaches a bounded
+# tail to its interim (exec_status="running") compute-job reports. Everything
+# is bounded: records kept, bytes serialized per report, bytes read per poll,
+# and bytes tolerated for a single (possibly hostile) line.
+_PROGRESS_TAIL_MAX_RECORDS = 20
+_PROGRESS_TAIL_MAX_BYTES = 2048
+_PROGRESS_READ_CHUNK_BYTES = 262144
+_PROGRESS_MAX_LINE_BYTES = 8192
+_PROGRESS_METRIC_MAX_CHARS = 128
+_PROGRESS_TS_MAX_CHARS = 64
+# Interim command-log tail attached to running reports so operators see live
+# output mid-run (stamped server-side as polling_metadata["live_output"]).
+_RUNNER_LIVE_TAIL_CHARS = 4096
+
 
 def _report_retry_sleep(attempt: int) -> float:
     """Capped exponential backoff (seconds) for the terminal-report retry loop."""
     return min(_REPORT_RETRY_BASE_SLEEP * (2 ** attempt), _REPORT_RETRY_MAX_SLEEP)
+
+
+def _parse_progress_record(line: bytes) -> dict | None:
+    """Parse+validate one BLUEPRINT_PROGRESS_FILE JSONL line, or None.
+
+    The file is written by sandboxed experiment code, so every field is
+    validated before it leaves the runner: ``metric`` must be a non-empty
+    string (bounded), ``value`` a finite number; ``step`` (non-negative int)
+    and ``ts`` (bounded string) are optional. Anything else — garbage bytes,
+    non-dict JSON, NaN/inf, absurd types — is dropped, never raised.
+    """
+    text = line.strip()
+    if not text or len(text) > _PROGRESS_MAX_LINE_BYTES:
+        return None
+    try:
+        raw = json.loads(text.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    value = raw.get("value")
+    if not isinstance(metric, str) or not metric.strip():
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if numeric != numeric or numeric in (float("inf"), float("-inf")):
+        return None
+    record: dict = {"metric": metric.strip()[:_PROGRESS_METRIC_MAX_CHARS], "value": numeric}
+    step = raw.get("step")
+    if isinstance(step, int) and not isinstance(step, bool) and 0 <= step <= 10**12:
+        record["step"] = step
+    ts = raw.get("ts")
+    if isinstance(ts, str) and ts:
+        record["ts"] = ts[:_PROGRESS_TS_MAX_CHARS]
+    return record
+
+
+class _ProgressTail:
+    """Offset-tracked, bounded reader of a job's BLUEPRINT_PROGRESS_FILE.
+
+    ``poll()`` reads only the bytes appended since the previous poll (capped at
+    ``_PROGRESS_READ_CHUNK_BYTES`` per call), parses complete JSONL lines, and
+    keeps the last ``_PROGRESS_TAIL_MAX_RECORDS`` valid records plus an exact
+    running count. A partial trailing line is carried to the next poll; an
+    oversized line (> ``_PROGRESS_MAX_LINE_BYTES``, e.g. hostile output) is
+    discarded up to its next newline so the reader can never wedge or balloon.
+    A file that shrinks below the tracked offset (truncated/rewritten by the
+    job) resets the reader to the top instead of freezing at a dead offset.
+
+    ``snapshot()`` returns the report payload ``{"records": [...], "count": n}``
+    (records byte-bounded to ``_PROGRESS_TAIL_MAX_BYTES``) or None when nothing
+    valid has been observed — an absent field on the wire, so old backends see
+    byte-identical reports for progress-less jobs.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._offset = 0
+        self._count = 0
+        self._records: deque = deque(maxlen=_PROGRESS_TAIL_MAX_RECORDS)
+        self._partial = b""
+        self._skip_to_newline = False
+
+    def poll(self) -> dict | None:
+        """Consume newly-appended bytes and return the current snapshot."""
+        try:
+            with open(self._path, "rb") as f:
+                size = f.seek(0, io.SEEK_END)
+                if size < self._offset:
+                    # File was truncated/rewritten under us (e.g. the job
+                    # recreates its progress file). Restart from the top —
+                    # the stale partial-line carry belongs to bytes that no
+                    # longer exist — so progress resumes instead of freezing.
+                    self._offset = 0
+                    self._partial = b""
+                    self._skip_to_newline = False
+                f.seek(self._offset)
+                chunk = f.read(_PROGRESS_READ_CHUNK_BYTES)
+        except OSError:
+            return self.snapshot()
+        if chunk:
+            self._offset += len(chunk)
+            data = self._partial + chunk
+            lines = data.split(b"\n")
+            # Last element is the (possibly empty) partial line after the final
+            # newline — carry it forward, bounded.
+            self._partial = lines.pop()
+            for line in lines:
+                if self._skip_to_newline:
+                    # This newline terminates the oversized line being skipped.
+                    self._skip_to_newline = False
+                    continue
+                record = _parse_progress_record(line)
+                if record is not None:
+                    self._count += 1
+                    self._records.append(record)
+            if len(self._partial) > _PROGRESS_MAX_LINE_BYTES:
+                # A single line larger than the cap: drop what we have and skip
+                # the remainder until its newline shows up in a later poll.
+                self._partial = b""
+                self._skip_to_newline = True
+        return self.snapshot()
+
+    def snapshot(self) -> dict | None:
+        if self._count <= 0:
+            return None
+        records = list(self._records)
+        while len(records) > 1 and len(json.dumps(records)) > _PROGRESS_TAIL_MAX_BYTES:
+            records.pop(0)
+        return {"records": records, "count": self._count}
 
 
 class _BoundedDedupLog:
@@ -1694,16 +1831,22 @@ def _heartbeat_loop(
             # a distinct runner capability, not a clobber of operator config.
             docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
             agent_available = bwrap_agent_ok or docker_agent_ok
+            # Granular unavailability reason (engine's FleetRunnersPanel
+            # observability field): when NEITHER backend leg is satisfiable, say
+            # WHY so the orchestrator/operator sees the cause rather than a bare
+            # agent_available=False. Derived from HEAD's dual-backend booleans.
             if agent_available:
-                agent_unavailable_reason = None
-            elif not agent_sandbox_ok:
-                agent_unavailable_reason = "bwrap not available"
+                agent_unavailable_reason: str | None = None
             elif not agent_binary_present:
                 agent_unavailable_reason = "agent binary not found"
-            elif not _node_runtime_ok():
+            elif agent_sandbox_ok and not _node_runtime_ok():
                 agent_unavailable_reason = "node runtime not functional"
+            elif not agent_sandbox_ok and not docker_agent_ok:
+                agent_unavailable_reason = (
+                    "bwrap sandbox unavailable and no docker agent backend"
+                )
             else:
-                agent_unavailable_reason = "docker agent unavailable"
+                agent_unavailable_reason = "no usable agent backend (bwrap or docker)"
             # Runner-DECLARED agent capability floor. A docker-ONLY box (docker+image
             # but NO bwrap) can only run the read-only agent slice — the prod agent
             # image is read-only-parity and write/heavy types would DECLINE at claim
@@ -1738,6 +1881,20 @@ def _heartbeat_loop(
                 agent_backend = None
                 compute_backend = None
                 llm_clis = None
+            # Flat CLI inventory derived from the same probe: {name: version|None}.
+            # Absent binary ⇒ None; present with an unknown version ⇒ "". Probed
+            # every heartbeat, so startup AND post-self-update (the process
+            # restarts and re-probes) are both covered without extra hooks.
+            cli_inventory = (
+                {
+                    name: ((info.get("version") or "") if info.get("present") else None)
+                    for name, info in llm_clis.items()
+                    if isinstance(info, dict)
+                }
+                if isinstance(llm_clis, dict)
+                else None
+            )
+            gpu_memory = _gpu_memory_mib() if has_gpu else None
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
@@ -1755,6 +1912,7 @@ def _heartbeat_loop(
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 "llm_clis": llm_clis,
+                "cli_inventory": cli_inventory,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / low on memory /
                 # pegged CPU.
@@ -1764,9 +1922,15 @@ def _heartbeat_loop(
                 "cpu_load_avg": _cpu_load_avg(),
                 "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
-                "gpu_free_vram_mib": _gpu_free_vram_mib() if has_gpu else None,
+                # Free-VRAM list (read by dispatch VRAM-fit gating) derived from
+                # the superset (total, free) probe — no second nvidia-smi call.
+                "gpu_free_vram_mib": gpu_memory[1] if gpu_memory else None,
                 **gpu_capabilities,
             }
+            # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching
+            # the schema's absent-tolerant contract for old runners).
+            if gpu_memory is not None:
+                body["gpu_memory_total_mib"], body["gpu_memory_free_mib"] = gpu_memory
             # Applied-vs-pending config report: echo the live-safe generation +
             # values the daemon currently has in effect so the orchestrator/UI
             # can tell desired-vs-applied apart. Reflects what was applied on the
@@ -2144,9 +2308,14 @@ def _report_compute_job(
     exit_code: int | None = None,
     result_metrics: dict | None = None,
     command_log: dict | None = None,
+    progress: dict | None = None,
     resume_hydration: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
+
+    ``progress`` is the optional bounded interim-progress tail from
+    :class:`_ProgressTail` (``{"records": [...], "count": n}``); absent when the
+    job never wrote a progress record. An old backend simply ignores the field.
 
     Terminal reports (``succeeded``/``failed``) carry the measured
     ``result_metrics`` and the job's final status, so a single transient network
@@ -2163,6 +2332,8 @@ def _report_compute_job(
         body["result_metrics"] = result_metrics
     if command_log is not None:
         body["command_log"] = command_log
+    if progress is not None:
+        body["progress"] = progress
     if resume_hydration is not None:
         body["resume_hydration"] = resume_hydration
 
@@ -2534,13 +2705,24 @@ def _run_compute_job(
             return
 
         if cancel_requested:
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": "[runner] job was cancel-requested at claim; "
+                    "command never started",
+                    "truncated": False,
+                },
+            )
             return
 
         tmpdir = tempfile.mkdtemp(prefix="bp_compute_")
         result_file = os.path.join(tmpdir, "result.json")
         artifact_dir = os.path.join(tmpdir, "artifacts")
+        # Interim-progress channel: the experiment may append JSONL records here
+        # (via $BLUEPRINT_PROGRESS_FILE); the runner tails it each heartbeat.
+        # Never pre-created — appending code creates it, absence means no progress.
+        progress_file = os.path.join(tmpdir, "progress.jsonl")
         os.makedirs(artifact_dir, exist_ok=True)
 
         # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
@@ -2597,8 +2779,15 @@ def _run_compute_job(
             if not ok:
                 print(f"[compute] git clone failed for job {job_id} (exit={clone_rc})", flush=True)
                 outcome = "failure"
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=clone_rc)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=clone_rc,
+                    command_log={
+                        "text": f"[runner] git clone of {owner}/{repo}@{ref} "
+                        f"failed (exit={clone_rc}); command never started",
+                        "truncated": False,
+                    },
+                )
                 return
             if not cwd:
                 cwd = clone_dir
@@ -2612,8 +2801,15 @@ def _run_compute_job(
             and not _docker_login(container_registry_auth, container_image=container_image)
         ):
             outcome = "failure"
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": "[runner] docker login to the container registry "
+                    f"failed for image {container_image!r}; command never started",
+                    "truncated": False,
+                },
+            )
             return
 
         # Fold setup_step into the sandboxed command so it runs INSIDE the same
@@ -2633,6 +2829,7 @@ def _run_compute_job(
             workspace_host=tmpdir,
             result_file_host=result_file,
             artifact_dir_host=artifact_dir,
+            progress_file_host=progress_file,
             clone_dir_host=clone_dir,
             cwd_host=cwd,
             job_env=env_override,
@@ -2732,8 +2929,14 @@ def _run_compute_job(
         except Exception as exc:
             print(f"[compute] failed to start job {job_id}: {exc}", flush=True)
             outcome = "failure"
-            _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": f"[runner] failed to start command: {exc}",
+                    "truncated": False,
+                },
+            )
             return
 
         print(
@@ -2747,6 +2950,50 @@ def _run_compute_job(
         log_capture = _BoundedDedupLog(
             _RUNNER_MAX_COMMAND_LOG_BYTES, _RUNNER_COMMAND_LOG_HEAD_BYTES
         )
+
+        # Bounded tail of the job's self-reported progress records; polled each
+        # heartbeat interval and attached to interim AND terminal reports so a
+        # deadline-killed 24h run still surfaces its training trajectory.
+        progress_tail = _ProgressTail(progress_file)
+
+        def _interim_log_tail() -> dict | None:
+            # Live-output tail (~4KB) for interim running reports. The server
+            # stamps it as polling_metadata["live_output"] (same shape as the
+            # GCP live-tail path); the FULL bounded log still travels on the
+            # terminal report only. truncated=True whenever the tail is a
+            # window on a longer capture.
+            log_text, truncated = log_capture.result()
+            if not log_text:
+                return None
+            tail = log_text[-_RUNNER_LIVE_TAIL_CHARS:]
+            return {
+                "text": tail,
+                "truncated": truncated or len(tail) < len(log_text),
+            }
+
+        def _terminal_command_log(kill_note: str | None = None) -> dict | None:
+            # EVERY terminal report must carry the captured log: the deadline/
+            # cancel/shutdown kill paths previously reported failed with NO
+            # command_log, discarding the output of exactly the most expensive
+            # failures (a 24h run killed at its deadline). ``kill_note`` lands
+            # at the TAIL so a tail-truncated view still ends with WHY.
+            log_text, truncated = log_capture.result()
+            if image_downgraded:
+                log_text = (
+                    f"NOTE: container_image {container_image} requested but no "
+                    "container runtime available on this host; running "
+                    "image-less on host toolchain.\n"
+                ) + log_text
+            if kill_note:
+                sep = "" if (not log_text or log_text.endswith("\n")) else "\n"
+                log_text = f"{log_text}{sep}[runner] {kill_note}\n"
+            if not log_text and not truncated:
+                return None
+            return {
+                "text": log_text,
+                "truncated": truncated,
+                "byte_count": len(log_text.encode("utf-8")),
+            }
 
         def _read_stdout() -> None:
             try:
@@ -2807,22 +3054,45 @@ def _run_compute_job(
             if deadline is not None and now >= deadline:
                 _teardown()
                 outcome = "failure"
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=124)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=124,
+                    command_log=_terminal_command_log(
+                        "killed by runner: runtime deadline "
+                        f"({runtime_deadline_seconds}s) exceeded"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
 
             if _shutdown_event.is_set():
                 _teardown()
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=1,
+                    command_log=_terminal_command_log(
+                        "killed by runner: runner shutting down"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
 
-            cancel = _report_compute_job(orchestrator_url, token, job_id,
-                                          exec_status="running")
+            cancel = _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="running",
+                command_log=_interim_log_tail(),
+                progress=progress_tail.poll(),
+            )
             if cancel:
                 _teardown()
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
+                _report_compute_job(
+                    orchestrator_url, token, job_id,
+                    exec_status="failed", exit_code=1,
+                    command_log=_terminal_command_log(
+                        "killed by runner: cancel requested by orchestrator"
+                    ),
+                    progress=progress_tail.poll(),
+                )
                 return
 
         # Process exited: let the reader drain, then close our read-fd so a leftover
@@ -2834,20 +3104,7 @@ def _run_compute_job(
 
         result_metrics = _parse_result_metrics(result_file)
 
-        log_text, truncated = log_capture.result()
-        if image_downgraded:
-            note = (
-                f"NOTE: container_image {container_image} requested but no container "
-                "runtime available on this host; running image-less on host toolchain.\n"
-            )
-            log_text = note + log_text
-        command_log: dict | None = None
-        if log_text or truncated or image_downgraded:
-            command_log = {
-                "text": log_text,
-                "truncated": truncated,
-                "byte_count": len(log_text.encode("utf-8")),
-            }
+        command_log = _terminal_command_log()
 
         succeeded = exit_code_val == 0
         outcome = "success" if succeeded else "failure"
@@ -2858,6 +3115,7 @@ def _run_compute_job(
             exit_code=exit_code_val,
             result_metrics=result_metrics,
             command_log=command_log,
+            progress=progress_tail.poll(),
         )
         print(f"[compute] job {job_id} {exec_status_final} (exit={exit_code_val})",
               flush=True)
@@ -2866,8 +3124,19 @@ def _run_compute_job(
         print(f"[compute] unexpected error for job {job_id}: {exc}", flush=True)
         outcome = "failure"
         try:
+            try:
+                # Salvage whatever the command printed before the runner crashed.
+                crash_log = _terminal_command_log(f"unexpected runner error: {exc}")
+            except NameError:
+                # Crashed before the log capture existed — the exception text is
+                # the only evidence there is.
+                crash_log = {
+                    "text": f"[runner] unexpected runner error: {exc}",
+                    "truncated": False,
+                }
             _report_compute_job(orchestrator_url, token, job_id,
-                                 exec_status="failed", exit_code=1)
+                                 exec_status="failed", exit_code=1,
+                                 command_log=crash_log)
         except Exception:
             pass
     finally:

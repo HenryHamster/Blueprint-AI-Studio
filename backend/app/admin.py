@@ -69,6 +69,7 @@ from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
+    validate_compute_runner_target_enrollment,
 )
 from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
 from app.vm_cost_rates import (
@@ -1433,6 +1434,18 @@ def _task_runner_sideboard_context(task: Task) -> dict[str, Any]:
     return {
         "vm_instance_id": compact_text(task.vm_instance_id, max_chars=120),
         "runner_target_id": compact_text(ctx.get("runner_target_id"), max_chars=120),
+        # Operator/agent runner pin (launch-contract runner_target) and, when a
+        # strict pin is holding the task, the machine-readable hold reason
+        # {runner_id, strict, reason_code, detail} — so the UI can show WHY
+        # nothing is dispatching instead of a silent QUEUED card.
+        "preferred_runner_target_id": compact_text(
+            ctx.get("preferred_runner_target_id"), max_chars=120
+        ),
+        "runner_pin_hold": (
+            ctx.get("runner_pin_hold")
+            if isinstance(ctx.get("runner_pin_hold"), dict)
+            else None
+        ),
         "machine_type": compact_text(task.vm_machine_type, max_chars=80),
         "spot": task.vm_spot,
         "warm_start": task.vm_warm_start,
@@ -2152,6 +2165,29 @@ class CreateTaskPayload(BaseModel):
         return self
 
 
+class ComputeRunnerTargetPayload(BaseModel):
+    """Operator pin of a compute_experiment to a specific enrolled runner.
+
+    ``strict=False`` (default) is a soft preference: dispatch prefers this
+    runner when it is live and eligible, falling through to normal selection
+    otherwise. ``strict=True`` dispatches ONLY to this runner: whenever it is
+    not currently eligible the task is held QUEUED with an explicit hold reason
+    naming the runner and why (``task.context['runner_pin_hold']``). The runner
+    must exist and be enrolled in the task's project (422 otherwise).
+    """
+
+    runner_id: str = Field(..., min_length=1, max_length=64)
+    strict: bool = False
+
+    @field_validator("runner_id")
+    @classmethod
+    def validate_runner_id(cls, v: str) -> str:
+        try:
+            return str(uuid.UUID(v.strip()))
+        except ValueError:
+            raise ValueError(f"runner_target.runner_id {v!r} is not a valid UUID")
+
+
 class ComputeExperimentTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
@@ -2192,6 +2228,11 @@ class ComputeExperimentTaskPayload(BaseModel):
     container_image: str | None = None
     container_registry_auth: dict[str, str] | None = None
     setup_step: str | None = None
+    # Optional pin to a specific enrolled runner (soft preference by default;
+    # strict=true dispatches only to that runner and holds with an explicit
+    # reason while it is ineligible). Validated against the project's enrolled
+    # runners — a cross-project or unknown runner id is a 422.
+    runner_target: ComputeRunnerTargetPayload | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -3139,10 +3180,23 @@ async def create_compute_experiment_task(
         val = getattr(payload, opt_key)
         if val is not None:
             launch_contract[opt_key] = val
+    if payload.runner_target is not None:
+        launch_contract["runner_target"] = payload.runner_target.model_dump()
 
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+
+    # A runner pin must name one of THIS project's enrolled runners — reject
+    # unknown and cross-project runner ids at authoring time with a clear 422
+    # instead of persisting a task that can never (strict) or silently won't
+    # (soft) dispatch where the operator expects.
+    if payload.runner_target is not None:
+        runner_target_error = await validate_compute_runner_target_enrollment(
+            session, project.id, launch_contract["runner_target"]
+        )
+        if runner_target_error is not None:
+            raise HTTPException(status_code=422, detail=runner_target_error)
 
     # Apply the same accelerator / machine-shape validation as compute-job
     # creation BEFORE persisting a Task, so invalid GPU launch contracts fail
@@ -3233,6 +3287,7 @@ async def create_compute_experiment_task(
                 "container_image",
                 "container_registry_auth",
                 "setup_step",
+                "runner_target",
             )
             if launch_contract.get(k) is not None
         },
@@ -3317,6 +3372,17 @@ async def create_compute_experiment_task(
     )
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
+    task_context: dict[str, Any] = {}
+    if payload.runner_target is not None:
+        # Existing dispatch seam: _select_eligible_runner prefers this runner
+        # when eligible. Strictness is read from the payload's runner_target at
+        # dispatch time (orchestrator_runner_dispatch._payload_runner_target).
+        task_context["preferred_runner_target_id"] = payload.runner_target.runner_id
+    if forced_runner_id:
+        # Operator HARD pin (runner_target_id): _resolve_forced_runner_target
+        # already validated this runner belongs to the project; dispatch refuses
+        # any other runner. Distinct from the soft preferred pin above.
+        task_context["forced_runner_target_id"] = forced_runner_id
     new_task = Task(
         project_id=project.id,
         title=payload.title,
@@ -3328,9 +3394,7 @@ async def create_compute_experiment_task(
         launched_by_user_id=current_user["user_id"],
         requires_approval=requires_approval,
         idempotency_key=scoped_idempotency_key,
-        context=(
-            {"forced_runner_target_id": forced_runner_id} if forced_runner_id else {}
-        ),
+        context=task_context,
     )
     session.add(new_task)
     try:

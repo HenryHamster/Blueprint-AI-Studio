@@ -290,8 +290,8 @@ describe('KnowledgeBrowser — viewport regression', () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Run provenance');
-    // criterion_met: true => earned Machine-verified badge (not hardcoded)
-    expect(text).toContain('Machine-verified');
+    // criterion_met: true => earned "Criterion MET" verdict badge (CriterionVerdictBadge, not hardcoded)
+    expect(text).toContain('Criterion MET');
     expect(text).toContain('Operator hardware');
     // runner_hostname preferred over truncated runner_target_id UUID
     expect(text).toContain('worker-host');
@@ -332,7 +332,7 @@ describe('KnowledgeBrowser — viewport regression', () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Run provenance');
-    expect(text).toContain('Criterion not met');
+    expect(text).toContain('Criterion NOT MET');
     expect(text).not.toContain('Machine-verified');
   });
 

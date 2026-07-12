@@ -2883,6 +2883,13 @@ async def update_agent_status(
                 # be unreliable under async + with_for_update(skip_locked=True)
                 # — see rollup_management._relock_parent (~line 186) and
                 # task_completion.py:1671 for the canonical pattern.
+                # Snapshot the pk BEFORE expiring: session.expire() drops every
+                # loaded attribute (including ``id``), so a ``task.id`` read in
+                # the expire→relock window triggers a sync lazy-load —
+                # MissingGreenlet under the async engine. The relock SELECT
+                # below repopulates the instance (same identity map entry), so
+                # reads after a successful relock are safe again.
+                _relock_task_pk = task.id
                 try:
                     session.expire(task)
                 except InvalidRequestError:
@@ -2891,7 +2898,7 @@ async def update_agent_status(
                     session.expire_all()
                 relock_stmt = (
                     select(Task)
-                    .where(Task.id == task.id)
+                    .where(Task.id == _relock_task_pk)
                     .with_for_update(skip_locked=True)
                     .execution_options(populate_existing=True)
                 )
@@ -2908,7 +2915,7 @@ async def update_agent_status(
                     # is added later it can grep for `_pr_state_check_pending`
                     # to find these tasks.
                     logger.info(
-                        f"[AGENT_STATUS] Task {task.id} re-lock skipped (locked elsewhere) — "
+                        f"[AGENT_STATUS] Task {_relock_task_pk} re-lock skipped (locked elsewhere) — "
                         f"tentative state persisted, returning"
                     )
                     return {"status": "accepted_pr_check_deferred"}

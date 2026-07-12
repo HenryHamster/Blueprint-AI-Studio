@@ -13,9 +13,12 @@ A runner process on operator hardware authenticates with its bearer token (see
     compute job pinned to this runner's project, atomically transitioning it to
     RUNNING (claim). Returns the exec fields the runner needs to execute the arm.
   * POST /api/runner/compute-job/{job_id}/report — runner reports exec_status
-    (running|succeeded|failed), exit_code, result_metrics, command_log. The
-    monitor's existing poll_status/finalize path picks up the stamped terminal
-    status. Returns {ok, cancel_requested}.
+    (running|succeeded|failed), exit_code, result_metrics, command_log, and an
+    optional self-reported ``progress`` tail (validated + merged into
+    polling_metadata["progress"]); interim running reports stamp their bounded
+    command_log tail as polling_metadata["live_output"]. The monitor's existing
+    poll_status/finalize path picks up the stamped terminal status. Returns
+    {ok, cancel_requested}.
 
 No LOCAL_MODE flag is involved: the orchestrator pins QUEUED tasks to an active
 registered runner (vm_instance_id='runner:{id}', context['runner_target_id']),
@@ -60,6 +63,41 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+# Interim live-output tail (running reports only). Stamped as
+# polling_metadata["live_output"] — the same key/shape the GCP live-tail path
+# writes (compute_jobs._apply_status_update + agent_compute_jobs heartbeat) and
+# the admin UI's live-output block reads. The runner sends ~4 KiB; server cap.
+_MAX_RUNNER_LIVE_OUTPUT_BYTES = 8192
+# Self-reported progress records (BLUEPRINT_PROGRESS_FILE protocol). Written by
+# sandboxed experiment code and relayed by the runner, so the server validates
+# every field and bounds every dimension before storing.
+_MAX_PROGRESS_RECORDS_STORED = 50
+_MAX_PROGRESS_RECORDS_PER_REPORT = 20
+_MAX_PROGRESS_METRIC_CHARS = 128
+_MAX_PROGRESS_TS_CHARS = 64
+_MAX_PROGRESS_COUNT = 1_000_000_000
+# Heartbeat capability-list bounds (defense against a garbage-emitting runner).
+_MAX_GPU_LIST_ENTRIES = 64
+# Upper clamp for per-GPU VRAM heartbeat fields. 4 TiB per entry is far beyond
+# any real device, so an absurd runner-reported integer can never reach the
+# authoring context / agent prompts while every plausible value passes through.
+_MAX_GPU_MEMORY_MIB = 4_194_304  # 4 TiB
+_MAX_CLI_INVENTORY_ENTRIES = 16
+_MAX_CLI_VERSION_CHARS = 128
+# _RUNNER_LIVENESS_SECONDS is imported from runner_health_monitors (SSOT) above.
+
+# ComputeJob statuses after which runner reports/uploads must no longer mutate
+# the job's evidence (exec stamps, previews): the monitor has finalized — or
+# will finalize — from what is already stamped, and verdicts may have been
+# drawn from it.
+_COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
+    {
+        ComputeJobStatus.SUCCEEDED,
+        ComputeJobStatus.FAILED,
+        ComputeJobStatus.CANCELLED,
+        ComputeJobStatus.TIMED_OUT,
+    }
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -94,6 +132,122 @@ def _filter_result_metrics(raw: dict) -> dict:
             out[key] = numeric
         # strings, None, nested dicts/lists → dropped
     return out
+
+
+def _filter_progress_record(raw: Any) -> dict | None:
+    """Validate ONE self-reported progress record into a fixed-shape dict.
+
+    Progress records originate from sandboxed experiment code (the runner
+    relays its BLUEPRINT_PROGRESS_FILE tail), so nothing is trusted: ``metric``
+    must be a non-empty bounded string, ``value`` a finite number; ``step``
+    (non-negative int) and ``ts`` (bounded string) are optional. Extra keys are
+    dropped; anything malformed returns None instead of raising.
+    """
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    value = raw.get("value")
+    if not isinstance(metric, str) or not metric.strip():
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return None
+    record: dict[str, Any] = {
+        "metric": metric.strip()[:_MAX_PROGRESS_METRIC_CHARS],
+        "value": numeric,
+    }
+    step = raw.get("step")
+    if isinstance(step, int) and not isinstance(step, bool) and 0 <= step <= 10**12:
+        record["step"] = step
+    ts = raw.get("ts")
+    if isinstance(ts, str) and ts:
+        record["ts"] = ts[:_MAX_PROGRESS_TS_CHARS]
+    return record
+
+
+def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | None:
+    """Validate a runner progress payload and merge it into the stored state.
+
+    The runner sends ``{"records": [last ≤20 records], "count": total}`` on each
+    report. ``count`` deltas against the stored count decide which tail entries
+    are NEW (re-sent overlap is not double-appended); the stored list is capped
+    at the last :data:`_MAX_PROGRESS_RECORDS_STORED` records. Returns the new
+    ``polling_metadata["progress"]`` value ``{"records", "count", "updated_at"}``,
+    or None when the payload adds nothing valid — the caller then leaves the
+    stored state untouched. Garbage of any shape degrades to None, never a 500.
+    """
+    if not isinstance(raw, dict):
+        return None
+    raw_records = raw.get("records")
+    if not isinstance(raw_records, list) or not raw_records:
+        return None
+    if len(raw_records) > _MAX_PROGRESS_RECORDS_PER_REPORT * 5:
+        # Wildly oversized payload: reject wholesale rather than paying to
+        # validate an unbounded list (the runner never sends more than 20).
+        return None
+    records = [
+        rec
+        for rec in (
+            _filter_progress_record(item)
+            for item in raw_records[-_MAX_PROGRESS_RECORDS_PER_REPORT:]
+        )
+        if rec is not None
+    ]
+    if not records:
+        return None
+
+    prev_records: list = []
+    prev_count = 0
+    if isinstance(existing, dict):
+        stored = existing.get("records")
+        if isinstance(stored, list):
+            prev_records = stored
+        stored_count = existing.get("count")
+        if (
+            isinstance(stored_count, int)
+            and not isinstance(stored_count, bool)
+            and stored_count > 0
+        ):
+            prev_count = min(stored_count, _MAX_PROGRESS_COUNT)
+
+    raw_count = raw.get("count")
+    if (
+        isinstance(raw_count, int)
+        and not isinstance(raw_count, bool)
+        and 0 < raw_count <= _MAX_PROGRESS_COUNT
+    ):
+        count = raw_count
+    else:
+        # Invalid/absent count: treat every validated record as new (bounded).
+        count = prev_count + len(records)
+
+    delta = count - prev_count
+    if delta <= 0:
+        # Re-sent snapshot with nothing new — keep the stored state (its
+        # updated_at keeps meaning "when the last NEW record arrived").
+        return None
+    new_records = records[-min(delta, len(records)):]
+    # Suffix-dedup backstop: a retried report whose count DISAGREES with its
+    # validated records (count bumped, tail re-sent verbatim) passes the delta
+    # check yet would re-append records already stored. Drop the longest leading
+    # run of incoming records that exactly equals the stored tail; the
+    # count-delta logic above stays the primary overlap filter.
+    if prev_records and new_records:
+        for k in range(min(len(new_records), len(prev_records)), 0, -1):
+            if prev_records[-k:] == new_records[:k]:
+                new_records = new_records[k:]
+                break
+    if not new_records:
+        # Every incoming record was already stored — treat as a re-send.
+        return None
+    merged = (prev_records + new_records)[-_MAX_PROGRESS_RECORDS_STORED:]
+    return {
+        "records": merged,
+        "count": max(count, len(merged)),
+        "updated_at": now.isoformat(),
+    }
 
 
 def _runner_capability_list(capabilities: Dict[str, Any], key: str) -> List[Any]:
@@ -233,11 +387,21 @@ class HeartbeatRequest(BaseModel):
     # Probed and sent by the runner each heartbeat; persisted in capabilities JSONB
     # so the orchestrator can filter pool LLM runtimes to clis the runner has.
     llm_clis: dict | None = None
+    # Flat CLI inventory: {"claude": "2.1.0", "codex": None, ...} — absent binary
+    # ⇒ null, present-with-unknown-version ⇒ "". Derived from the same probe as
+    # llm_clis; the flat shape is the capability-dispatch vocabulary.
+    cli_inventory: dict | None = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
     has_gpu: StrictBool | None = None
     gpu_count: int | None = None
     gpu_names: List[str] | None = None
     gpu_compute_capabilities: List[float] | None = None
+    # Per-GPU VRAM in MiB (index-aligned with gpu_names). Optional: old runners
+    # and probe failures omit them; consumers (experiment_authoring_context
+    # build_runner_device, future VRAM-fit eligibility) treat absence as
+    # "unknown", never as 0.
+    gpu_memory_total_mib: List[int] | None = None
+    gpu_memory_free_mib: List[int] | None = None
     # Trust telemetry (optional; old runners omit these). last_successful_job_at
     # is ISO-8601; consecutive_job_failures/disk_free_bytes/gpu_utilization_pct are
     # ints. These drive the "connected but failing" degraded state so the operator
@@ -638,6 +802,32 @@ async def heartbeat(
         caps["gpu_names"] = payload.gpu_names
     if payload.gpu_compute_capabilities is not None:
         caps["gpu_compute_capabilities"] = [max(0.0, float(v)) for v in payload.gpu_compute_capabilities]
+    # Per-GPU VRAM + flat CLI inventory (capability-dispatch vocabulary). All
+    # optional and tolerated as absent so older runners keep heartbeating; values
+    # are bounded/validated because they feed authoring context and dispatch.
+    if payload.gpu_memory_total_mib is not None:
+        caps["gpu_memory_total_mib"] = [
+            min(_MAX_GPU_MEMORY_MIB, max(0, int(v)))
+            for v in payload.gpu_memory_total_mib[:_MAX_GPU_LIST_ENTRIES]
+        ]
+    if payload.gpu_memory_free_mib is not None:
+        caps["gpu_memory_free_mib"] = [
+            min(_MAX_GPU_MEMORY_MIB, max(0, int(v)))
+            for v in payload.gpu_memory_free_mib[:_MAX_GPU_LIST_ENTRIES]
+        ]
+    if payload.cli_inventory is not None:
+        cli_inventory: dict[str, str | None] = {}
+        for name, version in payload.cli_inventory.items():
+            if len(cli_inventory) >= _MAX_CLI_INVENTORY_ENTRIES:
+                break
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if version is None:
+                cli_inventory[name.strip()[:64]] = None
+            elif isinstance(version, str):
+                cli_inventory[name.strip()[:64]] = version[:_MAX_CLI_VERSION_CHARS]
+            # non-str/non-null versions dropped
+        caps["cli_inventory"] = cli_inventory
     # Trust telemetry. last_successful_job_at / consecutive_job_failures are
     # first-class columns (the degraded-state logic and panel key on them);
     # disk_free_bytes / gpu_utilization_pct are display-only and ride in caps
@@ -882,7 +1072,16 @@ class ComputeJobReportRequest(BaseModel):
     exec_status: str  # "running" | "succeeded" | "failed"
     exit_code: int | None = None
     result_metrics: Dict[str, Any] | None = None
+    # On terminal reports: the full bounded command log (stamped as
+    # runner_command_log). On interim "running" reports: a ~4 KiB live tail
+    # (stamped as polling_metadata["live_output"], the GCP live-tail shape).
     command_log: Dict[str, Any] | None = None
+    # Optional interim-progress tail {"records": [...], "count": int} from the
+    # job's BLUEPRINT_PROGRESS_FILE. Absent from old runners. Typed ``Any`` ON
+    # PURPOSE: the tolerance contract lives in _merge_progress_report (garbage
+    # of any shape is dropped, never an error) — a Dict annotation would make
+    # pydantic 422 scalar garbage before that guard ever runs.
+    progress: Any = None
     # Cross-job checkpoint resume provenance: what actually happened when the
     # runner hydrated the predecessor's bundle into the artifact dir before the
     # command ran. Stamped into polling_metadata['resume_provenance'] so the
@@ -1007,6 +1206,19 @@ async def report_compute_job(
     can pick up the terminal state. Does NOT finalize the job itself — the monitor
     owns that transition so artifact-linking and wake delivery run on the normal path.
 
+    Interim ``running`` reports may additionally carry:
+
+    * ``command_log`` — a bounded live tail, stamped as
+      ``polling_metadata["live_output"] = {"text", "truncated"}`` (the same
+      key/shape the GCP live-tail path writes and the admin UI reads);
+    * ``progress`` — the job's self-reported BLUEPRINT_PROGRESS_FILE tail,
+      validated (types, finite floats, bounded counts) and merged into
+      ``polling_metadata["progress"] = {"records": [{"metric", "value",
+      "step"?, "ts"?}, ... last ≤50], "count": total, "updated_at": iso}``.
+      Terminal reports may carry ``progress`` too (final records). Malformed
+      payloads are dropped, never a 500 — the records originate from sandboxed
+      experiment code.
+
     Idempotent against already-terminal jobs: the update is skipped but the
     endpoint still returns ``{ok, cancel_requested}`` so the runner can observe
     the cancel signal even after the job has been finalized.
@@ -1070,17 +1282,10 @@ async def report_compute_job(
                 )
         raise HTTPException(status_code=404, detail="compute job not found")
 
-    _TERMINAL_STATUSES = {
-        ComputeJobStatus.SUCCEEDED,
-        ComputeJobStatus.FAILED,
-        ComputeJobStatus.CANCELLED,
-        ComputeJobStatus.TIMED_OUT,
-    }
-
     meta = dict(job.polling_metadata or {})
-    cancel_requested = bool(job.status in _TERMINAL_STATUSES)
+    cancel_requested = bool(job.status in _COMPUTE_JOB_TERMINAL_STATUSES)
 
-    if job.status not in _TERMINAL_STATUSES:
+    if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
         valid_statuses = {"running", "succeeded", "failed"}
         if payload.exec_status in valid_statuses:
             meta["runner_exec_status"] = payload.exec_status
@@ -1088,7 +1293,27 @@ async def report_compute_job(
             meta["runner_exit_code"] = payload.exit_code
         if payload.result_metrics is not None and isinstance(payload.result_metrics, dict):
             meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
-        if payload.command_log is not None:
+        if payload.command_log is not None and payload.exec_status == "running":
+            # Interim live tail → polling_metadata["live_output"] (fixed shape,
+            # bounded). runner_command_log stays terminal-only so the durable
+            # full log is never overwritten by a mid-run window.
+            if isinstance(payload.command_log, dict):
+                live_text = payload.command_log.get("text", "")
+                if not isinstance(live_text, str):
+                    live_text = ""
+                live_truncated = payload.command_log.get("truncated") is True
+                encoded = live_text.encode("utf-8")
+                if len(encoded) > _MAX_RUNNER_LIVE_OUTPUT_BYTES:
+                    live_text = encoded[-_MAX_RUNNER_LIVE_OUTPUT_BYTES:].decode(
+                        "utf-8", "replace"
+                    )
+                    live_truncated = True
+                if live_text:
+                    meta["live_output"] = {
+                        "text": live_text,
+                        "truncated": live_truncated,
+                    }
+        elif payload.command_log is not None:
             if isinstance(payload.command_log, dict):
                 log_text = payload.command_log.get("text", "")
                 if not isinstance(log_text, str):
@@ -1100,6 +1325,12 @@ async def report_compute_job(
                     meta["runner_command_log"] = {"text": log_text, "truncated": False}
             elif isinstance(payload.command_log, str):
                 meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
+        if payload.progress is not None:
+            merged_progress = _merge_progress_report(
+                meta.get("progress"), payload.progress, now
+            )
+            if merged_progress is not None:
+                meta["progress"] = merged_progress
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
         if isinstance(payload.resume_hydration, dict):
@@ -1220,7 +1451,19 @@ async def upload_compute_job_artifact(
         if declared is not None and declared > _MAX_RUNNER_ARTIFACT_BYTES + _MULTIPART_BODY_MARGIN:
             raise HTTPException(status_code=413, detail="artifact exceeds 25 MiB upload cap")
 
-    raw = await request.body()
+    # Buffer the body incrementally with a hard cap on ACTUAL bytes received.
+    # The Content-Length pre-check above is advisory only — a chunked
+    # transfer-encoding request carries no Content-Length at all — so the cap
+    # must bind on the stream itself before any parsing or storage work.
+    max_body_bytes = _MAX_RUNNER_ARTIFACT_BYTES + _MULTIPART_BODY_MARGIN
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > max_body_bytes:
+            raise HTTPException(status_code=413, detail="artifact exceeds 25 MiB upload cap")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     fields, files = _parse_multipart_form(raw, request.headers.get("content-type", ""))
 
     archive_bytes = files.get("archive")
@@ -1239,16 +1482,18 @@ async def upload_compute_job_artifact(
     total_bytes = _to_int(fields.get("total_bytes"))
 
     # Same ownership scoping as the report endpoint: pinned runner only.
-    result = await session.execute(
-        select(ComputeJob)
-        .where(
-            ComputeJob.id == job_id,
-            ComputeJob.project_id == runner.project_id,
-            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
-            ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
-        )
-        .with_for_update()
+    # Validation runs on a PLAIN read — the GCS upload below can take seconds,
+    # and holding the ComputeJob row FOR UPDATE across slow I/O is the exact
+    # lock-held-across-slow-I/O pattern behind the task-row-contention
+    # incidents. The row lock is taken only for the brief re-read + stamp
+    # after the bytes are durably stored.
+    _job_scope = (
+        ComputeJob.id == job_id,
+        ComputeJob.project_id == runner.project_id,
+        ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+        ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
     )
+    result = await session.execute(select(ComputeJob).where(*_job_scope))
     job = result.scalars().first()
     if job is None:
         raise HTTPException(status_code=404, detail="compute job not found")
@@ -1259,9 +1504,23 @@ async def upload_compute_job_artifact(
     # presence at import time.
     from app.compute_backends import store_runner_artifact
 
+    # Slow storage upload with NO row lock held (uses only job.id).
     artifact_info = await store_runner_artifact(
         session, job, archive_bytes, file_count, total_bytes
     )
+
+    # Brief lock: re-read the FRESH row, then stamp. populate_existing refreshes
+    # the identity-map instance so the stamp merges over anything a concurrent
+    # writer committed during the unlocked storage window.
+    result = await session.execute(
+        select(ComputeJob)
+        .where(*_job_scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:  # deleted mid-upload; object is orphaned, best-effort
+        raise HTTPException(status_code=404, detail="compute job not found")
 
     meta = dict(job.polling_metadata or {})
     meta["runner_artifact"] = artifact_info

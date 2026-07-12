@@ -2755,6 +2755,10 @@ async def test_failed_job_response_has_first_class_exit_code_and_command_log(
         },
     )
     failed_job.status = ComputeJobStatus.FAILED
+    # The monitor's finalize path always stamps completed_at when a job goes
+    # terminal; the list endpoint's recently-finished filter requires it
+    # (terminal jobs with a NULL completed_at are excluded by design).
+    failed_job.completed_at = _utcnow()
     db_session.add(failed_job)
     await db_session.commit()
 
@@ -2854,5 +2858,9 @@ async def test_gpu_contamination_audit_returns_completed_at(
     assert item["accelerator_type"] == "T4"
     # completed_at must be present (AttributeError on job.ended_at would crash here)
     assert "completed_at" in item
-    assert item["completed_at"] == suspect_completed.isoformat()
+    # ComputeJob datetime columns are NaiveUTCDateTime: a tz-aware value is stored
+    # and read back as naive UTC (tz stripped), matching the codebase-wide naive-UTC
+    # convention and the canonical serializer. So the serialized value carries no
+    # offset — compare against the naive-UTC round-trip, not the aware original.
+    assert item["completed_at"] == suspect_completed.replace(tzinfo=None).isoformat()
     assert "ended_at" not in item

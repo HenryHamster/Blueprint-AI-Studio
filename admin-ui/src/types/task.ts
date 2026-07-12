@@ -109,6 +109,19 @@ export interface TaskSideboardContext {
     runner?: {
       vm_instance_id?: string | null;
       runner_target_id?: string | null;
+      // Operator/agent-requested runner pin from the launch contract
+      // (task.context.preferred_runner_target_id). Set even before dispatch.
+      preferred_runner_target_id?: string | null;
+      // Present while a strict runner pin is holding dispatch: the
+      // machine-readable reason the pinned runner cannot take the task.
+      // reason_code is one of offline | not_enrolled | not_found | at_capacity |
+      // missing_gpu | missing_container_runtime | task_type_not_allowed | not_eligible.
+      runner_pin_hold?: {
+        runner_id?: string | null;
+        strict?: boolean | null;
+        reason_code?: string | null;
+        detail?: string | null;
+      } | null;
       machine_type?: string | null;
       spot?: boolean | null;
       warm_start?: boolean | null;

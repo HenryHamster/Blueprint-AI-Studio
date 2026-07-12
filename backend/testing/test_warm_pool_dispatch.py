@@ -799,6 +799,10 @@ async def test_cost_guard_disengaged_allows_lease(db_session, warm_pool_on):
     leased = await _dispatch(db_session, task, account="acct-1")
     assert leased is not None
     assert leased.vm_instance_id == "vm-no-guard"
+    # try_pool_dispatch's contract: the caller MUST commit on a non-None
+    # return. Commit before the refresh — refresh() discards the pending
+    # LEASED state under real ORM expiry.
+    await db_session.commit()
     await db_session.refresh(member)
     assert member.state == PoolVmState.LEASED
 

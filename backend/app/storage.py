@@ -304,14 +304,15 @@ _VIEWABLE_ARTIFACT_SUBDIR = "viewable"
 
 # Viewable file extension (lowercase, no dot) -> (content_type, kind). Only these
 # extensions are ever persisted as individual objects; everything else stays
-# inside the opaque bundle.
+# inside the opaque bundle. Deliberately conservative: raster images and the two
+# browser-native video containers. NO svg — an SVG served from a signed URL can
+# execute script in the viewer's browsing context.
 _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
     "jpeg": ("image/jpeg", "image"),
     "webp": ("image/webp", "image"),
     "gif": ("image/gif", "image"),
-    "svg": ("image/svg+xml", "image"),
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
 }

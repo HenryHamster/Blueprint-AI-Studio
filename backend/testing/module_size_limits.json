@@ -9,7 +9,7 @@
     "orchestrator.py": 5100,
     "orchestrator_ci_monitor.py": 3000,
     "orchestrator_health.py": 1150,
-    "orchestrator_runner_dispatch.py": 2150,
+    "orchestrator_runner_dispatch.py": 2200,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,
     "admin.py": 4600,
@@ -138,6 +138,7 @@
     "runner_health_alerts.py": 1950,
     "routers/agent_strategic_fetch.py": 1750,
     "runner_health_monitors.py": 1001,
+    "routers/runner.py": 1650,
     "strategic_context_package.py": 1800
   },
   "agent": {

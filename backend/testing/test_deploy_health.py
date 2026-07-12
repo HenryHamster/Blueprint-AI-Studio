@@ -1365,11 +1365,22 @@ def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fa
 
 
 def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_provider():
+    from app.models import LLMProviderName
+    from app.providers.registry import get_provider
+
     _shared_state.runtime_config["category_routing"] = {}
     _shared_state.runtime_config["task_type_routing"] = {}
     _shared_state.runtime_config["task_type_provider_preference"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {}
-    _shared_state.runtime_config["task_type_models"] = {"create": "gpt-5.4"}
+    # Derive a CURRENT OpenAI tier model rather than hardcoding one:
+    # infer_provider_for_model only matches models that equal a provider's
+    # current tier mapping, so a hardcoded id goes stale on every model bump
+    # (e.g. gpt-5.4 stopped matching when the defaults moved to gpt-5.6-*).
+    openai_model = get_provider(LLMProviderName.OPENAI).tier_to_model(
+        "sonnet", _shared_state.runtime_config
+    )
+    assert openai_model, "openai provider must define a sonnet-tier model"
+    _shared_state.runtime_config["task_type_models"] = {"create": openai_model}
     _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
 
     ext = {

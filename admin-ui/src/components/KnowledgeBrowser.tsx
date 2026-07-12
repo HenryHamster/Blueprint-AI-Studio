@@ -464,8 +464,9 @@ function ExportMarkdown({ body }: { body?: string }) {
 
 const PAGE_SIZE = 50;
 
-/** File extensions we can render inline as images or videos. */
-const VIEWABLE_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'];
+/** File extensions we can render inline as images or videos. NO svg — an SVG
+ *  opened from a signed URL is a full document context and can execute script. */
+const VIEWABLE_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
 const VIEWABLE_VIDEO_EXTS = ['.mp4', '.webm'];
 
 function viewableMediaKind(uri: string | null | undefined): 'image' | 'video' | null {

@@ -2644,8 +2644,22 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             if not history.added:
                 continue
             new_status = history.added[0]
+            # Expiry-safe pk read: post-rollback recovery paths (e.g. the
+            # smoketest spawn retry) flush a Task whose attributes were
+            # expired by the rollback. Reading ``instance.id`` on such an
+            # instance triggers a sync lazy-load inside before_flush; the
+            # load blows up (MissingGreenlet under the async engine) AND
+            # poisons the flush's transaction, failing the whole flush the
+            # handler promises never to block. The identity key is populated
+            # for every persistent instance and needs no IO.
+            _ident = _sa_inspect(instance).identity
+            _instance_pk = (
+                _ident[0] if _ident else instance.__dict__.get("id")
+            )
+            if _instance_pk is None:
+                continue
             if task_status_releases_agent_resources(new_status):
-                emit_task_terminated_notify(session, str(instance.id))
+                emit_task_terminated_notify(session, str(_instance_pk))
             elif history.deleted and task_status_releases_agent_resources(
                 history.deleted[0]
             ):
@@ -2653,7 +2667,7 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
                 # prior status was terminal and the new one is not. Broadcast so
                 # every instance evicts its stale deny-list entry. The guard on
                 # the PRIOR status keeps normal non-terminal steps silent.
-                emit_task_revived_notify(session, str(instance.id))
+                emit_task_revived_notify(session, str(_instance_pk))
     except Exception as exc:  # noqa: BLE001 — never block the flush
         logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
 

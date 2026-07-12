@@ -641,6 +641,82 @@ async def test_in_progress_heartbeat_timeout_reaped(
 
 
 @pytest.mark.asyncio
+async def test_reap_appends_durable_task_history_reason(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Every confirmed reap appends a durable TaskHistory row (action="REAPED")
+    carrying the full reap_reason + code — the reason survives even after the
+    next reap overwrites latest_status_message (surface REASONS, not states)."""
+    from app.models import TaskHistory
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-history",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=6),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    rows = (
+        (
+            await reaper_db.execute(
+                select(TaskHistory).where(
+                    TaskHistory.task_id == t.id, TaskHistory.action == "REAPED"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1, "confirmed reap must append exactly one REAPED history row"
+    details = rows[0].details
+    assert details["code"] == "heartbeat_timeout_post_claim"
+    assert "No heartbeat for" in details["reap_reason"]
+    assert details["vm_instance_id"] == "vm-history"
+
+
+@pytest.mark.asyncio
+async def test_healthy_task_gets_no_reap_history_row(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A live (fresh-heartbeat) task must not accrue REAPED history rows."""
+    from app.models import TaskHistory
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-healthy",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow(),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    rows = (
+        (
+            await reaper_db.execute(
+                select(TaskHistory).where(TaskHistory.task_id == t.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
 async def test_execution_timeout_retry_escalates_effort(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

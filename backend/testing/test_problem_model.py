@@ -5778,9 +5778,19 @@ def test_evidence_met_summary_capability_and_gap_tallies():
     assert "acceptance" not in summary
 
 
-def test_evidence_met_summary_tallies_attestation_only_capability_as_attested():
-    """A capability whose sole proof is operator_attestation classifies as
-    'attested' and is tallied on that axis — no KeyError from the new tier."""
+def test_evidence_met_summary_tallies_attestation_only_capability_as_partial():
+    """A capability whose sole proof is operator_attestation is tallied as
+    'partial' — NOT 'proven', and NOT on a distinct 'attested' axis.
+
+    v25 contract (evidence_primitive._proven_tier): a bare human waiver carries
+    no structural machine-check at all — unlike ``backing_path`` it does not even
+    prove a file exists at HEAD — so an attestation-only proven set is demoted all
+    the way to ``partial``.  ``partial`` is in ``_UNBACKED_STATUSES``, which is
+    what makes an attestation-only "working"/"closed" claim read as contradicted
+    rather than earned.  ``EvidenceStatus`` has no ``attested`` member; the
+    ``attested`` axis in the summary is an acceptance-layer coverage value that
+    ``criterion_coverage_to_evidence_status`` also maps down to ``partial``, so it
+    stays zero here."""
     model = ProblemModel(
         capabilities=[
             Capability(
@@ -5802,10 +5812,12 @@ def test_evidence_met_summary_tallies_attestation_only_capability_as_attested():
         ],
     )
     summary = evidence_met_summary(model)
-    assert summary["capabilities"]["attested"] == 1
+    assert summary["capabilities"]["partial"] == 1
     assert summary["capabilities"]["proven"] == 0
-    assert summary["gaps"]["attested"] == 1
+    assert summary["capabilities"]["attested"] == 0
+    assert summary["gaps"]["partial"] == 1
     assert summary["gaps"]["proven"] == 0
+    assert summary["gaps"]["attested"] == 0
 
 
 def test_evidence_met_summary_with_coverage_summary():

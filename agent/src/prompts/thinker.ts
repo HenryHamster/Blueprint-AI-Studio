@@ -259,9 +259,12 @@ export interface ThinkerPromptParams {
   /**
    * Live self-hosted local-runner availability note. Built from the strategic
    * payload's `local_runner_status` field ({ever_registered, active_total,
-   * active_gpu, require_local_runner}) so the strategist avoids authoring GPU
+   * active_gpu, require_local_runner}, plus an optional bounded `devices`
+   * hardware list — GPU models, per-GPU VRAM when advertised, container
+   * capability, current load) so the strategist avoids authoring GPU
    * compute_experiments while the operator's hardware is offline (they would
-   * hold then fail, or fall back to billable cloud GPU). Optional so existing
+   * hold then fail, or fall back to billable cloud GPU) and sizes experiments
+   * to the fleet's actual hardware. Optional so existing
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   localRunnerSection?: string;
@@ -437,9 +440,19 @@ Parallel moves are fine and encouraged when non-clashing. When two directions ar
 
 **Metric capture is MANDATORY.** Each command MUST emit the declared metric as JSON to \`$BLUEPRINT_RESULT_FILE\` (e.g. \`python -c "import json,os; json.dump({'<metric>':<value>},open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\`) or as the LAST stdout line. A command exiting 0 without emitting the metric = \`success_criterion\` unmeasured → FAILS (\`compute_unmeasured_criterion\`). State this contract in your commissioned command.
 
-**Containerized / GPU runtimes.** When the experiment needs a specific runtime stack (CUDA / cuDNN / NGC), include \`container_image\` (an NGC image URI, e.g. \`nvcr.io/nvidia/tensorflow:25.01\`) so the command runs inside that image. Use \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) to request a single GPU. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it.
+**Containerized / GPU runtimes.** When the experiment needs a specific runtime stack (CUDA / cuDNN / NGC), include \`container_image\` (an NGC image URI, e.g. \`nvcr.io/nvidia/tensorflow:25.01\`) so the command runs inside that image. Use \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) to request a single GPU. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it. When the note lists per-device hardware (GPU models, per-GPU VRAM, container capability), SIZE the experiment to a device that can actually run it — model + batch must fit the listed VRAM, and \`container_image\` only works on a device with a container runtime.
 
-**Dependency pinning is REQUIRED.** Any \`pip install\` (or other package manager invocation) inside \`command\` MUST pin every package version explicitly — e.g. \`pip install jax==0.4.28 brax==0.10.3\` — never install latest. Unpinned installs silently break on upstream drift: concrete example — \`brax\` (unmaintained) imports \`jax.device_put_replicated\`, which was removed in a later \`jax\` release, hard-failing at import with no code change on your part. This applies to every dependency, not just ML libraries. Pin the version you smoke-tested; if you don't know the current version, run \`pip show <pkg>\` or \`pip index versions <pkg>\` during your smoke to find it.
+**Experiment reliability conventions.** Experiments most often die from environment drift and lost metrics, not wrong hypotheses. When commissioning, state these in the task:
+- **Pin dependency versions** in the command (\`pip install jax==0.6.2\`, never latest): an unpinned \`pip install brax\` once pulled a jax whose API had changed and killed the run mid-training. Every unpinned install is a future breakage.
+- **Always set \`container_image\` explicitly** for any stack beyond what the repo itself pip-installs — never rely on whatever toolchain the host happens to have.
+- **Write the metric to \`$BLUEPRINT_RESULT_FILE\` early AND final**: emit a provisional value as soon as the first real measurement exists, then overwrite with the final value — a timeout/kill then still yields a measured result instead of \`compute_unmeasured_criterion\`.
+- **Structure long training as short gated stages**: a bounded first-stage experiment (smoke / few epochs, small cap) whose measured result gates a longer follow-on — never one deadline-sized run that can only succeed wholesale.
+- **Keep the artifact dir small** (final checkpoints/plots only — artifact uploads are size-capped at ~25 MiB; a bloated dir silently loses artifacts).
+- **Prefer a repo harness entrypoint when one exists** (an experiment/eval script already in the repo) over inlining a bespoke pipeline in the command — the harness already handles env, paths, and result plumbing.
+
+Check the "Experiment ledger" section (when present) before commissioning: it lists recent measured outcomes with command fingerprints and costs — re-running a settled hypothesis without naming what changed is waste.
+
+**Dependency pinning is REQUIRED.** Any \`pip install\` (or other package manager invocation) anywhere in a commissioned experiment — the main \`command\` or any environment setup it runs first — MUST pin every package version explicitly — e.g. \`pip install jax==0.4.28 brax==0.10.3\` — never install latest. Unpinned installs silently break on upstream drift: concrete example — \`brax\` (unmaintained) imports \`jax.device_put_replicated\`, which was removed in a later \`jax\` release, hard-failing at import with no code change on your part. This applies to every dependency, not just ML libraries. Pin the version you smoke-tested; if you don't know the current version, run \`pip show <pkg>\` or \`pip index versions <pkg>\` during your smoke to find it.
 
 Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
 

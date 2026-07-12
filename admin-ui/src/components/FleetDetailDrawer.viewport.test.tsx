@@ -24,26 +24,31 @@ const emptyState: WarmVmStateResponse = {
   next_role_poll_timeout_secs: 30,
 };
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
-  authGet: vi.fn(async () => new Response(JSON.stringify(emptyState), { status: 200 })),
-  enableWarmPoolForProject: vi.fn(async () => ({})),
-  disableWarmPoolForProject: vi.fn(async () => ({})),
-  fetchWarmPoolTargets: vi.fn(async () => ({
-    warm_pool_target_size: 2,
-    warm_pool_target_size_by_project: {},
-  })),
-  setWarmPoolTargetForProject: vi.fn(async () => ({})),
-  fetchEfficiencyAxes: vi.fn(async () => ({ axes: {} })),
-  // FleetRunnersPanel (rendered in the drawer) statically imports these from
-  // '../api'; browser-mode ESM requires the mock factory to expose every named
-  // export the subtree imports or the linker fails at import time.
-  listFleetRunners: vi.fn(async () => []),
-  registerFleetRunner: vi.fn(async () => ({})),
-  revokeFleetRunner: vi.fn(async () => ({})),
-  rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
-  API_BASE_URL: 'http://localhost:8000',
-}));
+// The drawer's subtree (WarmVmPanel + FleetRunnersPanel) statically imports
+// many named exports from '../api'; browser-mode ESM requires the mock factory
+// to expose EVERY export the subtree imports or the linker fails at import
+// time. createApiMock provides the complete, typecheck-enforced export surface
+// so new api.ts exports can't silently break this factory again.
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+    authGet: vi.fn(async () => new Response(JSON.stringify(emptyState), { status: 200 })),
+    enableWarmPoolForProject: vi.fn(async () => ({})),
+    disableWarmPoolForProject: vi.fn(async () => ({})),
+    fetchWarmPoolTargets: vi.fn(async () => ({
+      warm_pool_target_size: 2,
+      warm_pool_target_size_by_project: {},
+    })),
+    setWarmPoolTargetForProject: vi.fn(async () => ({})),
+    fetchEfficiencyAxes: vi.fn(async () => ({ axes: {} })),
+    listFleetRunners: vi.fn(async () => []),
+    registerFleetRunner: vi.fn(async () => ({})),
+    revokeFleetRunner: vi.fn(async () => ({})),
+    rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
+    API_BASE_URL: 'http://localhost:8000',
+  });
+});
 
 vi.mock('../hooks/useEfficiencySnapshot', () => ({
   useEfficiencySnapshot: () => null,

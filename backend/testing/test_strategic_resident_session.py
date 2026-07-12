@@ -387,6 +387,12 @@ async def test_start_does_not_adopt_in_progress_one_shot(db_session):
     # guard), not the no-device block that fires earlier when no runner exists.
     await _make_live_local_runner(db_session, project)
 
+    # Snapshot ids BEFORE the start: its refusal path rolls the caller session
+    # back, expiring every ORM instance — a post-refusal ``one_shot.id`` /
+    # ``project.id`` read would raise MissingGreenlet under the asyncpg harness.
+    one_shot_id = one_shot.id
+    project_id = project.id
+
     # The refusal path spawns a provisional claim then compensates it on a FRESH,
     # dedicated session (production: ``AsyncSessionLocal``); inject a factory bound
     # to this test's engine so that cleanup lands on the SAME DB the assertions
@@ -404,7 +410,7 @@ async def test_start_does_not_adopt_in_progress_one_shot(db_session):
     # The in-flight one-shot was NOT hijacked into a (non-streaming) session
     # (read committed state via a fresh session — see ``_fresh_vision``).
     async with factory() as s:
-        refreshed = await s.get(Task, one_shot.id)
+        refreshed = await s.get(Task, one_shot_id)
         assert (
             refreshed.context is None
             or refreshed.context.get("_resident_session") is not True
@@ -412,7 +418,7 @@ async def test_start_does_not_adopt_in_progress_one_shot(db_session):
         assert refreshed.status == TaskStatus.IN_PROGRESS
 
     # No provisional claim left behind to wedge future starts.
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     assert read_resident_session(vision) is None
 
 
@@ -435,6 +441,11 @@ async def test_start_does_not_adopt_started_provisioning_cycle(db_session):
 
     from fastapi import HTTPException
 
+    # Snapshot the id BEFORE the start: its refusal path rolls the caller session
+    # back, expiring ``started`` — a post-refusal ``started.id`` read would raise
+    # MissingGreenlet under the asyncpg harness.
+    started_id = started.id
+
     # No adoptable cycle + the started one keeps _has_active_strategic_task hot →
     # spawn blocked → refuse rather than adopt the already-dispatched task.
     with pytest.raises(HTTPException) as exc:
@@ -442,7 +453,7 @@ async def test_start_does_not_adopt_started_provisioning_cycle(db_session):
             db_session, project, operator_user_id=TEST_USER_ID
         )
     assert exc.value.status_code == 409
-    refreshed = await db_session.get(Task, started.id)
+    refreshed = await db_session.get(Task, started_id)
     assert refreshed.context is None or refreshed.context.get("_resident_session") is not True
 
 
@@ -1492,6 +1503,11 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     monkeypatch.setattr(srs, "_spawn_resident_strategic_task", fake_spawn)
     monkeypatch.setattr(srs, "persist_strategic_workbench_update", boom)
 
+    # Snapshot the id BEFORE the start: the failure path rolls the caller session
+    # back, expiring ``project`` — a post-failure ``project.id`` read would raise
+    # MissingGreenlet under the asyncpg harness.
+    project_id = project.id
+
     # Compensation runs on a FRESH, dedicated session (production:
     # ``AsyncSessionLocal``); inject a factory bound to this test's engine so the
     # cleanup lands on the SAME DB the assertions read back through.
@@ -1507,7 +1523,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     # Orphaned spawned task cancelled (read committed state via a fresh session).
     assert await _fresh_task_status(factory, created["id"]) == TaskStatus.CANCELLED
     # Provisional claim cleared — no active session left to wedge future starts.
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     assert read_resident_session(vision) is None
 
 
@@ -1614,7 +1630,9 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     assert captured["project_id"] == expected_id
     assert type(captured["project_id"]) is type(expected_id)
     # Claim actually cleared → compensation completed (not aborted mid-way).
-    vision = await _fresh_vision(factory, project.id)
+    # Use the pre-rollback ``expected_id`` snapshot: ``project`` was expired by
+    # the failure path's rollback, so ``project.id`` would raise MissingGreenlet.
+    vision = await _fresh_vision(factory, expected_id)
     assert read_resident_session(vision) is None
 
 
@@ -1634,6 +1652,10 @@ async def test_sync_auto_starts_on_enter_continuous(
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
     runner = await _make_live_local_runner(db_session, project)
+    # Snapshot ids BEFORE the sync: it rolls the caller session back up front,
+    # expiring every ORM instance — post-sync ``.id`` reads would raise
+    # MissingGreenlet under the asyncpg harness.
+    project_id, task_id, runner_id = project.id, task.id, runner.id
 
     factory = _dedicated_session_factory(db_session)
     snapshot = await sync_resident_session_for_interaction_mode(
@@ -1646,10 +1668,10 @@ async def test_sync_auto_starts_on_enter_continuous(
     )
     assert snapshot is not None
     assert snapshot["status"] == "active"
-    assert snapshot["task_id"] == str(task.id)
-    assert snapshot["runner_id"] == str(runner.id)
+    assert snapshot["task_id"] == str(task_id)
+    assert snapshot["runner_id"] == str(runner_id)
 
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     assert resident_session_is_active(read_resident_session(vision))
     # No blocked-reason recorded when the auto-start succeeds.
     assert read_resident_session_blocked_reason(vision) is None
@@ -1752,6 +1774,9 @@ async def test_sync_auto_stops_on_leave_continuous(
     await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
 
     project = await db_session.get(Project, project.id)
+    # Snapshot ids BEFORE the sync: its up-front rollback expires every ORM
+    # instance, so post-sync ``.id`` reads would raise MissingGreenlet.
+    project_id, task_id = project.id, task.id
     factory = _dedicated_session_factory(db_session)
     result = await sync_resident_session_for_interaction_mode(
         db_session,
@@ -1763,11 +1788,11 @@ async def test_sync_auto_stops_on_leave_continuous(
     )
     assert result is None
 
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     blob = read_resident_session(vision)
     assert blob is not None and blob["status"] == "ended"
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in vision
-    assert await _fresh_task_status(factory, task.id) == TaskStatus.CANCELLED
+    assert await _fresh_task_status(factory, task_id) == TaskStatus.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1780,6 +1805,9 @@ async def test_sync_records_no_runner_when_no_live_runner(
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
     # No runner registered.
+    # Snapshot the id BEFORE the sync: its up-front rollback expires every ORM
+    # instance, so a post-sync ``project.id`` read would raise MissingGreenlet.
+    project_id = project.id
 
     factory = _dedicated_session_factory(db_session)
     snapshot = await sync_resident_session_for_interaction_mode(
@@ -1792,7 +1820,7 @@ async def test_sync_records_no_runner_when_no_live_runner(
     )
     assert snapshot is None
 
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     assert read_resident_session(vision) is None
     assert (
         read_resident_session_blocked_reason(vision)
@@ -1819,6 +1847,10 @@ async def test_sync_records_start_failed_reason(
 
     monkeypatch.setattr(srs, "start_resident_session", boom)
 
+    # Snapshot the id BEFORE the sync: its up-front rollback expires every ORM
+    # instance, so a post-sync ``project.id`` read would raise MissingGreenlet.
+    project_id = project.id
+
     # Must NOT raise — the mode switch is already committed by the caller.
     factory = _dedicated_session_factory(db_session)
     snapshot = await sync_resident_session_for_interaction_mode(
@@ -1831,7 +1863,7 @@ async def test_sync_records_start_failed_reason(
     )
     assert snapshot is None
 
-    vision = await _fresh_vision(factory, project.id)
+    vision = await _fresh_vision(factory, project_id)
     reason = read_resident_session_blocked_reason(vision)
     assert reason is not None
     assert reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
@@ -1899,6 +1931,9 @@ async def test_sync_runs_start_on_dedicated_session(
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
     await _make_live_local_runner(db_session, project)
+    # Snapshot ids BEFORE the sync: its up-front rollback expires every ORM
+    # instance, so post-sync ``.id`` reads would raise MissingGreenlet.
+    project_id, task_id = project.id, task.id
 
     opened: list = []
     base_factory = _dedicated_session_factory(db_session)
@@ -1918,7 +1953,7 @@ async def test_sync_runs_start_on_dedicated_session(
     )
     assert snapshot is not None
     assert snapshot["status"] == "active"
-    assert snapshot["task_id"] == str(task.id)
+    assert snapshot["task_id"] == str(task_id)
 
     # The start ran on a dedicated session, never the caller's request session.
     assert len(opened) >= 1
@@ -1926,7 +1961,7 @@ async def test_sync_runs_start_on_dedicated_session(
 
     # The caller's request session stays clean/usable, and the committed session
     # blob is observable (read via a fresh session — see ``_fresh_vision``).
-    vision = await _fresh_vision(base_factory, project.id)
+    vision = await _fresh_vision(base_factory, project_id)
     assert resident_session_is_active(read_resident_session(vision))
 
 

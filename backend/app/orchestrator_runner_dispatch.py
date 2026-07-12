@@ -22,6 +22,7 @@ keeps working for existing callers and tests.
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -620,6 +621,7 @@ async def _try_runner_dispatch(
     new_ctx.pop("awaiting_local_runner_since", None)
     new_ctx.pop("awaiting_container_runner_since", None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+    new_ctx.pop("runner_pin_hold", None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -806,6 +808,140 @@ def _num_or_none(value) -> float | None:
         return None
     return f
 
+
+def _payload_runner_target(payload: dict) -> tuple[str | None, bool]:
+    """Extract a launch-contract runner pin as ``(runner_id, strict)``.
+
+    Reads ``runner_target: {runner_id, strict}`` flat or nested under
+    ``compute_experiment`` (mirroring the accelerator / container_image reads).
+    Returns ``(None, False)`` when absent or malformed — dispatch treats a
+    malformed pin as no pin (the authoring contract validator rejects malformed
+    shapes for operator launches; agent-authored payloads degrade soft).
+    """
+    target = payload.get("runner_target") or (
+        payload.get("compute_experiment") or {}
+    ).get("runner_target")
+    if not isinstance(target, dict):
+        return None, False
+    runner_id = target.get("runner_id")
+    if not (isinstance(runner_id, str) and runner_id.strip()):
+        return None, False
+    return runner_id.strip(), bool(target.get("strict"))
+
+
+_PIN_HOLD_DIGITS_RE = re.compile(r"\d+")
+
+
+def _pin_hold_stable_key(record) -> tuple | None:
+    """Change-comparison key for ``context['runner_pin_hold']`` records.
+
+    The human-readable ``detail`` embeds per-cycle-mutable values (live load
+    counts, heartbeat timestamps), so full-record equality would flip every
+    dispatch cycle while a pinned runner flaps — rewriting the held task row
+    each cycle and defeating the change-gated commit. The key keeps what
+    identifies the hold STATE — runner id + reason code — plus the detail with
+    digit runs collapsed, so a genuinely different hold (another gate, other
+    wording) still rewrites while volatile numbers do not. Returns ``None``
+    for a missing/malformed record so the first stamp always writes.
+    """
+    if not isinstance(record, dict):
+        return None
+    detail = record.get("detail")
+    coarse_detail = (
+        _PIN_HOLD_DIGITS_RE.sub("#", detail) if isinstance(detail, str) else None
+    )
+    return (record.get("runner_id"), record.get("reason_code"), coarse_detail)
+
+
+async def _diagnose_strict_runner_pin_hold(
+    session: AsyncSession,
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
+    project_id: uuid.UUID,
+    pinned_runner_id: str,
+    task_type: str,
+    accelerator: str | None,
+    container_image: str | None,
+    runner_pins_this_cycle: dict[uuid.UUID, int],
+) -> tuple[str, str]:
+    """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
+
+    Returns ``(reason_code, detail)``. The reason must be truthful and specific
+    (runner id + why), never a generic no-runner message: reason codes are
+    ``at_capacity`` / ``task_type_not_allowed`` / ``missing_gpu`` /
+    ``missing_container_runtime`` / ``not_eligible`` (live but failed another
+    gate) for runners in the live cache, and ``not_found`` / ``not_enrolled`` /
+    ``offline`` for runners that are not live. The pair is stamped into
+    ``task.context['runner_pin_hold']`` and the hold status message so the
+    admin UI can show exactly why nothing is dispatching.
+    """
+    candidates = active_runners_cache.get(project_id) or []
+    snapshot = next(
+        (r for r in candidates if str(r.id) == pinned_runner_id), None
+    )
+    if snapshot is not None:
+        if not _runner_handles_task_type(snapshot, task_type):
+            return (
+                "task_type_not_allowed",
+                f"runner does not accept task type {task_type!r} "
+                "(operator task_types policy)",
+            )
+        pins = runner_pins_this_cycle.get(snapshot.id, 0)
+        # Mirror _select_eligible_runner exactly: capacity is per CLASS
+        # (compute_experiment checks the compute-job class, agent tasks the
+        # agent class), so the diagnosed reason matches why selection skipped
+        # this runner.
+        if _runner_at_capacity(snapshot, pins, task_type):
+            caps = snapshot.capabilities or {}
+            if task_type == "compute_experiment":
+                load = _runner_active_compute_job_count(snapshot) + pins
+                limit = _runner_max_concurrent_compute(snapshot)
+                limit_label = f"max_concurrent_compute={limit}"
+            else:
+                load = _runner_active_task_count(snapshot) + pins
+                limit_label = f"max_concurrent={caps.get('max_concurrent')}"
+            return (
+                "at_capacity",
+                f"runner is at capacity ({load} active+pinned vs {limit_label})",
+            )
+        if accelerator and not (snapshot.capabilities or {}).get("has_gpu"):
+            return (
+                "missing_gpu",
+                f"job declares accelerator {accelerator!r} but the runner does "
+                "not advertise has_gpu",
+            )
+        if container_image and not _runner_has_container_capability(snapshot):
+            return (
+                "missing_container_runtime",
+                f"job declares container_image {container_image!r} but the "
+                "runner advertises no container isolation backend",
+            )
+        return ("not_eligible", "runner failed dispatch eligibility this cycle")
+
+    # Not in the live cache — distinguish unknown / cross-project / offline via
+    # the runner row. This path runs only while a strict pin is holding (rare,
+    # once per dispatch cycle for the held task), so the extra read is cheap.
+    try:
+        runner_uuid = uuid.UUID(pinned_runner_id)
+    except ValueError:
+        return ("not_found", "runner_target.runner_id is not a valid runner id")
+    row = await session.get(LocalRunner, runner_uuid)
+    if row is None:
+        return ("not_found", "no runner with this id is registered")
+    if row.project_id != project_id:
+        return (
+            "not_enrolled",
+            "runner is enrolled in a different project — a pin must name one "
+            "of this project's runners",
+        )
+    last_seen = (
+        row.last_seen_at.isoformat() if row.last_seen_at is not None else "never"
+    )
+    return (
+        "offline",
+        f"runner (host {row.hostname or 'unknown'}) is not live — "
+        f"status={row.status!r}, last heartbeat {last_seen}; it must be active "
+        f"and heartbeating within {_RUNNER_LIVENESS_SECONDS}s to claim work",
+    )
 
 
 async def _lookup_runner_hostname(
@@ -1108,9 +1244,13 @@ async def _dispatch_compute_experiment_directly(
         ``"blocked"``  — a recoverable live-release precondition (release not yet
                          serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
                          it once the deploy confirms (not a failure, no retry burn).
-        ``"held"``     — ``require_local_runner`` set and no live runner; held QUEUED
-                         (``awaiting_local_runner_since`` stamped; the existing bounded
-                         sweep terminal-fails a hold that outlives the wait window).
+        ``"held"``     — held QUEUED (``awaiting_local_runner_since`` stamped; the
+                         existing bounded sweep terminal-fails a hold that outlives
+                         the wait window). Two hold causes: ``require_local_runner``
+                         set and no live runner, or a strict ``runner_target`` pin
+                         whose runner is not currently eligible (the latter also
+                         stamps ``context['runner_pin_hold']`` with the
+                         machine-readable reason).
     Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"``/``"held"``
     leave the task waiting. The caller owns the dispatch loop; this function commits
     its own outcome.
@@ -1167,6 +1307,11 @@ async def _dispatch_compute_experiment_directly(
     ).get("vram_gb")
     vram_gb = float(_vram_raw) if _vram_raw is not None else None
 
+    # Launch-contract runner pin (operator or agent authored). The pin id feeds
+    # the existing preferred-runner seam; ``strict`` additionally forbids any
+    # other runner (hold-with-reason below instead of falling through).
+    pin_runner_id, pin_strict = _payload_runner_target(payload)
+
     # Operator HARD pin (distinct from the soft preferred hint): this job may run
     # ONLY on this runner id. A forced target that is offline/ineligible HOLDS the
     # task — it never falls back to another runner or to cloud (handled below).
@@ -1181,14 +1326,76 @@ async def _dispatch_compute_experiment_directly(
         "compute_experiment",
         accelerator,
         runner_pins_this_cycle,
-        preferred_runner_target_id=(task.context or {}).get(
-            "preferred_runner_target_id"
-        ),
+        preferred_runner_target_id=pin_runner_id
+        or (task.context or {}).get("preferred_runner_target_id"),
         dispatch_seed=task.id.int,
         container_image=container_image,
         forced_runner_target_id=forced_runner_target_id,
         vram_gb=vram_gb,
     )
+
+    # ── Strict runner pin: ONLY the pinned runner may take this job ────────────
+    # When the pinned runner is not currently eligible, hold QUEUED with a
+    # truthful, machine-readable reason (runner id + why) — never dispatch to
+    # another runner or the cloud, and never reuse the generic require-local
+    # wording. The ``awaiting_local_runner_since`` stamp reuses the existing
+    # bounded-wait sweep (15-min operator alert, 6h terminal fail), whose
+    # timeout message is pin-aware (see _fail_stale_local_runner_holds).
+    if (
+        pin_strict
+        and pin_runner_id
+        and (runner is None or str(runner.id) != pin_runner_id)
+    ):
+        reason_code, detail = await _diagnose_strict_runner_pin_hold(
+            session,
+            active_runners_cache,
+            task.project_id,
+            pin_runner_id,
+            "compute_experiment",
+            accelerator,
+            container_image,
+            runner_pins_this_cycle,
+        )
+        message = (
+            f"runner_target hold: strict pin to runner {pin_runner_id} cannot "
+            f"dispatch — {reason_code}: {detail}"
+        )[:500]
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None  # drop stale pin
+        if not ctx.get("awaiting_local_runner_since"):
+            ctx["awaiting_local_runner_since"] = _utcnow().isoformat()
+            changed = True
+        hold_record = {
+            "runner_id": pin_runner_id,
+            "strict": True,
+            "reason_code": reason_code,
+            "detail": detail,
+        }
+        # Change-gate on the STABLE key only (runner id + reason code + detail
+        # with volatile numbers stripped): the raw detail carries per-cycle
+        # values (live load counts, heartbeat timestamps), so full-record
+        # comparison would rewrite the task row every cycle for a flapping
+        # pinned runner. The stamped record and status message keep the
+        # volatile detail from the first write of each stable hold state.
+        if _pin_hold_stable_key(ctx.get("runner_pin_hold")) != _pin_hold_stable_key(
+            hold_record
+        ):
+            ctx["runner_pin_hold"] = hold_record
+            task.latest_status_message = message
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: strict runner_target pin "
+            "to %s not dispatchable (%s: %s)",
+            task.id,
+            pin_runner_id,
+            reason_code,
+            detail,
+        )
+        return "held"
 
     # ── Forced-runner hold: operator hard-pinned this job to a specific runner ──
     # When that runner is not eligible this cycle (offline / at capacity / wrong
@@ -1290,6 +1497,9 @@ async def _dispatch_compute_experiment_directly(
         ctx["runner_target_id"] = str(runner.id)
         ctx["runner_hostname"] = runner.hostname
         ctx.pop("awaiting_local_runner_since", None)
+        # A strict-pin hold that is now dispatching must drop its stale hold
+        # reason — the pinned runner became eligible.
+        ctx.pop("runner_pin_hold", None)
         ctx.pop("awaiting_container_runner_since", None)
         ctx.pop(AWAITING_FORCED_RUNNER_CONTEXT_KEY, None)
         task.context = ctx
@@ -1879,8 +2089,26 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             continue
 
         # compute_experiment hold — terminal FAIL (no safe cloud fallback).
+        # A strict runner_target pin gets a truthful, pin-specific reason
+        # (runner id + why it never dispatched) instead of the generic
+        # require-local wording, which would lie about why the task was held.
         hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
-        if is_container_hold:
+        # Most-specific cause wins. A strict runner_target pin gets a truthful,
+        # pin-specific reason (runner id + why it never dispatched) even when the
+        # job also declares a container image — the pin diagnosis already names
+        # the concrete blocker (e.g. that runner has no docker), which is strictly
+        # more actionable than the generic container-capability wording.
+        pin_hold = ctx.get("runner_pin_hold")
+        if isinstance(pin_hold, dict) and pin_hold.get("runner_id"):
+            reason = (
+                f"runner_target: strict-pinned runner {pin_hold.get('runner_id')} "
+                f"did not become eligible within {hours}h "
+                f"(last: {pin_hold.get('reason_code') or 'unknown'}: "
+                f"{pin_hold.get('detail') or 'no detail'}) — bring that runner "
+                f"online / free its capacity, or relaunch without the strict "
+                f"pin, then requeue"
+            )
+        elif is_container_hold:
             reason = (
                 f"container_image: no container-capable runner (docker_usable) "
                 f"became available within {hours}h — enroll a Docker-capable "

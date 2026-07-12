@@ -16255,19 +16255,24 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
     mocker.patch.object(_spawn_mod, "_recover_poisoned_session", _recover_and_report)
     mocker.patch.object(db_session, "flush", _patched_flush)
 
+    # Snapshot the pk before the call: the recovery path under test rolls the
+    # session back, expiring ``task`` — a ``task.id`` read afterwards would
+    # lazy-load synchronously and raise MissingGreenlet on the async engine.
+    task_pk = task.id
+
     payload = AgentStatusPayload(
-        task_id=str(task.id),
+        task_id=str(task_pk),
         status=TaskStatus.FAILED,
         artifact_type=ArtifactType.SMOKETEST_RESULT,
         logs=_json.dumps(smoketest_payload),
     )
 
-    await _spawn_mod.maybe_spawn_smoketest_fix(task, payload, db_session, str(task.id))
+    await _spawn_mod.maybe_spawn_smoketest_fix(task, payload, db_session, str(task_pk))
     await db_session.commit()
 
     # The retry should have produced exactly one plan task.
     result = await db_session.execute(
-        select(Task).where(Task.parent_task_id == task.id)
+        select(Task).where(Task.parent_task_id == task_pk)
     )
     spawned = result.scalars().all()
     assert len(spawned) == 1, (
@@ -16298,7 +16303,7 @@ async def test_smoketest_plan_spawn_retries_on_transient_error(
 
     alert_result = await db_session.execute(
         _select(Alert).where(
-            Alert.task_id == task.id,
+            Alert.task_id == task_pk,
             Alert.title.like("%spawn failed%"),
         )
     )
@@ -23976,6 +23981,9 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     db_session.add(job)
     await db_session.commit()
     await db_session.refresh(job)
+    # Snapshot before the expire_all below: reading ``job.id`` on the expired
+    # instance would lazy-load synchronously → MissingGreenlet on async engine.
+    job_pk_str = str(job.id)
 
     # No wake registration exists yet — the monitor fired nothing (lost-wakeup window).
     pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
@@ -24021,7 +24029,7 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
     )
     assert reg.fired_at is not None
     assert reg.wake_source_kind == COMPUTE_JOB_TERMINAL_WAKE_KIND
-    assert reg.wake_source_ref == str(job.id)
+    assert reg.wake_source_ref == job_pk_str
 
     # The leader sweep finalizes the parked task exactly once.
     delivered = await sweep_deliver_task_wakes(db_session, _utcnow())

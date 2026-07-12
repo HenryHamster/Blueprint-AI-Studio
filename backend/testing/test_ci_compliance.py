@@ -429,9 +429,12 @@ async def test_record_and_get_round_trip_keyed_by_sha(db_session):
     await db_session.commit()
 
     # Round-trip through the real JSONB column: re-fetch from the DB.
+    # Snapshot the id BEFORE expire(): reading an expired attribute emits a
+    # sync lazy-load that raises MissingGreenlet under the asyncpg harness.
+    project_id = project.id
     db_session.expire(project)
     refetched = (
-        await db_session.execute(select(Project).where(Project.id == project.id))
+        await db_session.execute(select(Project).where(Project.id == project_id))
     ).scalar_one()
 
     assert ci_compliance.get_ci_compliance(refetched, sha=_HEAD_SHA) == result

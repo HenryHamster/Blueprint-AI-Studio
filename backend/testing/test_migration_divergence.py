@@ -1348,7 +1348,14 @@ async def test_premerge_guard_blocks_pre_pr_rename_not_removed_by_pr(mocker):
     """Verify that the post-merge exclusion only applies when the PR actually
     removes the conflicting file. A PR that adds an unrelated migration while
     the integration branch carries a pre-existing unauthorized divergence (that
-    the PR does NOT remove) must still be blocked."""
+    the PR does NOT remove) must still be blocked.
+
+    The divergent identity here is deliberately NOT the authorized 0458 pair
+    ({add_perf_indexes, task_updated_at_vm_dispatched_at_indexes}, temporarily
+    registered in AUTHORIZED_DIVERGENCES until PR #14381 lands). Authorization is
+    identity-pair-specific, so a DIFFERENT duplicate identity at revision 0458 is
+    unauthorized and must still hard-block — this test guards the removal-
+    exclusion logic, not the authorization registry."""
     # PR only adds an unrelated 0503 migration; it does NOT touch 0458.
     new_path = f"{_VERSIONS_DIR}/0503_unrelated.py"
     mocker.patch(
@@ -1361,7 +1368,10 @@ async def test_premerge_guard_blocks_pre_pr_rename_not_removed_by_pr(mocker):
             integration=[
                 "0457_encrypt_github_pat.py",
                 "0458_add_perf_indexes.py",
-                "0458_task_updated_at_vm_dispatched_at_indexes.py",
+                # Unauthorized duplicate at 0458 (NOT the registered pair) — the
+                # effective automain 0458 maps to this identity, diverging from
+                # main's add_perf_indexes.
+                "0458_unauthorized_dup_index.py",
                 "0502_something_else.py",
             ],
             promotion=[

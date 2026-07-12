@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Activity, AlertTriangle, Box, Cpu, DollarSign, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Route } from 'lucide-react';
+import { Activity, AlertTriangle, Box, Cpu, DollarSign, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Pin, Route } from 'lucide-react';
 import type { Task } from '../types/task';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { SectionHeader } from './TaskDetailDrawerPrimitives';
@@ -59,6 +59,10 @@ function formatInlineLabel(value?: string | null): string | null {
 function formatCost(value?: number | null): string | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return `$${value.toFixed(2)}`;
+}
+
+function truncateText(value: string, maxChars: number): string {
+  return value.length > maxChars ? `${value.slice(0, maxChars - 1)}…` : value;
 }
 
 function runnerSummary(runner?: SideboardRunnerContext | null): string | null {
@@ -137,6 +141,8 @@ export function TaskSideboardContextSection({
   const blocker = taskContext?.blocker;
   const runner = taskContext?.runner;
   const runnerLabel = runnerSummary(runner);
+  const pinnedRunnerId = runner?.preferred_runner_target_id || null;
+  const pinHold = runner?.runner_pin_hold ?? null;
   const vmCost = formatCost(taskContext?.cost?.estimated_vm_usd);
   const llmCost = formatCost(taskContext?.cost?.llm_usd);
   const hasTaskContext = Boolean(
@@ -226,13 +232,47 @@ export function TaskSideboardContextSection({
           </ContextGroup>
         )}
 
-        {(runnerLabel || vmCost || llmCost || taskContext?.cost?.llm_any_unpriced) && (
+        {(runnerLabel || pinnedRunnerId || pinHold || vmCost || llmCost || taskContext?.cost?.llm_any_unpriced) && (
           <ContextGroup
             icon={<Cpu className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
             label="Runner"
             meta={runner?.spot ? 'spot' : runner?.warm_start ? 'warm' : undefined}
           >
             <div className="grid min-w-0 gap-2">
+              {pinnedRunnerId && (
+                <div className="min-w-0">
+                  <span
+                    data-testid="runner-pin-badge"
+                    title={`Pinned to runner ${pinnedRunnerId}`}
+                    className="inline-flex max-w-full items-center gap-1 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-xs font-semibold text-sky-300"
+                  >
+                    <Pin className="h-3 w-3 shrink-0" aria-hidden="true" />
+                    <span className="truncate font-mono">pinned · {compactTargetId(pinnedRunnerId)}</span>
+                  </span>
+                </div>
+              )}
+              {pinHold && (
+                <div
+                  data-testid="runner-pin-hold"
+                  className="min-w-0 break-words rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-sm text-amber-200"
+                >
+                  <div className="flex items-center gap-1.5 font-semibold">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>
+                      Runner pin hold
+                      {pinHold.reason_code ? ` — ${formatInlineLabel(pinHold.reason_code)}` : ''}
+                    </span>
+                  </div>
+                  {pinHold.detail && (
+                    <div className="mt-1 text-amber-200/90">{truncateText(pinHold.detail, 220)}</div>
+                  )}
+                  {pinHold.runner_id && (
+                    <div className="mt-1 font-mono text-xs text-amber-300/80">
+                      runner {compactTargetId(pinHold.runner_id)}
+                    </div>
+                  )}
+                </div>
+              )}
               {runnerLabel && <ContextValue>{runnerLabel}</ContextValue>}
               {(vmCost || llmCost || taskContext?.cost?.llm_any_unpriced) && (
                 <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">

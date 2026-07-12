@@ -1276,6 +1276,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "conversation_thread": None,
     "recent_interventions": None,   # requires GitHub API fan-out
     "drift_signals": None,          # requires async DB compute
+    "evidence_health": None,        # requires async coverage-summary DB compute
     "memo_citations": None,         # requires cycle-scoped Task query
     # Low — no recovery (in-memory runtime state or tiny unactionable scalars)
     "held_directions": None,        # in-memory shared state, not persisted

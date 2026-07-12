@@ -2427,6 +2427,27 @@ class TestAuditMissingReason:
         # No higher-severity findings to check → does not fire the new reason
         assert rq._audit_missing_reason(report) is None
 
+    def test_a_verified_low_does_not_rescue_unverified_higher_severity(self):
+        """A trusted low finding does NOT make an all-unverified higher-severity
+        report scoreable.
+
+        The fail-closed rule is about the HIGHER-severity findings being
+        unsubstantiated; a 0.02 style-nit deduction is orthogonal noise and must
+        not launder an unverified medium/high into a near-clean score.  So the
+        reason still fires and _score_audit still NULLs the score, even though the
+        deduction loop did move ``derived`` off 1.0."""
+        report = {
+            "findings": [
+                {"severity": "medium", "summary": "Row-vs-ORM false positive."},
+                {"severity": "low", "summary": "Minor style issue."},
+            ]
+        }
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+        audit_score, _ = rq._score_audit(report)
+        assert audit_score is None, (
+            "a lone verified low must not rescue an unverified higher-severity report"
+        )
+
 
 class TestExtractAuditFindings:
     """_extract_audit_findings carries the findings (not just the score) into
@@ -2520,26 +2541,41 @@ class TestExtractAuditFindings:
 
     def test_gate_agrees_with_score_audit_for_unverified(self):
         """When _score_audit treats a finding as undeducted (unverified),
-        _extract_audit_findings must also exclude it."""
+        _extract_audit_findings must also exclude it.
+
+        The report carries a VERIFIED high so it stays scoreable: without it,
+        every higher-severity finding would be unverified and _score_audit would
+        fail-closed to None (``all_findings_unverified``), which is a different
+        contract — pinned separately in TestAuditMissingReason — and would hide
+        the extract/score agreement this test is about."""
         report = {
             "findings": [
+                # Verified high: deducted by _score_audit, carried by extract.
+                # Keeps the report scoreable (not all higher-sev are unverified).
+                {
+                    "severity": "high",
+                    "summary": "Hardcoded credential in config.",
+                    "verification_note": "Read app/config.py lines 10-25: API key hardcoded in a module-level constant.",
+                },
                 # Medium without verification_note: _score_audit skips deduction.
                 {"severity": "medium", "summary": "Row-vs-ORM false positive."},
                 # Low always counted by both functions.
                 {"severity": "low", "summary": "Minor style issue."},
             ]
         }
-        # _score_audit should NOT deduct for the medium finding → score stays 1.0.
+        # _score_audit must NOT deduct for the unverified medium — only the
+        # verified high and the (always-trusted) low.
         audit_score, _ = rq._score_audit(report)
-        assert audit_score == pytest.approx(1.0 - rq._AUDIT_DEDUCTIONS["low"]), (
-            "_score_audit should only deduct for the verified low finding"
-        )
-        # _extract_audit_findings must agree: medium excluded, low present.
+        assert audit_score == pytest.approx(
+            1.0 - rq._AUDIT_DEDUCTIONS["high"] - rq._AUDIT_DEDUCTIONS["low"]
+        ), "_score_audit should only deduct for the verified high and the low finding"
+        # _extract_audit_findings must agree: medium excluded, high + low present.
         out = rq._extract_audit_findings(report)
         severities = [f["severity"] for f in out]
         assert "medium" not in severities, (
             "unverified medium finding must not appear in carried findings"
         )
+        assert "high" in severities, "verified high finding must be carried"
         assert "low" in severities, "low finding must be carried"
 
     def test_caps_count_and_truncates_summary(self):
@@ -14591,6 +14627,21 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
                     "summary": "Potential SQL injection in query builder.",
                     # No verification_note → fails _finding_is_verified → excluded_findings_count
                 },
+                {
+                    # VERIFIED medium the challenger does NOT refute. It survives
+                    # both gates, so the RECONCILED report still carries a verified
+                    # higher-severity finding and stays scoreable. Without it, the
+                    # only higher-sev finding left after the challenge removes the
+                    # XSS would be the unverified SQLi → _score_audit fail-closes to
+                    # None (``all_findings_unverified``) → ``audit_missing`` hard
+                    # blocker → not_promoted, which is a DIFFERENT contract (pinned
+                    # in TestAuditMissingReason) and would mask the two-exclusion-
+                    # count behaviour this test is about.
+                    "severity": "medium",
+                    "summary": "Missing rate limit on the login endpoint.",
+                    "file": "app/api.py",
+                    "verification_note": "Read app/api.py lines 40-70: the login route has no rate-limit decorator.",
+                },
             ],
             "test_erosion": {
                 "deleted_test_files": [],
@@ -14618,7 +14669,22 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
                 "file": "app/templates.py",
                 "verdict": "refuted_false_positive",
                 "reason": "Template output is auto-escaped by the framework — not a real XSS.",
-            }
+            },
+            {
+                # The challenge binds fail-closed: EVERY deductible finding (one
+                # that passed the verification gate) must carry exactly one
+                # verdict, else reconciliation holds with
+                # ``audit_challenge_binding_incomplete`` and respawns the
+                # challenge. The verified medium above is deductible, so it needs
+                # its own verdict. ``confirmed`` (not refuted) keeps it in the
+                # reconciled report, so it still deducts — which is what keeps the
+                # report scoreable and pins the audit sub-score below.
+                "severity": "medium",
+                "summary": "Missing rate limit on the login endpoint.",
+                "file": "app/api.py",
+                "verdict": "confirmed",
+                "reason": "Read app/api.py lines 40-70: the login route genuinely has no rate-limit decorator.",
+            },
         ],
     )
 
@@ -14627,7 +14693,10 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "dry_run"
+    assert result["status"] == "dry_run", (
+        f"expected dry_run, got {result['status']!r} "
+        f"(blocker={result.get('blocker')!r}, confidence={result.get('confidence')!r})"
+    )
     await db_session.refresh(version)
     lq = version.last_qualification
 
@@ -14647,24 +14716,36 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
     )
 
     # 4. findings_derived_score agrees with the applied audit sub-score.
-    #    Only the unverified finding is left after challenge removes the verified one;
-    #    the unverified finding also passes through _score_audit untouched (it has no
-    #    verification_note so it is silently skipped) → derived score is 1.0.
+    #    After the challenge removes the refuted XSS high, the reconciled report
+    #    holds the unverified SQLi high (skipped by the verification gate — no
+    #    deduction) and the verified medium (deducted). Both the applied score and
+    #    the reconciliation record are computed on that same reconciled report, so
+    #    an operator reading the record sees no contradiction.
     applied_audit = lq["sub_scores"]["audit"]
     assert recon["findings_derived_score"] == pytest.approx(applied_audit, abs=0.01), (
         f"findings_derived_score {recon['findings_derived_score']} disagrees with "
         f"applied audit sub-score {applied_audit}"
     )
-    # The refuted verified high finding no longer deducts → audit score is 1.0.
-    assert applied_audit == pytest.approx(1.0, abs=0.01)
+    # The refuted high no longer deducts; only the surviving verified medium does.
+    assert applied_audit == pytest.approx(
+        1.0 - rq._AUDIT_DEDUCTIONS["medium"], abs=0.01
+    )
 
     # 5. Binding record is persisted alongside audit_reconciliation and contains
     #    the refuted entry with verdict + summary fields.
+    #    The challenge binds fail-closed: EVERY deductible finding carries exactly
+    #    one verdict, so both the refuted XSS high and the confirmed medium appear.
+    #    (The unverified SQLi high is not deductible — it never reached the
+    #    challenge — which is precisely the two-exclusion split this test pins.)
     binding = recon.get("challenge_binding_record")
     assert isinstance(binding, list), f"expected list, got {type(binding)}"
-    assert len(binding) == 1, f"expected 1 binding entry, got {len(binding)}"
-    assert binding[0]["verdict"] == "refuted_false_positive"
-    assert "XSS vulnerability" in binding[0]["finding_summary"]
+    assert len(binding) == 2, f"expected 2 binding entries, got {len(binding)}"
+    refuted_entries = [b for b in binding if b["verdict"] == "refuted_false_positive"]
+    assert len(refuted_entries) == 1, "expected exactly one refuted binding entry"
+    assert "XSS vulnerability" in refuted_entries[0]["finding_summary"]
+    confirmed_entries = [b for b in binding if b["verdict"] == "confirmed"]
+    assert len(confirmed_entries) == 1, "expected exactly one confirmed binding entry"
+    assert "rate limit" in confirmed_entries[0]["finding_summary"]
 
 
 @pytest.mark.asyncio
@@ -23188,10 +23269,16 @@ async def test_sweep_commits_each_version_independently(db_session, mocker):
     # finalizes normally; the sweep processes each version in its own
     # try/except + commit, so whichever order the open-versions query returns
     # them in, A's commit lands and B's raise is isolated + rolled back.
+    # Snapshot version B's id as a plain scalar: with the shared-session
+    # factory, _finalize_locked_version's pre-lock rollback expires the test's
+    # instances, and reading ``version_b.id`` inside the side-effect would
+    # raise MissingGreenlet under real ORM expiry (masking the intended
+    # RuntimeError and failing version A's finalize too).
+    version_b_id = version_b.id
     real_finalize = rq._finalize_qualification
 
     async def _flaky_finalize(session, version, *, _pre_gates=None):
-        if version.id == version_b.id:
+        if version.id == version_b_id:
             raise RuntimeError("simulated finalize failure for version B")
         return await real_finalize(session, version, _pre_gates=_pre_gates)
 
@@ -34197,14 +34284,19 @@ async def test_redrive_promotion_failed_red_ci_deduplicates_on_same_sha(
     )
 
     factory = _shared_session_factory(db_session)
+    # Snapshot scalars BEFORE the redrive calls: the second sweep's dedup path
+    # rolls back its (here: shared) session, expiring the test's instances —
+    # an expired sync read then raises MissingGreenlet under real ORM expiry.
+    project_id = project.id
+    version_id = version.id
     # First sweep — creates the Alert and calls harvest.
-    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+    await _redrive_promotion_failed_qualification(version_id, session_factory=factory)
     # Second sweep at the same SHA — must be a no-op.
-    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+    await _redrive_promotion_failed_qualification(version_id, session_factory=factory)
 
     alerts = (
         await db_session.execute(
-            _select(Alert).where(Alert.project_id == project.id)
+            _select(Alert).where(Alert.project_id == project_id)
         )
     ).scalars().all()
     assert len(alerts) == 1, "dedup guard must prevent a second Alert for the same SHA"

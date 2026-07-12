@@ -731,7 +731,8 @@ def build_compute_env(
 
     No provider creds (untrusted experiment code never sees LLM keys) and never a
     full os.environ copy. ``injected`` = BLUEPRINT_RESULT_FILE, BLUEPRINT_ARTIFACT_DIR,
-    CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH, HOME.
+    BLUEPRINT_PROGRESS_FILE, CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH,
+    HOME.
     """
     env: dict[str, str] = {}
     for key in COMPUTE_ENV_PASSTHROUGH:
@@ -1363,6 +1364,7 @@ def plan_compute_execution(
     workspace_host: str,
     result_file_host: str,
     artifact_dir_host: str,
+    progress_file_host: str | None = None,
     clone_dir_host: str | None,
     cwd_host: str | None,
     job_env: dict[str, str],
@@ -1377,7 +1379,11 @@ def plan_compute_execution(
     """Build the sandbox plan for a compute job, or DECLINE (fail-closed).
 
     All ``*_host`` paths are on the runner filesystem; result_file/artifact_dir/
-    clone_dir are expected to live UNDER ``workspace_host`` (the per-job tmpdir).
+    progress_file/clone_dir are expected to live UNDER ``workspace_host`` (the
+    per-job tmpdir). ``progress_file_host`` is optional: when set, every backend
+    injects ``BLUEPRINT_PROGRESS_FILE`` (append-only JSONL the experiment may
+    write interim progress records to); when None the env var is simply absent —
+    byte-identical to the pre-progress behavior.
 
     When ``image`` is set but no container runtime is available, the job is DECLINED
     by default.  Set ``allow_host_fallback=True`` in the launch contract to permit
@@ -1402,6 +1408,13 @@ def plan_compute_execution(
             "BLUEPRINT_ARTIFACT_DIR": artifacts_in or f"{out_mount}/artifacts",
             "HOME": "/workspace" if clone_dir_host else out_mount,
         }
+        if progress_file_host:
+            # Interim-progress channel (append-only JSONL; the runner tails it
+            # between heartbeats). Mirrors BLUEPRINT_RESULT_FILE path translation.
+            inner["BLUEPRINT_PROGRESS_FILE"] = (
+                _rel_to_sandbox(progress_file_host, workspace_host, out_mount)
+                or f"{out_mount}/progress.jsonl"
+            )
         if clone_dir_host:
             binds.append((clone_dir_host, "/workspace"))
             inner["PYTHONPATH"] = "/workspace"
@@ -1451,6 +1464,11 @@ def plan_compute_execution(
             "BLUEPRINT_ARTIFACT_DIR": artifacts_in or "/workspace/artifacts",
             "HOME": "/workspace",
         }
+        if progress_file_host:
+            inner["BLUEPRINT_PROGRESS_FILE"] = (
+                _rel_to_sandbox(progress_file_host, workspace_host, "/workspace")
+                or "/workspace/progress.jsonl"
+            )
         clone_in = _rel_to_sandbox(clone_dir_host, workspace_host, "/workspace")
         if clone_in:
             inner["PYTHONPATH"] = clone_in
@@ -1493,6 +1511,11 @@ def plan_compute_execution(
         or f"{SANDBOX_WORKSPACE}/artifacts",
         "HOME": SANDBOX_HOME,
     }
+    if progress_file_host:
+        injected["BLUEPRINT_PROGRESS_FILE"] = (
+            _rel_to_sandbox(progress_file_host, workspace_host, SANDBOX_WORKSPACE)
+            or f"{SANDBOX_WORKSPACE}/progress.jsonl"
+        )
     clone_in = _rel_to_sandbox(clone_dir_host, workspace_host, SANDBOX_WORKSPACE)
     if clone_in:
         injected["PYTHONPATH"] = clone_in

@@ -525,13 +525,32 @@ def test_extract_viewable_candidates_excludes_nonviewable_and_oversized(monkeypa
     assert cands[0].kind == "image"
 
 
-def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch):
+@pytest.mark.asyncio
+async def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch, mocker):
+    """The total-count cap is enforced by ``_collect_viewable_artifact_candidates``,
+    NOT by the bundle extractor (which returns every qualifying file so the caller
+    can sort deterministically and report a dropped count). A bundle with more
+    viewable files than the cap yields exactly ``cap`` selected candidates, with the
+    remainder surfaced as the dropped count."""
     monkeypatch.setattr(compute_backends, "_MAX_VIEWABLE_FILE_COUNT", 2)
     bundle = _make_tar_gz_bundle(
         {f"./img{i}.png": _PNG_BYTES for i in range(5)}
     )
-    cands = compute_backends._extract_viewable_candidates_from_bundle(bundle)
-    assert len(cands) == 2
+    # The extractor itself does not cap — it returns all 5 qualifying files.
+    assert (
+        len(compute_backends._extract_viewable_candidates_from_bundle(bundle)) == 5
+    )
+    mocker.patch(
+        "app.storage.download_compute_job_artifact_bundle", return_value=bundle
+    )
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends.GCP_BACKEND_NAME
+
+    selected, dropped = await compute_backends._collect_viewable_artifact_candidates(job)
+    assert len(selected) == 2
+    assert dropped == 3
 
 
 def test_extract_viewable_candidates_corrupt_or_empty_bundle_returns_empty():
@@ -619,8 +638,9 @@ async def test_persist_viewable_artifacts_builds_manifest(db_session, mocker):
     gcs_client = mocker.patch("app.storage.storage.Client")
     blob = gcs_client.return_value.bucket.return_value.blob.return_value
 
-    manifest = await compute_backends.persist_viewable_artifacts(job)
+    manifest, dropped = await compute_backends.persist_viewable_artifacts(job)
 
+    assert dropped == 0  # 2 viewable files, well under the count cap
     by_name = {m["filename"]: m for m in manifest}
     assert set(by_name) == {"plot.png", "clip.mp4"}
     assert by_name["plot.png"]["kind"] == "image"
@@ -652,8 +672,8 @@ async def test_persist_viewable_artifacts_corrupt_bundle_degrades(db_session, mo
     )
     upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
 
-    manifest = await compute_backends.persist_viewable_artifacts(job)
-    assert manifest == []
+    manifest, dropped = await compute_backends.persist_viewable_artifacts(job)
+    assert (manifest, dropped) == ([], 0)
     upload.assert_not_called()
 
 
@@ -666,8 +686,8 @@ async def test_persist_viewable_artifacts_missing_bundle_degrades(db_session, mo
     mocker.patch("app.storage.download_compute_job_artifact_bundle", return_value=None)
     upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
 
-    manifest = await compute_backends.persist_viewable_artifacts(job)
-    assert manifest == []
+    manifest, dropped = await compute_backends.persist_viewable_artifacts(job)
+    assert (manifest, dropped) == ([], 0)
     upload.assert_not_called()
 
 

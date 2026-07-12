@@ -142,6 +142,49 @@ export function computeJobExecutionLocation(backend: string): {
   }
 }
 
+/** One gallery-renderable entry normalized from the job's first-class
+ *  `viewable_artifacts` manifest field. */
+export interface GalleryViewableArtifact {
+  name: string;
+  storage_uri: string;
+  kind: 'image' | 'video';
+  bytes: number;
+}
+
+/** Defensive parse of the job's first-class `viewable_artifacts` field — the
+ *  backend's normalized manifest ({filename, storage_uri, content_type,
+ *  size_bytes, kind}) of preview-able files persisted from the job's
+ *  artifacts. Entries missing a `storage_uri` or with an unknown `kind` are
+ *  dropped so a malformed manifest degrades to an empty gallery instead of a
+ *  render crash. */
+export function computeJobViewableArtifacts(job: ComputeJob): GalleryViewableArtifact[] {
+  const raw: unknown = job.viewable_artifacts;
+  if (!Array.isArray(raw)) return [];
+  const items: GalleryViewableArtifact[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.storage_uri !== 'string' || e.storage_uri.length === 0) continue;
+    if (e.kind !== 'image' && e.kind !== 'video') continue;
+    const fallbackName = e.storage_uri.split('/').pop() || 'artifact';
+    items.push({
+      name: typeof e.filename === 'string' && e.filename.length > 0 ? e.filename : fallbackName,
+      storage_uri: e.storage_uri,
+      kind: e.kind,
+      bytes: typeof e.size_bytes === 'number' && Number.isFinite(e.size_bytes) ? e.size_bytes : 0,
+    });
+  }
+  return items;
+}
+
+/** Compact byte-count label for artifact captions. Empty string when unknown. */
+export function fmtBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** Calculate the margin (distance from threshold to actual value).
  *  Positive margin means the result beat the threshold; negative means it missed.
  *  For >= / > operators: margin = value - threshold

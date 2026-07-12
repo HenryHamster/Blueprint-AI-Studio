@@ -6186,6 +6186,9 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
 
     db_session.expire_all()
     await db_session.refresh(job)
+    # Re-load the task too: park_task reads task attributes, and an expired
+    # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
+    await db_session.refresh(task)
     assert job.status == ComputeJobStatus.SUCCEEDED
     assert job.outcome == ComputeJobOutcome.SUCCESS
     # The monitor fired nothing — no registration existed when the job finalized.
@@ -6308,6 +6311,9 @@ async def test_compute_wake_delivery_commit_is_durable_and_single(
 
     db_session.expire_all()
     await db_session.refresh(task)
+    # Re-load the job before mutating it: writing to an expired instance makes
+    # the flush lazy-load old attribute state (MissingGreenlet under asyncpg).
+    await db_session.refresh(job)
     reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
     assert task.status == TaskStatus.PARKED
     assert reg.delivery_state == WakeDeliveryState.PENDING
@@ -6711,6 +6717,10 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
     assert advanced is True
     await db_session.commit()
 
+    # Snapshot the id before expire_all: reading task.id on an expired instance
+    # lazy-loads (MissingGreenlet under real asyncpg expiry).
+    task_id = task.id
+
     # Verify the marker is present on the DELIVERED row (seeded at delivery time).
     db_session.expire_all()
     reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
@@ -6723,7 +6733,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
         (
             await db_session.execute(
                 select(KnowledgeDocument).where(
-                    KnowledgeDocument.source_task_id == task.id
+                    KnowledgeDocument.source_task_id == task_id
                 )
             )
         )
@@ -6752,7 +6762,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
         (
             await db_session.execute(
                 select(KnowledgeDocument).where(
-                    KnowledgeDocument.source_task_id == task.id
+                    KnowledgeDocument.source_task_id == task_id
                 )
             )
         )
@@ -6763,7 +6773,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
     assert _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (reg.source_metadata or {})
     # Exactly one knowledge document persisted, no duplicates
     assert len(docs) == 1
-    assert docs[0].source_task_id == task.id
+    assert docs[0].source_task_id == task_id
 
     # Third sweep: no marker, no new work — idempotent
     third = await sweep_deliver_task_wakes(db_session, _utcnow())
@@ -6773,7 +6783,7 @@ async def test_wake_post_commit_recoverable_when_crash_before_marker_write(
         (
             await db_session.execute(
                 select(KnowledgeDocument).where(
-                    KnowledgeDocument.source_task_id == task.id
+                    KnowledgeDocument.source_task_id == task_id
                 )
             )
         )
@@ -6805,13 +6815,17 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id: the db_session.expire_all() inside the filler loop below
+    # expires `project`, and reading project.id on the next iteration would
+    # lazy-load (MissingGreenlet under real asyncpg expiry).
+    project_id = project.id
 
     # --- Build batch_size DELIVERED rows WITHOUT the marker ---
     # Use the default batch_size of sweep_deliver_task_wakes (10).
     batch_size = 10
     for _ in range(batch_size):
         filler_task = Task(
-            project_id=project.id,
+            project_id=project_id,
             title="compute_experiment: filler no-marker",
             status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "compute_experiment", "base_branch": "main"}],
@@ -6868,13 +6882,15 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
         await db_session.commit()
 
         # Now strip the marker to simulate an already-completed delivery with no
-        # pending post-commit side effects.
+        # pending post-commit side effects.  Snapshot the id first: reading
+        # filler_job.id after expire_all lazy-loads (MissingGreenlet on asyncpg).
+        filler_job_id = str(filler_job.id)
         db_session.expire_all()
         filler_reg = (
             (
                 await db_session.execute(
                     select(TaskWakeRegistration).where(
-                        TaskWakeRegistration.wake_source_ref == str(filler_job.id)
+                        TaskWakeRegistration.wake_source_ref == filler_job_id
                     )
                 )
             )
@@ -6889,7 +6905,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
 
     # --- Build ONE DELIVERED row WITH the marker ---
     marked_task = Task(
-        project_id=project.id,
+        project_id=project_id,
         title="compute_experiment: needs retry",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "compute_experiment", "base_branch": "main"}],
@@ -6930,12 +6946,18 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     )
     await db_session.commit()
 
+    # Snapshot the ids before the expire_all() calls below: reading
+    # marked_job.id / marked_task.id on an expired instance lazy-loads
+    # (MissingGreenlet under real asyncpg expiry).
+    marked_job_id = str(marked_job.id)
+    marked_task_id = marked_task.id
+
     # Deliver the marked row — marker is seeded atomically at delivery time.
     marked_reg = (
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(marked_job.id)
+                    TaskWakeRegistration.wake_source_ref == marked_job_id
                 )
             )
         )
@@ -6951,7 +6973,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(marked_job.id)
+                    TaskWakeRegistration.wake_source_ref == marked_job_id
                 )
             )
         )
@@ -6980,7 +7002,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(marked_job.id)
+                    TaskWakeRegistration.wake_source_ref == marked_job_id
                 )
             )
         )
@@ -6991,7 +7013,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
         (
             await db_session.execute(
                 select(KnowledgeDocument).where(
-                    KnowledgeDocument.source_task_id == marked_task.id
+                    KnowledgeDocument.source_task_id == marked_task_id
                 )
             )
         )
@@ -7002,7 +7024,7 @@ async def test_wake_post_commit_retry_skips_unmarked_delivered_rows(
     assert _COMPUTE_WAKE_POST_COMMIT_META_KEY not in (marked_reg.source_metadata or {})
     # Exactly one knowledge document persisted for the marked task.
     assert len(docs) == 1
-    assert docs[0].source_task_id == marked_task.id
+    assert docs[0].source_task_id == marked_task_id
 
 
 @pytest.mark.asyncio
@@ -7034,6 +7056,10 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id: the db_session.expire_all() inside the backlog loop below
+    # expires `project`, and reading project.id on the next iteration would
+    # lazy-load (MissingGreenlet under real asyncpg expiry).
+    project_id = project.id
 
     batch_size = 10
     # --- Build batch_size DELIVERED rows WITH the marker AND a far-future backoff ---
@@ -7041,7 +7067,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     backlog_regs = []
     for _ in range(batch_size):
         backlog_task = Task(
-            project_id=project.id,
+            project_id=project_id,
             title="compute_experiment: backoff row",
             status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "compute_experiment", "base_branch": "main"}],
@@ -7097,13 +7123,16 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         await deliver_wake(db_session, b_reg, now=_utcnow())
         await db_session.commit()
 
-        # Inject a far-future backoff timestamp so this row is skipped by the sweep.
+        # Inject a far-future backoff timestamp so this row is skipped by the
+        # sweep.  Snapshot the id first: reading backlog_job.id after
+        # expire_all lazy-loads (MissingGreenlet on asyncpg).
+        backlog_job_id = str(backlog_job.id)
         db_session.expire_all()
         b_reg = (
             (
                 await db_session.execute(
                     select(TaskWakeRegistration).where(
-                        TaskWakeRegistration.wake_source_ref == str(backlog_job.id)
+                        TaskWakeRegistration.wake_source_ref == backlog_job_id
                     )
                 )
             )
@@ -7119,7 +7148,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
 
     # --- Build ONE DELIVERED row WITH the marker and WITHOUT next_retry_after ---
     ready_task = Task(
-        project_id=project.id,
+        project_id=project_id,
         title="compute_experiment: ready row",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "compute_experiment", "base_branch": "main"}],
@@ -7160,11 +7189,17 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
     )
     await db_session.commit()
 
+    # Snapshot the ids before the expire_all() calls below: reading
+    # ready_job.id / ready_task.id on an expired instance lazy-loads
+    # (MissingGreenlet under real asyncpg expiry).
+    ready_job_id = str(ready_job.id)
+    ready_task_id = ready_task.id
+
     ready_reg = (
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                    TaskWakeRegistration.wake_source_ref == ready_job_id
                 )
             )
         )
@@ -7180,7 +7215,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                    TaskWakeRegistration.wake_source_ref == ready_job_id
                 )
             )
         )
@@ -7212,7 +7247,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         (
             await db_session.execute(
                 select(TaskWakeRegistration).where(
-                    TaskWakeRegistration.wake_source_ref == str(ready_job.id)
+                    TaskWakeRegistration.wake_source_ref == ready_job_id
                 )
             )
         )
@@ -7226,7 +7261,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         (
             await db_session.execute(
                 select(KnowledgeDocument).where(
-                    KnowledgeDocument.source_task_id == ready_task.id
+                    KnowledgeDocument.source_task_id == ready_task_id
                 )
             )
         )
@@ -7234,7 +7269,7 @@ async def test_wake_post_commit_retry_backlog_cannot_starve_newer_markers(
         .all()
     )
     assert len(docs) == 1
-    assert docs[0].source_task_id == ready_task.id
+    assert docs[0].source_task_id == ready_task_id
 
     # All backlog rows must still have their marker (and far-future backoff) intact.
     for reg_id in backlog_regs:
@@ -8251,8 +8286,11 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
     # instance from the identity map when deliver_wake queries the task row, which
     # makes deliver_wake think the task is not PARKED and marks the registration
     # task_not_parked instead of finalizing.
-    await db_session.refresh(task1)
+    # expire_all BEFORE the refresh: the refresh re-loads task1 so its
+    # attributes (task1.id below) stay readable — an expired instance would
+    # lazy-load and raise MissingGreenlet under real asyncpg expiry.
     db_session.expire_all()
+    await db_session.refresh(task1)
     regs1 = (
         (
             await db_session.execute(
@@ -8552,6 +8590,9 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
 
     db_session.expire_all()
     await db_session.refresh(job2)
+    # Re-load the task too: park_task reads task2 attributes, and an expired
+    # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
+    await db_session.refresh(task2)
     assert job2.status == ComputeJobStatus.SUCCEEDED
     assert job2.outcome == ComputeJobOutcome.SUCCESS
 
@@ -8753,6 +8794,10 @@ async def test_park_wake_timeout_when_job_finished_but_wake_never_fired(db_sessi
     job.outcome = ComputeJobOutcome.SUCCESS
     job.terminal_reason = "completed successfully"
     job.completed_at = completed_at
+    # Commit the job mutations BEFORE expire_all: real ORM expiry discards
+    # pending (unflushed) attribute changes, silently un-finishing the job.
+    db_session.add(job)
+    await db_session.commit()
 
     db_session.expire_all()
     await db_session.refresh(task)
@@ -8975,9 +9020,12 @@ async def test_deliver_wake_noop_when_task_not_parked(db_session):
 
     assert advanced is False, "deliver_wake must return False when task is not PARKED"
 
+    # Snapshot the id before expire_all: reading reg.id on an expired instance
+    # lazy-loads (MissingGreenlet under real asyncpg expiry).
+    reg_id = reg.id
     db_session.expire_all()
     await db_session.refresh(task)
-    reg_fresh = await db_session.get(TaskWakeRegistration, reg.id)
+    reg_fresh = await db_session.get(TaskWakeRegistration, reg_id)
 
     assert task.status == TaskStatus.COMPLETED, (
         "task status must be unchanged (COMPLETED) after no-op delivery"
@@ -8997,7 +9045,7 @@ async def test_deliver_wake_noop_when_task_not_parked(db_session):
     )
 
     db_session.expire_all()
-    reg_again = await db_session.get(TaskWakeRegistration, reg.id)
+    reg_again = await db_session.get(TaskWakeRegistration, reg_id)
     assert reg_again.delivery_state == WakeDeliveryState.FAILED
     assert reg_again.result_state == "task_not_parked"
 
@@ -9054,6 +9102,10 @@ async def test_kill_compute_job_fires_wake_for_parked_task(db_session, monkeypat
     )
     await db_session.commit()
 
+    # Snapshot ids before expire_all: reading them on expired instances
+    # lazy-loads (MissingGreenlet under real asyncpg expiry).
+    job_id = job.id
+    project_id = project.id
     db_session.expire_all()
     await db_session.refresh(task)
     reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
@@ -9073,8 +9125,8 @@ async def test_kill_compute_job_fires_wake_for_parked_task(db_session, monkeypat
     # Operator kill — must fire the wake in the same commit.
     killed = await compute_jobs.kill_compute_job(
         db_session,
-        job_id=job.id,
-        project_id=project.id,
+        job_id=job_id,
+        project_id=project_id,
         killed_by="operator@test.com",
     )
     assert killed.status == ComputeJobStatus.CANCELLED
@@ -9477,6 +9529,9 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Snapshot the id: the expire_all() calls below expire `project`, and
+    # reading project.id afterwards lazy-loads (MissingGreenlet on asyncpg).
+    project_id = project.id
 
     monkeypatch.setattr(
         "app.task_completion.broadcast_to_project", AsyncMock(return_value=None)
@@ -9496,7 +9551,7 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
     async def _make_parked_task_and_terminal_job(final_cost_usd: float):
         """Create a parked compute_experiment task backed by a terminal job."""
         task = Task(
-            project_id=project.id,
+            project_id=project_id,
             title="compute_experiment: cost ceiling test",
             status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "compute_experiment", "base_branch": "main"}],
@@ -9547,7 +9602,7 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
 
     db_session.expire_all()
     alerts_b = (
-        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        (await db_session.execute(select(Alert).where(Alert.project_id == project_id)))
         .scalars()
         .all()
     )
@@ -9564,7 +9619,7 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
         (
             await db_session.execute(
                 select(Alert).where(
-                    Alert.project_id == project.id,
+                    Alert.project_id == project_id,
                     Alert.title == "Daily cost ceiling exceeded",
                     Alert.severity == AlertSeverity.WARNING,
                 )
@@ -9587,7 +9642,7 @@ async def test_compute_wake_finalization_triggers_daily_cost_ceiling_alert(
         (
             await db_session.execute(
                 select(Alert).where(
-                    Alert.project_id == project.id,
+                    Alert.project_id == project_id,
                     Alert.title == "Daily cost ceiling exceeded",
                     Alert.severity == AlertSeverity.WARNING,
                 )
@@ -13959,9 +14014,12 @@ def test_materialize_local_manifest_accepts_normal_path():
 
 
 @pytest.mark.asyncio
-async def test_retry_provisioning_timeout_extends_deadline(db_session):
+async def test_retry_provisioning_timeout_extends_deadline(db_session, monkeypatch):
     """``_maybe_retry_provisioning_timeout`` extends the provisioning deadline
     and increments the retry counter when retry budget remains."""
+    # backend_name="local-subprocess" requires LOCAL_MODE; the CI shards do not
+    # export LOCAL_MODE=true (unlike the local harness), so patch explicitly.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
     project = Project(name="Prov Retry", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -14012,9 +14070,12 @@ async def test_retry_provisioning_timeout_extends_deadline(db_session):
 
 
 @pytest.mark.asyncio
-async def test_retry_provisioning_timeout_exhausted(db_session):
+async def test_retry_provisioning_timeout_exhausted(db_session, monkeypatch):
     """``_maybe_retry_provisioning_timeout`` returns False when max retries have
     been consumed, so the caller proceeds with the terminal transition."""
+    # backend_name="local-subprocess" requires LOCAL_MODE; the CI shards do not
+    # export LOCAL_MODE=true (unlike the local harness), so patch explicitly.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
     project = Project(name="Prov Retry Exhaust", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -14060,9 +14121,12 @@ async def test_retry_provisioning_timeout_exhausted(db_session):
 
 
 @pytest.mark.asyncio
-async def test_retry_provisioning_timeout_already_terminal(db_session):
+async def test_retry_provisioning_timeout_already_terminal(db_session, monkeypatch):
     """``_maybe_retry_provisioning_timeout`` returns True (no-op) when the job
     is already terminal (concurrent race)."""
+    # backend_name="local-subprocess" requires LOCAL_MODE; the CI shards do not
+    # export LOCAL_MODE=true (unlike the local harness), so patch explicitly.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
     project = Project(name="Prov Retry Term", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
@@ -15085,10 +15149,13 @@ def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
             _tag_exists=lambda *a, **k: False,
             _scan_layers_fn=fake_layer_scan,
         )
-    # Build was called, push was NOT.
+    # Build was called, push was NOT. Match the push COMMAND specifically
+    # (not a bare "push" substring, which false-matches the pytest tmp_path —
+    # this test function's name contains "push", so the repo_dir arg baked into
+    # the joined `docker build … <repo_dir>` string contains it too).
     flat = [" ".join(c) for c in cmds]
     assert any(c.startswith("docker build") for c in flat)
-    assert not any("push" in c for c in flat)
+    assert not any(c.startswith("docker push") for c in flat)
     assert len(layer_scan_called_with) == 1
 
 

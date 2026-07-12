@@ -49,12 +49,17 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
     db_session,
 ):
     project = await _make_project(db_session)
+    # Snapshot the id: the failed-command path inside
+    # execute_work_session_command rolls back the session, expiring
+    # ``project`` — later ``project.id`` lazy-loads would raise
+    # MissingGreenlet under real ORM expiry.
+    project_id = project.id
     alert_id = uuid.uuid4()
-    command = _dismiss_alert_command(project.id, alert_id)
+    command = _dismiss_alert_command(project_id, alert_id)
 
     result = await execute_work_session_command(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         user_id=TEST_USER_ID,
         command=command,
         idempotency_key="failed-alert-dismiss-1",
@@ -70,7 +75,7 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
     }
     assert result["receipt"]["target"] == {
         "surface": "runtime",
-        "project_id": str(project.id),
+        "project_id": str(project_id),
         "section": "health",
         "alert_id": str(alert_id),
         "action": "dismiss_alert",
@@ -88,7 +93,7 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
 
     jobs = await build_work_session_command_jobs(
         db_session,
-        project.id,
+        project_id,
         user_id=TEST_USER_ID,
     )
     assert jobs["items"][0]["id"] == str(receipt.id)
@@ -97,7 +102,7 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
 
     duplicate = await execute_work_session_command(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         user_id=TEST_USER_ID,
         command=command,
         idempotency_key="failed-alert-dismiss-1",
@@ -106,11 +111,11 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
     assert duplicate["receipt"]["id"] == str(receipt.id)
     assert duplicate["receipt"]["status"] == "failed"
 
-    other_command = _dismiss_alert_command(project.id, uuid.uuid4())
+    other_command = _dismiss_alert_command(project_id, uuid.uuid4())
     with pytest.raises(HTTPException) as exc_info:
         await execute_work_session_command(
             db_session,
-            project_id=project.id,
+            project_id=project_id,
             user_id=TEST_USER_ID,
             command=other_command,
             idempotency_key="failed-alert-dismiss-1",
@@ -119,7 +124,7 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
 
     receipts = (
         await db_session.execute(
-            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            select(ProjectMessage).where(ProjectMessage.project_id == project_id)
         )
     ).scalars().all()
     assert len(receipts) == 1
@@ -287,14 +292,19 @@ async def test_drifted_executable_descriptors_do_not_apply_or_persist_receipts(
 @pytest.mark.asyncio
 async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_session):
     project = await _make_project(db_session)
+    # Snapshot the id: the stale-clear 409 path inside
+    # execute_work_session_command rolls back the session, expiring
+    # ``project`` — later ``project.id`` lazy-loads would raise
+    # MissingGreenlet under real ORM expiry.
+    project_id = project.id
     runner = LocalRunner(
-        project_id=project.id,
+        project_id=project_id,
         token_hash="a" * 64,
         hostname="desk-mini",
         status="active",
     )
     stale_runner = LocalRunner(
-        project_id=project.id,
+        project_id=project_id,
         token_hash="b" * 64,
         hostname="old-desk",
         status="active",
@@ -311,7 +321,7 @@ async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_sessio
         "enabled": True,
         "target": {
             "surface": "runtime",
-            "project_id": str(project.id),
+            "project_id": str(project_id),
             "section": "devices",
             "action": "prefer_runner",
             "runner_id": runner_id,
@@ -319,21 +329,21 @@ async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_sessio
         "refetch_surfaces": ["strategic_session", "runtime"],
         "mutation": {
             "method": "POST",
-            "path": f"/api/admin/projects/{project.id}/strategic-session",
+            "path": f"/api/admin/projects/{project_id}/strategic-session",
             "body": {"workbench": {"preferred_runner_id": runner_id}},
         },
     }
 
     prefer_result = await execute_work_session_command(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         user_id=TEST_USER_ID,
         command=prefer_command,
         idempotency_key="prefer-runner-a-1",
     )
 
     assert prefer_result["status"] == "succeeded"
-    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project_id)
     assert prefs is not None
     assert prefs.prefs["_strategic_workbench"]["preferred_runner_id"] == runner_id
 
@@ -343,7 +353,7 @@ async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_sessio
         "enabled": True,
         "target": {
             "surface": "runtime",
-            "project_id": str(project.id),
+            "project_id": str(project_id),
             "section": "devices",
             "action": "clear_preferred_runner",
             "runner_id": stale_runner_id,
@@ -351,21 +361,21 @@ async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_sessio
         "refetch_surfaces": ["strategic_session", "runtime"],
         "mutation": {
             "method": "POST",
-            "path": f"/api/admin/projects/{project.id}/strategic-session",
+            "path": f"/api/admin/projects/{project_id}/strategic-session",
             "body": {"workbench": {"preferred_runner_id": None}},
         },
     }
     with pytest.raises(HTTPException) as exc_info:
         await execute_work_session_command(
             db_session,
-            project_id=project.id,
+            project_id=project_id,
             user_id=TEST_USER_ID,
             command=stale_clear_command,
             idempotency_key="clear-runner-stale-1",
         )
     assert exc_info.value.status_code == 409
 
-    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project_id)
     assert prefs is not None
     assert prefs.prefs["_strategic_workbench"]["preferred_runner_id"] == runner_id
 
@@ -378,14 +388,14 @@ async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_sessio
     }
     clear_result = await execute_work_session_command(
         db_session,
-        project_id=project.id,
+        project_id=project_id,
         user_id=TEST_USER_ID,
         command=clear_command,
         idempotency_key="clear-runner-a-1",
     )
 
     assert clear_result["status"] == "succeeded"
-    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project_id)
     assert prefs is not None
     assert prefs.prefs["_strategic_workbench"].get("preferred_runner_id") is None
 

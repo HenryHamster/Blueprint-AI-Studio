@@ -47,22 +47,31 @@ const mockJob: ComputeJob = {
   },
 };
 
-vi.mock('../api', () => ({
-  authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
-  apiFetch: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
-  API_BASE_URL: 'http://localhost:8000',
-  fetchComputeJobs: vi.fn(async () => ({
-    jobs: [mockJob],
-    hasMore: false,
-    summary: { total_jobs: 1, active_jobs: 0, terminal_jobs: 1, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 },
-    limit: 50,
-    offset: 0,
-  })),
-  fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '' })),
-  resolveArtifactDownloadUrl: vi.fn(async () => ''),
-  resolveViewportFailureDownloadUrl: vi.fn(async () => ''),
-  resolveViewportShotDownloadUrl: vi.fn(async () => ''),
-}));
+// TaskDetailDrawerSections' module graph statically imports many named exports
+// from '../api' (e.g. fetchTaskSerialConsole via TaskDetailDrawerDiagnostics);
+// browser-mode ESM requires the mock factory to expose EVERY export the graph
+// imports or the linker fails at import time. createApiMock provides the
+// complete, typecheck-enforced export surface so new api.ts exports can't
+// silently break this factory again.
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+    apiFetch: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+    API_BASE_URL: 'http://localhost:8000',
+    fetchComputeJobs: vi.fn(async () => ({
+      jobs: [mockJob],
+      hasMore: false,
+      summary: { total_jobs: 1, active_jobs: 0, terminal_jobs: 1, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 },
+      limit: 50,
+      offset: 0,
+    })),
+    fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '' })),
+    resolveArtifactDownloadUrl: vi.fn(async () => ''),
+    resolveViewportFailureDownloadUrl: vi.fn(async () => ''),
+    resolveViewportShotDownloadUrl: vi.fn(async () => ''),
+  });
+});
 
 const computeTask: Task = {
   id: 'task-compute-1',

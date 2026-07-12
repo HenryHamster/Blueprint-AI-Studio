@@ -2956,11 +2956,15 @@ async def test_spawn_strategic_review_aborts_when_strategic_task_appears_mid_bui
     await db_session.commit()
     await db_session.refresh(project)
     await _seed_legacy_cycles(db_session, project)
+    # Snapshot the id: the guarded-bail path rolls the session back, which
+    # expires every ORM instance — a post-bail project.id read would emit a
+    # sync lazy-load and raise MissingGreenlet under the asyncpg harness.
+    project_id = project.id
 
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is False
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(select(Task).where(Task.project_id == project_id))
     assert result.scalars().all() == []
 
 
@@ -2978,11 +2982,14 @@ async def test_spawn_strategic_review_aborts_when_peer_holds_spawn_lock_at_inser
     await db_session.commit()
     await db_session.refresh(project)
     await _seed_legacy_cycles(db_session, project)
+    # Snapshot the id: the advisory-lock bail rolls the session back, which
+    # expires every ORM instance (see the mid-build test above).
+    project_id = project.id
 
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is False
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(select(Task).where(Task.project_id == project_id))
     assert result.scalars().all() == []
 
 
@@ -3003,8 +3010,16 @@ async def test_spawn_strategic_review_bail_survives_rollback_expiry(db_session, 
     SQLAlchemy expires every instance in the identity map on rollback (expire_on_commit=False
     does not apply to rollback). Accessing project.id after rollback used to trigger a
     synchronous lazy-load that raises MissingGreenlet in async context (BUG_REPORT e530efec).
-    The fix captures project.id before rolling back; this test confirms the bail path returns
-    False cleanly rather than propagating the greenlet exception.
+    The fix captures project scalars at function entry (while the instance is live — the
+    documented precondition: callers pass a fresh-read project) so nothing after the
+    finalize bail's rollback touches the expirable instance.
+
+    The advisory-lock refusal below makes ``_finalize_strategic_review_spawn`` execute a
+    REAL ``session.rollback()`` mid-flow — under the Postgres harness that genuinely
+    expires every ORM instance, so any post-rollback ``project.<attr>`` read in the bail
+    tail would propagate MissingGreenlet and fail this test. (An entry-time
+    ``db_session.expire(project)`` would instead violate the fresh-read precondition and
+    break the top-of-function guard, which legitimately reads the live instance.)
     """
     mocker.patch(
         "app.autonomous_research._try_research_spawn_advisory_lock",
@@ -3016,14 +3031,8 @@ async def test_spawn_strategic_review_bail_survives_rollback_expiry(db_session, 
     await db_session.refresh(project)
     await _seed_legacy_cycles(db_session, project)
 
-    # Expire the project instance — simulates what SQLAlchemy does on rollback.
-    # After expire(), any attribute access on the instance without an active
-    # async IO context raises MissingGreenlet (the same failure mode as
-    # post-rollback access).  The bail path must not access ORM attributes
-    # after the rollback, so this expiry is functionally equivalent.
-    db_session.expire(project)
-
-    # Must return False without raising
+    # Must return False without raising: the finalize bail rolls back (expiring
+    # all instances) and everything after it must use the entry-time snapshots.
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is False

@@ -377,9 +377,13 @@ async def test_expire_project_with_no_proposed_directions(db_session):
     )
     db_session.add(project)
     await db_session.commit()
+    # Snapshot the id before the sweep: its trailing rollback expires all
+    # instances in the session, so a post-sweep ``project.id`` lazy-load
+    # would raise MissingGreenlet under real ORM expiry.
+    project_id = project.id
     count = await _expire_stale_proposals(db_session)
     assert count == 0
-    dirs = await _reload_directions(db_session, project.id)
+    dirs = await _reload_directions(db_session, project_id)
     assert dirs[0]["status"] == "active"
 
 
@@ -400,9 +404,11 @@ async def test_expire_recent_proposal_preserved(db_session):
     )
     db_session.add(project)
     await db_session.commit()
+    # Snapshot before the sweep's trailing rollback expires the instance.
+    project_id = project.id
     count = await _expire_stale_proposals(db_session)
     assert count == 0
-    dirs = await _reload_directions(db_session, project.id)
+    dirs = await _reload_directions(db_session, project_id)
     assert dirs[0]["status"] == "proposed"
     assert "expired_at" not in dirs[0]
 
@@ -449,9 +455,11 @@ async def test_expire_ignores_non_proposed_directions(db_session):
     )
     db_session.add(project)
     await db_session.commit()
+    # Snapshot before the sweep's trailing rollback expires the instance.
+    project_id = project.id
     count = await _expire_stale_proposals(db_session)
     assert count == 0
-    dirs = await _reload_directions(db_session, project.id)
+    dirs = await _reload_directions(db_session, project_id)
     assert dirs[0]["status"] == "active"
     assert dirs[1]["status"] == "expired"
 
@@ -504,11 +512,14 @@ async def test_expire_multiple_projects_mixed(db_session):
     )
     db_session.add_all([p1, p2, p3])
     await db_session.commit()
+    # Snapshot ids before the sweep: its trailing rollback (taken for the
+    # unchanged project) expires ALL instances in the session.
+    p1_id, p2_id, p3_id = p1.id, p2.id, p3.id
     count = await _expire_stale_proposals(db_session)
     assert count == 3
-    d1 = await _reload_directions(db_session, p1.id)
-    d2 = await _reload_directions(db_session, p2.id)
-    d3 = await _reload_directions(db_session, p3.id)
+    d1 = await _reload_directions(db_session, p1_id)
+    d2 = await _reload_directions(db_session, p2_id)
+    d3 = await _reload_directions(db_session, p3_id)
     assert d1[0]["status"] == "expired"
     assert d1[1]["status"] == "proposed"
     assert d2[0]["status"] == "expired"

@@ -629,6 +629,11 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         consumer, db_session, [artifact.id]
     )
     assert len(rows) == 1
+    # Flush BEFORE refreshing: refresh() expires the instance first, which
+    # under real ORM expiry discards its still-pending context change — the
+    # explicit flush persists the helper's flag_modified updates so the
+    # refresh below genuinely round-trips them through the DB.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
 
@@ -734,6 +739,8 @@ async def test_explicit_consumed_artifact_ids_ignore_undelivered_ids(db_session)
         [delivered_artifact.id, stray_artifact.id],
     )
     assert len(rows) == 1
+    # Flush before refresh — see test_consumed_downstream_artifact_upgrades_to_proven.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
 
@@ -852,6 +859,8 @@ async def test_legacy_omitted_consumed_artifact_ids_falls_back(db_session):
         consumer, db_session, None, modern_agent=False
     )
     assert len(rows) == 1
+    # Flush before refresh — see test_consumed_downstream_artifact_upgrades_to_proven.
+    await db_session.flush()
     await db_session.refresh(producer)
     await db_session.refresh(consumer)
     # Legacy fallback DID record consumption

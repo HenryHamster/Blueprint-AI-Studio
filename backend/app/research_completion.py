@@ -5595,6 +5595,36 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session, task, stage="child-task spawn"
     ):
         return
+    # The self-claim recovery path inside _commit_or_handle_duplicate_spawn
+    # rolls the session back before re-committing, which expires EVERY loaded
+    # ORM instance (rollback expires even with expire_on_commit=False). The
+    # helper re-populates ``task`` itself, but the other instances this
+    # function keeps reading below (project_obj, the dedup scans) would
+    # otherwise lazy-load synchronously on the next attribute access —
+    # MissingGreenlet under the async engine. Detect the rollback via the
+    # ``expired`` flag (no IO) and batch re-populate in place;
+    # ``populate_existing`` refreshes the SAME identity-map instances, so
+    # every existing reference becomes live again.
+    from sqlalchemy import inspect as _sa_inspect
+
+    with session.no_autoflush:
+        if project_obj is not None and _sa_inspect(project_obj).expired:
+            await session.execute(
+                select(Project)
+                .where(Project.id == _sa_inspect(project_obj).identity[0])
+                .execution_options(populate_existing=True)
+            )
+        _stale_scan_ids = [
+            _sa_inspect(t).identity[0]
+            for t in (*existing_tasks, *recent_tasks_for_dedup)
+            if _sa_inspect(t).expired
+        ]
+        if _stale_scan_ids:
+            await session.execute(
+                select(Task)
+                .where(Task.id.in_(_stale_scan_ids))
+                .execution_options(populate_existing=True)
+            )
     # Batch-reload all child tasks (N+1 guard: commit above expired the
     # session; one batch SELECT + identity-map lookups replaces N individual
     # session.refresh calls). Build a fresh map so the downstream code that

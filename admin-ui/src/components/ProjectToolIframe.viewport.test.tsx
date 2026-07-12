@@ -50,7 +50,12 @@ describe('ProjectToolIframe — viewport regression', () => {
       await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     });
     if (!host) throw new Error('host not mounted');
-    expect(host.textContent).toContain('Loading tool');
+    // The mocked token fetch resolves inside act, so the component has settled
+    // into its ready state: the loading placeholder is gone and the sandboxed
+    // opaque-origin iframe is the real signal that the tool rendered.
+    const iframe = host.querySelector('iframe');
+    expect(iframe).not.toBeNull();
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
   });
 
   test('renders iframe without overflow at 1440px', async () => {
@@ -64,7 +69,9 @@ describe('ProjectToolIframe — viewport regression', () => {
       await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     });
     if (!host) throw new Error('host not mounted');
-    expect(host.textContent).toContain('Loading tool');
+    const iframe = host.querySelector('iframe');
+    expect(iframe).not.toBeNull();
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
   });
 
   test('shows error state without overflow at 375px', async () => {
@@ -82,6 +89,9 @@ describe('ProjectToolIframe — viewport regression', () => {
   });
 
   test('no text truncation at 375px while loading', async () => {
+    // Hold the token fetch pending so the component actually stays in its
+    // loading state for the duration of the truncation check.
+    vi.mocked(fetchAssetToken).mockReturnValue(new Promise(() => {}));
     await expectNoTextTruncationAt(375, async () => {
       host = document.createElement('div');
       document.body.appendChild(host);
@@ -90,5 +100,7 @@ describe('ProjectToolIframe — viewport regression', () => {
       await act(async () => { r.render(<ProjectToolIframe projectId="proj-a" tool={MANIFEST_TOOL} />); });
       await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     });
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Loading tool');
   });
 });

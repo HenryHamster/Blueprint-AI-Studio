@@ -896,11 +896,29 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   // cloud normally).
   let localRunnerNote = '';
   const localRunnerStatus = payload.local_runner_status as
-    { ever_registered?: boolean; active_total?: number; active_gpu?: number } | undefined;
+    { ever_registered?: boolean; active_total?: number; active_gpu?: number; devices?: Array<Record<string, unknown>> } | undefined;
   if (localRunnerStatus && typeof localRunnerStatus === 'object' && !Array.isArray(localRunnerStatus)) {
     const activeGpu = typeof localRunnerStatus.active_gpu === 'number' ? localRunnerStatus.active_gpu : 0;
     if (activeGpu > 0) {
       localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
+      // Bounded per-device summary (when the backend advertises it) so authored
+      // experiments are sized to the hardware that will actually run them.
+      const devices = Array.isArray(localRunnerStatus.devices) ? localRunnerStatus.devices : [];
+      const deviceBits = devices.slice(0, 8).map((d) => {
+        if (!d || typeof d !== 'object') return '';
+        const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
+        const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
+        const models = Array.isArray(d.gpu_models) ? (d.gpu_models as unknown[]).filter((m) => typeof m === 'string').join('/') : '';
+        const vramVals = Array.isArray(d.gpu_vram_mib)
+          ? (d.gpu_vram_mib as unknown[]).filter((v): v is number => typeof v === 'number' && v > 0)
+          : [];
+        const vram = vramVals.length > 0 ? ` ${Math.min(...vramVals)} MiB/GPU` : '';
+        const containers = d.container_ok === true ? 'containers OK' : 'NO container runtime';
+        return `${name}: ${gpuCount}x GPU${models ? ` (${models})` : ''}${vram}, ${containers}`;
+      }).filter((b) => b !== '');
+      if (deviceBits.length > 0) {
+        localRunnerNote += ` Devices: ${deviceBits.join('; ')}. Size any GPU experiment to fit the listed VRAM and only use container_image on a device with a container runtime.`;
+      }
     } else if (localRunnerStatus.ever_registered) {
       localRunnerNote = `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
     }

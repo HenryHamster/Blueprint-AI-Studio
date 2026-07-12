@@ -1785,9 +1785,12 @@ def _extract_viewable_candidates_from_bundle(
     (via :func:`storage.sanitize_viewable_relpath`), NOT the bare basename, so a
     multi-arm sweep whose arms each write a same-named plot
     (``arm1/reward.png`` vs ``arm2/reward.png``) yields distinct candidates
-    instead of collapsing to one. Enforces the per-file size cap and the
-    total-count cap, dedupes by that sanitized relpath (first occurrence wins),
-    and classifies each as ``image``/``video``. A traversal/absolute member path
+    instead of collapsing to one. Enforces the per-file size cap, dedupes by that
+    sanitized relpath (first occurrence wins), and classifies each as
+    ``image``/``video``. The total-count cap is NOT applied here — every
+    qualifying file is returned so the caller can sort deterministically before
+    capping; :func:`_collect_viewable_artifact_candidates` enforces the count cap
+    and reports the dropped count. A traversal/absolute member path
     sanitizes to ``None`` and is skipped. Defensive by contract: a non-gzip/
     non-tar blob or ANY parse error yields ``[]``.
     """
@@ -1830,6 +1833,32 @@ def _extract_viewable_candidates_from_bundle(
     return out
 
 
+def _is_under_artifact_root(real_path: str, real_root: str) -> bool:
+    """True iff *real_path* (already realpath'd) is *real_root* or inside it."""
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
+    """Read a regular file for preview persistence, refusing to follow symlinks.
+
+    Re-checks ``islink`` + realpath containment at read time and opens with
+    ``O_NOFOLLOW`` where the platform supports it, closing the scan→read
+    TOCTOU window (an entry swapped for a symlink after the scan is refused
+    by the kernel, not just by the earlier stat). Returns ``None`` on any
+    refusal/error — callers skip the file.
+    """
+    if os.path.islink(path):
+        return None
+    if not _is_under_artifact_root(os.path.realpath(path), artifact_root):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as file_handle:
+            return file_handle.read(_MAX_VIEWABLE_FILE_BYTES + 1)
+    except OSError:
+        return None
+
+
 def _collect_viewable_candidates_from_dir(
     artifact_dir: str,
 ) -> list[ViewableArtifactCandidate]:
@@ -1843,18 +1872,43 @@ def _collect_viewable_candidates_from_dir(
     (``arm1/reward.png`` vs ``arm2/reward.png``) stay distinct instead of
     collapsing to one. Returns ``[]`` for a missing/empty/unreadable dir or on
     ANY OS error — never raises.
+
+    SECURITY — symlink exfiltration guard: the artifact dir was writable by the
+    experiment command, and this scan runs on the HOST after the run — a
+    planted symlink (e.g. ``loss_curve.png -> /etc/passwd`` or an operator
+    credentials file) must never be dereferenced and persisted as a
+    viewer-accessible preview. Symlinks are excluded at every layer:
+    ``followlinks=False`` on the walk, symlinked dirs pruned, symlinked entries
+    skipped, a realpath containment check against the artifact root, and an
+    ``O_NOFOLLOW`` read (:func:`_read_viewable_file_nofollow`) so an entry
+    swapped for a symlink between scan and read (TOCTOU) is refused by the
+    kernel, not just by the earlier stat.
     """
-    if not artifact_dir or not os.path.isdir(artifact_dir):
+    if (
+        not artifact_dir
+        or not os.path.isdir(artifact_dir)
+        or os.path.islink(artifact_dir)
+    ):
         return []
+    artifact_root = os.path.realpath(artifact_dir)
     out: list[ViewableArtifactCandidate] = []
     seen: set[str] = set()
     try:
-        for root, _dirs, files in os.walk(artifact_dir):
+        for root, dirs, files in os.walk(artifact_dir, followlinks=False):
+            dirs[:] = [
+                d for d in dirs if not os.path.islink(os.path.join(root, d))
+            ]
             for name in sorted(files):
                 classified = storage.viewable_content_type_for_filename(name)
                 if classified is None:
                     continue
                 path = os.path.join(root, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                if not _is_under_artifact_root(
+                    os.path.realpath(path), artifact_root
+                ):
+                    continue
                 relpath = os.path.relpath(path, artifact_dir)
                 relname = storage.sanitize_viewable_relpath(relpath)
                 if relname is None or relname in seen:
@@ -1865,11 +1919,7 @@ def _collect_viewable_candidates_from_dir(
                     continue
                 if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
                     continue
-                try:
-                    with open(path, "rb") as file_handle:
-                        data = file_handle.read(_MAX_VIEWABLE_FILE_BYTES + 1)
-                except OSError:
-                    continue
+                data = _read_viewable_file_nofollow(path, artifact_root)
                 if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
                     continue
                 content_type, kind = classified
@@ -1930,7 +1980,8 @@ async def persist_viewable_artifacts(
 ) -> tuple[list[dict[str, Any]], int]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
-    Extracts the viewable files (png/jpg/jpeg/webp/gif/svg/mp4/webm) from the
+    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
+    can execute script when served from a signed URL) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
     returns ``(manifest, dropped)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored

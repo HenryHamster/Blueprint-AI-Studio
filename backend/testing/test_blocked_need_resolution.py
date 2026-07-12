@@ -608,10 +608,11 @@ def test_working_capability_proof_status_backing_paths_are_partial():
     )
 
 
-def test_working_capability_proof_status_backing_path_evidence_ref_is_partial():
+def test_working_capability_proof_status_backing_path_evidence_ref_is_path_proven():
     """A working cap whose ONLY evidence_ref is a proven ``backing_path`` reads
-    ``partial`` (not ``proven``): a file-existence proof is not machine-verified
-    corroboration, so it must NOT clear the enforce gate on its own."""
+    ``path_proven`` (the distinct structural-only tier, not ``proven``): a
+    file-existence proof is not machine-verified corroboration, so it must NOT
+    clear the enforce gate on its own (the gate passes only ``proven``)."""
     from app.capability_registry import (
         capability_need_blocked_by_proof_gate,
         working_capability_proof_status,
@@ -638,7 +639,7 @@ def test_working_capability_proof_status_backing_path_evidence_ref_is_partial():
         ]
     )
     proof = working_capability_proof_status(model)
-    assert proof["backing-only"] == "partial"
+    assert proof["backing-only"] == "path_proven"
     assert proof["corroborated"] == "proven"
 
     # Enforce mode: the backing-only cap stays gated; the corroborated one clears.
@@ -774,25 +775,37 @@ def _capability_blocker_task(ref: str, project_id=None):
     return task
 
 
-def _classify_capability_need(ref: str, proof_map: dict, *, proof_gate_mode: str = "off") -> dict:
-    """Run ``_classify_blocker_needs`` with every candidate cache pre-populated
+async def _classify_capability_need_async(
+    ref: str, proof_map: dict, *, proof_gate_mode: str = "off"
+) -> dict:
+    """Await ``_classify_blocker_needs`` with every candidate cache pre-populated
     (so no DB/session is touched) and the registry proof map injected — returns
-    the disposition dict, isolating the registry/proof-gate branch."""
+    the disposition dict, isolating the registry/proof-gate branch.
+
+    Async-native so it is safe to call from ``async def`` tests already running
+    inside an event loop; the sync :func:`_classify_capability_need` wrapper below
+    drives it via ``asyncio.run`` for the many synchronous ``def`` tests."""
     from app import blocked_task_unblock_sweeps as btu
 
     task = _capability_blocker_task(ref)
     pid = task.project_id
+    return await btu._classify_blocker_needs(
+        task,
+        None,
+        candidate_cache={pid: []},
+        completed_cache={pid: []},
+        dead_cache={pid: []},
+        knowledge_cache={pid: []},
+        registry_cache={pid: proof_map},
+        proof_gate_mode=proof_gate_mode,
+    )
+
+
+def _classify_capability_need(ref: str, proof_map: dict, *, proof_gate_mode: str = "off") -> dict:
+    """Synchronous wrapper around :func:`_classify_capability_need_async` for
+    ``def`` tests (no running event loop)."""
     return asyncio.run(
-        btu._classify_blocker_needs(
-            task,
-            None,
-            candidate_cache={pid: []},
-            completed_cache={pid: []},
-            dead_cache={pid: []},
-            knowledge_cache={pid: []},
-            registry_cache={pid: proof_map},
-            proof_gate_mode=proof_gate_mode,
-        )
+        _classify_capability_need_async(ref, proof_map, proof_gate_mode=proof_gate_mode)
     )
 
 
@@ -2898,7 +2911,7 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
     # ── Phase 2: blocked-resume seam — proven cap routes need to completed_needs ──
     # Simulate proof being recorded: the capability is now proven.
     proven_proof_map = {"container-runtime": "proven"}
-    disp = _classify_capability_need(
+    disp = await _classify_capability_need_async(
         "container-runtime", proven_proof_map, proof_gate_mode="enforce"
     )
     assert disp["completed_needs"] == [

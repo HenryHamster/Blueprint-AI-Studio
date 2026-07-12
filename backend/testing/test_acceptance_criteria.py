@@ -413,10 +413,18 @@ async def test_record_evidence_duplicate_is_noop(db_session):
     version = await _make_version(db_session, project)
     criterion = await ac.create_criterion(db_session, project.id, version.id, "CI green")
 
+    # Snapshot ids up front: the duplicate insert below is collapsed inside
+    # record_evidence via IntegrityError → session.rollback(), which expires
+    # every instance in the session — a post-rollback ``version.id`` lazy-load
+    # would raise MissingGreenlet under real ORM expiry.
+    version_id = version.id
+    criterion_id = criterion.id
+    project_id = project.id
+
     await ac.record_evidence(
         db_session,
-        criterion_id=criterion.id,
-        project_id=project.id,
+        criterion_id=criterion_id,
+        project_id=project_id,
         source_kind="task_merge",
         source_id="task-uuid-abc123",
         detail={"pr": 42},
@@ -424,16 +432,16 @@ async def test_record_evidence_duplicate_is_noop(db_session):
 
     await ac.record_evidence(
         db_session,
-        criterion_id=criterion.id,
-        project_id=project.id,
+        criterion_id=criterion_id,
+        project_id=project_id,
         source_kind="task_merge",
         source_id="task-uuid-abc123",
         detail={"pr": 43},
     )
 
-    assert await ac.count_criteria_for_version(db_session, version.id) == 1
+    assert await ac.count_criteria_for_version(db_session, version_id) == 1
 
-    fetched = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    fetched = await ac.get_evidence_for_criterion(db_session, criterion_id)
     assert len(fetched) == 1
     assert fetched[0].source_kind == "task_merge"
     assert fetched[0].source_id == "task-uuid-abc123"
@@ -7482,6 +7490,15 @@ async def test_reattest_after_failed_corroboration_restores_attested(
         source_id=_TEST_USER_ID,
         detail={"attested_at": re_fresh_at, "reason": "re-attest after failure"},
     )
+    # The re-attestation duplicates the (criterion, kind, source) evidence key,
+    # so record_evidence collapses it via IntegrityError → rollback — which
+    # expires every instance in the session. Refresh before further attribute
+    # reads (project/version/criterion are used below, and ``project`` is
+    # passed into build_operator_attention) so real ORM expiry can't raise
+    # MissingGreenlet on a sync lazy-load.
+    await db_session.refresh(project)
+    await db_session.refresh(version)
+    await db_session.refresh(criterion)
 
     queued_task = _Task(
         project_id=project.id,

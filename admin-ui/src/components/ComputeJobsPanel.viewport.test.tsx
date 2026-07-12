@@ -573,7 +573,7 @@ describe('ComputeJobsPanel — viewport regression', () => {
     );
   });
 
-  test('renders plot gallery inline in job card at 1100px', async () => {
+  test('renders artifact preview gallery in job card at 1100px', async () => {
     jobsToReturn = [
       {
         id: 'job-gallery',
@@ -617,9 +617,12 @@ describe('ComputeJobsPanel — viewport regression', () => {
           r.render(<ComputeJobsPanel projectId="proj-1" />);
         });
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
-        const gallery = host.querySelector('[data-testid="compute-plot-gallery"]');
-        if (!gallery) throw new Error('compute-plot-gallery not rendered');
-        const slots = host.querySelectorAll('[data-testid="plot-gallery-slot"]');
+        const gallery = host.querySelector('[data-testid="compute-artifact-gallery"]');
+        if (!gallery) throw new Error('compute-artifact-gallery not rendered');
+        const toggle = host.querySelector('[data-testid="compute-artifact-gallery-toggle"]') as HTMLButtonElement | null;
+        if (!toggle) throw new Error('compute-artifact-gallery-toggle not rendered');
+        await act(async () => { toggle.click(); });
+        const slots = host.querySelectorAll('[data-testid="compute-viewable-artifact"]');
         if (slots.length < 2) throw new Error(`Expected 2 gallery slots, got ${slots.length}`);
       },
       { waitMs: 120 },

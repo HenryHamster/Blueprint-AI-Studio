@@ -456,14 +456,19 @@ async def test_precompute_persists_verdicts_when_l2_cache_write_fails(
         new=AsyncMock(side_effect=RuntimeError("forced L2 merge failure")),
     )
 
+    # Snapshot the id: the forced L2 failure makes write_shared roll back
+    # db_session inside _precompute_one, expiring ``project`` — a later
+    # ``project.id`` lazy-load would raise MissingGreenlet under real ORM expiry.
+    project_id = project.id
+
     # Should not raise: write_shared is fail-open.
-    await _precompute_one(db_session, hours=24, project_id=project.id)
+    await _precompute_one(db_session, hours=24, project_id=project_id)
 
     Session = async_sessionmaker(
         db_session.bind, class_=AsyncSession, expire_on_commit=False
     )
     async with Session() as fresh:
-        stored_project = await fresh.get(Project, project.id)
+        stored_project = await fresh.get(Project, project_id)
         stored = stored_project.capability_adoption_verdicts or {}
         decided = [
             (k, v)

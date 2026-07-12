@@ -3653,91 +3653,137 @@ describe('ComputeJobsPanel — draft provenance', () => {
     expect(queryByTestId('compute-draft-provenance')).toBeNull();
   });
 });
-
-describe('ComputeJobsPanel — plot gallery', () => {
+describe('ComputeJobsPanel — viewable artifact gallery', () => {
   afterEach(() => {
-    vi.clearAllMocks();
+    fetchComputeJobs.mockReset();
+    resolveArtifactDownloadUrl.mockReset();
   });
 
-  test('renders plot gallery with image thumbnails for jobs with viewable_artifacts', async () => {
-    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/plot.png');
+  const VIEWABLE = [
+    { filename: 'loss_curve.png', storage_uri: 'gs://bucket/compute-jobs/job-1/artifacts/viewable/0-loss_curve.png', content_type: 'image/png', kind: 'image' as const, size_bytes: 41233 },
+    { filename: 'rollout.mp4', storage_uri: 'gs://bucket/compute-jobs/job-1/artifacts/viewable/1-rollout.mp4', content_type: 'video/mp4', kind: 'video' as const, size_bytes: 2_400_000 },
+  ];
+
+  function makeGalleryJob(): ComputeJob {
+    return makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      viewable_artifacts: VIEWABLE,
+    });
+  }
+
+  test('renders collapsed gallery from viewable_artifacts without resolving URLs', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    expect(toggle.textContent).toContain('Show previews (2)');
+    // Lazy: nothing resolved and no thumbnails until the gallery is expanded.
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalled();
+    expect(queryByTestId('compute-viewable-artifact')).toBeNull();
+  });
+
+  test('expanding the gallery resolves each storage_uri and renders image + video previews', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    resolveArtifactDownloadUrl.mockImplementation(async (_projectId: string, uri: string) =>
+      `https://signed.example/${uri.split('/').pop()}`);
+    const { findByTestId, findAllByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    await act(async () => { toggle.click(); });
+
+    const items = await findAllByTestId('compute-viewable-artifact');
+    expect(items).toHaveLength(2);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', VIEWABLE[0].storage_uri);
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', VIEWABLE[1].storage_uri);
+
+    await waitFor(() => {
+      const img = container.querySelector('img[alt="loss_curve.png"]');
+      expect(img?.getAttribute('src')).toBe('https://signed.example/0-loss_curve.png');
+    });
+    const video = await findByTestId('compute-artifact-video');
+    expect(video.tagName).toBe('VIDEO');
+    expect(video.hasAttribute('controls')).toBe(true);
+    expect(video.getAttribute('src')).toBe('https://signed.example/1-rollout.mp4');
+    // Captions carry name + size.
+    const gallery = await findByTestId('compute-artifact-gallery');
+    expect(gallery.textContent).toContain('loss_curve.png · 40 KB');
+    expect(gallery.textContent).toContain('rollout.mp4 · 2.3 MB');
+  });
+
+  test('resolution failure shows a quiet placeholder that can retry', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
+    resolveArtifactDownloadUrl.mockRejectedValue(new Error('403'));
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    await act(async () => { toggle.click(); });
+
+    const placeholders = await findAllByTestId('compute-artifact-placeholder');
+    expect(placeholders).toHaveLength(2);
+    expect(placeholders[0].textContent).toContain('preview unavailable');
+
+    // Retry re-resolves just the clicked artifact and swaps in the thumbnail.
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example/retried.png');
+    await act(async () => { placeholders[0].click(); });
+    expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(3);
+    await waitFor(async () => {
+      const thumb = await findByTestId('compute-artifact-thumbnail');
+      expect(thumb.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/retried.png');
+    });
+  });
+
+  test('no gallery section when viewable_artifacts is absent or malformed', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
         status: 'SUCCEEDED',
         outcome: 'SUCCESS',
         final_cost_usd: 1.0,
-        viewable_artifacts: [
-          { storage_uri: 'gs://bucket/jobs/job-1/plot.png', filename: 'plot.png', kind: 'image', content_type: 'image/png', size_bytes: 12345 },
-        ],
+        viewable_artifacts: [{ kind: 'image' }, 'nonsense', null] as unknown as ComputeJob['viewable_artifacts'],
       }),
-    ]));
-    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const gallery = await findByTestId('compute-plot-gallery');
-    expect(gallery).toBeTruthy();
-    await waitFor(() => {
-      const img = gallery.querySelector('[data-testid="plot-gallery-image"]') as HTMLImageElement | null;
-      expect(img).toBeTruthy();
-      expect(img?.src).toBe('https://signed.example.com/plot.png');
-    });
-    expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', 'gs://bucket/jobs/job-1/plot.png', expect.anything());
-  });
-
-  test('renders video element for video viewable_artifacts', async () => {
-    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example.com/run.mp4');
-    fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({
-        status: 'SUCCEEDED',
-        outcome: 'SUCCESS',
-        final_cost_usd: 1.0,
-        viewable_artifacts: [
-          { storage_uri: 'gs://bucket/jobs/job-1/run.mp4', filename: 'run.mp4', kind: 'video', content_type: 'video/mp4', size_bytes: 99999 },
-        ],
-      }),
-    ]));
-    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const gallery = await findByTestId('compute-plot-gallery');
-    await waitFor(() => {
-      const video = gallery.querySelector('[data-testid="plot-gallery-video"]');
-      expect(video).toBeTruthy();
-    });
-  });
-
-  test('no plot gallery when viewable_artifacts is absent', async () => {
-    fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
     ]));
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
-    expect(queryByTestId('compute-plot-gallery')).toBeNull();
+    expect(queryByTestId('compute-artifact-gallery')).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel — live output expander', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
   });
 
-  test('no plot gallery when viewable_artifacts is empty', async () => {
-    fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, viewable_artifacts: [] }),
-    ]));
-    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
-    await findByText('compute_experiment: sweep');
-    expect(queryByTestId('compute-plot-gallery')).toBeNull();
-  });
-
-  test('shows error state when resolveArtifactDownloadUrl rejects', async () => {
-    resolveArtifactDownloadUrl.mockRejectedValue(new Error('forbidden'));
+  test('clips active live output to 30 lines with a Show-all expander', async () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({
-        status: 'SUCCEEDED',
-        outcome: 'SUCCESS',
-        final_cost_usd: 1.0,
-        viewable_artifacts: [
-          { storage_uri: 'gs://bucket/jobs/job-1/plot.png', filename: 'plot.png', kind: 'image' },
-        ],
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: lines, truncated: false } },
       }),
     ]));
-    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const gallery = await findByTestId('compute-plot-gallery');
-    await waitFor(() => {
-      const errSlot = gallery.querySelector('[data-testid="plot-gallery-error"]');
-      expect(errSlot).toBeTruthy();
-    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const showAllBtn = await findByTestId('compute-live-output-show-all');
+    expect(showAllBtn.textContent).toContain('50 lines');
+    // Only the last 30 lines visible before expanding.
+    const block = await findByTestId('compute-live-output');
+    expect(block.textContent).not.toContain('line 0');
+    expect(block.textContent).toContain('line 49');
+
+    await act(async () => { showAllBtn.click(); });
+    const expanded = await findByTestId('compute-live-output');
+    expect(expanded.textContent).toContain('line 0');
+    expect(queryByTestId('compute-live-output-show-all')).toBeNull();
+  });
+
+  test('no live-output expander when output fits within 30 lines', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        polling_metadata: { live_output: { text: 'line1\nline2\n', truncated: false } },
+      }),
+    ]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('compute-live-output');
+    expect(queryByTestId('compute-live-output-show-all')).toBeNull();
   });
 });
 
@@ -3778,7 +3824,11 @@ describe('ComputeJobsPanel — runner identity on finished jobs', () => {
     ]));
     const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const runnerEl = await findByTestId('compute-runner-claimed');
-    expect(runnerEl.textContent).toContain('runner-ab');
+    // The component truncates the target id to 8 chars (`slice(0, 8)`) — the
+    // long-standing behavior on both branches. Assert the truncated form is
+    // rendered AND that the full id is not, so this genuinely covers truncation.
+    expect(runnerEl.textContent).toContain('runner-a');
+    expect(runnerEl.textContent).not.toContain('runner-abc12345-dead-beef-0000-111122223333');
     expect(runnerEl.textContent).not.toContain('claimed');
   });
 

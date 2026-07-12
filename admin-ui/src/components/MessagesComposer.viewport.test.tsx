@@ -488,19 +488,19 @@ describe('MessagesComposer — attachment interaction', () => {
     expect(composerBox).toBeTruthy();
 
     // Initially no drag-over style
-    expect(composerBox.className).not.toContain('border-emerald-500/30');
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
 
     // Dispatch dragover
     await act(async () => {
       composerBox.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
     });
-    expect(composerBox.className).toContain('border-emerald-500/30');
+    expect(composerBox.className).toContain('border-emerald-500/60');
 
     // Dispatch dragleave
     await act(async () => {
       composerBox.dispatchEvent(new DragEvent('dragleave', { bubbles: true, cancelable: true }));
     });
-    expect(composerBox.className).not.toContain('border-emerald-500/30');
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
   });
 
   test('handleDrop clears drag-over state', async () => {
@@ -518,7 +518,7 @@ describe('MessagesComposer — attachment interaction', () => {
     await act(async () => {
       composerBox.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
     });
-    expect(composerBox.className).toContain('border-emerald-500/30');
+    expect(composerBox.className).toContain('border-emerald-500/60');
 
     // Drop with files
     const file = new File(['content'], 'file.txt', { type: 'text/plain' });
@@ -529,6 +529,6 @@ describe('MessagesComposer — attachment interaction', () => {
     });
 
     // State cleared after drop
-    expect(composerBox.className).not.toContain('border-emerald-500/30');
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
   });
 });

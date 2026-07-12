@@ -2326,6 +2326,111 @@ class TestRunnerEndpoints:
         assert "llm_clis" not in runner.capabilities
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-GPU VRAM lists + flat cli_inventory persist into capabilities.
+
+        gpu_memory_total_mib is the key experiment_authoring_context's
+        build_runner_device consumes for the devices block — the names must
+        match exactly.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "gpu_memory_total_mib": [16384, 16384],
+                "gpu_memory_free_mib": [15021, 830],
+                "cli_inventory": {"claude": "2.1.0", "codex": None, "gemini": ""},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["gpu_memory_total_mib"] == [16384, 16384]
+        assert runner.capabilities["gpu_memory_free_mib"] == [15021, 830]
+        assert runner.capabilities["cli_inventory"] == {
+            "claude": "2.1.0",
+            "codex": None,
+            "gemini": "",
+        }
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Old runners omit the VRAM/CLI fields — heartbeat succeeds and the
+        capability keys stay absent (never 0/empty, which would read as data)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "gpu_memory_total_mib" not in runner.capabilities
+        assert "gpu_memory_free_mib" not in runner.capabilities
+        assert "cli_inventory" not in runner.capabilities
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_bounds_gpu_memory_and_cli_inventory(
+        self, client: AsyncClient, db_session
+    ):
+        """Garbage-emitting runner: VRAM lists are length-capped and clamped
+        non-negative; cli_inventory drops non-string names/versions and is
+        entry-capped. Heartbeat still succeeds (no 500 on garbage)."""
+        from app.routers.runner import (
+            _MAX_CLI_INVENTORY_ENTRIES,
+            _MAX_GPU_LIST_ENTRIES,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "gpu_memory_total_mib": [-5] + [16384] * (_MAX_GPU_LIST_ENTRIES + 20),
+                "gpu_memory_free_mib": [1024],
+                "cli_inventory": {
+                    **{f"cli{i}": "1.0" for i in range(_MAX_CLI_INVENTORY_ENTRIES + 10)},
+                    "bad_version": 42,
+                    "": "unnamed",
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        totals = runner.capabilities["gpu_memory_total_mib"]
+        assert len(totals) == _MAX_GPU_LIST_ENTRIES
+        assert totals[0] == 0  # negative clamped, not preserved
+        inventory = runner.capabilities["cli_inventory"]
+        assert len(inventory) <= _MAX_CLI_INVENTORY_ENTRIES
+        assert "bad_version" not in inventory  # non-str version dropped
+        assert "" not in inventory  # unnamed CLI dropped
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_clamps_absurd_gpu_memory_to_upper_bound(
+        self, client: AsyncClient, db_session
+    ):
+        """An absurd runner-reported VRAM integer is clamped to the 4 TiB
+        upper bound (_MAX_GPU_MEMORY_MIB) so it can never reach authoring
+        context / agent prompts, while plausible values pass through."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"gpu_memory_total_mib": [10**15]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["gpu_memory_total_mib"] == [4_194_304]
+
+    @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_trust_telemetry(
         self, client: AsyncClient, db_session
     ):
@@ -3554,6 +3659,9 @@ class TestOrchestratorRunnerRouting:
     async def test_active_compute_jobs_count_toward_runner_capacity(
         self, db_session
     ):
+        """Capacity is per CLASS: active compute jobs saturate the COMPUTE
+        class (a further compute_experiment is refused), while the AGENT class
+        stays dispatchable — one class must not starve the other."""
         project = await _make_project(db_session)
         runner, _ = await _make_runner(
             db_session,
@@ -3565,17 +3673,28 @@ class TestOrchestratorRunnerRouting:
                 "active_compute_job_ids": ["job-a", "job-b"],
             },
         )
-        task = Task(
+        compute_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.QUEUED,
+        )
+        agent_task = Task(
             project_id=project.id,
             payloads=[{"type": "create"}],
             status=TaskStatus.QUEUED,
         )
-        db_session.add(task)
+        db_session.add(compute_task)
+        db_session.add(agent_task)
         await db_session.commit()
 
+        # Compute class full (2 active vs max_concurrent fallback 2) → refused.
         assert await orch._try_runner_dispatch(
-            db_session, task, {project.id: [runner]}, {}
+            db_session, compute_task, {project.id: [runner]}, {}
         ) is False
+        # Agent class is independent — the same runner still takes agent work.
+        assert await orch._try_runner_dispatch(
+            db_session, agent_task, {project.id: [runner]}, {}
+        ) is True
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_prefers_least_loaded(self, db_session):
@@ -5181,6 +5300,143 @@ class TestLocalRunnerStatusForStrategist:
         assert status["active_total"] == 2
         assert status["active_gpu"] == 1
 
+    @pytest.mark.asyncio
+    async def test_devices_absent_when_no_live_runner(self, db_session):
+        """The additive `devices` key is OMITTED when no runner is live, so the
+        load-bearing 3-key shape is preserved for existing consumers."""
+        project = await _make_project(db_session)
+        # Registered-but-stale runner → ever_registered True, no live devices.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow() - timedelta(seconds=400),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status == {
+            "ever_registered": True,
+            "active_total": 0,
+            "active_gpu": 0,
+        }
+        assert "devices" not in status
+
+    @pytest.mark.asyncio
+    async def test_devices_block_for_live_gpu_runner(self, db_session):
+        """A live runner's persisted capabilities become a bounded device entry:
+        name, gpu_count, deduped models, per-GPU VRAM (when advertised),
+        container capability, and current load."""
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            hostname="dgx-1",
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "max_concurrent": 2,
+                "gpu_count": 8,
+                "gpu_names": ["Tesla V100-SXM2-16GB"] * 8,
+                "gpu_memory_total_mib": [16384] * 8,
+                "isolation_backends": {
+                    "bwrap_ok": True,
+                    "userns_ok": True,
+                    "docker_usable": True,
+                    "docker_cdi_gpu": True,
+                    "podman_usable": False,
+                    "apptainer_ok": False,
+                    "enroot_ok": False,
+                    "systemd_run_ok": False,
+                },
+                "active_task_ids": ["t-1"],
+                "active_compute_job_ids": [],
+            },
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status["active_gpu"] == 1
+        assert status["devices"] == [
+            {
+                "runner_name": "dgx-1",
+                "gpu_count": 8,
+                "gpu_models": ["Tesla V100-SXM2-16GB"],
+                "container_ok": True,
+                "gpu_in_container_ok": True,
+                "active_tasks": 1,
+                "active_compute_jobs": 0,
+                "gpu_vram_mib": [16384] * 8,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_devices_skip_vram_when_not_advertised(self, db_session):
+        """Older runners that do not advertise gpu_memory_total_mib get no
+        gpu_vram_mib key (never a misleading zero), and a caps dict without an
+        isolation inventory reads as no container runtime."""
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            hostname="old-box",
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "max_concurrent": 2,
+                "gpu_count": 1,
+                "gpu_names": ["NVIDIA GeForce RTX 3060"],
+            },
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        (device,) = status["devices"]
+        assert "gpu_vram_mib" not in device
+        assert device["container_ok"] is False
+        assert device["gpu_in_container_ok"] is False
+        assert device["active_tasks"] == 0
+        assert device["active_compute_jobs"] == 0
+
+    @pytest.mark.asyncio
+    async def test_devices_bounded_in_total_gpu_richest_first(self, db_session):
+        """The devices list is capped at DEVICES_MAX_RUNNERS total, keeping the
+        GPU-richest runners (the ones VRAM-fit reasoning needs)."""
+        from app.experiment_authoring_context import DEVICES_MAX_RUNNERS
+
+        project = await _make_project(db_session)
+        for i in range(DEVICES_MAX_RUNNERS + 2):
+            await _make_runner(
+                db_session,
+                project.id,
+                status="active",
+                hostname=f"node-{i}",
+                capabilities={
+                    "task_types": "all",
+                    "has_gpu": i % 2 == 0,
+                    "max_concurrent": 2,
+                    # Alternating 1-GPU / CPU-only so the cap has to choose.
+                    "gpu_count": 1 if i % 2 == 0 else 0,
+                },
+                last_seen_at=_utcnow(),
+            )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        devices = status["devices"]
+        assert len(devices) == DEVICES_MAX_RUNNERS
+        # GPU runners sort ahead of CPU-only runners.
+        gpu_counts = [d["gpu_count"] for d in devices]
+        assert gpu_counts == sorted(gpu_counts, reverse=True)
 
     def test_local_runner_status_registered_in_strategic_schema(self):
         """Regression guard: local_runner_status must be in _STRATEGIC_REVIEW_SCHEMA
@@ -5355,10 +5611,12 @@ class TestReportCommandLogDropsArbitraryKeys:
         # Build a result_metrics dict exceeding the key cap.
         oversized_metrics = {f"metric_{i}": i for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 50)}
 
+        # Terminal report: command_log routes to runner_command_log (interim
+        # "running" reports route their tail to live_output instead).
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
             json={
-                "exec_status": "running",
+                "exec_status": "failed",
                 "command_log": hostile_command_log,
                 "result_metrics": oversized_metrics,
             },
@@ -5405,7 +5663,7 @@ class TestReportCommandLogDropsArbitraryKeys:
         resp = await client.post(
             f"/api/runner/compute-job/{job.id}/report",
             json={
-                "exec_status": "running",
+                "exec_status": "failed",
                 "command_log": {"text": big_text, "extra_hostile": "should_drop"},
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -5579,6 +5837,250 @@ class TestReportCommandLogDropsArbitraryKeys:
         assert len(result) == _MAX_RUNNER_RESULT_METRICS_KEYS, (
             f"expected exactly {_MAX_RUNNER_RESULT_METRICS_KEYS} keys, got {len(result)}"
         )
+
+
+class TestReportInterimProgressAndLiveOutput:
+    """Interim-report protocol: live_output tail + self-reported progress records.
+
+    Progress records originate from SANDBOXED experiment code (the runner just
+    relays its BLUEPRINT_PROGRESS_FILE tail), so the endpoint must validate
+    every field, cap every dimension, and tolerate arbitrary garbage without a
+    500 — and interim command_log tails must land on the UI's live_output key,
+    never clobbering the terminal runner_command_log.
+    """
+
+    async def _make_running_job(self, db_session):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_running_command_log_stamps_live_output_not_runner_command_log(
+        self, client: AsyncClient, db_session
+    ):
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": {"text": "epoch 3 loss=0.42\n", "truncated": True},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+        assert meta.get("live_output") == {
+            "text": "epoch 3 loss=0.42\n",
+            "truncated": True,
+        }
+        assert "runner_command_log" not in meta, (
+            "an interim tail must never masquerade as the terminal command log"
+        )
+
+    @pytest.mark.asyncio
+    async def test_running_live_output_is_tail_truncated_at_cap(
+        self, client: AsyncClient, db_session
+    ):
+        """Oversized live tails keep the TAIL (most recent output), not the head."""
+        from app.routers.runner import _MAX_RUNNER_LIVE_OUTPUT_BYTES
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        big = "A" * _MAX_RUNNER_LIVE_OUTPUT_BYTES + "END"
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running", "command_log": {"text": big}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        live = job.polling_metadata.get("live_output", {})
+        assert live.get("truncated") is True
+        assert live.get("text", "").endswith("END")
+        assert len(live["text"].encode("utf-8")) <= _MAX_RUNNER_LIVE_OUTPUT_BYTES
+
+    @pytest.mark.asyncio
+    async def test_progress_records_validated_and_stamped(
+        self, client: AsyncClient, db_session
+    ):
+        """Valid records land in polling_metadata['progress'] with count +
+        updated_at; invalid records (bad types, non-finite, bool value) drop."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "progress": {
+                    "records": [
+                        {"step": 1, "metric": "loss", "value": 2.5},
+                        {"step": 2, "metric": "loss", "value": 2.1, "ts": "2026-07-11T00:00:00Z"},
+                        {"metric": "loss", "value": True},  # bool → dropped
+                        {"metric": "", "value": 1.0},  # blank metric → dropped
+                        {"metric": "loss", "value": "NaN"},  # string → dropped
+                        "garbage",  # non-dict → dropped
+                    ],
+                    "count": 2,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        progress = job.polling_metadata.get("progress")
+        assert progress is not None
+        assert progress["count"] == 2
+        assert "updated_at" in progress
+        assert progress["records"] == [
+            {"step": 1, "metric": "loss", "value": 2.5},
+            {"step": 2, "metric": "loss", "value": 2.1, "ts": "2026-07-11T00:00:00Z"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_progress_garbage_payloads_tolerated_without_500(
+        self, client: AsyncClient, db_session
+    ):
+        """Arbitrary garbage shapes must 200 and leave no progress key."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        for garbage in (
+            "not a dict",
+            123,
+            {"records": "nope"},
+            {"records": []},
+            {"records": [{"metric": "m"}]},  # no value
+            {"no_records_key": True},
+            {"records": [{"metric": "m", "value": 1.0}] * 500},  # wildly oversized
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={"exec_status": "running", "progress": garbage},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, f"payload {garbage!r}: {resp.text}"
+        await db_session.refresh(job)
+        assert "progress" not in (job.polling_metadata or {})
+
+    @pytest.mark.asyncio
+    async def test_progress_count_delta_merge_appends_only_new_and_caps_at_50(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-sent tail overlap is not double-appended (count-delta merge) and
+        the stored list is capped at the last _MAX_PROGRESS_RECORDS_STORED."""
+        from app.routers.runner import _MAX_PROGRESS_RECORDS_STORED
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        async def _send(records, count):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={
+                    "exec_status": "running",
+                    "progress": {"records": records, "count": count},
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, resp.text
+
+        def _rec(step):
+            return {"step": step, "metric": "loss", "value": 10.0 - step * 0.1}
+
+        # Report 1: steps 1-3. Report 2 re-sends 2-3 plus new 4-5 (tail overlap).
+        await _send([_rec(1), _rec(2), _rec(3)], 3)
+        await _send([_rec(2), _rec(3), _rec(4), _rec(5)], 5)
+        await db_session.refresh(job)
+        progress = job.polling_metadata["progress"]
+        assert [r["step"] for r in progress["records"]] == [1, 2, 3, 4, 5], (
+            "overlapping tail entries must not be double-appended"
+        )
+        assert progress["count"] == 5
+
+        # A re-sent identical snapshot (count unchanged) adds nothing.
+        await _send([_rec(4), _rec(5)], 5)
+        await db_session.refresh(job)
+        assert [r["step"] for r in job.polling_metadata["progress"]["records"]] == [
+            1, 2, 3, 4, 5,
+        ]
+
+        # Long run: the stored list caps at the newest 50.
+        total = 5
+        for batch_start in range(6, 106, 20):
+            batch = [_rec(s) for s in range(batch_start, batch_start + 20)]
+            total = batch_start + 19
+            await _send(batch, total)
+        await db_session.refresh(job)
+        progress = job.polling_metadata["progress"]
+        assert len(progress["records"]) == _MAX_PROGRESS_RECORDS_STORED
+        assert progress["records"][-1]["step"] == 105
+        assert progress["count"] == 105
+
+    @pytest.mark.asyncio
+    async def test_progress_retry_with_bumped_count_not_double_appended(
+        self, client: AsyncClient, db_session
+    ):
+        """Suffix-dedup backstop: a retried report whose count was BUMPED but
+        whose records are the already-stored tail verbatim adds nothing (the
+        count delta alone would falsely admit it); the next genuinely new
+        record still appends exactly once."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        r1 = {"step": 1, "metric": "loss", "value": 2.5}
+        r2 = {"step": 2, "metric": "loss", "value": 2.1}
+
+        async def _send(records, count):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/report",
+                json={
+                    "exec_status": "running",
+                    "progress": {"records": records, "count": count},
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200, resp.text
+
+        await _send([r1], 1)
+        # Retry of the SAME record with a bumped count: delta says "one new"
+        # but the record equals the stored tail — must not re-append.
+        await _send([r1], 2)
+        await db_session.refresh(job)
+        assert job.polling_metadata["progress"]["records"] == [r1]
+
+        # Overlap plus one genuinely new record appends exactly the new one.
+        await _send([r1, r2], 3)
+        await db_session.refresh(job)
+        assert job.polling_metadata["progress"]["records"] == [r1, r2]
+
+    @pytest.mark.asyncio
+    async def test_progress_accepted_on_terminal_report(
+        self, client: AsyncClient, db_session
+    ):
+        """The final terminal report may carry the last progress records."""
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "failed",
+                "exit_code": 124,
+                "command_log": {"text": "killed at deadline", "truncated": False},
+                "progress": {
+                    "records": [{"step": 9, "metric": "reward", "value": 41.5}],
+                    "count": 9,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+        assert meta["progress"]["records"][-1]["value"] == 41.5
+        assert meta["runner_command_log"]["text"] == "killed at deadline"
 
 
 # ── Direct compute_experiment dispatch (no agent half) ───────────────────────
@@ -5881,6 +6383,377 @@ class TestDirectComputeExperimentDispatch:
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
         assert await _compute_job_for_task(db_session, task.id) is None
+
+    # ── Launch-contract runner_target pin (soft + strict) ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_soft_runner_pin_prefers_pinned_runner_via_payload(
+        self, db_session
+    ):
+        """runner_target (strict=false) in the launch contract wins over the
+        least-loaded rule when the pinned runner is eligible — same seam as the
+        existing context preference, but authored in the payload."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": [],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": False}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(pinned.id)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(pinned.id)
+
+    @pytest.mark.asyncio
+    async def test_soft_runner_pin_falls_through_when_pinned_ineligible(
+        self, db_session
+    ):
+        """A soft pin to an at-capacity runner falls through to normal selection
+        (the idle runner gets the job) instead of holding or wedging."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "active_compute_job_ids": ["existing-job"],  # at capacity
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": False}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(idle.id)
+        assert "runner_pin_hold" not in (task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_dispatches_when_pinned_runner_eligible(
+        self, db_session
+    ):
+        """A strict pin dispatches to the pinned runner (even when busier than a
+        competitor) and clears a stale hold reason from a prior held cycle."""
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 4},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+            # Stale artifacts from a prior held cycle — must be cleared on launch.
+            context={
+                "awaiting_local_runner_since": _utcnow().isoformat(),
+                "runner_pin_hold": {
+                    "runner_id": str(pinned.id),
+                    "strict": True,
+                    "reason_code": "offline",
+                    "detail": "stale",
+                },
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned, idle]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.context["runner_target_id"] == str(pinned.id)
+        assert "awaiting_local_runner_since" not in task.context
+        assert "runner_pin_hold" not in task.context
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(pinned.id)
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_runner_offline(self, db_session):
+        """strict=true + pinned runner not live → held with a truthful reason
+        naming the runner (never dispatched to the other eligible runner, never
+        a generic no-runner message)."""
+        project = await _make_project(db_session)
+        offline, _ = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",  # enrolled but not live → not in the cache
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(offline.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [idle]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert (task.context or {}).get("awaiting_local_runner_since")
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["runner_id"] == str(offline.id)
+        assert hold["strict"] is True
+        assert hold["reason_code"] == "offline"
+        # The status message names the runner and the why — machine-checkable
+        # by the UI, truthful for the operator.
+        message = task.latest_status_message or ""
+        assert str(offline.id) in message
+        assert "offline" in message
+        assert "runner_target hold" in message
+        # Strict means strict: nothing dispatched anywhere.
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_at_capacity(self, db_session):
+        project = await _make_project(db_session)
+        pinned, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "active_compute_job_ids": ["existing-job"],  # at capacity
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "at_capacity"
+        assert "at_capacity" in (task.latest_status_message or "")
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_not_enrolled(self, db_session):
+        """A strict pin to another project's runner holds with reason_code
+        not_enrolled (authoring-time 422 normally prevents this; dispatch stays
+        truthful for agent-authored payloads that slipped one through)."""
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, name="Other Project")
+        foreign, _ = await _make_runner(db_session, other_project.id)
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(foreign.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "not_enrolled"
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_missing_gpu(self, db_session):
+        """A strict pin to a live CPU runner for a GPU job holds with the
+        capability-specific reason, not a generic one."""
+        project = await _make_project(db_session)
+        cpu_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="T4",
+                    runner_target={"runner_id": str(cpu_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [cpu_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_gpu"
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_pin_hold_stable_reason_not_rewritten_each_cycle(
+        self, db_session
+    ):
+        """Churn gate: repeated hold cycles with the SAME reason_code but a
+        different volatile detail number (live load 3 → 4) must NOT rewrite
+        the stamped hold record or the status message (first-write values
+        retained); a genuinely DIFFERENT reason_code rewrites both."""
+        project = await _make_project(db_session)
+        caps = {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "active_compute_job_ids": ["j1", "j2", "j3"],  # load 3
+        }
+        pinned, _ = await _make_runner(db_session, project.id, capabilities=caps)
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(pinned.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        first_hold = dict(task.context["runner_pin_hold"])
+        first_message = task.latest_status_message
+        assert first_hold["reason_code"] == "at_capacity"
+        assert "(3 active+pinned" in first_hold["detail"]
+
+        # Cycle 2: still at_capacity, but the volatile load count moved 3 → 4.
+        pinned.capabilities = dict(
+            caps, active_compute_job_ids=["j1", "j2", "j3", "j4"]
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [pinned]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        # First-write values retained: same stable hold state, no per-cycle
+        # rewrite of the held task row.
+        assert task.context["runner_pin_hold"] == first_hold
+        assert task.latest_status_message == first_message
+
+        # Cycle 3: a DIFFERENT reason_code (runner gone from the live cache →
+        # offline) rewrites both the record and the message.
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = task.context["runner_pin_hold"]
+        assert hold["reason_code"] == "offline"
+        assert "offline" in (task.latest_status_message or "")
+        assert task.latest_status_message != first_message
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────

@@ -1283,6 +1283,13 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(db_session, m
     await db_session.commit()
     await db_session.refresh(source_task)
 
+    # Snapshot scalar ids BEFORE the spawn call: the production lock-timeout
+    # handler rolls back the shared session, which expires every loaded
+    # instance — an expired sync read afterwards raises MissingGreenlet under
+    # real ORM expiry.
+    project_id = project.id
+    seed_task_ids = {original_task.id, source_task.id}
+
     # Fail the spawn commit ONLY when the new pipeline task is pending. Inject
     # a GENUINE flush-level abort first (duplicate-PK insert) so the underlying
     # transaction is really dead — the way a lock_timeout-cancelled INSERT
@@ -1306,7 +1313,7 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(db_session, m
                 self.add(
                     Task(
                         id=dup,
-                        project_id=project.id,
+                        project_id=project_id,
                         payloads=[{"type": "create"}],
                         status=TaskStatus.QUEUED,
                     )
@@ -1350,12 +1357,12 @@ async def test_spawn_lock_timeout_defers_without_poisoning_session(db_session, m
 
     # Nothing was spawned and the poison rows were rolled back.
     rows = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(select(Task).where(Task.project_id == project_id)))
         .scalars()
         .all()
     )
     ids = {t.id for t in rows}
-    assert ids == {original_task.id, source_task.id}, (
+    assert ids == seed_task_ids, (
         f"only the seed tasks may exist after the deferred spawn, got {ids}"
     )
 
@@ -9858,6 +9865,12 @@ async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(
     assert result is None
     assert was_created is False
 
+    # Persist before refreshing: the halt path leaves the reclassification and
+    # the spawn-reason marker pending for the rollup caller's final commit
+    # (per the _spawn_pipeline_task contract); under real ORM expiry a refresh
+    # without this commit would discard the pending writes.
+    await db_session.commit()
+
     # most_recent_fix gets reclassified.
     await db_session.refresh(most_recent_fix)
     ctx = most_recent_fix.context or {}
@@ -13240,6 +13253,10 @@ async def test_already_merged_skip_completes_stranded_leaf_origin(db_session, mo
     assert result is None and created is False, (
         "Review spawn must be skipped for an already-merged PR"
     )
+    # The already-merged guard leaves the COMPLETED transition pending for the
+    # caller's commit — commit it (as the rollup caller would) before the
+    # refresh, which under real ORM expiry reloads persisted state.
+    await db_session.commit()
     await db_session.refresh(original_task)
     assert original_task.status == TaskStatus.COMPLETED, (
         "Stranded leaf originating task must be COMPLETED on the already-merged "
@@ -16461,6 +16478,10 @@ async def test_lane_shadow_checkpoint_owner_conflict_records_visible_reason(
     )
 
     assert outcome == CHECKPOINT_PHASE_OK
+    # The recovery marker is left pending for the caller's commit (the lane
+    # ops contract) — commit before refresh so the refresh reads persisted
+    # state instead of discarding the pending write under real ORM expiry.
+    await db_session.commit()
     await db_session.refresh(lane)
     assert lane.status == ImprovementLaneStatus.ACTIVE.value
     assert lane.current_task_id == owner_task_id
@@ -17447,7 +17468,11 @@ class TestLaneCheckpointShaVerification:
 
         assert result is False
         mock_checkpoint_lane.assert_not_called()
-        # phase_requeues incremented via mark_checkpoint_missing.
+        # phase_requeues incremented via mark_checkpoint_missing — the bump is
+        # left pending for the caller's commit (lane ops contract), so commit
+        # before refresh: under real ORM expiry a refresh would otherwise
+        # discard the pending write.
+        await db_session.commit()
         await db_session.refresh(lane)
         assert (lane.phase_requeues or 0) == initial_requeues + 1
 
@@ -17549,6 +17574,9 @@ class TestLaneCheckpointShaVerification:
         )
 
         assert result is True
+        # checkpoint_lane leaves its writes pending for the caller's commit
+        # (lane ops contract) — commit before refresh under real ORM expiry.
+        await db_session.commit()
         await db_session.refresh(lane)
         assert lane.last_checkpoint_sha == "abc1234def5678"
 
@@ -17739,6 +17767,10 @@ async def test_lane_pilot_manifest_patch_and_fix_resume_context(db_session, mock
         summary="addressed null-guard review",
     )
     assert wrote is True
+    # checkpoint_lane leaves the PARKED transition + manifest merge pending for
+    # the caller's commit (lane ops contract) — commit before refresh so the
+    # refresh reads persisted state under real ORM expiry.
+    await db_session.commit()
     await db_session.refresh(lane)
     assert lane.status == ImprovementLaneStatus.PARKED.value
     manifest = lane.manifest or {}

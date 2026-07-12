@@ -9,8 +9,12 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +91,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "container_registry_auth",
         "allow_host_fallback",
         "spawn_followup",
+        "runner_target",
         "vram_gb",
     ):
         val = _pick(opt_key)
@@ -245,6 +250,36 @@ def _validate_compute_launch_contract(
                 if val is not None and not isinstance(val, str):
                     return False, f"container_registry_auth.{req_key} must be a string"
 
+    runner_target = contract.get("runner_target")
+    if runner_target is not None:
+        # Operator/agent pin of the job to a specific enrolled runner.
+        # Shape: {runner_id: uuid-string, strict: bool=false}. Enrollment
+        # (runner exists AND belongs to the launching project) is a DB check —
+        # see validate_compute_runner_target_enrollment; this validator only
+        # rejects malformed shapes.
+        if not isinstance(runner_target, dict):
+            return (
+                False,
+                "runner_target must be an object of the form "
+                "{runner_id: <uuid>, strict: <bool>}",
+            )
+        rt_runner_id = runner_target.get("runner_id")
+        if not (isinstance(rt_runner_id, str) and rt_runner_id.strip()):
+            return (
+                False,
+                "runner_target.runner_id is required and must be a non-empty string",
+            )
+        try:
+            uuid.UUID(rt_runner_id.strip())
+        except ValueError:
+            return (
+                False,
+                f"runner_target.runner_id {rt_runner_id!r} is not a valid UUID",
+            )
+        rt_strict = runner_target.get("strict")
+        if rt_strict is not None and not isinstance(rt_strict, bool):
+            return False, "runner_target.strict must be a boolean"
+
     if require_smoke:
         # Author-attested smoke is now ADVISORY ONLY.  The platform-executed
         # pre-flight smoke (capability `platform-preflight-smoke`) runs the
@@ -282,6 +317,52 @@ def _validate_compute_launch_contract(
             )
 
     return True, ""
+
+
+async def validate_compute_runner_target_enrollment(
+    session: AsyncSession,
+    project_id: Any,
+    runner_target: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Check a shape-valid ``runner_target`` against the project's enrolled runners.
+
+    Returns ``None`` when the pinned runner exists AND is enrolled in
+    ``project_id``, else a machine-readable 422 detail dict::
+
+        {"error": "runner_target_invalid", "reason_code": "not_found"|"not_enrolled",
+         "runner_id": "<id>", "message": "..."}
+
+    Liveness is deliberately NOT checked here — an offline-but-enrolled runner
+    is a valid authoring target (a soft pin falls through at dispatch; a strict
+    pin holds with an explicit reason until the runner comes back). Cross-project
+    runner ids are rejected at authoring time so a typo'd or stale id fails the
+    launch with a clear 422 instead of silently never dispatching.
+    """
+    from app.models import LocalRunner  # local import keeps this module neutral
+
+    runner_id = str(runner_target.get("runner_id") or "").strip()
+    runner = await session.get(LocalRunner, uuid.UUID(runner_id))
+    if runner is None:
+        return {
+            "error": "runner_target_invalid",
+            "reason_code": "not_found",
+            "runner_id": runner_id,
+            "message": (
+                f"runner_target.runner_id {runner_id} does not match any "
+                "registered runner"
+            ),
+        }
+    if runner.project_id != project_id:
+        return {
+            "error": "runner_target_invalid",
+            "reason_code": "not_enrolled",
+            "runner_id": runner_id,
+            "message": (
+                f"runner {runner_id} is not enrolled in this project — "
+                "runner_target must name one of the project's enrolled runners"
+            ),
+        }
+    return None
 
 
 def resolve_compute_spend_threshold(

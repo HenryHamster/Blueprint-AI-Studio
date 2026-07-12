@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument, type ViewableArtifact } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -21,6 +21,8 @@ import {
   computeJobProjectedSpend,
   computeJobMargin,
   computeJobExecutionLocation,
+  computeJobViewableArtifacts,
+  fmtBytes,
   computeJobEvidenceTier,
   fmtUsd,
   fmtCountdown,
@@ -28,6 +30,15 @@ import {
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
+
+// Signed artifact URLs expire after ~60 minutes; treat anything older than
+// 50 minutes as stale and re-resolve instead of handing out a dead link.
+const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
+
+type PreviewResolution =
+  | { state: 'resolving' }
+  | { state: 'resolved'; url: string; resolvedAt: number }
+  | { state: 'error' };
 
 const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
@@ -955,69 +966,6 @@ function CompactJobsTable({
   );
 }
 
-function PlotGallery({ artifacts, projectId }: { artifacts: ViewableArtifact[]; projectId: string }) {
-  const [urls, setUrls] = useState<Record<string, string | 'error'>>({});
-
-  useEffect(() => {
-    const controller = new AbortController();
-    for (const artifact of artifacts) {
-      resolveArtifactDownloadUrl(projectId, artifact.storage_uri, controller.signal)
-        .then((url) => {
-          setUrls((prev) => ({ ...prev, [artifact.storage_uri]: url }));
-        })
-        .catch(() => {
-          if (!controller.signal.aborted) {
-            setUrls((prev) => ({ ...prev, [artifact.storage_uri]: 'error' }));
-          }
-        });
-    }
-    return () => controller.abort();
-  }, [artifacts, projectId]);
-
-  return (
-    <div className="mt-2 flex flex-wrap gap-2" data-testid="compute-plot-gallery">
-      {artifacts.map((artifact) => {
-        const url = urls[artifact.storage_uri];
-        return (
-          <div
-            key={artifact.storage_uri}
-            className="relative w-28 h-28 rounded border border-neutral-700 bg-neutral-900 overflow-hidden flex items-center justify-center shrink-0"
-            data-testid="plot-gallery-slot"
-          >
-            {url === undefined && (
-              <div className="text-ui-xs text-neutral-500" data-testid="plot-gallery-loading">loading</div>
-            )}
-            {url === 'error' && (
-              <div className="text-ui-xs text-neutral-500 px-1 text-center" data-testid="plot-gallery-error">unavailable</div>
-            )}
-            {url && url !== 'error' && artifact.kind === 'image' && (
-              <a href={url} target="_blank" rel="noopener noreferrer" className="block w-full h-full">
-                <img
-                  src={url}
-                  alt={artifact.filename}
-                  className="w-full h-full object-cover"
-                  data-testid="plot-gallery-image"
-                />
-              </a>
-            )}
-            {url && url !== 'error' && artifact.kind === 'video' && (
-              <video
-                src={url}
-                controls
-                className="w-full h-full object-cover"
-                data-testid="plot-gallery-video"
-              />
-            )}
-            <div className="absolute bottom-0 left-0 right-0 px-1 py-0.5 bg-neutral-900/80 text-ui-xs text-neutral-400 truncate pointer-events-none">
-              {artifact.filename}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
@@ -1059,6 +1007,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
+  // Signed preview URLs for viewable artifacts, keyed by `${jobId}:${storageUri}`.
+  // Resolved lazily on gallery expand and cached for the session; entries are
+  // re-resolved on click / media error once the signed URL goes stale.
+  const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
     `compute-ask-state:${projectId}`,
@@ -1121,6 +1073,61 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       return next;
     });
   }, []);
+
+  const resolvePreviewUrl = useCallback(async (key: string, storageUri: string): Promise<string | null> => {
+    if (!projectId) return null;
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
+    try {
+      const url = await resolveArtifactDownloadUrl(projectId, storageUri);
+      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
+      return url;
+    } catch {
+      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+      return null;
+    }
+  }, [projectId]);
+
+  const markPreviewError = useCallback((key: string) => {
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+  }, []);
+
+  const toggleArtifactGallery = useCallback((job: ComputeJob) => {
+    const galleryKey = `gallery-${job.id}`;
+    const wasExpanded = expandedDocIds.has(galleryKey);
+    toggleDocExpanded(galleryKey);
+    if (wasExpanded) return;
+    // Lazy resolution: sign URLs only when the operator expands this job's
+    // gallery, and only for entries without a live resolution in flight.
+    for (const art of computeJobViewableArtifacts(job)) {
+      const key = `${job.id}:${art.storage_uri}`;
+      const cached = previewUrls[key];
+      if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
+      void resolvePreviewUrl(key, art.storage_uri);
+    }
+  }, [expandedDocIds, toggleDocExpanded, previewUrls, resolvePreviewUrl]);
+
+  const openPreviewFullSize = useCallback(async (key: string, storageUri: string) => {
+    const cached = previewUrls[key];
+    if (cached?.state === 'resolved' && Date.now() - cached.resolvedAt < SIGNED_PREVIEW_FRESH_MS) {
+      window.open(cached.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    // Stale or errored cache — re-resolve, keeping a pending tab open across
+    // the async gap so popup blockers don't eat the navigation (same pattern
+    // as ResolvedReferenceLink in TaskCard).
+    const pendingTab = window.open('', '_blank');
+    const url = await resolvePreviewUrl(key, storageUri);
+    if (!url) {
+      pendingTab?.close();
+      return;
+    }
+    if (pendingTab) {
+      pendingTab.opener = null;
+      pendingTab.location.replace(url);
+    } else {
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+  }, [previewUrls, resolvePreviewUrl]);
 
   const load = useCallback(
     async (signal?: AbortSignal, appendOffset?: number) => {
@@ -1393,12 +1400,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
           <Cpu className="w-3.5 h-3.5 shrink-0" />
           Compute jobs
         </div>
-        <div className="flex items-center gap-2">
+        {/* flex-wrap + min-w-0: window selector (6×44px touch targets) plus the
+            view-mode toggle exceed a 375px viewport on one line — let the
+            controls wrap under the title instead of overflowing horizontally. */}
+        <div className="flex flex-wrap items-center justify-end gap-2 min-w-0">
           {onLaunchCompute && (
             <button
               type="button"
@@ -2155,9 +2165,92 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   </ResolvedReferenceLink>
                 </div>
               )}
-              {(job.viewable_artifacts?.length ?? 0) > 0 && projectId && (
-                <PlotGallery artifacts={job.viewable_artifacts!} projectId={projectId} />
-              )}
+              {(() => {
+                const artifacts = computeJobViewableArtifacts(job);
+                if (artifacts.length === 0) return null;
+                const galleryKey = `gallery-${job.id}`;
+                const galleryExpanded = expandedDocIds.has(galleryKey);
+                return (
+                  <div className="mt-1.5" data-testid="compute-artifact-gallery">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>Artifacts</span>
+                      <button
+                        type="button"
+                        onClick={() => toggleArtifactGallery(job)}
+                        className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                        data-testid="compute-artifact-gallery-toggle"
+                      >
+                        {galleryExpanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
+                      </button>
+                    </div>
+                    {galleryExpanded && (
+                      <div className="flex flex-wrap gap-2">
+                        {artifacts.map((art) => {
+                          const key = `${job.id}:${art.storage_uri}`;
+                          const resolution = previewUrls[key];
+                          const sizeLabel = fmtBytes(art.bytes);
+                          const caption = (
+                            <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
+                              {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
+                            </div>
+                          );
+                          if (resolution?.state === 'resolved') {
+                            return (
+                              <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
+                                {art.kind === 'video' ? (
+                                  <video
+                                    controls
+                                    preload="metadata"
+                                    src={resolution.url}
+                                    onError={() => markPreviewError(key)}
+                                    className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
+                                    data-testid="compute-artifact-video"
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
+                                    title={`Open ${art.name} full-size in a new tab`}
+                                    className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
+                                    data-testid="compute-artifact-thumbnail"
+                                  >
+                                    <img
+                                      src={resolution.url}
+                                      alt={art.name}
+                                      loading="lazy"
+                                      onError={() => markPreviewError(key)}
+                                      className="h-24 w-auto max-w-[16rem] rounded object-contain"
+                                    />
+                                  </button>
+                                )}
+                                {caption}
+                              </div>
+                            );
+                          }
+                          return (
+                            <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
+                              <button
+                                type="button"
+                                onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
+                                disabled={resolution?.state === 'resolving'}
+                                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
+                                data-testid="compute-artifact-placeholder"
+                              >
+                                {resolution?.state === 'resolving'
+                                  ? 'resolving…'
+                                  : resolution?.state === 'error'
+                                    ? 'preview unavailable — retry'
+                                    : 'load preview'}
+                              </button>
+                              {caption}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;
@@ -2411,8 +2504,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const lo = job.polling_metadata?.live_output as ComputeJobLiveOutput | undefined | null;
                 if (!lo || typeof lo.text !== 'string' || !lo.text.trim()) return null;
                 const lines = lo.text.split('\n');
-                const displayLines = lines.length > 30 ? lines.slice(-30) : lines;
                 const clipped = lines.length > 30;
+                const liveKey = `liveout-${job.id}`;
+                const liveExpanded = expandedDocIds.has(liveKey);
+                const displayLines = clipped && !liveExpanded ? lines.slice(-30) : lines;
                 return (
                   <div className="mt-1.5" data-testid="compute-live-output">
                     <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
@@ -2420,10 +2515,20 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-500">
                         updating…
                       </span>
-                      {(lo.truncated || clipped) && (
+                      {(lo.truncated || (clipped && !liveExpanded)) && (
                         <span className="rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-neutral-400">
                           truncated
                         </span>
+                      )}
+                      {clipped && !liveExpanded && (
+                        <button
+                          type="button"
+                          onClick={() => toggleDocExpanded(liveKey)}
+                          className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
+                          data-testid="compute-live-output-show-all"
+                        >
+                          Show all ({lines.length} lines)
+                        </button>
                       )}
                     </div>
                     <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-32 overflow-y-auto">

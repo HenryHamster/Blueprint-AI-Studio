@@ -1490,7 +1490,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1529,7 +1529,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({
                 "exec_status": exec_status,
                 "exit_code": exit_code,
@@ -1565,7 +1565,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1598,7 +1598,7 @@ class TestRunComputeJob(unittest.TestCase):
         captured: dict = {}
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -1651,7 +1651,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append(exec_status)
             return False
 
@@ -1960,7 +1960,7 @@ class TestComputePollLoop(unittest.TestCase):
             }
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({
                 "job_id": job_id,
                 "exec_status": exec_status,
@@ -3282,7 +3282,7 @@ class TestComputeJobTelemetry(unittest.TestCase):
         reports = []
 
         def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None):
+                        result_metrics=None, command_log=None, progress=None):
             reports.append({"exec_status": exec_status, "command_log": command_log})
             return False
 
