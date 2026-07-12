@@ -570,3 +570,201 @@ class TestScoreAuditFailClosed:
         report = {"findings": [{"severity": "low", "summary": "nit", "file": ""}]}
         audit, _erosion = rs._score_audit(report)
         assert audit == round(1.0 - 0.02, 4)
+
+
+# ---------------------------------------------------------------------------
+# Finding 67ac7f64df47b7a4 — three paths where category_verdicts=None reaches
+# compute_composite and the per-category gate does not engage.
+# ---------------------------------------------------------------------------
+
+
+class TestCategoryGateNonEngagingPaths:
+    """Document and assert the three paths where category_verdicts=None reaches
+    compute_composite, so the per-category goal-verification gate does not fire.
+
+    Finding 67ac7f64df47b7a4 identified these paths:
+      1. empty/contentless-goal: evaluate_merge_grade returns category_verdicts=None
+         for a contentless placeholder goal — the caller (_finalize_qualification)
+         MUST use _never_graded_category_verdicts to block for active criteria.
+      2. merge-grade-exempt: superseded_exempt / already_on_main_exempt candidates
+         skip the entire category-ledger block → category_verdicts=None (by-design).
+      3. legacy ci_unresolved-recovery: the recovery re-runs compute_composite with
+         base_record.get("category_verdicts") — when the original finalize persisted
+         None (no rubric or exempt), recovery also passes None (by-design same-SHA).
+
+    For each path we assert the designed behavior and verify the documented
+    fallback (path 1) or explicit exemption (paths 2 and 3) is in place.
+    """
+
+    # Path 1 -------------------------------------------------------------------
+
+    def test_contentless_goal_evaluate_returns_none_category_verdicts(self):
+        """evaluate_merge_grade with a contentless placeholder goal returns
+        category_verdicts=None and status=not_applicable (blocked=False).
+
+        This is the root cause: no merge-grade child is spawned for a
+        contentless goal, so evaluate_merge_grade never receives a graded
+        artifact and returns None for the per-category verdicts.  The caller
+        (_finalize_qualification) must synthesize _never_graded_category_verdicts
+        for active criteria rather than passing None to compute_composite.
+        """
+        active_cats = [{"category_key": "c-1"}, {"category_key": "c-2"}]
+        for goal in ("", "test", "n/a", "tbd", "placeholder", "none"):
+            result = rs.evaluate_merge_grade(
+                goal,
+                {"covers_goal": True, "coverage_score": 1.0},
+                active_cats,
+            )
+            assert result["category_verdicts"] is None, f"goal={goal!r}"
+            assert result["status"] == "not_applicable"
+            assert result["blocked"] is False
+
+    def test_contentless_goal_none_category_verdicts_skips_gate_in_compute_composite(self):
+        """compute_composite with category_verdicts=None skips the per-category
+        gate — this is the pre-redesign path deliberately preserved.
+
+        When a version has no gradeable goal, no merge-grade runs and there are
+        no per-category verdicts to gate on.  The caller (_finalize_qualification)
+        synthesizes _never_graded_category_verdicts for active criteria; compute_composite
+        itself only skips when None is explicitly passed (the no-rubric contract).
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(category_verdicts=None, residual_uncaptured_gap=None)
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+
+    def test_never_graded_verdicts_fallback_blocks_contentless_goal_path(self):
+        """Documented fallback for path 1: _never_graded_category_verdicts synthesizes
+        not_met for every active criterion when no merge-grade ran.
+
+        This is FIX 3 in _finalize_qualification (lines 5310-5337): when
+        _gate_category_verdicts is None but the version has active criteria (and
+        is not merge-grade-exempt), _never_graded_category_verdicts is called to
+        ensure the gate DOES engage with a fail-closed verdict rather than None.
+        """
+        from app.release_qualifier import _never_graded_category_verdicts
+
+        active_keys = {"c-auth", "c-dashboard"}
+        verdicts = _never_graded_category_verdicts(active_keys)
+        # Every active criterion gets not_met with a 'never graded' reason.
+        assert all(v["status"] == "not_met" for v in verdicts)
+        assert all("never graded" in (v.get("gap") or "") for v in verdicts)
+        # Feeding these to compute_composite must block with the preserved blocker string.
+        result = rs.compute_composite(**_perfect_kwargs(category_verdicts=verdicts))
+        assert result["promote"] is False
+        assert result["confidence"] == 0.0
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
+    # Path 2 -------------------------------------------------------------------
+
+    def test_merge_grade_exempt_category_verdicts_none_skips_gate_by_design(self):
+        """Path 2: merge-grade-exempt candidates receive category_verdicts=None
+        (by-design).  superseded_exempt and already_on_main_exempt skip the
+        entire category-ledger block in _finalize_qualification, so
+        _gate_category_verdicts stays None and the gate is not applied.
+
+        This is intentional: a candidate already landed on the promotion target
+        (already_on_main_exempt) or whose release was superseded (superseded_exempt)
+        does not need its acceptance contract re-evaluated.
+        """
+        # When _finalize_qualification skips the ledger block for an exempt
+        # candidate, it passes category_verdicts=None to compute_composite.
+        # The gate must be a no-op (not raise criterion_coverage_incomplete).
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                category_verdicts=None,
+                merge_grade_misses=False,  # exempt candidates also clear this
+            )
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+
+    def test_merge_grade_exempt_path_only_holistic_blockers_apply(self):
+        """On the merge-grade-exempt path, holistic quality blockers (CI, audit,
+        migration) still apply even though the category gate is skipped.
+
+        An exempt candidate is not a free pass — it still needs green CI and a
+        clean audit.  The exemption ONLY covers the goal-verification gate.
+        """
+        # A ci_not_green exempt candidate must still be blocked.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                ci_green=False,
+                category_verdicts=None,  # exempt path
+            )
+        )
+        assert result["blocker"] in ("ci_not_green", "ci_unresolved")
+
+        # A migration collision still blocks an exempt candidate.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                category_verdicts=None,
+                migration_collision=True,
+            )
+        )
+        assert result["blocker"] == "migration_identity_collision"
+
+    # Path 3 -------------------------------------------------------------------
+
+    def test_ci_unresolved_recovery_with_none_category_verdicts_skips_gate_by_design(self):
+        """Path 3: legacy ci_unresolved-recovery — when the original finalize
+        persisted category_verdicts=None (no active rubric or merge-grade-exempt),
+        the recovery re-runs compute_composite with the same None, and the gate
+        is correctly skipped.
+
+        This is by-design: the recovery is same-SHA, so the persisted None faithfully
+        represents the finalize's decision (no rubric, or exempt at finalize time).
+        Passing None through the recovery does not silently mask a graded failure.
+        """
+        from app.release_promotion import _recover_confidence_from_ci_unresolved
+
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "category_verdicts": None,  # no rubric or exempt at finalize time
+        }
+        out = _recover_confidence_from_ci_unresolved(record)
+        # Gate correctly skipped — category_verdicts=None means no rubric to gate on.
+        assert out.get("blocker") is None
+        assert out["confidence"] > 0.0
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+
+    def test_ci_unresolved_recovery_with_not_met_category_verdicts_keeps_blocker(self):
+        """Contrast: ci_unresolved recovery with a persisted not_met category verdict
+        must keep the criterion_coverage_incomplete blocker after CI clears.
+
+        This confirms that path 3's gate-skip is ONLY for the None case — when the
+        finalize DID persist real verdicts, the recovery re-applies the gate.
+        Covered by existing test_ci_unresolved_preserves_criterion_coverage_blocker,
+        but repeated here to document the contrast with the None path.
+        """
+        from app.release_promotion import _recover_confidence_from_ci_unresolved
+
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "tier": "judged",
+                    "citations": [{"kind": "diff", "ref": "a.py:1"}],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "not_met",
+                    "tier": "judged",
+                    "gap": "feature not shipped",
+                    "citations": [],
+                },
+            ],
+        }
+        out = _recover_confidence_from_ci_unresolved(record)
+        # Real verdicts: gate fires and keeps the unmet category blocked.
+        assert out["blocker"] == "criterion_coverage_incomplete"
+        assert out["confidence"] == 0.0
