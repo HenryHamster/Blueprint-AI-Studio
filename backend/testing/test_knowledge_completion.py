@@ -33,6 +33,10 @@ class TestComputeEvidenceTier:
         job = self._make_job(backend="local-container")
         assert _compute_evidence_tier(job, {"loss": 0.1}) == "covered"
 
+    def test_runner_subprocess_backend_returns_covered(self):
+        job = self._make_job(backend="runner-subprocess")
+        assert _compute_evidence_tier(job, None) == "covered"
+
     def test_gcp_backend_returns_attested(self):
         job = self._make_job(backend="gcp")
         assert _compute_evidence_tier(job, None) == "attested"

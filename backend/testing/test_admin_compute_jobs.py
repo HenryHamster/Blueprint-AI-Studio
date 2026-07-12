@@ -2661,3 +2661,64 @@ async def test_failed_job_response_has_first_class_exit_code_and_command_log(
     assert empty["exit_code"] is None
     assert "command_log" in empty, "command_log must always be present (null when absent)"
     assert empty["command_log"] is None
+
+
+@pytest.mark.asyncio
+async def test_gpu_contamination_audit_returns_completed_at(
+    client: AsyncClient, db_session
+):
+    """gpu-contamination-audit serializes completed_at (not ended_at) for suspect jobs.
+
+    ComputeJob has no ended_at attribute; accessing it raises AttributeError.
+    This test confirms the response carries completed_at and the endpoint
+    does not crash when at least one suspect job is present.
+    """
+    project = await _make_project(db_session, name="GPU Contamination")
+    await _add_member(db_session, project.id, "viewer")
+
+    task = Task(
+        project_id=project.id,
+        title="gpu experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A suspect job: runner-subprocess backend + accelerator_type set + started
+    # before the fix timestamp (2026-07-11 07:06:21 UTC).
+    suspect_started = datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc)
+    suspect_completed = datetime(2026, 7, 10, 13, 0, 0, tzinfo=timezone.utc)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="runner-subprocess",
+        accelerator_type="T4",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="n1-standard-4",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.0,
+        started_at=suspect_started,
+        completed_at=suspect_completed,
+        polling_metadata={},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(
+        f"/api/admin/compute-jobs/gpu-contamination-audit?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["suspect_count"] == 1
+    jobs = body["jobs"]
+    assert len(jobs) == 1
+    item = jobs[0]
+    assert item["job_id"] == str(job.id)
+    assert item["accelerator_type"] == "T4"
+    # completed_at must be present (AttributeError on job.ended_at would crash here)
+    assert "completed_at" in item
+    assert item["completed_at"] == suspect_completed.isoformat()
+    assert "ended_at" not in item

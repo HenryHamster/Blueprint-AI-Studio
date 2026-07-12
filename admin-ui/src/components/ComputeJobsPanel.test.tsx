@@ -218,6 +218,7 @@ describe('ComputeJobsPanel helpers', () => {
   test('computeJobExecutionLocation maps known local backends to operator-hardware', () => {
     expect(computeJobExecutionLocation('local-subprocess')).toEqual({ label: 'Operator hardware', isOperatorHardware: true });
     expect(computeJobExecutionLocation('local-gpu')).toEqual({ label: 'Operator hardware · GPU', isOperatorHardware: true });
+    expect(computeJobExecutionLocation('runner-subprocess')).toEqual({ label: 'Operator hardware · Runner', isOperatorHardware: true });
   });
 
   test('computeJobExecutionLocation maps gcp to GCP cloud', () => {

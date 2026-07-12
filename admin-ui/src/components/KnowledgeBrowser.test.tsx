@@ -1324,6 +1324,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
       ...computeDoc,
       id: 'doc-provenance-1',
       title: 'GPU benchmark with provenance',
+      evidence_tier: 'covered' as const,
       forward_quality_verdict: {
         ...computeDoc.forward_quality_verdict,
         terminal_diagnostics: {
@@ -1335,7 +1336,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
     await renderAndOpenDoc(docWithProvenance);
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Run provenance');
-    expect(text).toContain('Machine-verified');
+    expect(text).toContain('Machine verified');
     expect(text).toContain('Operator hardware');
     expect(text).toContain('abc12345');
     expect(text).not.toContain('abc12345xyz');
@@ -1346,6 +1347,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
       ...computeDoc,
       id: 'doc-provenance-gpu',
       title: 'GPU experiment with gpu backend',
+      evidence_tier: 'covered' as const,
       forward_quality_verdict: {
         ...computeDoc.forward_quality_verdict,
         terminal_diagnostics: {
@@ -1356,6 +1358,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
     };
     await renderAndOpenDoc(docWithGpu);
     const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Machine verified');
     expect(text).toContain('Operator hardware · GPU');
     expect(text).toContain('gpu-runn');
   });
@@ -1365,6 +1368,7 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
       ...computeDoc,
       id: 'doc-provenance-gcp',
       title: 'Cloud experiment with gcp backend',
+      evidence_tier: 'attested' as const,
       forward_quality_verdict: {
         ...computeDoc.forward_quality_verdict,
         terminal_diagnostics: {
@@ -1377,6 +1381,34 @@ describe('KnowledgeBrowser — compute run provenance detail', () => {
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('Run provenance');
     expect(text).toContain('GCP cloud');
+    expect(text).toContain('Attested');
+    expect(text).not.toContain('Machine-verified');
+    expect(text).not.toContain('Machine verified');
+  });
+
+  test('does not render duplicate Machine-verified badge when criterion_met=true and evidence_tier=attested', async () => {
+    // A cloud run where criterion_met=true but evidence_tier=attested should show
+    // "Attested" from EvidenceTierBadge — never the old hardcoded "Machine-verified" label.
+    const docCloudCriterionMet = {
+      ...computeDoc,
+      id: 'doc-provenance-cloud-criterion-met',
+      title: 'Cloud experiment criterion met but attested tier',
+      criterion_met: true,
+      evidence_tier: 'attested' as const,
+      forward_quality_verdict: {
+        ...computeDoc.forward_quality_verdict,
+        terminal_diagnostics: {
+          executing_backend: 'gcp',
+          runner_target_id: 'cloud-runner-xyz',
+        },
+      },
+    };
+    await renderAndOpenDoc(docCloudCriterionMet);
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Run provenance');
+    expect(text).toContain('Attested');
+    expect(text).not.toContain('Machine-verified');
+    expect(text).not.toContain('Machine verified');
   });
 
   test('renders no run provenance panel when terminal_diagnostics is absent', async () => {

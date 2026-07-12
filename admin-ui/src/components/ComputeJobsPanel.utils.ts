@@ -122,6 +122,8 @@ export function computeJobExecutionLocation(backend: string): {
       return { label: 'Operator hardware', isOperatorHardware: true };
     case 'local-gpu':
       return { label: 'Operator hardware · GPU', isOperatorHardware: true };
+    case 'runner-subprocess':
+      return { label: 'Operator hardware · Runner', isOperatorHardware: true };
     case 'gcp':
       return { label: 'GCP cloud', isOperatorHardware: false };
     default:

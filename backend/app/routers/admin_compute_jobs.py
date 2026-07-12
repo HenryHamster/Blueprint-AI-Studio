@@ -782,7 +782,7 @@ async def gpu_contamination_audit(
             "accelerator_type": job.accelerator_type,
             "status": job.status.value if job.status else None,
             "started_at": job.started_at.isoformat() if job.started_at else None,
-            "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "suspect_reason": (
                 "started before /sys ro-bind fix (PR #14183); cuInit likely "
                 "returned CUDA_ERROR_OPERATING_SYSTEM (rc=304), causing silent "

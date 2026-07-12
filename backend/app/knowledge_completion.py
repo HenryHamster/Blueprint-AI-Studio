@@ -1296,7 +1296,7 @@ def _compute_evidence_tier(
     if job is None:
         return "backfilled" if result_metrics else "uncovered"
     backend = getattr(job, "backend", None) or ""
-    if backend.startswith("local-"):
+    if backend.startswith("local-") or backend == "runner-subprocess":
         return "covered"
     if backend:
         return "attested"
