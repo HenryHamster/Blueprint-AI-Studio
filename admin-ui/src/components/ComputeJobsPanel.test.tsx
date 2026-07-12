@@ -3740,3 +3740,62 @@ describe('ComputeJobsPanel — plot gallery', () => {
     });
   });
 });
+
+describe('ComputeJobsPanel — runner identity on finished jobs', () => {
+  beforeEach(() => {
+    fetchComputeJobs.mockReset();
+    killComputeJob.mockReset();
+    resolveArtifactDownloadUrl.mockReset();
+  });
+
+  test('renders runner identity on finished job without claim timestamp', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: { hostname: 'my-gpu-host', id: 'runner-abc12345-dead-beef-0000-111122223333', status: null },
+        runner_claimed_at: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    expect(runnerEl.textContent).toContain('my-gpu-host');
+    expect(runnerEl.textContent).not.toContain('claimed');
+  });
+
+  test('renders runner identity using truncated target id when hostname absent', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: null,
+        runner_claimed_at: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    expect(runnerEl.textContent).toContain('runner-ab');
+    expect(runnerEl.textContent).not.toContain('claimed');
+  });
+
+  test('renders claimed suffix when runner_claimed_at is present', async () => {
+    const claimedAt = new Date(Date.now() - 60_000).toISOString();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        runner_target_id: 'runner-abc12345-dead-beef-0000-111122223333',
+        runner: { hostname: 'my-gpu-host', id: 'runner-abc12345-dead-beef-0000-111122223333', status: null },
+        runner_claimed_at: claimedAt,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const runnerEl = await findByTestId('compute-runner-claimed');
+    expect(runnerEl.textContent).toContain('my-gpu-host');
+    expect(runnerEl.textContent).toContain('claimed');
+    expect(runnerEl.textContent).toContain('ago');
+  });
+});

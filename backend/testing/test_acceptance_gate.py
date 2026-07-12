@@ -300,6 +300,96 @@ def test_named_test_cross_cutting_invariants_passes_semantic_grounding():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# named_test — frontend (vitest/jest) test files ground against a changed seam
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_named_test_frontend_vitest_grounded_proven():
+    """A frontend named_test (`ComputeJobsPanel.test.tsx`) grounds against a
+    changed production seam (`ComputeJobsPanel.tsx`) exactly like a Python
+    `test_<module>.py` does — this is the recording-seam fix that lets UI-only
+    work flip criterion coverage to covered."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/ComputeJobsPanel.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+    assert verdict.proof_ref
+
+
+def test_named_test_frontend_spec_ts_grounded_proven():
+    """The `.spec.ts` (jasmine/jest) naming convention grounds too: a
+    `KnowledgeBrowser.spec.ts` grounds against a changed `KnowledgeBrowser.ts`."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/KnowledgeBrowser.spec.ts",
+        },
+        changed_files=[
+            "admin-ui/src/components/KnowledgeBrowser.ts",
+            "admin-ui/src/components/KnowledgeBrowser.spec.ts",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+
+
+def test_named_test_frontend_mts_suffix_grounded_proven():
+    """The `[cm]?[jt]sx?` suffix coverage grounds `.mts`/`.cjs`-style names:
+    a `Widget.test.mts` grounds against a changed `Widget.ts`."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/Widget.test.mts",
+        },
+        changed_files=[
+            "admin-ui/src/Widget.ts",
+            "admin-ui/src/Widget.test.mts",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+
+
+def test_named_test_frontend_stem_mismatch_fails_closed():
+    """A frontend test whose stem matches no changed production seam fails
+    closed — `ComputeJobsPanel.test.tsx` cannot be proven by a change to an
+    unrelated `KnowledgeBrowser.tsx`, even with a real merge verdict."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/KnowledgeBrowser.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert "does not semantically correspond" in verdict.reason
+    assert verdict.proven is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # named_test — GitHub-verified file list closes the self-declaration trust gap
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2186,6 +2276,59 @@ async def test_backfill_acceptance_verdicts_upgrades_false_negative(db_session):
     updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     assert updated is not None
     assert updated.get("proven") is True, "verdict should be upgraded to proven"
+    assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_upgrades_frontend_named_test(db_session):
+    """A pre-fix FRONTEND named_test (vitest) verdict stamped satisfied=True /
+    proven=False — because the old grounding only understood Python
+    `test_<module>.py` naming — is upgraded to proven=True by the backfill sweep
+    once JS/TS grounding lands. This is the self-healing path for rollup #14487.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=[
+            "admin-ui/src/components/ComputeJobsPanel.tsx",
+            "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        ],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test "
+            "'admin-ui/src/components/ComputeJobsPanel.test.tsx' exercises a "
+            "production seam that does not semantically correspond to the "
+            "declared test module"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should upgrade the pre-fix frontend verdict"
+
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("proven") is True, "frontend verdict should upgrade to proven"
     assert updated.get("backfilled") is True
 
 

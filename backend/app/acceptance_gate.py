@@ -264,32 +264,61 @@ def get_cross_cutting_test_files() -> frozenset[str]:
     return _CROSS_CUTTING_TEST_FILES
 
 
+# vitest/jest test-file naming: ``<stem>.test.tsx`` / ``<stem>.spec.mts`` →
+# ``<stem>``. The recognized suffix set mirrors the JS/TS alternatives in
+# :data:`app.payload_schemas._TEST_FILE_BASENAME_RE` so test-file *detection*
+# and semantic *grounding* cannot drift apart.
+_JS_TS_TEST_BASENAME_RE = re.compile(r"^(?P<stem>.+)\.(?:test|spec)\.[cm]?[jt]sx?$")
+
+
+def _test_module_stem(test_basename: str) -> str | None:
+    """Extract the production-module stem a test file is named after.
+
+    Understands both the Python ``test_<module>.py`` convention (→ ``module``)
+    and the vitest/jest ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions
+    (→ ``module``). ``test_basename`` is the file basename *including* its
+    extension.
+
+    Returns ``None`` (fail closed) for any name that follows no recognized
+    convention (e.g. ``foo_test.py``), so the caller cannot grant
+    machine-checked proof it is unable to ground.
+    """
+    js_match = _JS_TS_TEST_BASENAME_RE.match(test_basename)
+    if js_match:
+        return js_match.group("stem") or None
+    # Python: strip the file extension, then the leading ``test_`` prefix.
+    py_stem = test_basename.rsplit(".", 1)[0]
+    if py_stem.startswith("test_"):
+        module = py_stem[len("test_"):]
+        return module or None
+    return None
+
+
 def _test_semantically_grounded(
     declared_test_path: str, seam_files: list[str]
 ) -> bool:
     """Whether a declared test path semantically corresponds to a changed seam.
 
-    A heuristic that the test file's module name (its basename minus the
-    ``test_`` prefix and file extension) must match at least one changed
-    non-test file's module name exactly.  A declaration of
-    ``test_acceptance_gate.py`` must co-occur with a change to
-    ``acceptance_gate.py`` — not just any production file.
+    A heuristic that the test file's module stem must match at least one changed
+    non-test file's module name exactly. The stem is derived from either the
+    Python ``test_<module>.py`` convention or the vitest/jest
+    ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions (see
+    :func:`_test_module_stem`). A declaration of ``test_acceptance_gate.py``
+    must co-occur with a change to ``acceptance_gate.py``; a declaration of
+    ``ComputeJobsPanel.test.tsx`` must co-occur with a change to
+    ``ComputeJobsPanel.tsx`` (or ``.ts``) — not just any production file.
 
-    Files that do not follow the ``test_`` prefix convention (e.g.
-    ``foo_test.py`` or non-Python files) fail closed: the heuristic cannot
-    ground them, so the gate errs on the side of not granting machine-checked
-    proof.
+    Files that follow no recognized test-naming convention (e.g.
+    ``foo_test.py``) fail closed: the heuristic cannot ground them, so the gate
+    errs on the side of not granting machine-checked proof.
     """
-    test_basename = declared_test_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    if not test_basename.startswith("test_"):
-        return False
-    test_stem = test_basename[len("test_"):]
-    if not test_stem:
-        return False
-    for path in seam_files:
-        prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        if prod_basename == test_stem:
-            return True
+    test_basename = declared_test_path.rsplit("/", 1)[-1]
+    test_stem = _test_module_stem(test_basename)
+    if test_stem:
+        for path in seam_files:
+            prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if prod_basename == test_stem:
+                return True
     # Cross-cutting test files (e.g., test_invariants.py) do not map to a
     # single production module — accept them as intrinsically grounded when
     # any non-test production seam exists (already verified by the caller).

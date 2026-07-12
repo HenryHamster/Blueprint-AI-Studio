@@ -1613,8 +1613,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   {(() => {
                     const runner = job.runner;
                     const runnerName = runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
-                    if (runnerName && job.runner_claimed_at) {
-                      const claimedMs = Date.parse(job.runner_claimed_at);
+                    if (runnerName) {
+                      const claimedMs = job.runner_claimed_at ? Date.parse(job.runner_claimed_at) : NaN;
                       const elapsedSec = isNaN(claimedMs) ? null : Math.max(0, Math.round((nowMs - claimedMs) / 1000));
                       return (
                         <div className="text-ui-sm text-neutral-400 font-mono mt-0.5" data-testid="compute-runner-claimed">
