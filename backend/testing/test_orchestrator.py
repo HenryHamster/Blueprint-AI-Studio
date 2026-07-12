@@ -10937,6 +10937,118 @@ class TestPerClassCapacityGating:
         # still free in the old model. The new code is consistent: agent tasks do
         # NOT fill compute slots when max_concurrent_compute is absent.)
 
+
+class TestAuthoritativeAgentTaskCount:
+    """Signal-that-lies fix #5: agent load is derived from the AUTHORITATIVE
+    ``_active_agent_task_count`` (committed Task rows) rather than the stale-prone
+    heartbeat ``active_task_ids`` list. A runner heartbeat that still lists
+    COMPLETED/FAILED tasks must not falsely hold an idle runner at capacity and
+    block a pinned head."""
+
+    def _make_runner(self, caps: dict):
+        from app.orchestrator_runner_dispatch import RunnerDispatchSnapshot
+
+        return RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities=caps
+        )
+
+    def test_active_count_prefers_authoritative_over_stale_heartbeat(self):
+        from app.orchestrator_runner_dispatch import (
+            _ACTIVE_AGENT_TASK_COUNT_KEY,
+            _runner_active_task_count,
+        )
+
+        runner = self._make_runner(
+            {
+                "active_task_ids": ["stale1", "stale2", "stale3"],  # stale-HIGH hb
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 0,  # authoritative: idle
+            }
+        )
+        assert _runner_active_task_count(runner) == 0
+
+    def test_at_capacity_idle_despite_stale_heartbeat(self):
+        import app.orchestrator as orch
+        from app.orchestrator_runner_dispatch import _ACTIVE_AGENT_TASK_COUNT_KEY
+
+        runner = self._make_runner(
+            {
+                "max_concurrent": 2,
+                "active_task_ids": ["stale1", "stale2"],  # would read AT capacity
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 0,  # authoritatively idle
+            }
+        )
+        assert orch._runner_at_capacity(runner, 0, "fix") is False
+
+    def test_authoritative_full_still_caps(self):
+        import app.orchestrator as orch
+        from app.orchestrator_runner_dispatch import _ACTIVE_AGENT_TASK_COUNT_KEY
+
+        runner = self._make_runner(
+            {
+                "max_concurrent": 2,
+                "active_task_ids": [],  # heartbeat lags / empty
+                _ACTIVE_AGENT_TASK_COUNT_KEY: 2,  # authoritatively full
+            }
+        )
+        assert orch._runner_at_capacity(runner, 0, "fix") is True
+
+    def test_falls_back_to_heartbeat_when_authoritative_absent(self):
+        from app.orchestrator_runner_dispatch import _runner_active_task_count
+
+        # No authoritative key (bare LocalRunner ORM / old snapshot) → heartbeat hint.
+        runner = self._make_runner({"active_task_ids": ["a", "b"]})
+        assert _runner_active_task_count(runner) == 2
+
+
+@pytest.mark.asyncio
+async def test_load_runner_active_task_counts_counts_committed_task_rows(db_session):
+    """The authoritative loader counts only active-status Task rows pinned to each
+    runner (``vm_instance_id == 'runner:<id>'``), excluding terminal rows and rows
+    pinned to a different runner."""
+    from app.orchestrator_runner_dispatch import _load_runner_active_task_counts
+
+    runner_a = uuid.uuid4()
+    runner_b = uuid.uuid4()
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    rows = [
+        # 2 active tasks pinned to runner_a (PROVISIONING + IN_PROGRESS) → counted.
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        # Terminal task pinned to runner_a → excluded (left the active set).
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=f"runner:{runner_a}",
+        ),
+        # Active task pinned to a DIFFERENT runner → not counted for runner_a.
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{runner_b}",
+        ),
+    ]
+    for t in rows:
+        db_session.add(t)
+    await db_session.commit()
+
+    counts = await _load_runner_active_task_counts(db_session, [runner_a, runner_b])
+    assert counts.get(runner_a) == 2
+    assert counts.get(runner_b) == 1
+    # Empty input → empty map (no query).
+    assert await _load_runner_active_task_counts(db_session, []) == {}
+
     def test_select_eligible_runner_compute_task_ignores_agent_load(self):
         """_select_eligible_runner returns the runner for a compute_experiment
         even when the runner's agent task slots are full, as long as compute

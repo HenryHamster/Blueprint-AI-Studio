@@ -499,13 +499,18 @@ async def _spawn_release_merge_grade_task(
     candidate_sha: str,
     version_goal: str,
     merged_pr_numbers: list[int],
+    categories: list[dict[str, Any]] | None = None,
 ) -> Task:
     """Create + queue a blind ``release_merge_grade`` task for the qualifier.
 
     The merge-grade agent grades the MERGED DIFFS of this version (the
     ``base_branch...candidate_sha`` range plus the merged-PR window) against the
-    frozen ``version_goal`` and returns ``{covers_goal, coverage_score,
-    biggest_gap}``.
+    frozen ``version_goal`` and returns the holistic ``{covers_goal,
+    coverage_score, biggest_gap}`` plus — per the goal-verification redesign — a
+    per-category verdict for each active acceptance-criterion CATEGORY in
+    ``categories`` (``{category_key, text}``) and a residual "gap no category
+    captures" answer.  The categories are the ACTIVE ``VersionAcceptanceCriterion``
+    rows; the agent keys its verdicts on the supplied ``category_key`` values.
 
     BLINDNESS CONTRACT (dir d-c0fe439f): this grade must be UNINVESTED — the
     agent sees the version goal and the merged diffs ONLY.  The strategist's
@@ -527,6 +532,11 @@ async def _spawn_release_merge_grade_task(
         # merged-PR discovery the blind merge-grade uses); the agent fetches each
         # PR's diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
+        # Goal-verification redesign: the ACTIVE acceptance-criterion CATEGORIES
+        # the agent grades the merged diff against (per-category met/not_met/
+        # partial + cited diff evidence + gap).  Empty list ⇒ no rubric; the agent
+        # then grades only the holistic goal coverage.
+        "categories": list(categories or []),
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
         "quality_tier": "opus",

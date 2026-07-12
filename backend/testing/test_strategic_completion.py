@@ -39,6 +39,8 @@ from app.strategic_completion import (
     _compute_lifetime_burn_metrics,
     _direction_non_merge_pause,
     _direction_still_productive,
+    _cycle_landed_or_noop,
+    _direction_consecutive_zero_landed_cycles,
     _recent_merges_mostly_unproven,
     _already_built_signature,
     already_built_completion_suggestion,
@@ -10493,11 +10495,36 @@ class TestDirectionStillProductive:
 
 
 class TestProductivityGateOnHealthRules:
-    """Core regression: a still-productive direction with 0 merges over many cycles
-    must NOT be paused by Rule 2 / 5 / 6, while genuine code failures still pause."""
+    """Core regression: a still-productive direction that is genuinely LANDING work
+    (or completing already-built no-ops) must NOT be paused by Rule 2 / 5 / 6, while
+    genuine code failures still pause.
+
+    Signal-that-lies fix: ``last_cycle_productive`` alone (mere spawn/notes) no
+    longer holds the shield — the direction must show a real landing/no-op signal
+    in its recent history. Each "skipped_when_still_productive" case therefore
+    carries a genuine no-op completion on its most-recent cycle (which resets the
+    zero-landed strip); the companion "..._fires_when_spawn_only_never_lands" cases
+    confirm that a spawn-only-never-land direction now correctly reaches the pause.
+    """
 
     def test_rule2_zero_merge_skipped_when_still_productive(self):
-        # 6 cycles, 0 merges, fully finished — Rule 2 would normally fire.
+        # 6 cycles, 0 merges — Rule 2 would fire — BUT the latest cycle completed a
+        # genuine no-op (already-built), so the direction keeps its shield.
+        history = _history(
+            6, tasks_created=2, tasks_completed=2, tasks_failed=0, prs_merged=0
+        )
+        history[-1]["tasks_completed_no_pr"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=history,
+        )
+        assert _check_direction_health(d) is None
+
+    def test_rule2_zero_merge_fires_when_spawn_only_never_lands(self):
+        # Corrected behaviour: last_cycle_productive credits mere spawning, but 6
+        # cycles with zero merges AND zero no-op completions is spawn-only churn —
+        # the shield is stripped and Rule 2 (zero-merge) now fires.
         d = _direction(
             last_cycle_productive=True,
             consecutive_unproductive_cycles=0,
@@ -10505,10 +10532,25 @@ class TestProductivityGateOnHealthRules:
                 6, tasks_created=2, tasks_completed=2, tasks_failed=0, prs_merged=0
             ),
         )
-        assert _check_direction_health(d) is None
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Unproductive" in result
 
     def test_rule5_churn_skipped_when_still_productive(self):
-        # Would trip Rule 5 (non_merge_finished=20, merge_rate 0%) but productive.
+        # Would trip Rule 5 (high non-merge volume, 0% merge rate) but the latest
+        # cycle is a genuine no-op completion → shield retained.
+        history = _history(
+            5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+        )
+        history[-1]["tasks_completed_no_pr"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=history,
+        )
+        assert _check_direction_health(d) is None
+
+    def test_rule5_churn_fires_when_spawn_only_never_lands(self):
         d = _direction(
             last_cycle_productive=True,
             consecutive_unproductive_cycles=0,
@@ -10516,9 +10558,41 @@ class TestProductivityGateOnHealthRules:
                 5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
             ),
         )
-        assert _check_direction_health(d) is None
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
 
     def test_rule6_lifetime_burn_skipped_when_still_productive(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 160,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        # Rule 6 (lifetime burn) has NO real_merges guard, so the still-productive
+        # shield is genuinely load-bearing here: the latest cycle's no-op completion
+        # keeps the shield and skips the lifetime-burn backstop.
+        history = _history(
+            5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+        )
+        history[-1]["tasks_completed_no_pr"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=history,
+            history_aggregate=agg,
+        )
+        assert _check_direction_health(d) is None
+
+    def test_rule6_lifetime_burn_fires_when_spawn_only_never_lands(self, mocker):
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
             {
@@ -10541,7 +10615,9 @@ class TestProductivityGateOnHealthRules:
             ),
             history_aggregate=agg,
         )
-        assert _check_direction_health(d) is None
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
 
     def test_code_failure_rule3_still_pauses_when_productive(self):
         # Rule 3 is UNGATED: a crashing direction pauses regardless of the flag.
@@ -10587,6 +10663,132 @@ class TestProductivityGateOnHealthRules:
         result = _check_direction_health(d)
         assert result is not None
         assert "Churn guardrail" in result
+
+
+class TestStillProductiveLandingGate:
+    """Signal-that-lies fix for the still-productive shield: ``last_cycle_productive``
+    credits mere spawning / notes-only cycles, which is fine for the cooldown cadence
+    but must NOT keep the merge-rate pause shield up forever. The shield now requires
+    a real landing (merged PR, integration OR staging) or a genuine no-op completion
+    within the recent window, and is stripped after N consecutive zero-landed cycles.
+    """
+
+    def test_stripped_after_n_zero_landed_cycles(self):
+        # 6 cycles, all spawn-only (zero merges, zero no-ops) → shield stripped.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(6, prs_merged=0),
+        )
+        assert _direction_still_productive(d) is False
+
+    def test_held_when_recent_staging_merge(self):
+        # A staging merge on the latest cycle (merged_prs_any_base) is a landing,
+        # even before rollup-landing credit propagates → shield held.
+        hist = _history(6, prs_merged=0)
+        hist[-1]["merged_prs_any_base"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=hist,
+        )
+        assert _direction_still_productive(d) is True
+
+    def test_held_when_recent_noop_completion(self):
+        # Genuine no-op completion (already-built) on the latest cycle preserves the
+        # shield — its legitimate purpose.
+        hist = _history(6, prs_merged=0)
+        hist[-1]["tasks_completed_no_pr"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=hist,
+        )
+        assert _direction_still_productive(d) is True
+
+    def test_held_when_zero_landed_below_strip_max(self):
+        # Landed 3 cycles ago, then 2 trailing zero-landed (< default strip_max 3)
+        # → shield still held (recent-enough landing keeps the grace).
+        hist = _history(5, prs_merged=0)
+        hist[-3]["prs_merged"] = 1
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=hist,
+        )
+        assert _direction_still_productive(d) is True
+
+    def test_empty_history_not_stripped(self):
+        # No history → 0 consecutive zero-landed → shield unchanged (the pause rules
+        # need history to fire anyway, so this is behaviour-preserving).
+        d = _direction(
+            last_cycle_productive=True, consecutive_unproductive_cycles=0
+        )
+        assert _direction_still_productive(d) is True
+
+    def test_strip_threshold_configurable(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_productive_shield_max_zero_landed_cycles": 1},
+            clear=False,
+        )
+        # strip_max=1: a single zero-landed latest cycle strips the shield.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(3, prs_merged=0),
+        )
+        assert _direction_still_productive(d) is False
+
+
+class TestCycleLandedOrNoop:
+    """Per-cycle shield-qualifying predicate + the trailing zero-landed counter."""
+
+    def test_merged_prs_any_base_is_landing(self):
+        assert _cycle_landed_or_noop({"merged_prs_any_base": 1}) is True
+
+    def test_verified_merge_is_landing(self):
+        assert _cycle_landed_or_noop({"verified_prs_merged": 2}) is True
+
+    def test_legacy_prs_merged_is_landing(self):
+        assert _cycle_landed_or_noop({"prs_merged": 1}) is True
+
+    def test_noop_completion_qualifies(self):
+        assert _cycle_landed_or_noop({"tasks_completed_no_pr": 1}) is True
+
+    def test_spawn_only_does_not_qualify(self):
+        assert (
+            _cycle_landed_or_noop(
+                {"tasks_created": 3, "tasks_completed": 2, "prs_merged": 0}
+            )
+            is False
+        )
+
+    def test_non_dict_is_false(self):
+        assert _cycle_landed_or_noop(None) is False
+
+    def test_consecutive_zero_landed_counts_trailing(self):
+        hist = [
+            {"prs_merged": 1},
+            {"prs_merged": 0},
+            {"prs_merged": 0},
+        ]
+        assert (
+            _direction_consecutive_zero_landed_cycles({"research_history": hist}) == 2
+        )
+
+    def test_consecutive_zero_landed_stops_at_landing(self):
+        hist = [
+            {"prs_merged": 0},
+            {"merged_prs_any_base": 1},
+            {"prs_merged": 0},
+        ]
+        assert (
+            _direction_consecutive_zero_landed_cycles({"research_history": hist}) == 1
+        )
+
+    def test_consecutive_zero_landed_empty_history(self):
+        assert _direction_consecutive_zero_landed_cycles({}) == 0
 
 
 # ── Fix #2: tasks_completed_no_pr excluded from non-merge churn ────────────────

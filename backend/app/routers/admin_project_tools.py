@@ -611,14 +611,6 @@ class _ToolContentSave(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _parse_uuid(raw: str, field: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(raw))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail=f"Invalid {field} format")
-
-
-
 def _tool_summary(tool: ProjectTool) -> Dict[str, Any]:
     """Lean list projection — deliberately omits the (potentially large) content."""
     return {

@@ -90,6 +90,18 @@ from app.acceptance_gate import (
     classify_undeclared_reason,
 )
 from app.acceptance_criteria import get_version_coverage_summary
+
+# Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
+# module owns this file; it may not be present in every checkout during the
+# staged rollout of the redesign, so the import is guarded exactly like the
+# best-effort ``app.completion_debt`` snapshot below.  When absent, the qualifier
+# falls back to the pre-redesign path (no per-category gate, holistic merge-grade
+# only) rather than failing to import.  The integrator's tree carries the module.
+try:  # pragma: no cover - exercised once the sibling ledger module lands
+    from app import category_verdict_ledger as _category_ledger
+except Exception:  # noqa: BLE001 - sibling module not yet landed in this checkout
+    _category_ledger = None  # type: ignore[assignment]
+
 from app.landed_signal import landed_signal_predicate
 from app.models import (
     ArtifactType,
@@ -283,6 +295,25 @@ logger = logging.getLogger(__name__)
 _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
+
+
+def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
+    """Coerce a category-verdict row read back from the ledger into a plain dict.
+
+    ``compute_composite``'s goal-verification gate reads ``status``/``tier`` via
+    ``dict.get``; the sibling ledger may hand back either dicts or ORM rows, so
+    this normalises both to ``{category_key, status, tier}`` (the only fields the
+    gate consumes).  Keeps the gate pure and shape-agnostic to the ledger's
+    internal representation.
+    """
+    if isinstance(v, dict):
+        return v
+    return {
+        "category_key": getattr(v, "category_key", None),
+        "status": getattr(v, "status", None),
+        "tier": getattr(v, "tier", "judged"),
+        "gap": getattr(v, "gap", None),
+    }
 
 
 def _is_audited_surface_path(path: str) -> bool:
@@ -2046,49 +2077,43 @@ async def run_qualification(
         and prior_qual.get("candidate_sha") == candidate_sha
         and ci_green
     )
-    # Criterion-coverage recovery — the acceptance-contract safety valve.  A
-    # same-SHA not_promoted verdict whose blocker was
-    # ``criterion_coverage_incomplete`` (set in release_scoring when active
-    # criteria are uncovered) may re-run once the LIVE coverage summary shows the
-    # gate would no longer fire: every active criterion covered, or ZERO active
-    # criteria remain after a retraction/supersession cleared an uncoverable one.
-    # This is the deadlock this direction exists to break — retracting an
-    # uncoverable criterion must let the qualifier re-audit and clear the gate
-    # WITHOUT a SHA change or operator action.  Mirrors the ``ci_unresolved``
-    # narrow exception exactly: it relaxes caching for THIS blocker only and
-    # only on the SAME SHA (a different SHA already re-runs via the normal cache
-    # miss), and every downstream gate still applies to the fresh re-audit.
+    # Goal-verification recovery — the acceptance-contract safety valve, updated
+    # in LOCKSTEP with the redesigned gate.  A same-SHA not_promoted verdict whose
+    # blocker was ``criterion_coverage_incomplete`` (now set in release_scoring
+    # when any active CATEGORY is not ``met`` OR the residual gap is non-empty) may
+    # re-run once the ledger shows the candidate is FULLY MET again: every active
+    # category met AND the residual clean.  This is the deadlock this valve exists
+    # to break — retracting/superseding an uncoverable criterion, or a re-grade
+    # flipping a category to ``met``, must let the qualifier re-audit and clear the
+    # gate WITHOUT a SHA change or operator action.  ``is_candidate_fully_met``
+    # subsumes the old ``total - covered - attested - backfilled <= 0`` arithmetic
+    # AND the residual leg in one sha-keyed read.  Mirrors the ``ci_unresolved``
+    # narrow exception: relaxes caching for THIS blocker, on the SAME SHA only.
     criterion_coverage_recovered_same_sha = False
     if (
         prior_status == "not_promoted"
         and prior_qual.get("blocker") == "criterion_coverage_incomplete"
         and prior_qual.get("candidate_sha") == candidate_sha
     ):
-        try:
-            _coverage = await get_version_coverage_summary(session, version.id)
-            _total = int(_coverage.get("total") or 0)
-            _covered = int(_coverage.get("covered") or 0)
-            _attested = int(_coverage.get("attested") or 0)
-            _backfilled = int(_coverage.get("backfilled") or 0)
-            # Mirror the release_scoring gate exactly: it fires when
-            # ``total > 0 and (total - covered - attested - backfilled) > 0``, so
-            # the gate is CLEAR when no active criteria remain (total == 0), every
-            # active one is machine-covered, the remaining ones are at least covered
-            # by a non-expired operator attestation, or they are covered by
-            # unverified-merge backfill evidence (which clears the blocker but
-            # incurs the confidence penalty in both cases rather than wedging
-            # not_promoted).
-            criterion_coverage_recovered_same_sha = (
-                _total == 0
-                or (_total - _covered - _attested - _backfilled) <= 0
-            )
-        except Exception:  # noqa: BLE001 — a coverage lookup failure stays cached (safe: no wrong re-run)
-            logger.warning(
-                "[RELEASE_QUALIFIER] run_qualification: coverage-recovery check "
-                "failed for v%d — leaving the not_promoted verdict cached",
-                version.version_number,
-            )
+        if _category_ledger is None:
+            # Sibling ledger not present in this checkout — cannot re-evaluate the
+            # per-category gate, so leave the verdict cached (safe: no wrong re-run).
             criterion_coverage_recovered_same_sha = False
+        else:
+            try:
+                criterion_coverage_recovered_same_sha = (
+                    await _category_ledger.is_candidate_fully_met(
+                        session, version.id, candidate_sha
+                    )
+                )
+            except Exception:  # noqa: BLE001 — a ledger lookup failure stays cached (safe: no wrong re-run)
+                logger.warning(
+                    "[RELEASE_QUALIFIER] run_qualification: goal-verification "
+                    "recovery check failed for v%d — leaving the not_promoted "
+                    "verdict cached",
+                    version.version_number,
+                )
+                criterion_coverage_recovered_same_sha = False
     # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
     # to the prior conclusive candidate (differs only in excluded CI/fixture/
     # config files) carries the same verdict — reuse it instead of re-rolling the
@@ -2274,6 +2299,16 @@ async def run_qualification(
             audit_task_id = str(audit_task.id)
         if _merge_grade_needed:
             merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
+            # Goal-verification redesign: the merge-grade agent grades the merged
+            # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
+            # (stable ``criterion_key`` + text) into the payload.  The agent keys
+            # its per-category verdicts back on these keys.
+            _mg_criteria = await get_version_coverage_summary(session, version.id)
+            _mg_categories = [
+                {"category_key": c.get("criterion_key"), "text": c.get("text")}
+                for c in (_mg_criteria.get("criteria") or [])
+                if c.get("status") == "active" and c.get("criterion_key")
+            ]
             merge_grade_task = await _spawn_release_merge_grade_task(
                 session,
                 project_id,
@@ -2283,6 +2318,7 @@ async def run_qualification(
                 candidate_sha=candidate_sha,
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
+                categories=_mg_categories,
             )
             merge_grade_task_id = str(merge_grade_task.id)
         if _smoketest_needed:
@@ -2437,9 +2473,11 @@ _BLOCKER_LABELS: dict[str, str] = {
         "production's recorded schema state (deploy-fatal drift)"
     ),
     "criterion_coverage_incomplete": (
-        "one or more version acceptance criteria remain uncovered; stuck "
-        "criteria (no direction mapping, or all mapped directions retired) need "
-        "direction remapping or operator attestation to clear"
+        "the blind merge-grade found the merged diff does not yet satisfy the "
+        "version goal: at least one active acceptance-criterion CATEGORY is not "
+        "met (or is only partially met), or the grader named a goal aspect that "
+        "no category captures (residual gap) — the categories must all grade "
+        "'met' with cited diff evidence, and the residual must be clean, to clear"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
@@ -4809,6 +4847,18 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
+    # Acceptance-criteria coverage summary + the ACTIVE-criteria rubric.  Computed
+    # once here (before the merge-grade block) so the rubric can be threaded into
+    # the per-category grade below.  ``criterion_coverage`` is still persisted for
+    # observability / back-compat; ``active_categories`` are the CATEGORIES the
+    # goal-verification redesign grades the merged diff against.
+    criterion_coverage = await get_version_coverage_summary(session, version.id)
+    active_categories: list[dict[str, Any]] = [
+        {"category_key": c.get("criterion_key"), "text": c.get("text")}
+        for c in (criterion_coverage.get("criteria") or [])
+        if c.get("status") == "active" and c.get("criterion_key")
+    ]
+
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
     # frozen version.goal (blind to running_update).  Since ae0664174 the grade
@@ -4861,7 +4911,9 @@ async def _finalize_qualification(
                 merge_grade_task_id,
                 version.version_number,
             )
-        merge_grade_cert = evaluate_merge_grade(version.goal, merge_grade_artifact)
+        merge_grade_cert = evaluate_merge_grade(
+            version.goal, merge_grade_artifact, active_categories or None
+        )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {
                 **merge_grade_cert,
@@ -4888,7 +4940,6 @@ async def _finalize_qualification(
     elif ci_state == _CI_NO_CHECKS:
         _proj_for_ci_gate = await session.get(Project, version.project_id)
         ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
-    criterion_coverage = await get_version_coverage_summary(session, version.id)
     merge_grade_misses = _merge_grade_misses_armed(
         {
             "merge_grade_status": merge_grade_cert["status"],
@@ -4942,6 +4993,116 @@ async def _finalize_qualification(
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
             producing_task_id=merge_grade_task_id,
         )
+
+    # --- Goal-verification per-category ledger (redesign) -------------------
+    # The acceptance criteria ARE the merge-grade's categories.  Persist this
+    # candidate's per-category verdicts + residual into the sha-keyed ledger (the
+    # verdict cache), then read the gate inputs back FROM the ledger so the gate
+    # is a pure read that survives a re-drive (on a re-drive the merge_grade child
+    # is not re-spawned; its verdicts are already in the ledger).  Exemptions
+    # (superseded / already-on-main) skip the category gate exactly as they skip
+    # the holistic merge_grade_misses gate.  When the sibling ledger module is not
+    # present in this checkout, or there is no active rubric, the gate is skipped
+    # (fallback to the pre-redesign holistic-only path).
+    _merge_grade_exempt = merge_grade_cert.get("status") in (
+        "superseded_exempt",
+        "already_on_main_exempt",
+    )
+    _gate_category_verdicts: list[dict[str, Any]] | None = None
+    _gate_residual: str | None = None
+    if _category_ledger is not None and active_categories and not _merge_grade_exempt:
+        # The CURRENTLY-ACTIVE criterion keys.  A retracted / superseded criterion
+        # keeps its (possibly ``not_met``) CategoryVerdict row in the ledger — the
+        # row is never cleared — but it is no longer part of the acceptance
+        # contract, so it must NOT gate.  Both the ledger read-back (FIX 1) and the
+        # fail-closed in-memory fallback (FIX 2) below filter to this set, mirroring
+        # ``category_verdict_ledger.is_candidate_fully_met`` (the sweep / reuse
+        # guard) so the gate and the sweep never disagree.
+        _active_keys = {
+            c.get("category_key")
+            for c in active_categories
+            if c.get("category_key")
+        }
+        _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
+        _ledger_write_failed = False
+        if _fresh_category_verdicts is not None:
+            # Fresh grade this finalize: write each category verdict + the residual.
+            try:
+                for _v in _fresh_category_verdicts:
+                    await _category_ledger.upsert_category_verdict(
+                        session,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        category_key=_v.get("category_key"),
+                        status=_v.get("status"),
+                        tier=_v.get("tier", "judged"),
+                        gap=_v.get("gap"),
+                        citations=_v.get("citations") or [],
+                        grader_run_id=merge_grade_task_id,
+                    )
+                await _category_ledger.upsert_residual(
+                    session,
+                    version.id,
+                    candidate_sha,
+                    merge_grade_cert.get("residual_uncaptured_gap"),
+                )
+            except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
+                _ledger_write_failed = True
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d failed to persist per-category "
+                    "goal-verification verdicts to the ledger — gating on the "
+                    "freshly-computed in-memory verdicts (fail-closed) for this "
+                    "finalize",
+                    version.version_number,
+                )
+        if _ledger_write_failed:
+            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
+            # would see stale/absent rows and (via a None gate input) SKIP the
+            # category gate entirely, letting a ``not_met`` candidate promote.  The
+            # freshly-computed in-memory grade is authoritative: feed it to the gate
+            # directly (filtered to the active keys, exactly like the read-back).
+            _gate_category_verdicts = [
+                cv
+                for cv in (
+                    _coerce_ledger_category_verdict(_v)
+                    for _v in (_fresh_category_verdicts or [])
+                )
+                if cv.get("category_key") in _active_keys
+            ] or None
+            _gate_residual = merge_grade_cert.get("residual_uncaptured_gap")
+        else:
+            # Read the gate inputs back FROM the ledger (canonical source; covers
+            # the re-drive path where no fresh artifact was re-evaluated).
+            try:
+                _ledger_verdicts = await _category_ledger.get_category_verdicts(
+                    session, version.id, candidate_sha
+                )
+                # FIX 1 — filter to the CURRENTLY-ACTIVE criterion keys.  The ledger
+                # returns EVERY row for the (version, sha) pair, including a
+                # retracted criterion's stale ``not_met`` row, which would otherwise
+                # permanently re-block this gate even though the sweep's
+                # ``is_candidate_fully_met`` (which filters the same way) reports the
+                # candidate FULLY MET — a permanent finalize wedge + re-qual loop.
+                _gate_category_verdicts = [
+                    cv
+                    for cv in (
+                        _coerce_ledger_category_verdict(_v)
+                        for _v in (_ledger_verdicts or [])
+                    )
+                    if cv.get("category_key") in _active_keys
+                ] or None
+                _gate_residual = await _category_ledger.get_residual(
+                    session, version.id, candidate_sha
+                )
+            except Exception:  # noqa: BLE001 — a read failure falls back to no-gate (safe)
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d failed to read per-category verdicts back "
+                    "from the ledger — falling back to the holistic gate",
+                    version.version_number,
+                )
+                _gate_category_verdicts = None
+                _gate_residual = None
+
     # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
     # Reflects whether the capability proof gate is active and — in ENFORCE
     # mode — whether all working capabilities carry machine-verified proof.
@@ -5046,7 +5207,12 @@ async def _finalize_qualification(
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
-        criterion_coverage=criterion_coverage,
+        # Goal-verification redesign: the per-category verdicts + residual (read
+        # from the sha-keyed ledger) drive the gate INSTEAD of the coverage-count
+        # summary.  Both are None when there is no active rubric / the ledger is
+        # absent / the grade was exempted — preserving the holistic-only path.
+        category_verdicts=_gate_category_verdicts,
+        residual_uncaptured_gap=_gate_residual,
         merge_grade_misses=merge_grade_misses,
         debt_pressure_score=_debt_pressure_score,
         capability_proof_blocked=capability_proof_blocked,
@@ -5130,6 +5296,12 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "criterion_coverage": criterion_coverage,
+        # Goal-verification redesign: the per-category verdicts + residual that
+        # drove the gate this finalize (sha-keyed; None when no rubric / ledger
+        # absent / exempt).  Persisted so the CI-unresolved-recovery recompute in
+        # release_promotion can re-run the SAME gate without a DB round-trip.
+        "category_verdicts": _gate_category_verdicts,
+        "residual_uncaptured_gap": _gate_residual,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
         # last_qualification AND persisted on QualificationVerdict so an operator
         # can see the single biggest gap toward the goal.

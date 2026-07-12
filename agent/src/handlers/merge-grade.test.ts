@@ -217,7 +217,33 @@ describe('normalizeMergeGradeOutput — stable contract shape', () => {
       coverage_score: 0,
       biggest_gap: '',
       rationale: '',
+      // Goal-verification redesign: per-category grade defaults to empty / null.
+      category_verdicts: [],
+      residual_uncaptured_gap: null,
     });
+  });
+
+  it('coerces per-category verdicts + residual (goal-verification redesign)', () => {
+    const out = normalizeMergeGradeOutput(
+      {
+        covers_goal: false,
+        coverage_score: 0.4,
+        biggest_gap: 'ui not wired',
+        category_verdicts: [
+          { category_key: 'c-1', status: 'met', citations: [{ kind: 'diff', ref: 'api.py:3' }] },
+          { category_key: 'c-2', status: 'weird', gap: 'not done', citations: ['ui.tsx'] },
+          { status: 'met' }, // no key → dropped
+        ],
+        residual_uncaptured_gap: 'no migration for the widget table',
+      },
+      CANDIDATE_SHA,
+    );
+    expect(out.category_verdicts).toEqual([
+      { category_key: 'c-1', status: 'met', gap: null, citations: [{ kind: 'diff', ref: 'api.py:3' }] },
+      // unknown status coerces to not_met; bare-string citation → diff kind
+      { category_key: 'c-2', status: 'not_met', gap: 'not done', citations: [{ kind: 'diff', ref: 'ui.tsx' }] },
+    ]);
+    expect(out.residual_uncaptured_gap).toBe('no migration for the widget table');
   });
 });
 

@@ -42,37 +42,12 @@ export type { RecentCompletion } from '../types/digest';
 
 export type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
 
-type DismissEntry = { type: 'dismiss' } | { type: 'snooze'; until: number };
-export type DismissedState = Record<string, DismissEntry>;
-
 export function formatDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   const minutes = seconds / 60;
   if (minutes < 60) return `${Math.round(minutes)}m`;
   const hours = minutes / 60;
   return hours < 10 ? `${hours.toFixed(1)}h` : `${Math.round(hours)}h`;
-}
-
-export function loadDismissed(): DismissedState {
-  try {
-    const raw = localStorage.getItem('blueprint-admin:dismissedAttention');
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-export function saveDismissed(state: DismissedState): void {
-  localStorage.setItem('blueprint-admin:dismissedAttention', JSON.stringify(state));
-}
-
-export function formatSnoozeRemaining(until: number): string {
-  const remaining = until - Date.now();
-  if (remaining <= 0) return 'expired';
-  const hours = Math.floor(remaining / (3600 * 1000));
-  const mins = Math.floor((remaining % (3600 * 1000)) / 60000);
-  if (hours > 0) return `snoozed for ${hours}h more`;
-  return `snoozed for ${mins}m more`;
 }
 
 const CATCH_UP_VIEWED_KEY_BASE = 'blueprint-admin:lastCatchUpViewed';

@@ -1107,6 +1107,16 @@ def _compute_direction_productivity(
     current direction.  Crediting verification-only cycles prevents live-verification
     sweeps and concluded design/research cycles from incurring the longer unproductive
     refractory window.
+
+    Scope note: this flag drives the COOLDOWN cadence only (``direction_refractory``
+    picks the fast productive window when ``last_cycle_productive`` is True). It is a
+    spawn-/notes-level signal and deliberately does NOT mean the direction LANDED
+    work, so it must NOT be treated on its own as a merge-rate pause shield: a
+    direction that spawns every cycle but never merges is still spawn-productive here
+    yet is churn for pause purposes. The still-productive pause shield
+    (``strategic_completion._direction_still_productive``) therefore additionally
+    requires a real landing / no-op-completion signal from the direction's history —
+    see that function.
     """
     if tasks_by_dir.get(direction_id, 0) > 0:
         return True

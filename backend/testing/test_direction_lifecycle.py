@@ -1109,8 +1109,15 @@ async def test_process_lifecycle_productive_direction_not_churn_paused(
     db_session, mocker
 ):
     """Fix #1 integration: a still-productive direction (last_cycle_productive=True,
-    consecutive_unproductive_cycles=0) with many cycles and 0 merges is NOT paused by
-    the cumulative merge-rate family (Rule 2 / 5 / 6)."""
+    consecutive_unproductive_cycles=0) whose most-recent cycle completed genuine
+    no-op work (already-built) is NOT paused by the cumulative merge-rate family
+    (Rule 2 / 5 / 6).
+
+    Signal-that-lies refinement: ``last_cycle_productive`` alone (mere spawning) no
+    longer shields — the direction must show a real landing/no-op signal in recent
+    history. The latest cycle here carries a genuine no-op completion, so the shield
+    legitimately holds; a spawn-only-never-land direction is now correctly paused
+    (covered by the unit tests in test_strategic_completion)."""
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
         new_callable=AsyncMock,
@@ -1129,6 +1136,9 @@ async def test_process_lifecycle_productive_direction_not_churn_paused(
         }
         for i in range(6, 0, -1)
     ]
+    # Most-recent cycle completed a genuine no-op (deliverable already built) — a
+    # real productivity signal that holds the shield under the corrected semantics.
+    history[-1]["tasks_completed_no_pr"] = 1
     direction = {
         "id": "d-productive-no-merge",
         "text": "Productive operator-ask direction with no merges yet",
@@ -2484,7 +2494,11 @@ async def test_zombie_churn_threshold_recommends_retirement_without_completion(
         "gap_id": "g-zombie",
     }
     # A genuinely productive direction with the same churn count must NOT retire —
-    # last_cycle_productive shields it from the churn-family pause entirely.
+    # last_cycle_productive PLUS a real productivity signal (its most-recent cycle
+    # completed a genuine no-op) shields it from the churn-family pause. (Under the
+    # signal-that-lies fix, mere spawning no longer holds the shield.)
+    healthy_history = _unproductive_history(now)
+    healthy_history[-1]["tasks_completed_no_pr"] = 1
     healthy = {
         "id": "d-healthy",
         "text": "Still-productive direction",
@@ -2492,7 +2506,7 @@ async def test_zombie_churn_threshold_recommends_retirement_without_completion(
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": _unproductive_history(now),
+        "research_history": healthy_history,
         "churn_family_pause_count": 1,
         "last_cycle_productive": True,
         "consecutive_unproductive_cycles": 0,

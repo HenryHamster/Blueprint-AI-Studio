@@ -51,10 +51,6 @@ export const WORKBENCH_RUNTIME_SECTIONS = [
   'advanced',
 ] as const;
 
-export const PROJECT_TARGET_SECTIONS = WORKBENCH_PROJECT_SECTIONS;
-export const PIPELINE_TARGET_SECTIONS = WORKBENCH_PIPELINE_SECTIONS;
-export const RUNTIME_TARGET_SECTIONS = WORKBENCH_RUNTIME_SECTIONS;
-
 const WORKBENCH_SURFACE_ALIASES = {
   chat: 'messages',
   message: 'messages',
@@ -119,10 +115,6 @@ function isOneOf<const T extends readonly string[]>(values: T, value: string | n
 
 export function isWorkbenchTargetSurface(value: unknown): value is WorkbenchTargetSurface {
   return isOneOf(WORKBENCH_TARGET_SURFACES, compactText(value));
-}
-
-export function isWorkbenchRefetchSurface(value: unknown): value is WorkbenchRefetchSurface {
-  return isOneOf(WORKBENCH_REFETCH_SURFACES, compactText(value));
 }
 
 export function isWorkbenchProjectSection(value?: string | null): value is WorkbenchProjectSection {

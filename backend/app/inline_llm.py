@@ -94,14 +94,6 @@ class InlineLLMTarget:
     base_url: str | None
 
 
-def _default_base_url(provider: str) -> str | None:
-    if provider == "deepseek":
-        return DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
-    if provider == "zai":
-        return DEFAULT_ZAI_ANTHROPIC_BASE_URL
-    return None
-
-
 def _default_model(provider: str) -> str:
     if provider == "deepseek":
         return "deepseek-v4-flash"

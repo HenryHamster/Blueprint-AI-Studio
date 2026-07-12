@@ -208,13 +208,6 @@ def autonomous_spawn_budget_config_from_runtime(
     )
 
 
-def _first_payload(payloads: Any) -> dict[str, Any]:
-    if isinstance(payloads, Sequence) and not isinstance(payloads, (str, bytes)):
-        first = payloads[0] if payloads else {}
-        return first if isinstance(first, dict) else {}
-    return {}
-
-
 def _has_servicing_lineage(
     *,
     payload: Mapping[str, Any],

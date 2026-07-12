@@ -897,15 +897,19 @@ async def test_attestation_approaching_expiry_warns_before_lapse(db_session):
     assert item["criterion_key"] == criterion.criterion_key
 
 
-def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
+def test_uncorroborated_attestation_takes_flat_penalty_not_hard_block():
     """When NO criterion carries machine-verified evidence (covered=0, attested>0),
-    compute_composite HARD-BLOCKS with blocker='uncorroborated_attestation' and
-    confidence=0.0 — the one-coverage-gate policy ships a hard block rather than
-    a doubled penalty for entirely uncorroborated versions.
+    the goal-verification REDESIGN no longer hard-blocks.  The removed
+    ``uncorroborated_attestation`` blocker is gone; the legacy coverage-count path
+    (``category_verdicts is None``) applies only the flat proportional penalty
+    ``ATTESTATION_PENALTY_WEIGHT * attested/total`` — there is NO escalation
+    multiplier (that constant/logic was removed by the redesign).  The
+    ``uncorroborated_attested`` sub-score survives as an OBSERVABILITY flag only,
+    not a blocker.
 
-    When at least one criterion has machine-verified coverage (covered>0), a flat
-    proportional penalty (ATTESTATION_PENALTY_WEIGHT * attested/total) applies
-    instead and promotion is allowed.
+    When at least one criterion has machine-verified coverage (covered>0) the same
+    flat proportional penalty applies and the ``uncorroborated_attested`` flag is
+    not set.
     """
     from app.release_scoring import (
         compute_composite,
@@ -915,9 +919,11 @@ def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
     policy = {"threshold": 0.75}
 
     # Case 1: Uncorroborated — all criteria are attested-only, zero machine evidence.
-    # Hard-blocks with blocker='uncorroborated_attestation' and confidence=0.0.
-    # The UNCORROBORATED_PENALTY_MULTIPLIER escalation path is unreachable dead code
-    # because the hard-block at release_scoring.py:607-615 fires first.
+    # REDESIGN: NO hard block (the uncorroborated_attestation blocker was removed).
+    # The legacy path applies only the flat penalty = ATTESTATION_PENALTY_WEIGHT *
+    # (attested/total) = 0.15 * (2/2) = 0.15 → confidence = 1.0 * (1 - 0.15) = 0.85,
+    # which clears the 0.75 threshold, so promotion is allowed.  The
+    # ``uncorroborated_attested`` sub-score is still recorded for observability.
     result = compute_composite(
         ci_green=True,
         audit_score=1.0,
@@ -932,9 +938,11 @@ def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
             "uncovered": 0,
         },
     )
-    assert result["blocker"] == "uncorroborated_attestation"
-    assert result["confidence"] == 0.0
-    assert result["promote"] is False
+    assert result["blocker"] is None
+    flat_penalty1 = ATTESTATION_PENALTY_WEIGHT * (2 / 2)
+    assert result["confidence"] == pytest.approx(1.0 * (1.0 - flat_penalty1))
+    assert result["promote"] is True
+    # Observability flag survives (covered==0, attested>0) — it is NOT a blocker.
     assert result["sub_scores"].get("uncorroborated_attested") is True
 
     # Case 2: Corroborated — attestation exists alongside machine-verified evidence.
@@ -1880,13 +1888,21 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert before["covered"] == 1
     assert before["uncovered"] == 1
     assert before["retracted"] == 0
+    # Goal-verification gate: the acceptance criteria ARE the merge-grade's
+    # categories.  Before retraction the stale criterion grades not_met (no
+    # feasible evidence) → the gate hard-blocks; the covered one is met.
     before_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=before,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+            {"category_key": stale.criterion_key, "status": "not_met", "tier": "judged",
+             "gap": "no feasible evidence", "citations": []},
+        ],
     )
     assert before_gate["blocker"] == "criterion_coverage_incomplete"
 
@@ -1914,13 +1930,18 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert by_key[stale.criterion_key]["coverage"] == "uncovered"
     assert by_key[stale.criterion_key]["stuck_reason"] is None
 
+    # After retracting the stale criterion only the covered category remains
+    # active and grades met → the gate no longer fires.
     after_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=after,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+        ],
     )
     assert after_gate["blocker"] is None
     assert after_gate["promote"] is True

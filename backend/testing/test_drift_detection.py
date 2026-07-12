@@ -314,11 +314,20 @@ async def test_window_excludes_older_tasks(
 
 
 @pytest.mark.asyncio
-async def test_compute_direction_drift_ignores_non_integration_unblock_signal(
+async def test_compute_direction_drift_counts_staging_merge_unblock_signal(
     db_session,
     project_with_directions,
 ):
-    """Legacy pr_merged=True with a non-landing marker must not count as merged."""
+    """A staging-rollup child (pr_merged=True + non-merge-unblock marker) opened a
+    real PR that merged onto the rollup staging branch. It MUST count as a shipped
+    change for drift.
+
+    Credit-blindness fix: counting integration-landings only
+    (``has_landed_signal``) missed staging-merge credit, so a healthy direction
+    whose children merge to staging — before the rollup lands and re-stamps
+    ``landed_on_integration`` — read as 0 merged against positive claims, producing
+    false ``over_claim`` / ``stalled`` flags (wasted audit spend, poisoned
+    strategist context). ``has_merge_unblock_signal`` now credits it."""
     project = project_with_directions
     task = await _make_completed_task(
         db_session,
@@ -328,6 +337,36 @@ async def test_compute_direction_drift_ignores_non_integration_unblock_signal(
         has_pr_artifact=True,
     )
     task.context[NON_MERGE_UNBLOCK_REASON_KEY] = "staging_rollup"
+    await db_session.commit()
+
+    drift = await compute_direction_drift(db_session, project)
+    sig = drift["by_direction"]["d-overclaim"]
+    assert sig["claimed_changes_count"] == 1
+    assert sig["actually_merged_prs"] == 1
+    # 1 claimed / 1 merged → consistent; no false over_claim flag.
+    assert sig["over_claim_flag"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_direction_drift_excludes_confirmed_stranded_non_landing(
+    db_session,
+    project_with_directions,
+):
+    """A confirmed-stranded rollup (ancestry proved the merge never reached the
+    integration branch) has its ``pr_merged`` unblock bit cleared and
+    ``landed_on_integration=False`` stamped. It must NOT count as merged even though
+    it opened a PR — both the landing signal and the merge-unblock signal are
+    absent, so the credit-aware count still excludes genuine non-landings."""
+    project = project_with_directions
+    task = await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-overclaim",
+        pr_merged=False,  # stranded: unblock bit was cleared
+        has_pr_artifact=True,
+    )
+    task.context["landed_on_integration"] = False
+    task.context["rollup_landing_stranded"] = "not_ancestor"
     await db_session.commit()
 
     drift = await compute_direction_drift(db_session, project)
