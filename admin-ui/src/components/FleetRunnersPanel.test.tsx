@@ -1401,4 +1401,59 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(text).toContain('Cloud cost avoided:');
     expect(text).not.toContain('Claim latency:');
   });
+
+  test('telemetry recent-jobs rows show terminal_reason and exit_code for a failed job', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 2,
+      jobs_terminal_count: 2,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 0.5,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+        {
+          job_id: 'job-ok',
+          task_id: null,
+          status: 'SUCCEEDED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: null,
+          exit_code: null,
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // The failed row surfaces the reason and exit code inline.
+    expect(text).toContain('process exited non-zero');
+    expect(text).toContain('(exit 137)');
+  });
 });

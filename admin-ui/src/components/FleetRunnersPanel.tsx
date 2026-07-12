@@ -1420,6 +1420,16 @@ function RunnerTelemetryDetail({ projectId, runnerId }: { projectId: string; run
               >
                 {o.status}
               </span>
+              {(o.status === 'FAILED' || o.status === 'TIMED_OUT') &&
+                (o.terminal_reason || o.exit_code != null) && (
+                  <span
+                    className="truncate text-red-400/70"
+                    title={o.terminal_reason ?? undefined}
+                  >
+                    {o.terminal_reason ?? ''}
+                    {o.exit_code != null ? ` (exit ${o.exit_code})` : ''}
+                  </span>
+                )}
               {o.task_id && (
                 <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
               )}

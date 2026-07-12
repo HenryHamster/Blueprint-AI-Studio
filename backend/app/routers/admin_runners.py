@@ -978,6 +978,14 @@ async def runner_stats(
             ),
             "created_at": j.created_at.isoformat() if j.created_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "terminal_reason": j.terminal_reason,
+            "exit_code": (
+                exit_code
+                if isinstance(
+                    (exit_code := (j.polling_metadata or {}).get("exit_code")), int
+                )
+                else None
+            ),
         }
         for j in recent_jobs
     ]

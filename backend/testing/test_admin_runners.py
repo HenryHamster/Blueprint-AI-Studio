@@ -225,3 +225,55 @@ class TestRunnerStatsCloudCostAvoided:
             f"/api/admin/projects/{project.id}/runners/{uuid.uuid4()}/stats"
         )
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_runner_stats_recent_outcomes_include_terminal_reason_and_exit_code(
+        self, client: AsyncClient, db_session
+    ):
+        # A FAILED runner job must carry its terminal_reason and exit_code into the
+        # fleet recent-outcomes list so the operator sees *why* a job failed without
+        # leaving the fleet panel. A SUCCEEDED/legacy job yields None for both.
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="d" * 64, hostname="host4", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        failed = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.FAILED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=5),
+            terminal_reason="process exited non-zero",
+            polling_metadata={**_pin(runner.id), "exit_code": 137},
+        )
+        succeeded = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=1),
+            polling_metadata=_pin(runner.id),
+        )
+        db_session.add_all([failed, succeeded])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        outcomes = {o["job_id"]: o for o in resp.json()["last_n_outcomes"]}
+
+        failed_row = outcomes[str(failed.id)]
+        assert failed_row["terminal_reason"] == "process exited non-zero"
+        assert failed_row["exit_code"] == 137
+
+        # A success row (no terminal_reason, no exit_code in metadata) surfaces None
+        # for both — never a stale placeholder or a non-int leak.
+        succeeded_row = outcomes[str(succeeded.id)]
+        assert succeeded_row["terminal_reason"] is None
+        assert succeeded_row["exit_code"] is None

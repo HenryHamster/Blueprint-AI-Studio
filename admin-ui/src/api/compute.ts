@@ -1920,6 +1920,10 @@ export interface RunnerOutcome {
   outcome: string | null;
   created_at: string | null;
   completed_at: string | null;
+  /** Terminal diagnostic reason for a failed/timed-out job; null on success/legacy rows. */
+  terminal_reason?: string | null;
+  /** Process exit code for a failed job; null when not an int / absent. */
+  exit_code?: number | null;
 }
 
 export interface RunnerStatsResponse {
