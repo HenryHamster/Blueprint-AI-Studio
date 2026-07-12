@@ -196,6 +196,17 @@ async def _persist_heartbeat_snapshot(
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
     active_compute_job_ids: List[str] = []
+    # True iff this heartbeat carries a GENUINE active-work report — the runner's
+    # real active_task_ids/active_compute_job_ids as read from its live
+    # running-agents table. The daemon heartbeat loop always sets this True; a
+    # ``--check`` preflight (which posts active_task_ids=[] as a probe, NOT a
+    # report) sets it False. The handler refreshes the reaper-trusted active-set
+    # snapshot + active_work_reported_at stamp ONLY when this is True, so a
+    # preflight (or any non-report heartbeat) can neither zero out a live task's
+    # claim nor mint a fresh stamp over a stale report. Defaults True so an older
+    # daemon that omits the field keeps the prior stamp-every-heartbeat behaviour
+    # (every loop heartbeat IS a genuine report), while the preflight opts out.
+    active_work_report: StrictBool = True
     agent_available: StrictBool | None = None
     # Why the agent is unavailable (null when agent_available=True or unknown).
     # Named failing leg(s): "bwrap not available", "agent binary not found",
@@ -574,15 +585,24 @@ async def heartbeat(
     if runner.status not in ("paused", "draining"):
         runner.status = "active"
     caps = dict(runner.capabilities or {})
-    caps["active_task_ids"] = list(payload.active_task_ids)
-    caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
+    # Refresh the reported active-work set + its report timestamp ONLY for a
+    # genuine active-work report. A ``--check`` preflight posts active_task_ids=[]
+    # as a probe (active_work_report=False), NOT a real report: writing that empty
+    # set with a fresh stamp would let the reaper's zombie-task reconcile conclude
+    # a live task is no longer claimed by its runner and reap it. Gating the whole
+    # trio together keeps the list and its stamp a coherent pair — a non-report
+    # heartbeat leaves the last genuine report untouched.
+    #
     # Stamp WHEN this active-work list was reported. last_seen_at alone can't
     # serve: other endpoints bump it without refreshing the list. The reaper's
     # zombie-task reconcile (reaper_orphan_classify._runner_report_excludes_task)
     # only trusts a list carrying a fresh stamp, so a task absent from a fresh
     # report is reapable even while sibling agents keep the shared per-runner
     # vmcontact row alive.
-    caps["active_work_reported_at"] = now.isoformat()
+    if payload.active_work_report:
+        caps["active_task_ids"] = list(payload.active_task_ids)
+        caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
+        caps["active_work_reported_at"] = now.isoformat()
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).

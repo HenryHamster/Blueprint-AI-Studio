@@ -1741,6 +1741,11 @@ def _heartbeat_loop(
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
+                # This is a genuine active-work report: task_ids/compute_job_ids
+                # are the live running-agents set. The orchestrator refreshes its
+                # reaper-trusted active-set snapshot + stamp only for reports
+                # flagged here (a --check preflight sets this False).
+                "active_work_report": True,
                 "agent_available": agent_available,
                 "agent_unavailable_reason": agent_unavailable_reason,
                 "supported_agent_task_types": supported_agent_task_types,
@@ -3195,8 +3200,15 @@ def _preflight(
             f"{orchestrator_url}/api/runner/heartbeat",
             token,
             {
+                # Preflight probe, NOT a genuine active-work report: this empty
+                # active set must NOT overwrite a live report on a box that is
+                # already running a real runner. active_work_report=False makes
+                # the orchestrator ignore the active set here, so the reaper's
+                # zombie reconcile cannot mistake this probe for "no work claimed"
+                # and reap a live task (reaper_orphan_classify).
                 "active_task_ids": [],
                 "active_compute_job_ids": [],
+                "active_work_report": False,
                 "agent_available": claimable[iso.CLASS_AGENT],
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,

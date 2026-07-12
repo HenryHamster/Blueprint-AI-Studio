@@ -144,6 +144,97 @@ async def test_heartbeat_persists_snapshot_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_without_report_does_not_refresh_stamp(db_session):
+    """A heartbeat that is NOT a genuine active-work report (active_work_report
+    False) must NOT refresh active_work_reported_at nor clobber the active set.
+
+    Regression for the reaper zombie-override hazard (interleaving 1): stamping
+    the report timestamp on a non-report makes the reaper trust a stale/absent
+    report as fresh. The first (genuine) report establishes the stamp+set; the
+    second (non-report) heartbeat must leave BOTH untouched.
+    """
+    _project, runner = await _make_runner(db_session)
+
+    # 1) Genuine report: stamps active_work_reported_at + records the live set.
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_task_ids=["live-task"], active_work_report=True
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    stamp = runner.capabilities.get("active_work_reported_at")
+    assert stamp is not None
+    assert runner.capabilities.get("active_task_ids") == ["live-task"]
+
+    # 2) Non-report heartbeat (e.g. a probe): empty set, active_work_report False.
+    await heartbeat(
+        payload=HeartbeatRequest(active_task_ids=[], active_work_report=False),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    # Stamp is NOT refreshed and the live set is NOT zeroed by the non-report.
+    assert runner.capabilities.get("active_work_reported_at") == stamp
+    assert runner.capabilities.get("active_task_ids") == ["live-task"]
+
+
+@pytest.mark.asyncio
+async def test_check_preflight_does_not_zero_live_task_claim(db_session):
+    """A --check preflight (active_task_ids=[], active_work_report=False) must not
+    let the reaper conclude a live task is unclaimed and reap it.
+
+    Regression for the reaper zombie-override hazard (interleaving 2): builds the
+    reaper's runner-report lookup from the runner row AFTER a genuine report then
+    a preflight, and asserts the live task is still NOT excluded by the
+    zombie-override predicate.
+    """
+    from datetime import datetime
+
+    from app.reaper_orphan_classify import (
+        _build_runner_report_lookup,
+        _runner_report_excludes_task,
+    )
+
+    _project, runner = await _make_runner(db_session)
+
+    # 1) Genuine report claiming the live task.
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_task_ids=["live-task"], active_work_report=True
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    # 2) A --check preflight probe arrives (empty set, non-report).
+    await heartbeat(
+        payload=HeartbeatRequest(active_task_ids=[], active_work_report=False),
+        runner=runner,
+        session=db_session,
+    )
+
+    vm_id = f"runner:{runner.id}"
+    lookup = await _build_runner_report_lookup(db_session, {vm_id})
+    assert vm_id in lookup, "runner report should survive the preflight"
+    reported_at, active_ids = lookup[vm_id]
+    assert "live-task" in active_ids
+
+    # The live task, claimed well before the (still-fresh) report, must NOT be
+    # excluded by the zombie-override — so the reaper leaves it alone.
+    class _Task:
+        id = "live-task"
+        vm_instance_id = vm_id
+        started_at = reported_at - timedelta(hours=1)
+
+    hb_cutoff = reported_at - timedelta(seconds=300)
+    assert (
+        _runner_report_excludes_task(_Task(), hb_cutoff, lookup) is False
+    )
+    assert isinstance(reported_at, datetime)
+
+
+@pytest.mark.asyncio
 async def test_snapshot_persist_is_best_effort(db_session, monkeypatch):
     """A failure inside snapshot persistence must be swallowed, not raised —
     the heartbeat response must never fail over telemetry history."""

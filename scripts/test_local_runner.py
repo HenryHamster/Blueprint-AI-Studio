@@ -2186,6 +2186,9 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(posted_bodies[0]["active_task_ids"], ["task-1"])
         self.assertEqual(posted_bodies[0]["active_compute_job_ids"], ["job-a", "job-b"])
         self.assertFalse(posted_bodies[0]["agent_available"])
+        # The daemon loop always carries a GENUINE active-work report, so the
+        # orchestrator refreshes its reaper-trusted active set + stamp from it.
+        self.assertTrue(posted_bodies[0]["active_work_report"])
 
     def test_hostname_included_in_heartbeat_body(self):
         """Heartbeat carries the host name so the console shows a real machine name.
@@ -4783,6 +4786,28 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
         """enrolled_max_concurrent is None when the server response omits the field."""
         result = self._run_preflight(enrolled_max_concurrent=None)
         self.assertIsNone(result.get("enrolled_max_concurrent"))
+
+    def test_preflight_heartbeat_flagged_as_non_report(self):
+        """The --check preflight posts active_work_report=False with an empty active
+        set, so the orchestrator IGNORES the probe rather than treating it as a real
+        report. Guards the zombie-reap hazard: a preflight on a box already running a
+        live runner must never zero out that task's claim (reaper_orphan_classify)."""
+        captured = {}
+
+        def fake_post(url, token, body, **kwargs):
+            captured["body"] = body
+            return 200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_workspace_writable", return_value=True):
+            local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), 2, 2,
+            )
+
+        self.assertIn("body", captured)
+        self.assertFalse(captured["body"]["active_work_report"])
+        self.assertEqual(captured["body"]["active_task_ids"], [])
 
     def test_no_warn_only_mismatch_path(self):
         """main() no longer emits the warn-only "disagrees" advisory when the env
