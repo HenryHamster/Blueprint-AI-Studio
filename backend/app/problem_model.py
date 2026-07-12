@@ -35,7 +35,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.evidence_primitive import EvidenceRef, EvidenceStatus, classify_evidence
+from app.evidence_primitive import (
+    EvidenceRef,
+    EvidenceStatus,
+    claim_contradicts_evidence,
+    classify_evidence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +691,95 @@ def evidence_met_summary(
     return result
 
 
+#: Upper bound on the number of contradiction entries carried in the health
+#: block's ``reconciliation_flags``. The list is a strategist-visible preview,
+#: not an exhaustive ledger — the standing reconciliation sweep records the full
+#: set to the observability ring. Kept small so the payload stays bounded even
+#: when a project has many uncovered criteria (the "0/N covered" case).
+MAX_RECONCILIATION_FLAGS: int = 25
+
+
+def evidence_reconciliation_flags(
+    model: ProblemModel,
+    coverage_summary: dict | None = None,
+) -> list[dict]:
+    """Pure contradiction preview across all three claim surfaces.
+
+    Component 4 of the evidence-primitive design (Phase 1): derives, without any
+    IO, the "claim contradicts its evidence" set the standing reconciliation
+    sweep computes asynchronously, so those findings reach the strategist
+    through the health block it already receives. Each entry has the shape::
+
+        {"surface": "capability"|"gap"|"criterion", "id": str,
+         "claimed_status": str, "evidence_status": EvidenceStatus,
+         "reason": str}
+
+    Grading, per surface, all via the single
+    :func:`~app.evidence_primitive.claim_contradicts_evidence` predicate:
+
+    * **capability** — a ``working`` capability (not ``proof_exempt``) whose
+      ``evidence_refs`` do not back the claim. ``partial`` / ``planned`` are not
+      done-type claims and never flag.
+    * **gap** — a ``closed`` gap whose ``evidence_refs`` do not back the claim.
+      In-progress (``active`` / ``blocked``) gaps never flag.
+    * **criterion** — an ``active`` acceptance criterion the open version must
+      PROVE whose evidence status (from ``coverage``) is not ``proven`` — the
+      honest "0/N covered" signal. Graded with the fixed ``proven`` claim so an
+      uncovered / partial / contradicted criterion surfaces on the same axis.
+
+    This mirrors the stored-flag-only reconciliation checks exactly (it never
+    re-verifies a ref against HEAD, so it never invents ``contradicted``); the
+    sweep remains the source of ground-truth path re-verification. The returned
+    list is truncated to :data:`MAX_RECONCILIATION_FLAGS`.
+    """
+    from app.acceptance_criteria import criterion_coverage_to_evidence_status
+
+    flags: list[dict] = []
+
+    for cap in model.capabilities:
+        if cap.proof_exempt:
+            continue
+        ev = capability_evidence_status(cap)
+        if claim_contradicts_evidence(cap.status, ev):
+            flags.append({
+                "surface": "capability",
+                "id": cap.name,
+                "claimed_status": cap.status,
+                "evidence_status": ev,
+                "reason": f"capability claims {cap.status} but evidence is {ev}",
+            })
+
+    for gap in model.gaps:
+        ev = gap_evidence_status(gap)
+        if claim_contradicts_evidence(gap.status, ev):
+            flags.append({
+                "surface": "gap",
+                "id": gap.id,
+                "claimed_status": gap.status,
+                "evidence_status": ev,
+                "reason": f"gap claims {gap.status} but evidence is {ev}",
+            })
+
+    if coverage_summary is not None:
+        for criterion in coverage_summary.get("criteria", []):
+            if criterion.get("status") != "active":
+                continue
+            ev = criterion_coverage_to_evidence_status(criterion.get("coverage", ""))
+            # An active acceptance criterion is a standing claim the open version
+            # must PROVE; grade it with the fixed done-type "proven" claim so an
+            # uncovered/partial/contradicted criterion is the honest 0/N signal.
+            if claim_contradicts_evidence("proven", ev):
+                flags.append({
+                    "surface": "criterion",
+                    "id": criterion.get("criterion_key", "unknown"),
+                    "claimed_status": "active",
+                    "evidence_status": ev,
+                    "reason": f"active criterion evidence is {ev}, not proven",
+                })
+
+    return flags[:MAX_RECONCILIATION_FLAGS]
+
+
 def compute_evidence_health(
     model: ProblemModel,
     coverage_summary: dict | None = None,
@@ -703,9 +797,18 @@ def compute_evidence_health(
                              "contradicted": N, "unverified": N},
             "gaps": {same axes},
             "acceptance": {same axes, "total": T},  # only when coverage_summary given
-            "reconciliation_flags": [],              # populated in Phase 2
+            "reconciliation_flags": [ {surface, id, claimed_status,
+                                       evidence_status, reason}, ... ],
             "overall": "healthy" | "degraded" | "poor",
         }
+
+    ``reconciliation_flags`` is the pure contradiction preview from
+    :func:`evidence_reconciliation_flags` (Phase 1, Component 4): every
+    done-type claim (a ``working`` capability, a ``closed`` gap, an ``active``
+    criterion) whose evidence does not back it, bounded to
+    :data:`MAX_RECONCILIATION_FLAGS`. It carries no behavioral change — it just
+    routes the sweep's contradiction findings into the block the strategist
+    already receives.
 
     ``overall`` classification (per design-doc trade-off 1):
       - ``poor``: any contradicted refs OR zero proven across all active items
@@ -741,7 +844,8 @@ def compute_evidence_health(
     else:
         overall = "degraded"
 
-    return {**summary, "reconciliation_flags": [], "overall": overall}
+    flags = evidence_reconciliation_flags(model, coverage_summary)
+    return {**summary, "reconciliation_flags": flags, "overall": overall}
 
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:

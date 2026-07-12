@@ -627,6 +627,23 @@ def criterion_coverage_to_evidence_status(coverage: str) -> str:
     return _MAP.get(coverage, "unverified")
 
 
+def criterion_evidence_status(evidence: list[CriterionEvidence]) -> str:
+    """Map a criterion's evidence rows onto the shared EvidenceStatus axis.
+
+    Component 1 of the evidence-primitive design: composes
+    :func:`compute_criterion_coverage` with
+    :func:`criterion_coverage_to_evidence_status` so a single acceptance
+    criterion produces the same axis
+    (:data:`~app.evidence_primitive.EvidenceStatus`) as a gap or capability.
+    This makes the acceptance surface a full peer in the shared "evidence met"
+    contract (``evidence_met_summary`` / ``compute_evidence_health`` derive it
+    only in aggregate today) and lets the reconciliation sweep grade a single
+    criterion with :func:`~app.evidence_primitive.claim_contradicts_evidence`.
+    Pure, no IO.
+    """
+    return criterion_coverage_to_evidence_status(compute_criterion_coverage(evidence))
+
+
 def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 

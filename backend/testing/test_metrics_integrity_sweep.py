@@ -177,6 +177,7 @@ def test_registry_contains_initial_checks():
         "capability_claim_reconciliation",
         "merged_pr_count_consistency",
         "criterion_evidence_count_integrity",
+        "criterion_claim_reconciliation",
         "capability_proof_gate_gap",
     } <= names
 
@@ -3876,6 +3877,151 @@ async def test_criterion_evidence_count_integrity_runs_in_sweep_tick(db):
     # The check name must appear in the registered set.
     names = {c.name for c in registered_checks()}
     assert "criterion_evidence_count_integrity" in names
+
+
+# --- Check: criterion_claim_reconciliation -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_flags_uncovered_active_criterion(db):
+    """An active criterion with no covering evidence is flagged as unbacked."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Uncovered active criterion"
+    )  # no evidence rows → uncovered → unproven
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "criterion_claim_reconciliation"
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+    assert f.delta == 1
+    assert criterion.criterion_key in f.detail
+    assert "unproven" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_ok_when_covered(db):
+    """A criterion with proven task_merge evidence (covered → proven) is not flagged."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Covered active criterion"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="reachability",  # covers on its own → proven
+            detail={"note": "reachable"},
+        )
+    )
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+    assert ok[0].delta == 0
+    assert "reconciled" in ok[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_skips_no_open_version(db):
+    """Project with no open version → SKIPPED for that project."""
+    project = await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no open version" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_skips_no_active_criteria(db):
+    """Open version with no active criteria → SKIPPED for that project."""
+    project = await _project(db)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no active criteria" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_is_flag_only(db):
+    """The check never mutates CriterionEvidence rows in any mode."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Flag-only reconciliation test"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="task_merge",
+            detail={"proven": False},  # present but not covering → partial
+        )
+    )
+    await db.commit()
+    before = len((
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all())
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_claim_reconciliation(ctx)
+    # partial evidence does not back a "proven" claim → flagged.
+    assert any(r.flagged for r in results)
+
+    after = len((
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all())
+    assert after == before, f"CriterionEvidence rows changed: {before} → {after}"
+
+
+@pytest.mark.asyncio
+async def test_criterion_claim_reconciliation_runs_in_sweep_tick(db):
+    """The new check is auto-discovered and executed in a full sweep tick."""
+    project = await _project(db)
+    await _open_version_with_criterion(
+        db, project, text="Sweep tick reconciliation test"
+    )
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+    assert tick is not None
+    names = {c.name for c in registered_checks()}
+    assert "criterion_claim_reconciliation" in names
 
 
 # --- Check: capability_proof_gate_gap ----------------------------------------

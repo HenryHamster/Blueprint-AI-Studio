@@ -59,6 +59,7 @@ from app.problem_model import (
     reconcile_gaps_for_retired_directions,
     evidence_met_summary,
     compute_evidence_health,
+    evidence_reconciliation_flags,
 )
 
 
@@ -5876,7 +5877,14 @@ def test_compute_evidence_health_healthy_majority_proven():
     model = _make_model_caps(proven=3, unproven=1)
     result = compute_evidence_health(model)
     assert result["overall"] == "healthy"
-    assert result["reconciliation_flags"] == []
+    # The one 'working' capability with empty evidence_refs (unproven) is a
+    # done-type claim contradicted by its evidence — Phase-1 reconciliation
+    # flags now surface it (the placeholder is no longer always empty).
+    flags = result["reconciliation_flags"]
+    assert len(flags) == 1
+    assert flags[0]["surface"] == "capability"
+    assert flags[0]["claimed_status"] == "working"
+    assert flags[0]["evidence_status"] == "unproven"
     assert result["capabilities"]["proven"] == 3
     assert result["capabilities"]["unproven"] == 1
 
@@ -5941,6 +5949,114 @@ def test_compute_evidence_health_exactly_50_percent_is_healthy():
     result = compute_evidence_health(model)
     # 1/2 == 0.5 — boundary is >=0.5, so this is healthy
     assert result["overall"] == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# evidence_reconciliation_flags (Component 4, Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def test_reconciliation_flags_flags_working_capability_without_evidence():
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="dispatch", status="working"),  # no refs → unproven
+            Capability(
+                name="proven_cap",
+                status="working",
+                evidence_refs=[{"kind": "named_test", "ref": "t.py", "proven": True}],
+            ),
+        ]
+    )
+    flags = evidence_reconciliation_flags(model)
+    assert len(flags) == 1
+    f = flags[0]
+    assert f == {
+        "surface": "capability",
+        "id": "dispatch",
+        "claimed_status": "working",
+        "evidence_status": "unproven",
+        "reason": "capability claims working but evidence is unproven",
+    }
+
+
+def test_reconciliation_flags_skips_proof_exempt_capability():
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="exempt", status="working", proof_exempt=True),
+        ]
+    )
+    assert evidence_reconciliation_flags(model) == []
+
+
+def test_reconciliation_flags_partial_and_planned_capabilities_never_flag():
+    model = ProblemModel(
+        capabilities=[
+            Capability(name="p", status="partial"),   # not a done-type claim
+            Capability(name="q", status="planned"),   # aspirational
+        ]
+    )
+    assert evidence_reconciliation_flags(model) == []
+
+
+def test_reconciliation_flags_flags_closed_gap_without_evidence():
+    model = ProblemModel(
+        gaps=[
+            Gap(id="g-closed", name="g-closed", status="closed"),  # unproven
+            Gap(id="g-active", name="g-active", status="active"),  # never flags
+        ]
+    )
+    flags = evidence_reconciliation_flags(model)
+    assert len(flags) == 1
+    assert flags[0]["surface"] == "gap"
+    assert flags[0]["id"] == "g-closed"
+    assert flags[0]["claimed_status"] == "closed"
+    assert flags[0]["evidence_status"] == "unproven"
+
+
+def test_reconciliation_flags_flags_uncovered_active_criterion():
+    model = ProblemModel()
+    coverage = {
+        "criteria": [
+            {"criterion_key": "c-covered", "coverage": "covered", "status": "active"},
+            {"criterion_key": "c-uncov", "coverage": "uncovered", "status": "active"},
+            {"criterion_key": "c-partial", "coverage": "partial", "status": "active"},
+            {"criterion_key": "c-inactive", "coverage": "uncovered", "status": "retracted"},
+        ]
+    }
+    flags = evidence_reconciliation_flags(model, coverage_summary=coverage)
+    ids = {f["id"]: f for f in flags}
+    # covered → proven → not flagged; inactive skipped; uncovered + partial flagged.
+    assert set(ids) == {"c-uncov", "c-partial"}
+    assert ids["c-uncov"]["surface"] == "criterion"
+    assert ids["c-uncov"]["evidence_status"] == "unproven"
+    assert ids["c-partial"]["evidence_status"] == "partial"
+
+
+def test_reconciliation_flags_bounded_to_max():
+    from app.problem_model import MAX_RECONCILIATION_FLAGS
+
+    model = ProblemModel(
+        gaps=[
+            Gap(id=f"g{i}", name=f"g{i}", status="closed")
+            for i in range(MAX_RECONCILIATION_FLAGS + 10)
+        ]
+    )
+    flags = evidence_reconciliation_flags(model)
+    assert len(flags) == MAX_RECONCILIATION_FLAGS
+
+
+def test_reconciliation_flags_empty_when_all_backed():
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="ok",
+                status="working",
+                evidence_refs=[{"kind": "named_test", "ref": "t.py", "proven": True}],
+            )
+        ],
+        gaps=[Gap(id="g", name="g", status="active")],
+    )
+    assert evidence_reconciliation_flags(model) == []
 
 
 # ---------------------------------------------------------------------------

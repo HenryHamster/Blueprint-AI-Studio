@@ -65,6 +65,11 @@ exceeds the canonical count; the delta is the rollup double-count), and
 rows per criterion with a direct COUNT(*) and flags any criterion whose
 self-reported evidence_count from get_version_coverage_summary diverges from
 the actual row count; the delta is the silent miscount), and
+``criterion_claim_reconciliation`` (grades each active acceptance criterion on
+the shared EvidenceStatus axis via criterion_evidence_status and flags those the
+open version must prove but whose evidence does not back coverage — the same
+tri-state claim_contradicts_evidence predicate the gap/capability reconciliation
+checks use, making acceptance criteria a full peer in the shared contract), and
 ``capability_proof_gate_gap`` (scans each project's problem_model capabilities and
 flags per-project the count of ``working`` capabilities whose ``proof_status`` is
 not ``proven`` — these capabilities satisfy prerequisite resolution today but would
@@ -3417,6 +3422,148 @@ async def check_criterion_evidence_count_integrity(
                 status=CheckStatus.SKIPPED,
                 subject="global",
                 detail="no criteria with evidence to audit across all projects",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "criterion_claim_reconciliation",
+    "Grade each active acceptance criterion on the shared EvidenceStatus axis "
+    "(criterion_evidence_status) and flag those the open version claims it must "
+    "prove but whose recorded evidence does not back it (uncovered/partial) — "
+    "the strategist-visible '0/N covered, machine 0-for-N' signal. Flag-only.",
+)
+async def check_criterion_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: an ACTIVE acceptance criterion on the open version is a
+    standing claim the version must PROVE. Grading it via
+    :func:`app.acceptance_criteria.criterion_evidence_status` (the shared axis
+    used by gaps/capabilities) and
+    :func:`app.evidence_primitive.claim_contradicts_evidence` with the fixed
+    done-type ``proven`` claim, a criterion whose recorded evidence does not back
+    coverage (``unproven`` / ``partial`` / ``contradicted``) is flagged. This
+    makes acceptance criteria a full peer in the shared "evidence met" contract
+    (Component 4) — the same tri-state predicate the gap/capability
+    reconciliation checks use, rather than the count-only checks.
+
+    DB-only and cheap: it issues no HEAD git calls (unlike the path-backed
+    gap/capability reconciliation checks) — a ``covered/attested/backfilled/
+    partial/uncovered`` classification of already-loaded evidence rows. Flag-only
+    and side-effect-free in every mode: it NEVER mutates a criterion or its
+    evidence. Bounded to ``ctx.max_projects`` projects; SKIPPED for projects with
+    no open version or no active criteria.
+    """
+    from app.acceptance_criteria import (
+        criterion_evidence_status,
+        get_criteria_for_version,
+        get_evidence_for_criteria_batch,
+    )
+    from app.evidence_primitive import claim_contradicts_evidence
+    from app.models import Project
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="criterion_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        active_criteria = [c for c in criteria if c.status == "active"]
+        if not active_criteria:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no active criteria on open version",
+                )
+            )
+            continue
+
+        any_checked = True
+        evidence_by_cid = await get_evidence_for_criteria_batch(
+            ctx.session, [c.id for c in active_criteria]
+        )
+        flagged: List[str] = []
+        for criterion in active_criteria:
+            rows = evidence_by_cid.get(criterion.id, [])
+            evidence_status = criterion_evidence_status(rows)
+            # An active criterion is a standing "must be proven" claim; grade it
+            # with the fixed done-type claim so an uncovered/partial/contradicted
+            # criterion is flagged on the same axis as gaps/capabilities.
+            if claim_contradicts_evidence("proven", evidence_status):
+                flagged.append(f"{criterion.criterion_key}={evidence_status}")
+
+        audited = len(active_criteria)
+        if flagged:
+            preview = ", ".join(flagged[:3])
+            if len(flagged) > 3:
+                preview += f" (+{len(flagged) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=audited,
+                    ground_truth=audited - len(flagged),
+                    delta=len(flagged),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{len(flagged)}/{audited} active criterion(s) claim the "
+                        f"open version must prove them but evidence does not back "
+                        f"coverage: {preview}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="criterion_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=audited,
+                    ground_truth=audited,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {audited} active criterion(s) reconciled; every "
+                        "criterion's evidence backs its coverage claim"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="criterion_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no active criteria on any open version to reconcile",
             )
         ]
     return results

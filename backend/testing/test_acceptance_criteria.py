@@ -556,6 +556,37 @@ def test_unverified_merge_backfill_reports_distinct_tier():
 
 
 # ---------------------------------------------------------------------------
+# criterion_evidence_status (pure function, Component 1)
+# ---------------------------------------------------------------------------
+
+
+def test_criterion_evidence_status_proven_from_covered():
+    """A proven task_merge → covered → 'proven' on the shared axis."""
+    ev = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.criterion_evidence_status([ev]) == "proven"
+    # reachability alone also covers → proven.
+    assert ac.criterion_evidence_status([_make_evidence("reachability")]) == "proven"
+
+
+def test_criterion_evidence_status_unproven_when_no_evidence():
+    """No evidence rows → uncovered → 'unproven'."""
+    assert ac.criterion_evidence_status([]) == "unproven"
+
+
+def test_criterion_evidence_status_partial_when_evidence_does_not_cover():
+    """Evidence present but not covering/attested/backfilled → partial."""
+    ev = _make_evidence("task_merge", detail={"proven": False})
+    assert ac.criterion_evidence_status([ev]) == "partial"
+
+
+def test_criterion_evidence_status_composes_coverage_and_axis_map():
+    """criterion_evidence_status is exactly the composition of its two parts."""
+    evs = [_make_evidence("operator"), _make_evidence("task_merge", detail={"proven": True})]
+    expected = ac.criterion_coverage_to_evidence_status(ac.compute_criterion_coverage(evs))
+    assert ac.criterion_evidence_status(evs) == expected == "proven"
+
+
+# ---------------------------------------------------------------------------
 # get_version_coverage_summary
 # ---------------------------------------------------------------------------
 
