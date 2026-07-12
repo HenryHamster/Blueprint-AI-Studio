@@ -48,12 +48,14 @@ from app.models_base import NaiveUTCDateTime
 # (never on ``app.models``), so this import forms no cycle.
 from app.release_models import (  # noqa: F401
     AuditFindingResolution,
+    CategoryVerdict,
     CompletionDebtEntry,
     CriterionEvidence,
     QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    ResidualVerdict,
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _utcnow
