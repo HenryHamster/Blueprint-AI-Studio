@@ -14879,6 +14879,67 @@ def test_credential_scanner_allows_env_var_reference():
     assert findings == []
 
 
+def test_image_scanner_covers_runner_credential_allowlist():
+    """Drift guard: every provider-credential key in runner_isolation is caught by the image scanner.
+
+    runner_isolation.AGENT_ENV_ALLOWLIST is the canonical list of credential-bearing env
+    keys the platform recognises. The image scanner's _SECRET_ENV_NAMES must cover all of
+    them (plus FORBIDDEN_ENV_KEYS) so a key added to the runner cannot silently be baked
+    into a published image layer. If this test fails, add the key to _SECRET_ENV_NAMES in
+    backend/app/compute_image_build.py.
+    """
+    import importlib.util
+    import pathlib
+    import sys
+
+    if sys.version_info < (3, 11):
+        pytest.skip("runner_isolation.py uses Python 3.11 dataclass syntax; covered in CI")
+
+    # Load runner_isolation by path (it is stdlib-only, not in the backend package).
+    spec = importlib.util.spec_from_file_location(
+        "runner_isolation",
+        pathlib.Path(__file__).parent.parent.parent / "scripts" / "runner_isolation.py",
+    )
+    ri = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ri)
+
+    # Credential-bearing subset of AGENT_ENV_ALLOWLIST: keys whose names suggest they
+    # carry a secret (API key, token, credentials, secret).  Config/routing/locale keys
+    # (PROVIDER, LANG, TERM, …) are intentionally excluded — they carry no secrets.
+    _CREDENTIAL_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_CREDENTIALS")
+    credential_keys = {
+        k for k in ri.AGENT_ENV_ALLOWLIST
+        if any(k.upper().endswith(sfx) for sfx in _CREDENTIAL_SUFFIXES)
+    }
+    # FORBIDDEN_ENV_KEYS must also be detected — they must never reach task code at all.
+    all_keys_to_cover = credential_keys | set(ri.FORBIDDEN_ENV_KEYS)
+
+    secret_names = _bci._SECRET_ENV_NAMES
+
+    # 1. Every credential key is in _SECRET_ENV_NAMES.
+    missing = all_keys_to_cover - secret_names
+    assert not missing, (
+        f"runner_isolation keys not covered by compute_image_build._SECRET_ENV_NAMES: {sorted(missing)}. "
+        "Add them to _SECRET_ENV_NAMES in backend/app/compute_image_build.py."
+    )
+
+    # 2. Each key is actually detected when literally assigned in a Dockerfile ENV.
+    for key in sorted(all_keys_to_cover):
+        dockerfile = f"FROM python:3.11-slim\nENV {key}=supersecretvalue\n".encode()
+        findings = _bci.scan_inputs_for_credentials(
+            {"Dockerfile": dockerfile},
+            dockerfile_names=["Dockerfile"],
+        )
+        assert any(key in f for f in findings), (
+            f"scan_inputs_for_credentials did not flag 'ENV {key}=...' — "
+            "the key is in _SECRET_ENV_NAMES but the scanner did not detect it"
+        )
+
+    # 3. A clean Dockerfile with only benign vars produces no findings.
+    clean = b"FROM python:3.11-slim\nENV PYTHONUNBUFFERED=1\nENV LANG=C.UTF-8\n"
+    assert _bci.scan_inputs_for_credentials({"Dockerfile": clean}, dockerfile_names=["Dockerfile"]) == []
+
+
 # ---------------------------------------------------------------------------
 # Build script hash-check-before-build orchestration
 # ---------------------------------------------------------------------------

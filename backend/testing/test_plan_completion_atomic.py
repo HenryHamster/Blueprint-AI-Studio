@@ -27,7 +27,7 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
 )
-from app.models import Task, TaskHistory, TaskStatus
+from app.models import ProjectComputeImage, Task, TaskHistory, TaskStatus
 from app.plan_completion import _handle_plan_completion
 from app.task_capabilities import PLAN_KNOWLEDGE_SUBTASK_TYPES, PLAN_SUBTASK_TYPES
 from testing.factories import make_project, make_task
@@ -716,6 +716,148 @@ async def test_compute_experiment_prereq_spawns_launch_payload_and_dependency(
         COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY
     ] == COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY
     assert dependent.depends_on == [str(producer.id)]
+
+
+async def _setup_plan_task_with_project(
+    db_session, mocker, subtasks_json, *, build_config=None, base_branch="main"
+):
+    """Like ``_setup_plan_task`` but returns ``(task, project)`` and lets the
+    caller seed ``Project.build_config`` (for baked compute-image defaulting)."""
+    project = make_project(name="ImgDefaultPlan", build_config=build_config)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Plan: image defaulting",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "x", "base_branch": base_branch}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=task,
+    )
+    return task, project
+
+
+def _compute_prereq_plan_logs():
+    return json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Measure the baseline",
+                    "prompt": "benchmark it",
+                    "type": "compute_experiment",
+                    "command": "python bench.py",
+                    "spend_cap_usd": 1.0,
+                    "success_criterion": {
+                        "metric": "accuracy",
+                        "operator": ">=",
+                        "threshold": 0.9,
+                    },
+                    "machine_type": "n2-standard-4",
+                    "smoke_sample": {
+                        "exit_code": 0,
+                        "startup_ok": True,
+                        "metric_captured": True,
+                        "timed_out": False,
+                    },
+                }
+            ]
+        }
+    )
+
+
+_PLAN_MANIFEST_TAG = "registry.example.com/proj/compute:latest"
+_PLAN_PINNED_REF = "registry.example.com/proj/compute@sha256:" + ("b" * 64)
+
+
+@pytest.mark.asyncio
+async def test_plan_compute_experiment_defaults_to_pinned_ref(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan-spawned compute_experiment with no declared container_image
+    inherits the project's digest-pinned baked reference (preferred over the
+    mutable manifest tag).
+
+    Production resolves the default via
+    ``compute_backends.resolve_digest_pinned_default_image``, which pins the
+    mutable manifest tag to the ``pinned_ref`` of the matching built
+    ``ProjectComputeImage`` row — so the reproducibility win is exercised by
+    seeding that durable build record, not ``Project.build_config``."""
+    task, project = await _setup_plan_task_with_project(
+        db_session,
+        mocker,
+        _compute_prereq_plan_logs(),
+    )
+    # image_name is derived from the manifest tag exactly as the resolver does:
+    # "registry.example.com/proj/compute:latest" -> "compute".
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute",
+            registry_repo="registry.example.com/proj",
+            dep_hash="deadbeef",
+            tag="latest",
+            pinned_ref=_PLAN_PINNED_REF,
+            digest="sha256:" + ("b" * 64),
+            built=True,
+        )
+    )
+    await db_session.commit()
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": _PLAN_MANIFEST_TAG}}},
+    )
+
+    await _handle_plan_completion(task, _compute_prereq_plan_logs(), db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    payload = children[0].first_payload or {}
+    assert payload["container_image"] == _PLAN_PINNED_REF
+
+
+@pytest.mark.asyncio
+async def test_plan_compute_experiment_falls_back_to_manifest_tag(
+    db_session, mocker, _quiet_mocks
+):
+    """With no baked pinned_ref, the plan-spawned compute_experiment still
+    inherits the mutable manifest tag exactly as before (backward compat)."""
+    task, _project = await _setup_plan_task_with_project(
+        db_session,
+        mocker,
+        _compute_prereq_plan_logs(),
+        build_config=None,
+    )
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": _PLAN_MANIFEST_TAG}}},
+    )
+
+    await _handle_plan_completion(task, _compute_prereq_plan_logs(), db_session)
+
+    children = (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    payload = children[0].first_payload or {}
+    assert payload["container_image"] == _PLAN_MANIFEST_TAG
 
 
 @pytest.mark.asyncio

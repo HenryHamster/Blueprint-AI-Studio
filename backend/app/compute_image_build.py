@@ -107,19 +107,38 @@ _CREDENTIAL_PATTERNS: List[tuple[str, re.Pattern[bytes]]] = [
 # Environment-variable *names* that carry Blueprint platform secrets. A
 # Dockerfile that pins any of these to a literal value leaks a platform
 # credential into the image and must fail the build.
+#
+# Kept in sync with scripts/runner_isolation.py's AGENT_ENV_ALLOWLIST
+# (credential-bearing subset) and FORBIDDEN_ENV_KEYS via a drift-guard test
+# in backend/testing/test_compute.py::test_image_scanner_covers_runner_credential_allowlist.
 _SECRET_ENV_NAMES = {
+    # Blueprint platform tokens / URLs (also covers FORBIDDEN_ENV_KEYS)
     "ORCHESTRATOR_TOKEN",
     "ADMIN_API_KEY",
     "RUNNER_TOKEN",
+    "BLUEPRINT_RUNNER_TOKEN",
+    "BLUEPRINT_ORCHESTRATOR_URL",
     "RUNNER_ENROLLMENT_TOKEN",
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_APP_INSTALLATION_TOKEN",
+    # Anthropic / Claude
     "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    # OpenAI / Codex
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    # Gemini / Google
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    # Z.ai
     "ZAI_API_KEY",
+    # AWS / Bedrock
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    # Other LLM providers
     "DEEPSEEK_API_KEY",
 }
 
