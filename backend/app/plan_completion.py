@@ -375,6 +375,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             _ci = ((_manifest.get("compute") or {}).get("image") or {})
             if isinstance(_ci, dict):
                 _project_default_container_image = _ci.get("name") or None
+            if _project_default_container_image:
+                # Pin the mutable manifest tag to a content-addressed digest so
+                # repeated defaulting is bit-identical over time (design gap G3).
+                from app.compute_backends import resolve_digest_pinned_default_image
+                _project_default_container_image = await resolve_digest_pinned_default_image(
+                    session, project.id, _project_default_container_image
+                )
         except Exception:
             logger.debug("[PLAN] manifest fetch for compute image default failed")
 

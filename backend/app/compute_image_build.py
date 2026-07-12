@@ -298,6 +298,114 @@ def registry_tag_exists(
     return proc.returncode == 0
 
 
+# ── DB-aware GC protection tags ──────────────────────────────────────────────
+#
+# Registry retention (Terraform cleanup_policy on the compute-images repo) is
+# purely time/count-based and cannot query the orchestrator DB. To stop a digest
+# a live/recent compute job still depends on from being GC'd, the reaper stamps a
+# durable ``inuse-<shorthash>`` tag on the referenced digest; a matching KEEP
+# cleanup_policy (``keep-inuse-tagged``) shields anything so tagged from
+# deletion. These helpers apply / list / delete those protection tags via
+# ``gcloud artifacts docker tags`` and FAIL OPEN — any error (no gcloud, no
+# creds, transient API) is swallowed so the reaper cycle never breaks; a missed
+# protection tag only costs a chance at reclaim on the next hourly sweep.
+
+_PROTECTION_TAG_PREFIX = "inuse-"
+
+
+def protection_tag_for_digest(digest: str) -> str:
+    """Deterministic ``inuse-<shorthash>`` protection tag for a ``sha256:`` digest.
+
+    The 16-hex-char shorthash is taken from the digest hex so the tag is stable
+    across sweeps (idempotent re-tagging) and the reaper can decide which tags to
+    prune purely from the tag name, without resolving each tag back to a digest.
+    """
+    short = digest.split(":", 1)[-1][:16]
+    return f"{_PROTECTION_TAG_PREFIX}{short}"
+
+
+def apply_registry_protection_tag(
+    full_repo: str, digest: str, *, _run=subprocess.run
+) -> str | None:
+    """Tag ``full_repo@digest`` with its ``inuse-`` protection tag; None on failure.
+
+    Idempotent: re-adding an existing tag pointed at the same digest is a no-op
+    for the KEEP policy. Fails open — returns None on any gcloud/OS error.
+    """
+    tag = protection_tag_for_digest(digest)
+    src = f"{full_repo}@{digest}"
+    dst = f"{full_repo}:{tag}"
+    try:
+        proc = _run(
+            ["gcloud", "artifacts", "docker", "tags", "add", src, dst],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return tag if proc.returncode == 0 else None
+
+
+def list_registry_protection_tags(
+    full_repo: str, *, _run=subprocess.run
+) -> List[str]:
+    """Short ``inuse-`` tag names currently present on ``full_repo`` (fail open -> [])."""
+    try:
+        proc = _run(
+            ["gcloud", "artifacts", "docker", "tags", "list", full_repo, "--format=json"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        entries = json.loads(proc.stdout or "[]")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    tags: List[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("tag")
+        if not isinstance(raw, str) or not raw:
+            continue
+        # gcloud emits a fully-qualified tag path; keep just the short tag name.
+        short = raw.rsplit(":", 1)[-1] if ":" in raw else raw.rsplit("/", 1)[-1]
+        if short.startswith(_PROTECTION_TAG_PREFIX):
+            tags.append(short)
+    return tags
+
+
+def delete_registry_protection_tag(
+    full_repo: str, tag: str, *, _run=subprocess.run
+) -> bool:
+    """Delete a single ``inuse-`` protection tag from ``full_repo`` (fail open -> False)."""
+    try:
+        proc = _run(
+            [
+                "gcloud",
+                "artifacts",
+                "docker",
+                "tags",
+                "delete",
+                f"{full_repo}:{tag}",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def _resolve_pushed_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:

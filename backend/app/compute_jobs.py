@@ -34,6 +34,7 @@ from app.compute_backends import (
     ComputeLaunchSpec,
     ComputeStatusResult,
     PreflightSmokeResult,
+    _parse_digest_from_pinned_ref,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
     detect_local_gpu,
@@ -1352,6 +1353,52 @@ async def active_compute_job_vm_ids(session) -> set[str]:
         )
     )
     return {vid for vid in result.scalars().all() if vid}
+
+
+async def referenced_compute_image_digests(
+    session, *, since: datetime | None = None
+) -> set[str]:
+    """``sha256:...`` digests of compute images a live/recent job still depends on.
+
+    A baked compute-image digest must NOT be garbage-collected out of the
+    registry while something still references it. A digest is "referenced" when
+    it is the ``container_image`` of either:
+
+      * a non-terminal compute job (``_COMPUTE_JOB_ACTIVE_STATUSES``) — a running
+        or queued experiment that will still need to pull the image, OR
+      * a terminal compute job whose ``completed_at >= since`` — a recent result
+        whose provenance/reproducibility depends on the image staying pullable.
+        When ``since`` is ``None`` only live jobs are considered.
+
+    The image reference is stored in ``polling_metadata['container_image']`` as a
+    digest-pinned ``registry/repo@sha256:<hex>`` (contributes its digest) or a
+    tag-only ``registry/repo:tag`` (no stable digest — ignored). Returns the
+    deduplicated set of ``sha256:...`` digests; an absent/tag-only/malformed
+    reference contributes nothing.
+    """
+    conditions = [ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)]
+    if since is not None:
+        conditions.append(
+            and_(
+                ComputeJob.status.in_(list(_COMPUTE_JOB_TERMINAL_STATUSES)),
+                ComputeJob.completed_at.is_not(None),
+                ComputeJob.completed_at >= since,
+            )
+        )
+    result = await session.execute(
+        select(ComputeJob.polling_metadata).where(or_(*conditions))
+    )
+    digests: set[str] = set()
+    for meta in result.scalars().all():
+        if not isinstance(meta, dict):
+            continue
+        ref = meta.get("container_image")
+        if not isinstance(ref, str):
+            continue
+        digest = _parse_digest_from_pinned_ref(ref)
+        if digest:
+            digests.add(digest)
+    return digests
 
 
 _COMPUTE_JOB_BATCH_SIZE = 50

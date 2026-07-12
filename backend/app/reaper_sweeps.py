@@ -1681,6 +1681,117 @@ async def sweep_closed_handmerge_prs(session) -> int:
     return resolved
 
 
+# Independent cadence timer for the compute-image GC guard (below). Hourly, on
+# its own clock so it can never be gated out by another sweep stamping a shared
+# global at the top of the same reaper cycle.
+_COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
+# How far back a *completed* compute job still counts as depending on its image:
+# a recent result's provenance/reproducibility needs the digest to stay pullable.
+_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
+_last_compute_image_gc_guard_sweep: datetime | None = None
+
+
+async def sweep_protect_referenced_compute_image_digests(
+    session,
+    now=None,
+    *,
+    _apply_tag=None,
+    _list_tags=None,
+    _delete_tag=None,
+    max_images: int = 500,
+) -> dict[str, int]:
+    """Protect registry digests a live/recent compute job still depends on.
+
+    Registry retention (Terraform ``cleanup_policy`` on the compute-images repo)
+    is purely time/count-based and cannot query the DB, so a digest a *running*
+    experiment — or a *recent* result's provenance — depends on can be GC'd out
+    from under it, breaking reproducibility. This sweep closes that gap: it
+    stamps a durable ``inuse-<shorthash>`` protection tag on every referenced
+    digest, and a matching KEEP ``cleanup_policy`` (``keep-inuse-tagged`` in
+    ``infra/terraform/registry.tf``) shields anything so tagged from deletion.
+    Protection tags whose digest is no longer referenced are pruned so ordinary
+    time-based retention can reclaim the image on a later pass.
+
+    A digest is "referenced" when it is the ``container_image`` of a live compute
+    job, of a job completed within the protection window, OR the digest of a
+    ``ProjectComputeImage`` row (re)built within that window (protect the current
+    project default even before its first job lands).
+
+    Cadence-gated to hourly on an independent timer. Returns a summary dict
+    (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
+    never crash the reaper cycle; the registry helpers fail open individually.
+    """
+    global _last_compute_image_gc_guard_sweep
+    from app.compute_image_build import (
+        apply_registry_protection_tag,
+        delete_registry_protection_tag,
+        list_registry_protection_tags,
+        protection_tag_for_digest,
+    )
+    from app.compute_jobs import referenced_compute_image_digests
+    from app.models import ProjectComputeImage
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_compute_image_gc_guard_sweep,
+        _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
+        _now,
+    ):
+        return {"applied": 0, "pruned": 0, "skipped_cadence": 1}
+    _last_compute_image_gc_guard_sweep = _now
+
+    apply_tag = _apply_tag or apply_registry_protection_tag
+    list_tags = _list_tags or list_registry_protection_tags
+    delete_tag = _delete_tag or delete_registry_protection_tag
+
+    cutoff = _now - timedelta(seconds=_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS)
+    referenced = await referenced_compute_image_digests(session, since=cutoff)
+
+    images = (
+        (
+            await session.execute(
+                select(ProjectComputeImage)
+                .where(ProjectComputeImage.digest.is_not(None))
+                .limit(max_images)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # A freshly-(re)built image is protected even before its first job lands, so
+    # the current project default is never GC'd between bake and first use.
+    for img in images:
+        updated = getattr(img, "updated_at", None)
+        if img.digest and updated is not None and updated >= cutoff:
+            referenced.add(img.digest)
+
+    protected_tags = {protection_tag_for_digest(d) for d in referenced}
+
+    applied = 0
+    pruned = 0
+    # Group images by their full registry repo so pruning lists each repo once.
+    repos: set[str] = set()
+    for img in images:
+        full_repo = f"{img.registry_repo}/{img.image_name}"
+        repos.add(full_repo)
+        if img.digest and img.digest in referenced and apply_tag(
+            full_repo, img.digest
+        ):
+            applied += 1
+
+    for full_repo in repos:
+        try:
+            existing = list_tags(full_repo)
+        except Exception:  # noqa: BLE001 — registry helpers fail open
+            continue
+        for tag in existing:
+            if tag not in protected_tags and delete_tag(full_repo, tag):
+                pruned += 1
+
+    return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -1722,4 +1833,5 @@ __all__ = [
     "sweep_resolve_stale_open_bug_messages",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
+    "sweep_protect_referenced_compute_image_digests",
 ]

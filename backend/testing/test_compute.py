@@ -55,6 +55,7 @@ from app.models import (
     ComputeJobStatus,
     KnowledgeDocument,
     Project,
+    ProjectComputeImage,
     ProjectMember,
     ReleaseDeployArtifact,
     ReleaseVersion,
@@ -14429,12 +14430,20 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
 ):
     """When a project's manifest declares compute.image.name and a plan subtask omits
     container_image, _handle_plan_completion must default the spawned child's
-    container_image to the project's declared image."""
+    container_image to the project's declared image — pinned to the durable
+    ProjectComputeImage build digest (not the mutable tag) when one exists, so
+    two runs of the same experiment are bit-identical over time (design gap G3)."""
     from sqlmodel import select as _select
+    from app.models import ProjectComputeImage
     from app.plan_completion import _handle_plan_completion
     from testing.factories import make_project, make_task
 
+    # Mutable manifest tag (image_name "base"); a build record pins it to a digest.
     _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
+    _PINNED_REF = (
+        "us-central1-docker.pkg.dev/myproject/compute/base@sha256:"
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    )
 
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -14460,6 +14469,21 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Durable digest-pinned build record for the manifest image ("base").
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="base",
+            registry_repo="us-central1-docker.pkg.dev/myproject/compute",
+            dep_hash="dep-hash-1",
+            tag="sha256-abc123",
+            pinned_ref=_PINNED_REF,
+            digest="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            built=True,
+        )
+    )
+    await db_session.commit()
 
     plan_task = make_task(
         project_id=project.id,
@@ -14512,8 +14536,14 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
         f"Expected 1 compute_experiment child, got {len(compute_children)}: {child_tasks}"
     )
     payload = compute_children[0].first_payload or {}
-    assert payload.get("container_image") == _PROJECT_IMAGE, (
-        f"Expected container_image={_PROJECT_IMAGE!r}, got {payload.get('container_image')!r}"
+    # Digest-pinned: the child carries the content-addressed pinned_ref, NOT the
+    # mutable manifest tag, so re-authoring days later resolves identically.
+    assert payload.get("container_image") == _PINNED_REF, (
+        f"Expected digest-pinned container_image={_PINNED_REF!r}, "
+        f"got {payload.get('container_image')!r}"
+    )
+    assert payload.get("container_image") != _PROJECT_IMAGE, (
+        "container_image must be pinned to the build digest, not the mutable tag"
     )
 
 
@@ -15028,6 +15058,749 @@ async def test_build_project_compute_image_requires_repo():
             _clone_fn=lambda *a: None,
             _build_fn=lambda **k: None,
         )
+
+
+# ---------------------------------------------------------------------------
+# ProjectComputeImage persistence (record_project_compute_image_build).
+#
+# The baking pipeline returns a BuildResult (pinned_ref/tag/dep_hash/built) but
+# nothing durably recorded it. These cover the additive UPSERT helper: a fresh
+# insert, an in-place UPSERT keyed on (project_id, dep_hash), and digest parsing
+# from a @sha256 pinned_ref vs a tag-only ref.
+# ---------------------------------------------------------------------------
+def _build_result(*, pinned_ref, tag="latest", dep_hash="deadbeef", built=True):
+    from app.compute_image_build import BuildResult
+
+    return BuildResult(
+        pinned_ref=pinned_ref,
+        tag=tag,
+        dep_hash=dep_hash,
+        already_present=not built,
+        built=built,
+    )
+
+
+async def _make_project(db_session, name="Compute Image Proj"):
+    from app.models import Project
+
+    project = Project(name=name, user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+# ---------------------------------------------------------------------------
+# resolve_digest_pinned_default_image: pin a mutable manifest tag to a durable
+# content digest when a ProjectComputeImage build record exists (design gap G3).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_returns_none_for_empty_input(db_session):
+    from app import compute_backends as cb
+    import uuid as _uuid
+
+    assert await cb.resolve_digest_pinned_default_image(db_session, _uuid.uuid4(), None) is None
+    assert await cb.resolve_digest_pinned_default_image(db_session, _uuid.uuid4(), "") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_passthrough_when_already_pinned(db_session):
+    from app import compute_backends as cb
+    import uuid as _uuid
+
+    already = "ghcr.io/org/base@sha256:" + "a" * 64
+    # Already content-addressed: returned unchanged without any DB lookup.
+    assert (
+        await cb.resolve_digest_pinned_default_image(db_session, _uuid.uuid4(), already)
+        == already
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_falls_back_to_tag_when_no_row(db_session):
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+    tag = "ghcr.io/org/base:latest"
+    # No build record for this project -> fail-open to the mutable tag.
+    assert (
+        await cb.resolve_digest_pinned_default_image(db_session, project.id, tag) == tag
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_uses_built_digest_row(db_session):
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+    pinned = "ghcr.io/org/base@sha256:" + "b" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="base",
+            registry_repo="ghcr.io/org",
+            dep_hash="h1",
+            tag="latest",
+            pinned_ref=pinned,
+            digest="sha256:" + "b" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await cb.resolve_digest_pinned_default_image(
+            db_session, project.id, "ghcr.io/org/base:latest"
+        )
+        == pinned
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_ignores_unbuilt_and_digestless_rows(db_session):
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+    tag = "ghcr.io/org/base:latest"
+    # A row that never finished building (built=False) and one with no digest
+    # must both be ignored; the resolver falls back to the mutable tag.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="base",
+            registry_repo="ghcr.io/org",
+            dep_hash="unbuilt",
+            tag="latest",
+            pinned_ref="ghcr.io/org/base@sha256:" + "c" * 64,
+            digest="sha256:" + "c" * 64,
+            built=False,
+        )
+    )
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="base",
+            registry_repo="ghcr.io/org",
+            dep_hash="digestless",
+            tag="latest",
+            pinned_ref="ghcr.io/org/base:latest",
+            digest=None,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await cb.resolve_digest_pinned_default_image(db_session, project.id, tag) == tag
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_project_compute_image_build_inserts_fresh_row(db_session):
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+    digest = "sha256:" + "a" * 64
+    result = _build_result(
+        pinned_ref=f"ghcr.io/org/repo@{digest}",
+        tag="v1",
+        dep_hash="hash-fresh",
+        built=True,
+    )
+
+    row = await cb.record_project_compute_image_build(
+        db_session,
+        project.id,
+        registry_repo="ghcr.io/org/repo",
+        image_name="compute-proj",
+        result=result,
+    )
+    await db_session.commit()
+
+    assert row.project_id == project.id
+    assert row.registry_repo == "ghcr.io/org/repo"
+    assert row.image_name == "compute-proj"
+    assert row.dep_hash == "hash-fresh"
+    assert row.tag == "v1"
+    assert row.pinned_ref == f"ghcr.io/org/repo@{digest}"
+    assert row.digest == digest
+    assert row.built is True
+
+    rows = (
+        await db_session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_project_compute_image_build_upserts(db_session):
+    """A second build for the same (project_id, dep_hash) updates in place."""
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+
+    first_digest = "sha256:" + "b" * 64
+    first = await cb.record_project_compute_image_build(
+        db_session,
+        project.id,
+        registry_repo="ghcr.io/org/repo",
+        image_name="compute-proj",
+        result=_build_result(
+            pinned_ref=f"ghcr.io/org/repo@{first_digest}",
+            tag="v1",
+            dep_hash="stable-hash",
+            built=True,
+        ),
+    )
+    await db_session.commit()
+    first_id = first.id
+
+    # Second build: same dep_hash, different digest/tag/built -> UPSERT in place.
+    second_digest = "sha256:" + "c" * 64
+    second = await cb.record_project_compute_image_build(
+        db_session,
+        project.id,
+        registry_repo="ghcr.io/org/repo",
+        image_name="compute-proj",
+        result=_build_result(
+            pinned_ref=f"ghcr.io/org/repo@{second_digest}",
+            tag="v2",
+            dep_hash="stable-hash",
+            built=False,
+        ),
+    )
+    await db_session.commit()
+
+    # No duplicate row: same primary key, updated fields.
+    assert second.id == first_id
+    assert second.pinned_ref == f"ghcr.io/org/repo@{second_digest}"
+    assert second.digest == second_digest
+    assert second.tag == "v2"
+    assert second.built is False
+
+    rows = (
+        await db_session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].id == first_id
+    assert rows[0].tag == "v2"
+
+
+@pytest.mark.asyncio
+async def test_record_project_compute_image_build_parses_digest(db_session):
+    """Digest is parsed from a @sha256 ref and None for a tag-only ref."""
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+
+    digest = "sha256:" + "d" * 64
+    pinned = await cb.record_project_compute_image_build(
+        db_session,
+        project.id,
+        registry_repo="ghcr.io/org/repo",
+        image_name="compute-proj",
+        result=_build_result(
+            pinned_ref=f"ghcr.io/org/repo@{digest}",
+            dep_hash="digest-pinned",
+        ),
+    )
+    await db_session.commit()
+    assert pinned.digest == digest
+
+    tag_only = await cb.record_project_compute_image_build(
+        db_session,
+        project.id,
+        registry_repo="ghcr.io/org/repo",
+        image_name="compute-proj",
+        result=_build_result(
+            pinned_ref="ghcr.io/org/repo:latest",
+            tag="latest",
+            dep_hash="tag-only",
+        ),
+    )
+    await db_session.commit()
+    assert tag_only.digest is None
+    assert tag_only.pinned_ref == "ghcr.io/org/repo:latest"
+
+
+# ---------------------------------------------------------------------------
+# resolve_compute_image_registry_repo — pure env/config function.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_compute_image_registry_repo_explicit_env(monkeypatch):
+    """COMPUTE_IMAGE_REGISTRY env var takes precedence."""
+    from app import compute_backends as cb
+
+    monkeypatch.setenv("COMPUTE_IMAGE_REGISTRY", "us-docker.pkg.dev/my-project/compute-images")
+    assert cb.resolve_compute_image_registry_repo() == "us-docker.pkg.dev/my-project/compute-images"
+
+
+def test_resolve_compute_image_registry_repo_fallback(monkeypatch):
+    """Without COMPUTE_IMAGE_REGISTRY, falls back to derived form from GCP_PROJECT_ID."""
+    from app import compute_backends as cb
+    from app import storage
+
+    monkeypatch.delenv("COMPUTE_IMAGE_REGISTRY", raising=False)
+    monkeypatch.delenv("COMPUTE_IMAGE_REGION", raising=False)
+    monkeypatch.setattr(storage, "GCP_PROJECT_ID", "my-gcp-proj")
+    result = cb.resolve_compute_image_registry_repo()
+    assert result == "us-docker.pkg.dev/my-gcp-proj/compute-images"
+
+
+def test_resolve_compute_image_registry_repo_custom_region(monkeypatch):
+    """COMPUTE_IMAGE_REGION customises the region prefix."""
+    from app import compute_backends as cb
+    from app import storage
+
+    monkeypatch.delenv("COMPUTE_IMAGE_REGISTRY", raising=False)
+    monkeypatch.setenv("COMPUTE_IMAGE_REGION", "europe-west4")
+    monkeypatch.setattr(storage, "GCP_PROJECT_ID", "my-gcp-proj")
+    result = cb.resolve_compute_image_registry_repo()
+    assert result == "europe-west4-docker.pkg.dev/my-gcp-proj/compute-images"
+
+
+# ---------------------------------------------------------------------------
+# POST /projects/{project_id}/compute-image/build — trigger endpoint.
+#
+# Exercises the seam end-to-end: build_project_compute_image is monkeypatched
+# to skip the real Docker build; the endpoint must persist a ProjectComputeImage
+# row with the parsed digest from the returned BuildResult.
+# ---------------------------------------------------------------------------
+
+
+async def _make_member_project(db_session, name="Build-Trigger-Test"):
+    from app.models import Project, ProjectMember
+
+    project = Project(name=name, user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="member"))
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_trigger_persists_digest(
+    client, db_session, monkeypatch
+):
+    """POST /projects/{id}/compute-image/build persists a ProjectComputeImage row.
+
+    Acceptance test: monkeypatches build_project_compute_image to return a
+    digest-pinned BuildResult; asserts the row is persisted with the parsed
+    sha256 digest.
+    """
+    from app import compute_backends as cb
+    from app.compute_image_build import BuildResult
+    from app.models import ProjectComputeImage
+    from app.routers import admin_project_tools as pt
+
+    project = await _make_member_project(db_session)
+    digest = "sha256:" + "b" * 64
+    pinned_ref = f"us-docker.pkg.dev/test-project/compute-images/compute-proj@{digest}"
+
+    fake_result = BuildResult(
+        pinned_ref=pinned_ref,
+        tag="dep-abc123",
+        dep_hash="abc123",
+        already_present=False,
+        built=True,
+    )
+
+    # Monkeypatch the manifest discovery to return a valid compute.image.build config.
+    async def _fake_discover(proj):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {
+                "image": {
+                    "name": "us-docker.pkg.dev/test-project/compute-images/compute-proj:dep-abc123",
+                    "build": {
+                        "dockerfile": ".blueprint/Dockerfile.compute",
+                        "parent": None,
+                        "build_args": {},
+                    },
+                }
+            },
+            "error": None,
+        }
+
+    monkeypatch.setattr(pt, "_discover_manifest_tools", _fake_discover)
+
+    # Monkeypatch the build function to return the fake result without a real build.
+    async def _fake_build(proj, *, registry_repo, build_config, dry_run=False, **kwargs):
+        return fake_result
+
+    monkeypatch.setattr(cb, "build_project_compute_image", _fake_build)
+    monkeypatch.setenv("COMPUTE_IMAGE_REGISTRY", "us-docker.pkg.dev/test-project/compute-images")
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+    assert resp.status_code == 200, resp.text
+
+    body = resp.json()
+    assert body["digest"] == digest
+    assert body["pinned_ref"] == pinned_ref
+    assert body["dep_hash"] == "abc123"
+    assert body["built"] is True
+    assert body["already_present"] is False
+
+    # Verify the row was persisted in the database.
+    row = (
+        await db_session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project.id,
+                ProjectComputeImage.dep_hash == "abc123",
+            )
+        )
+    ).scalar_one_or_none()
+    assert row is not None
+    assert row.digest == digest
+    assert row.pinned_ref == pinned_ref
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_no_build_config_returns_422(
+    client, db_session, monkeypatch
+):
+    """POST returns 422 when the project declares no compute.image.build section."""
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+    from app.routers import admin_project_tools as pt
+
+    project = await _make_member_project(db_session, name="NoBuild-Test")
+
+    # Manifest has image.name but no build section — resolve returns None.
+    async def _fake_discover_no_build(proj):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {
+                "image": {
+                    "name": "prebuilt-image:latest",
+                    # No "build" key — resolve_project_compute_image_build returns None.
+                }
+            },
+            "error": None,
+        }
+
+    monkeypatch.setattr(pt, "_discover_manifest_tools", _fake_discover_no_build)
+
+    build_called = []
+
+    async def _fail_if_called(*args, **kwargs):
+        build_called.append(True)
+        raise AssertionError("build should not be called")
+
+    monkeypatch.setattr(cb, "build_project_compute_image", _fail_if_called)
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+    assert resp.status_code == 422
+    assert "build" in resp.json()["detail"].lower()
+
+    # No row should have been persisted.
+    rows = (
+        await db_session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert rows == []
+    assert build_called == []  # build was never invoked
+
+
+# ---------------------------------------------------------------------------
+# DB-aware GC guard for project compute-image digests.
+#
+# Registry retention (Terraform cleanup_policy) is purely time/count-based and
+# cannot query the DB, so a digest a live/recent compute job depends on can be
+# GC'd out from under it. These cover the DB-aware primitive
+# (referenced_compute_image_digests), the fail-open registry-tag helpers, and
+# the reaper sweep that ties them together
+# (sweep_protect_referenced_compute_image_digests).
+# ---------------------------------------------------------------------------
+def _digest(hexchar):
+    return "sha256:" + hexchar * 64
+
+
+async def _make_compute_job(
+    db_session, project, *, status, container_image=None, completed_at=None
+):
+    meta = {}
+    if container_image is not None:
+        meta["container_image"] = container_image
+    job = ComputeJob(
+        project_id=project.id,
+        backend="gcp",
+        status=status,
+        polling_metadata=meta,
+        completed_at=completed_at,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_referenced_compute_image_digests_active_and_recent_only(db_session):
+    project = await _make_project(db_session, name="GC Guard Refs")
+    repo = "ghcr.io/org/img"
+    d_active = _digest("a")
+    d_recent = _digest("b")
+    d_old = _digest("c")
+    d_tag_only = "ghcr.io/org/img:latest"  # no @digest -> ignored
+
+    now = _utcnow()
+    # Live job -> referenced regardless of since.
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.RUNNING,
+        container_image=f"{repo}@{d_active}",
+    )
+    # Terminal job completed inside the window -> referenced.
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.SUCCEEDED,
+        container_image=f"{repo}@{d_recent}",
+        completed_at=now - timedelta(days=2),
+    )
+    # Terminal job completed long ago -> NOT referenced.
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.SUCCEEDED,
+        container_image=f"{repo}@{d_old}",
+        completed_at=now - timedelta(days=90),
+    )
+    # Live job with only a tag (no digest) -> contributes nothing.
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.QUEUED,
+        container_image=d_tag_only,
+    )
+
+    cutoff = now - timedelta(days=30)
+    referenced = await compute_jobs.referenced_compute_image_digests(
+        db_session, since=cutoff
+    )
+    assert referenced == {d_active, d_recent}
+
+    # With no window, only live jobs count.
+    live_only = await compute_jobs.referenced_compute_image_digests(db_session)
+    assert live_only == {d_active}
+
+
+def test_registry_protection_tag_helpers_are_fail_open():
+    from app import compute_image_build as cib
+
+    digest = _digest("a")
+    assert cib.protection_tag_for_digest(digest) == "inuse-" + "a" * 16
+
+    # apply: success path returns the tag; non-zero exit and OSError fail open.
+    ok = cib.apply_registry_protection_tag(
+        "ghcr.io/org/img", digest, _run=lambda *a, **k: MagicMock(returncode=0)
+    )
+    assert ok == "inuse-" + "a" * 16
+    assert (
+        cib.apply_registry_protection_tag(
+            "ghcr.io/org/img", digest, _run=lambda *a, **k: MagicMock(returncode=1)
+        )
+        is None
+    )
+
+    def _boom(*a, **k):
+        raise OSError("gcloud missing")
+
+    assert (
+        cib.apply_registry_protection_tag("ghcr.io/org/img", digest, _run=_boom)
+        is None
+    )
+    assert cib.list_registry_protection_tags("ghcr.io/org/img", _run=_boom) == []
+    assert cib.delete_registry_protection_tag("ghcr.io/org/img", "inuse-x", _run=_boom) is False
+
+    # list: parses the short inuse- tag name out of gcloud JSON, drops others.
+    tags_json = json.dumps(
+        [
+            {"tag": "ghcr.io/org/img:inuse-aaaaaaaaaaaaaaaa"},
+            {"tag": "ghcr.io/org/img:latest"},
+            {"tag": "ghcr.io/org/img:inuse-bbbbbbbbbbbbbbbb"},
+        ]
+    )
+    listed = cib.list_registry_protection_tags(
+        "ghcr.io/org/img",
+        _run=lambda *a, **k: MagicMock(returncode=0, stdout=tags_json),
+    )
+    assert set(listed) == {"inuse-" + "a" * 16, "inuse-" + "b" * 16}
+
+
+@pytest.mark.asyncio
+async def test_compute_image_gc_protects_referenced_digest(db_session):
+    """The reaper sweep tags a referenced digest inuse- and prunes stale tags."""
+    from app import reaper_sweeps
+
+    # Reset the module-level cadence timer so the first call below is due.
+    reaper_sweeps._last_compute_image_gc_guard_sweep = None
+
+    project = await _make_project(db_session, name="GC Guard Sweep")
+    repo_base = "ghcr.io/org"
+    image_name = "img"
+    full_repo = f"{repo_base}/{image_name}"
+    d_referenced = _digest("a")
+    d_unreferenced = _digest("d")
+
+    # Two baked images: one still referenced by a running job, one orphaned.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name=image_name,
+            registry_repo=repo_base,
+            dep_hash="dep-ref",
+            tag="tag-ref",
+            pinned_ref=f"{full_repo}@{d_referenced}",
+            digest=d_referenced,
+            built=True,
+        )
+    )
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name=image_name,
+            registry_repo=repo_base,
+            dep_hash="dep-orphan",
+            tag="tag-orphan",
+            pinned_ref=f"{full_repo}@{d_unreferenced}",
+            digest=d_unreferenced,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # A live job references only the first digest.
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.RUNNING,
+        container_image=f"{full_repo}@{d_referenced}",
+    )
+
+    # Run the sweep from a point 60 days in the future: both image rows were
+    # just built, so pushing "now" past the 30-day freshness window ensures
+    # neither is auto-protected as a recent bake. Protection then comes purely
+    # from the live job's reference — isolating the referenced-digest behaviour.
+    sweep_now = _utcnow() + timedelta(days=60)
+
+    applied_tags = []
+    deleted_tags = []
+    protect_tag = reaper_sweeps.sweep_protect_referenced_compute_image_digests
+
+    def _apply(repo, digest):
+        tag = "inuse-" + digest.split(":", 1)[-1][:16]
+        applied_tags.append((repo, tag))
+        return tag
+
+    # Registry already carries a stale inuse- tag for the now-unreferenced digest.
+    stale_tag = "inuse-" + d_unreferenced.split(":", 1)[-1][:16]
+
+    def _list(repo):
+        return [
+            "inuse-" + d_referenced.split(":", 1)[-1][:16],
+            stale_tag,
+        ]
+
+    def _delete(repo, tag):
+        deleted_tags.append((repo, tag))
+        return True
+
+    summary = await protect_tag(
+        db_session,
+        sweep_now,
+        _apply_tag=_apply,
+        _list_tags=_list,
+        _delete_tag=_delete,
+    )
+
+    # The referenced digest was protected; the orphan was not.
+    referenced_tag = "inuse-" + d_referenced.split(":", 1)[-1][:16]
+    assert (full_repo, referenced_tag) in applied_tags
+    assert (full_repo, stale_tag) not in applied_tags
+    assert summary["applied"] == 1
+
+    # The stale tag for the unreferenced digest was pruned; the live one kept.
+    assert (full_repo, stale_tag) in deleted_tags
+    assert (full_repo, referenced_tag) not in deleted_tags
+    assert summary["pruned"] == 1
+
+    # Cadence gate: an immediate second call is a no-op.
+    second = await protect_tag(
+        db_session,
+        sweep_now,
+        _apply_tag=_apply,
+        _list_tags=_list,
+        _delete_tag=_delete,
+    )
+    assert second["skipped_cadence"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gc_guard_sweep_never_raises_when_registry_helper_throws(db_session):
+    from app import reaper_sweeps
+
+    # Reset the module-level cadence timer so this call is due.
+    reaper_sweeps._last_compute_image_gc_guard_sweep = None
+
+    project = await _make_project(db_session, name="GC Guard Robust")
+    full_repo = "ghcr.io/org/img"
+    d = _digest("e")
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="img",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep-e",
+            tag="tag-e",
+            pinned_ref=f"{full_repo}@{d}",
+            digest=d,
+            built=True,
+        )
+    )
+    await db_session.commit()
+    await _make_compute_job(
+        db_session,
+        project,
+        status=ComputeJobStatus.RUNNING,
+        container_image=f"{full_repo}@{d}",
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("registry exploded")
+
+    # A throwing list helper must not propagate out of the sweep.
+    summary = await reaper_sweeps.sweep_protect_referenced_compute_image_digests(
+        db_session,
+        _utcnow(),
+        _apply_tag=lambda repo, digest: "inuse-x",
+        _list_tags=_boom,
+        _delete_tag=lambda repo, tag: True,
+    )
+    assert summary["applied"] == 1
+    assert summary["pruned"] == 0
 
 
 # --------------------------------------------------------------------------

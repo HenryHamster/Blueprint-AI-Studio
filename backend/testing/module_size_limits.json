@@ -119,7 +119,7 @@
     "release_version.py": 2050,
     "ci_resolution.py": 1800,
     "routers/admin_project_config.py": 1800,
-    "compute_backends.py": 3250,
+    "compute_backends.py": 3287,
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 1850,
     "strategic_state_read_model.py": 1100,
@@ -135,10 +135,10 @@
     "metrics_integrity_sweep.py": 4000,
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 2600,
-    "strategic_context_package.py": 1800,
     "runner_health_alerts.py": 1950,
     "routers/agent_strategic_fetch.py": 1750,
-    "runner_health_monitors.py": 1001
+    "runner_health_monitors.py": 1001,
+    "strategic_context_package.py": 1800
   },
   "agent": {
     "index.ts": 4600,

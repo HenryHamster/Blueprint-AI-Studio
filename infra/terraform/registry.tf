@@ -52,6 +52,21 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
       keep_count = 5
     }
   }
+  # DB-aware GC guard: the orchestrator reaper
+  # (sweep_protect_referenced_compute_image_digests) stamps an `inuse-<shorthash>`
+  # tag on any digest a live/recent compute job still depends on. This KEEP
+  # policy runs before the DELETE policies below and shields anything so tagged,
+  # so a running experiment's (or a recent result's provenance) image is never
+  # reclaimed out from under it. The reaper prunes `inuse-` tags once the digest
+  # is no longer referenced, letting delete-old-tagged reclaim it normally.
+  cleanup_policy {
+    id     = "keep-inuse-tagged"
+    action = "KEEP"
+    condition {
+      tag_state    = "TAGGED"
+      tag_prefixes = ["inuse-"]
+    }
+  }
   cleanup_policy {
     id     = "delete-untagged"
     action = "DELETE"
@@ -65,7 +80,7 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
     action = "DELETE"
     condition {
       tag_state  = "TAGGED"
-      older_than = "7776000s" # 90 days; KEEP keep-recent-tagged runs first and protects the 5 most recent
+      older_than = "7776000s" # 90 days; KEEP keep-recent-tagged + keep-inuse-tagged run first
     }
   }
 }

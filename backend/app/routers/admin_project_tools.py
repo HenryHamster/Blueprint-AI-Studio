@@ -50,6 +50,7 @@ from app.models import Project, ProjectTool, _utcnow
 from app.auth import get_current_user, AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
 from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
+from app import compute_backends as _cb
 
 logger = logging.getLogger(__name__)
 
@@ -1173,3 +1174,73 @@ async def serve_tool_asset(
             "Cache-Control": "public, max-age=300",
         },
     )
+
+
+# ── Compute-image build trigger endpoint ─────────────────────────────────────
+
+
+@router.post("/projects/{project_id}/compute-image/build")
+async def trigger_project_compute_image_build(
+    project_id: uuid.UUID,
+    dry_run: bool = Query(False, description="When true, skip the actual docker build/push"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Trigger a per-project compute-image build and persist the result.
+
+    Discovers the project manifest, extracts the ``compute.image.build`` config,
+    invokes ``compute_backends.build_project_compute_image``, and UPSERTs the
+    resulting ``(dep_hash -> digest)`` mapping into ``ProjectComputeImage``.
+
+    Returns the persisted row fields: ``pinned_ref``, ``digest``, ``dep_hash``,
+    ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
+    RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
+    Requires member role on the project.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    manifest = await _discover_manifest_tools(project)
+    build_config = _cb.resolve_project_compute_image_build(manifest.get("compute"))
+    if build_config is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Project declares no compute.image.build section in "
+                ".blueprint/tools.json — nothing to build."
+            ),
+        )
+
+    registry_repo = _cb.resolve_compute_image_registry_repo()
+    image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+
+    try:
+        result = await _cb.build_project_compute_image(
+            project,
+            registry_repo=registry_repo,
+            build_config=build_config,
+            dry_run=dry_run,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    row = await _cb.record_project_compute_image_build(
+        session,
+        project.id,
+        registry_repo,
+        image_name,
+        result,
+    )
+    await session.commit()
+    await session.refresh(row)
+
+    already_present = getattr(result, "already_present", not row.built)
+    return {
+        "pinned_ref": row.pinned_ref,
+        "digest": row.digest,
+        "dep_hash": row.dep_hash,
+        "tag": row.tag,
+        "built": row.built,
+        "already_present": already_present,
+    }

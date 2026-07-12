@@ -3554,6 +3554,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _ci = ((_manifest.get("compute") or {}).get("image") or {})
             if isinstance(_ci, dict):
                 _project_default_container_image = _ci.get("name") or None
+            if _project_default_container_image:
+                # Pin the mutable manifest tag to a content-addressed digest so
+                # repeated defaulting is bit-identical over time (design gap G3).
+                from app.compute_backends import resolve_digest_pinned_default_image
+                _project_default_container_image = await resolve_digest_pinned_default_image(
+                    session, _scope_cal_project.id, _project_default_container_image
+                )
         except Exception:
             logger.debug("[RESEARCH] manifest fetch for compute image default failed")
 

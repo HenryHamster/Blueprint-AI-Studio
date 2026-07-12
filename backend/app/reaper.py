@@ -298,6 +298,7 @@ from app.reaper_sweeps import (
     sweep_metrics_integrity,
     sweep_capability_backing_proofs,
     sweep_closed_handmerge_prs,
+    sweep_protect_referenced_compute_image_digests,
     sweep_proof_earn_loop,
     _sweep_strategic_cycle_starvation,
 )
@@ -2961,6 +2962,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Proof-earn loop error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22c: Compute-image GC guard — stamp durable ``inuse-`` tags
+                # on registry digests a live/recent compute job still depends on
+                # so purely time/count-based registry retention can't reclaim an
+                # image out from under a running experiment or a recent result's
+                # provenance. Hourly cadence-gated on an independent timer.
+                # Wrapped so it can never crash the cycle; registry I/O fails open.
+                _mark_reaper_progress()
+                try:
+                    await sweep_protect_referenced_compute_image_digests(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Compute-image GC guard sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

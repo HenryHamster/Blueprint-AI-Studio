@@ -39,7 +39,7 @@ from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
-from app.models import ComputeJob, ComputeJobStatus, Project
+from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
 
 # Scripts baked into the GCP compute-job startup script as base64 blobs.
@@ -2820,3 +2820,166 @@ async def build_project_compute_image(
             dry_run=dry_run,
         )
     return result
+
+
+def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
+    """Extract the ``sha256:...`` digest from a pinned reference.
+
+    A digest-pinned ref looks like ``registry/repo@sha256:<hex>``; the digest is
+    the substring after the last ``@``. A tag-only ref (``registry/repo:tag``)
+    has no ``@`` and yields ``None``.
+    """
+    if not pinned_ref or "@" not in pinned_ref:
+        return None
+    return pinned_ref.rsplit("@", 1)[1] or None
+
+
+async def record_project_compute_image_build(
+    session: Any,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+    result: Any,
+) -> ProjectComputeImage:
+    """UPSERT a :class:`ProjectComputeImage` row from a ``BuildResult``.
+
+    Keyed on ``(project_id, dep_hash)``: if a row already exists for that
+    dependency hash it is updated in place (``pinned_ref``, ``digest``, ``tag``,
+    ``built``, ``updated_at`` refreshed); otherwise a new row is inserted. The
+    ``sha256:...`` digest is parsed out of ``result.pinned_ref`` (the substring
+    after ``@``) and stored in ``digest`` — ``None`` when the ref is tag-pinned.
+
+    Callers are responsible for committing the session.
+    """
+    from sqlalchemy import select
+
+    pinned_ref = getattr(result, "pinned_ref", None) or ""
+    tag = getattr(result, "tag", None) or ""
+    dep_hash = getattr(result, "dep_hash", None) or ""
+    built = bool(getattr(result, "built", False))
+    digest = _parse_digest_from_pinned_ref(pinned_ref)
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.dep_hash == dep_hash,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        existing.registry_repo = registry_repo
+        existing.image_name = image_name
+        existing.pinned_ref = pinned_ref
+        existing.digest = digest
+        existing.tag = tag
+        existing.built = built
+        existing.updated_at = _utcnow()
+        session.add(existing)
+        return existing
+
+    row = ProjectComputeImage(
+        project_id=project_id,
+        registry_repo=registry_repo,
+        image_name=image_name,
+        dep_hash=dep_hash,
+        tag=tag,
+        pinned_ref=pinned_ref,
+        digest=digest,
+        built=built,
+    )
+    session.add(row)
+    return row
+
+
+async def resolve_digest_pinned_default_image(
+    session: Any,
+    project_id: uuid.UUID,
+    manifest_name: str | None,
+) -> str | None:
+    """Pin a project's mutable manifest compute-image tag to a content digest.
+
+    ``compute.image.name`` in a project manifest is typically a *mutable* tag
+    (e.g. ``registry/repo/my-project:latest``). Two runs of the same
+    compute_experiment days apart can therefore resolve to different image
+    layers, breaking A/B reproducibility (design gap G3). When a durable
+    :class:`ProjectComputeImage` build record exists for this project, this
+    resolves the tag to its content-addressed ``registry/repo@sha256:...``
+    reference so repeated defaulting is bit-identical over time.
+
+    Fail-open by design — the return value is a drop-in replacement for the raw
+    ``manifest_name``:
+
+    * ``None``/empty in -> ``None`` out (nothing to default).
+    * already digest-pinned (contains ``@sha256:``) -> returned unchanged.
+    * a matching ``built`` row with a non-null ``digest`` exists -> its
+      ``pinned_ref``.
+    * no such row -> the raw ``manifest_name`` unchanged (logs a debug note);
+      this preserves today's behavior rather than introducing a new failure.
+    """
+    if not manifest_name:
+        return None
+    if "@sha256:" in manifest_name:
+        # Already content-addressed; nothing to pin.
+        return manifest_name
+
+    # Short image name within the registry repo, derived identically to the
+    # build pipeline (see build_project_compute_image) so it matches the
+    # persisted ProjectComputeImage.image_name.
+    image_name = manifest_name.rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+
+    try:
+        from sqlalchemy import select
+
+        row = (
+            await session.execute(
+                select(ProjectComputeImage)
+                .where(
+                    ProjectComputeImage.project_id == project_id,
+                    ProjectComputeImage.image_name == image_name,
+                    ProjectComputeImage.built.is_(True),
+                    ProjectComputeImage.digest.is_not(None),
+                )
+                .order_by(ProjectComputeImage.updated_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 — fail-open to the raw tag on any DB error.
+        logger.debug(
+            "[COMPUTE] digest-pin lookup failed for project=%s image=%s; "
+            "falling back to mutable tag",
+            project_id,
+            image_name,
+        )
+        return manifest_name
+
+    if row is not None and row.pinned_ref:
+        return row.pinned_ref
+
+    logger.debug(
+        "[COMPUTE] no digest-pinned build record for project=%s image=%s; "
+        "defaulting to mutable tag %s",
+        project_id,
+        image_name,
+        manifest_name,
+    )
+    return manifest_name
+
+
+def resolve_compute_image_registry_repo() -> str:
+    """Return the Artifact Registry repo base for compute images.
+
+    Reads ``COMPUTE_IMAGE_REGISTRY`` from the environment first; when absent,
+    derives it from ``GCP_PROJECT_ID`` and ``COMPUTE_IMAGE_REGION`` (defaulting
+    to ``"us"``) using the repo declared in ``infra/terraform/registry.tf``:
+    ``<region>-docker.pkg.dev/<project>/compute-images``.
+
+    Pure function of env/config — testable via monkeypatch.
+    """
+    explicit = os.environ.get("COMPUTE_IMAGE_REGISTRY", "").strip()
+    if explicit:
+        return explicit
+    region = os.environ.get("COMPUTE_IMAGE_REGION", "us").strip() or "us"
+    project = storage.GCP_PROJECT_ID
+    return f"{region}-docker.pkg.dev/{project}/compute-images"

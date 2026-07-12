@@ -2066,6 +2066,53 @@ def bank_task_current_attempt(
     return snapshot
 
 
+class ProjectComputeImage(SQLModel, table=True):
+    """Durable record of a baked per-project compute image (dep_hash -> digest).
+
+    The image-build pipeline (``compute_backends.build_project_compute_image`` ->
+    ``compute_image_build.build_and_push``) content-hashes a project's declared
+    dependency files and bakes (or reuses) a digest-pinned compute image. This
+    table persists the resulting ``(dependency-hash -> pinned reference/digest)``
+    mapping so a later trigger can record and re-read what was built without
+    re-running the pipeline.
+
+    Additive and purely a record: nothing in dispatch reads it yet. Rows UPSERT
+    on ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
+    update the single row in place rather than accumulating duplicates.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Short image name within the registry repo (e.g. "compute-myproj").
+    image_name: str = Field()
+    # Registry repo base the image was pushed to (e.g. "ghcr.io/org/repo").
+    registry_repo: str = Field()
+    # Content hash of the project's dependency inputs — the UPSERT key.
+    dep_hash: str = Field(index=True)
+    tag: str = Field()
+    # Full reference from BuildResult: "registry/repo@sha256:..." or ":tag".
+    pinned_ref: str = Field()
+    # The "sha256:..." digest parsed out of ``pinned_ref`` when it is
+    # digest-pinned (contains ``@``); NULL when the ref is only tag-pinned.
+    digest: str | None = Field(default=None)
+    # Whether this build freshly built the image vs reused an already-present one.
+    built: bool = Field(default=False)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "dep_hash", name="uq_projectcomputeimage_project_dep_hash"
+        ),
+    )
+
+
 class ComputeJob(SQLModel, table=True):
     """Durable compute-job record for budgeted work decoupled from ``Task``.
 
