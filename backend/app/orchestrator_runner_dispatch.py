@@ -1008,6 +1008,15 @@ def _build_compute_launch_kwargs(
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
     if payload.get("allow_host_fallback"):
         kwargs["allow_host_fallback"] = bool(payload["allow_host_fallback"])
+    # declared_metric names the contract metric the no-progress watchdog watches
+    # for a stall. Accept the nested compute_experiment form too, mirroring how the
+    # accelerator is read above. (The multi-arm command is still synthesized at task
+    # creation; this only forwards the label so the watchdog has a metric to track.)
+    declared_metric = payload.get("declared_metric") or (
+        payload.get("compute_experiment") or {}
+    ).get("declared_metric")
+    if _present(declared_metric):
+        kwargs["declared_metric"] = declared_metric
     return kwargs
 
 

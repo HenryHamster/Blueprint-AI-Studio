@@ -65,6 +65,10 @@ class LaunchComputeJobRequest(BaseModel):
     # backend launcher exists in the orchestrated path).
     container_image: str | None = Field(default=None, max_length=512)
     container_registry_auth: Dict[str, Any] | None = None
+    # Optional metric name the no-progress watchdog watches for a stall. When set,
+    # a still-running job whose reported metric plateaus over the watchdog window
+    # is cut early instead of burning its full deadline. Omission = no watchdog.
+    declared_metric: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 @router.post("/compute-jobs")
@@ -135,6 +139,7 @@ async def launch_compute_job(
             setup_step=req.setup_step,
             container_image=req.container_image,
             container_registry_auth=req.container_registry_auth,
+            declared_metric=req.declared_metric,
         )
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc

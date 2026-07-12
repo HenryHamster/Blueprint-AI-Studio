@@ -144,6 +144,35 @@ MAX_PROVISIONING_RETRY_COUNT = int(
 PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
     os.getenv("COMPUTE_PROVISIONING_RETRY_BACKOFF_SECONDS", "120")
 )
+# No-progress watchdog. A long-running compute job (e.g. multi-day RL training)
+# can burn its entire wall-clock deadline while learning nothing; the surfacing
+# half (a bounded progress-metric ring buffer in polling_metadata, written from
+# runner heartbeats via append_progress_sample) already ships. These constants
+# drive the CONSUMER that reads that trend and cuts a stalled job early.
+#
+# The watchdog is FAIL-OPEN by construction: it fires ONLY when the job declares
+# a metric to watch (polling_metadata['declared_metric']) AND enough progress
+# samples exist to prove a sustained plateau. Jobs that report no progress
+# telemetry, or declare no metric, are byte-for-byte unaffected. Setting the
+# window to 0 disables the watchdog entirely.
+COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS", "1800")
+)
+# The progress ring buffer holds at most 50 samples (drop-oldest); at the ~60s
+# heartbeat cadence that is ~50 min of history, so the stall window must stay
+# comfortably under that to ever accumulate a full window of samples.
+COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", "1800")
+)
+COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES = int(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES", "4")
+)
+# Relative movement below this fraction of the metric's magnitude over the whole
+# window counts as "no progress" (direction-agnostic: a flat metric is a stall
+# whether higher or lower is better).
+COMPUTE_JOB_NO_PROGRESS_EPSILON = float(
+    os.getenv("COMPUTE_JOB_NO_PROGRESS_EPSILON", "1e-4")
+)
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -352,6 +381,7 @@ async def create_compute_job(
     container_image: str | None = None,
     container_registry_auth: dict | None = None,
     allow_host_fallback: bool = False,
+    declared_metric: str | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -543,6 +573,10 @@ async def create_compute_job(
         "status_message": _LAUNCH_PLACEHOLDER_STATUS_MESSAGE,
         "park_deadline_seconds": park_deadline_seconds,
     }
+    if isinstance(declared_metric, str) and declared_metric.strip():
+        # Persisted so the no-progress watchdog knows which reported metric to
+        # watch for a stall. Absent → the watchdog never fires for this job.
+        polling_metadata["declared_metric"] = declared_metric.strip()
     if setup_step is not None:
         polling_metadata["setup_step"] = setup_step
     if container_image:
@@ -989,6 +1023,92 @@ def _runtime_deadline_at(job: ComputeJob) -> datetime | None:
     if requested is None:
         return None
     return job.started_at + timedelta(seconds=requested)
+
+
+def _declared_progress_metric(job: ComputeJob) -> str | None:
+    """Return the contract-declared metric name to watch, or None.
+
+    Written into ``polling_metadata['declared_metric']`` at job creation from the
+    validated compute_experiment launch contract. Absent for jobs that declare no
+    metric (the watchdog then never fires for them).
+    """
+    metric = (job.polling_metadata or {}).get("declared_metric")
+    if isinstance(metric, str) and metric.strip():
+        return metric
+    return None
+
+
+def _watched_progress_samples(
+    job: ComputeJob, metric: str
+) -> list[tuple[datetime, float]]:
+    """Return time-sorted ``(t, value)`` samples for ``metric`` from the ring buffer.
+
+    Reads the bounded ``progress_series`` written by ``append_progress_sample``.
+    Malformed entries (bad timestamp, non-numeric value, wrong/absent name) are
+    silently skipped so a single bad heartbeat can never corrupt the trend.
+    """
+    series = (job.polling_metadata or {}).get("progress_series")
+    if not isinstance(series, list):
+        return []
+    out: list[tuple[datetime, float]] = []
+    for sample in series:
+        if not isinstance(sample, dict) or sample.get("name") != metric:
+            continue
+        ts = _parse_naive_iso_datetime(sample.get("t"))
+        val = _coerce_metric_number(sample.get("value"))
+        if ts is None or val is None:
+            continue
+        out.append((ts, float(val)))
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
+    """True when a declared-metric job has stopped making measurable progress.
+
+    Fail-open: returns False unless ALL of the following hold, so a job that emits
+    no progress telemetry is never affected —
+
+    * the job declares a metric to watch;
+    * the job has been running longer than the grace period (never cut a job
+      before it has had a fair chance to start converging);
+    * the metric history spans at least a full window (the oldest recorded
+      sample is at least ``WINDOW`` seconds old) — so a job that has only just
+      begun reporting is never cut on a few seconds of data;
+    * at least ``COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES`` samples of that metric fall
+      inside the trailing ``[now - WINDOW, now]`` window (a stale buffer whose
+      last sample predates the window contributes nothing and cannot fire); and
+    * the spread (max - min) of the metric across that window is within a small
+      relative tolerance of the metric's magnitude — a sustained plateau.
+
+    Direction-agnostic: a flat metric is "no progress" whether higher or lower
+    is better, so the check never needs to know the metric's polarity.
+    """
+    if COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS <= 0:
+        return False
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return False
+    if job.started_at is None:
+        return False
+    if (now - job.started_at).total_seconds() < COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS:
+        return False
+    samples = _watched_progress_samples(job, metric)
+    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return False
+    # Enough history: the oldest recorded sample must be at least a full window
+    # old, else we have not yet observed a window's worth of the metric.
+    if (now - samples[0][0]).total_seconds() < COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS:
+        return False
+    window_start = now - timedelta(seconds=COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
+    window = [(t, v) for (t, v) in samples if t >= window_start]
+    if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return False
+    values = [v for (_, v) in window]
+    spread = max(values) - min(values)
+    reference = max((abs(v) for v in values), default=0.0)
+    tolerance = COMPUTE_JOB_NO_PROGRESS_EPSILON * (reference if reference > 0 else 1.0)
+    return spread <= tolerance
 
 
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
@@ -2225,6 +2345,55 @@ async def _process_single_compute_job(
         )
         return
 
+    # No-progress watchdog: cut a still-running job whose declared metric has
+    # plateaued so a multi-day run cannot burn its whole deadline learning
+    # nothing. Runs AFTER the deadline/budget hard limits so those always win.
+    if _no_progress_stalled(job, now=now):
+        watched_metric = _declared_progress_metric(job)
+        started_at = _utcnow()
+        terminate_diagnostic = None
+        try:
+            terminated = await backend.terminate(job, reason="no_progress")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] no-progress terminate failed for job=%s: %s",
+                job.id,
+                exc,
+            )
+            terminated = False
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="terminate",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="no_progress",
+            )
+        salvaged = await _salvage_poll_status(backend, job)
+        await _apply_polled_compute_job_result(
+            session_factory,
+            job.id,
+            now=now,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+            status=_merge_salvaged_status(status, salvaged),
+            accrued_cost_usd=accrued_cost_usd,
+            terminal_status=ComputeJobStatus.TIMED_OUT,
+            outcome=ComputeJobOutcome.TIMED_OUT,
+            terminal_reason=(
+                "compute job made no measurable progress on declared metric "
+                f"{watched_metric!r} over "
+                f"{int(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
+                "cut early to reclaim compute"
+            ),
+            terminal_kind=NO_PROGRESS_TERMINAL_REASON,
+            terminate_ok=terminated,
+            compute_rpc_diagnostic=terminate_diagnostic,
+        )
+        return
+
     await _apply_polled_compute_job_result(
         session_factory,
         job.id,
@@ -2354,6 +2523,7 @@ async def _apply_polled_compute_job_result(
     terminal_reason: str | None = None,
     exit_code: int | None = None,
     terminate_ok: bool = True,
+    terminal_kind: str | None = None,
     compute_rpc_diagnostic: dict[str, Any] | None = None,
 ) -> bool:
     async with session_factory() as session:
@@ -2385,6 +2555,7 @@ async def _apply_polled_compute_job_result(
                 now=now,
                 exit_code=exit_code,
                 terminate_ok=terminate_ok,
+                terminal_kind=terminal_kind,
             )
             if compute_rpc_diagnostic is not None:
                 _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)

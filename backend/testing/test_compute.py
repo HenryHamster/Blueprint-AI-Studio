@@ -16585,3 +16585,359 @@ async def test_extract_viewable_files_empty_or_bad_bundle(db_session):
     assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"") == 0
     assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"not-a-tar") == 0
     assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"\x00" * 100) == 0
+
+
+# ── No-progress watchdog ──────────────────────────────────────────────────────
+#
+# The surfacing half (progress_series ring buffer + declared_metric) already
+# shipped; these cover the CONSUMER wired in this change: _no_progress_stalled
+# and its enforcement in _process_single_compute_job.
+
+
+# Six ages spanning >WINDOW (1800s): oldest is 2000s old (satisfies the "full
+# window of history" gate) and five samples fall inside the trailing 1800s
+# window (satisfies the min-sample floor).
+_SPAN_AGES = [2000, 1500, 1100, 700, 300, 0]
+
+
+def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
+    """Build an in-memory job-like object for pure watchdog-trend tests.
+
+    ``samples`` is a list of ``(seconds_before_now, name, value)`` tuples for the
+    progress ring buffer; ``started_offset_seconds`` is how long ago the job
+    started.
+    """
+    from types import SimpleNamespace
+
+    now = _utcnow()
+    meta = dict(extra_meta or {})
+    if metric is not None:
+        meta["declared_metric"] = metric
+    series = [
+        {
+            "t": (now - timedelta(seconds=age)).isoformat(),
+            "name": name,
+            "value": value,
+        }
+        for (age, name, value) in samples
+    ]
+    meta["progress_series"] = series
+    return SimpleNamespace(
+        polling_metadata=meta,
+        started_at=now - timedelta(seconds=started_offset_seconds),
+    ), now
+
+
+def test_no_progress_stalled_flat_metric_over_window_fires():
+    metric = "val/loss"
+    # A flat metric spanning >1 window, job running ~2h.
+    samples = [(age, metric, 2.5000001) for age in _SPAN_AGES]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is True
+
+
+def test_no_progress_stalled_improving_metric_does_not_fire():
+    metric = "val/loss"
+    # Monotonically decreasing loss across the window → real progress.
+    samples = [(age, metric, 3.0 - i * 0.2) for i, age in enumerate(_SPAN_AGES)]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_requires_min_samples():
+    metric = "val/loss"
+    # Only 2 flat samples spanning the window — below the min-sample floor.
+    samples = [(2000, metric, 1.0), (0, metric, 1.0)]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_requires_window_of_history():
+    metric = "val/loss"
+    # Enough flat samples but all bunched into the last ~2 minutes — the metric
+    # history does not yet span a full window, so no stall can be declared.
+    samples = [(120 - i * 20, metric, 1.0) for i in range(6)]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_ignores_stale_buffer():
+    metric = "val/loss"
+    # A flat buffer whose newest sample predates the trailing window entirely
+    # (the job stopped reporting long ago). The window slice is empty → no fire;
+    # a genuinely dead VM is handled by the poll-failure kills, not the watchdog.
+    samples = [(3600 - i * 300, metric, 1.0) for i in range(6)]  # ages 3600..2100
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_respects_grace_period():
+    metric = "val/loss"
+    samples = [(age, metric, 1.0) for age in _SPAN_AGES]
+    # Job only started 10 minutes ago (< 30m grace) — never cut this early even
+    # though the (back-dated) samples look flat.
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=600
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_no_declared_metric_is_fail_open():
+    # Flat samples exist, but the job declares no metric → watchdog never fires.
+    samples = [(age, "val/loss", 1.0) for age in _SPAN_AGES]
+    job, now = _progress_job(
+        metric=None, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_ignores_other_metric_names():
+    metric = "val/loss"
+    # The declared metric only has 1 sample; a DIFFERENT metric is flat. The
+    # watchdog must key strictly on the declared metric and stay fail-open.
+    samples = [(0, metric, 1.0)] + [(age, "throughput", 5.0) for age in _SPAN_AGES]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+def test_no_progress_stalled_skips_malformed_samples():
+    metric = "val/loss"
+    job, now = _progress_job(
+        metric=metric,
+        samples=[(age, metric, 1.0) for age in _SPAN_AGES],
+        started_offset_seconds=7200,
+    )
+    # Inject garbage entries: they must be skipped, not crash or corrupt trend.
+    job.polling_metadata["progress_series"].extend(
+        [
+            "not-a-dict",
+            {"name": metric, "value": "not-a-number", "t": "bad"},
+            {"name": metric, "value": 1.0},  # missing t
+        ]
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is True
+
+
+def test_no_progress_stalled_disabled_when_window_zero(monkeypatch):
+    monkeypatch.setattr(compute_jobs, "COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", 0.0)
+    metric = "val/loss"
+    samples = [(age, metric, 1.0) for age in _SPAN_AGES]
+    job, now = _progress_job(
+        metric=metric, samples=samples, started_offset_seconds=7200
+    )
+    assert compute_jobs._no_progress_stalled(job, now=now) is False
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_persists_declared_metric(db_session):
+    project = Project(name="Declared Metric Persist", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        declared_metric="  val/loss  ",
+    )
+    # Stored trimmed so the watchdog matches the runner-reported sample name.
+    assert job.polling_metadata["declared_metric"] == "val/loss"
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_cuts_stalled_no_progress_job(
+    db_session, monkeypatch
+):
+    project = Project(name="No Progress Watchdog", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=100.0,
+        deadline_seconds=86400,
+        declared_metric="val/loss",
+    )
+    now = _utcnow()
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    # A long-running (5h) job with a flat declared metric spanning >1 window.
+    meta["runtime_deadline_at"] = (now + timedelta(hours=20)).isoformat()
+    meta["progress_series"] = [
+        {
+            "t": (now - timedelta(seconds=age)).isoformat(),
+            "name": "val/loss",
+            "value": 2.71828,
+        }
+        for age in (2000, 1500, 1100, 700, 300, 0)
+    ]
+    job.polling_metadata = meta
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "no-progress-job"
+    job.started_at = now - timedelta(hours=5)
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-progress-job"
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.05, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert terminate_reasons == ["no_progress"]
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert job.polling_metadata["terminal_kind"] == "no_progress"
+    assert "no measurable progress" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_keeps_progressing_job_running(
+    db_session, monkeypatch
+):
+    project = Project(name="Progressing Job", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=100.0,
+        deadline_seconds=86400,
+        declared_metric="val/loss",
+    )
+    now = _utcnow()
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    meta["runtime_deadline_at"] = (now + timedelta(hours=20)).isoformat()
+    # Loss is still steadily improving → not a stall.
+    meta["progress_series"] = [
+        {
+            "t": (now - timedelta(seconds=age)).isoformat(),
+            "name": "val/loss",
+            "value": 3.0 - i * 0.15,
+        }
+        for i, age in enumerate((2000, 1500, 1100, 700, 300, 0))
+    ]
+    job.polling_metadata = meta
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "progressing-job"
+    job.started_at = now - timedelta(hours=5)
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "progressing-job"
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.05, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("progressing job must not be terminated")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+
+def test_build_compute_launch_kwargs_forwards_declared_metric():
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    kwargs = _build_compute_launch_kwargs(
+        {"declared_metric": "val/acc"},
+        command="python x.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    assert kwargs["declared_metric"] == "val/acc"
+
+    nested = _build_compute_launch_kwargs(
+        {"compute_experiment": {"declared_metric": "val/acc"}},
+        command="python x.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=60,
+    )
+    assert nested["declared_metric"] == "val/acc"
+
+    absent = _build_compute_launch_kwargs(
+        {}, command="python x.py", spend_cap_usd=1.0, deadline_seconds=60
+    )
+    assert "declared_metric" not in absent
