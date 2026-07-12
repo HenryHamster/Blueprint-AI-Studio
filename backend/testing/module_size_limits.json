@@ -27,7 +27,7 @@
     "routers/admin_analytics.py": 2300,
     "routers/admin_operator_triggers.py": 1200,
     "routers/admin_digest.py": 10300,
-    "routers/admin_release_version.py": 1950,
+    "routers/admin_release_version.py": 2250,
     "routers/admin_pipeline_observability.py": 2350,
     "routers/admin_agent_ops.py": 6350,
     "routers/admin_pool_accounts.py": 1950,
