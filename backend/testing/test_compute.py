@@ -2350,6 +2350,125 @@ async def test_process_compute_jobs_once_reclassifies_no_usable_gpu_as_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backend_status,backend_message,expected_outcome,expected_substr",
+    [
+        (ComputeJobStatus.SUCCEEDED, None, ComputeJobOutcome.SUCCESS, "succeeded"),
+        (ComputeJobStatus.SUCCEEDED, "", ComputeJobOutcome.SUCCESS, "succeeded"),
+        (ComputeJobStatus.FAILED, None, ComputeJobOutcome.FAILURE, "failure"),
+        (ComputeJobStatus.FAILED, "", ComputeJobOutcome.FAILURE, "failure"),
+    ],
+)
+async def test_terminal_reason_not_stale_launch_placeholder_on_empty_backend_message(
+    db_session,
+    monkeypatch,
+    backend_status,
+    backend_message,
+    expected_outcome,
+    expected_substr,
+):
+    """A terminal poll with an empty backend message yields an honest reason.
+
+    Regression guard: create_compute_job seeds polling_metadata["status_message"]
+    with the launch-time placeholder "queued for compute-job launch". When a job
+    reaches SUCCEEDED/FAILED but the backend poll returns an empty message,
+    terminal_reason must NOT silently inherit that stale launch placeholder — it
+    would then propagate into the durable knowledge/evidence record, recording a
+    completed or failed run with a misleading "still queued" diagnostic.
+    """
+    from app import knowledge_completion
+
+    project = Project(name="Empty Terminal Message", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="silent-terminal experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    # Sanity: the launch-time placeholder really is seeded, so the fallback under
+    # test has something stale to (wrongly) inherit.
+    assert (
+        (job.polling_metadata or {}).get("status_message")
+        == "queued for compute-job launch"
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "silent-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="silent-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            # Terminal, but the backend reports an EMPTY message.
+            return ComputeStatusResult(
+                status=backend_status,
+                exit_code=0 if backend_status == ComputeJobStatus.SUCCEEDED else 1,
+                finished_at=_utcnow(),
+                message=backend_message,
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.outcome == expected_outcome
+    # The core assertion: an honest, outcome-derived reason — never the stale
+    # launch placeholder.
+    assert job.terminal_reason
+    assert job.terminal_reason != "queued for compute-job launch"
+    assert "queued for compute-job launch" not in (job.terminal_reason or "")
+    assert expected_substr in job.terminal_reason
+
+    # The durable knowledge/evidence record reads terminal_reason verbatim, so
+    # the honest reason must reach the persisted diagnostics too.
+    diag = knowledge_completion._extract_job_terminal_diagnostics(job)
+    assert diag is not None
+    assert diag["terminal_reason"] == job.terminal_reason
+    assert "queued for compute-job launch" not in diag["terminal_reason"]
+
+
+@pytest.mark.asyncio
 async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_success(
     db_session, monkeypatch
 ):

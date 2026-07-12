@@ -540,7 +540,7 @@ async def create_compute_job(
         "cost_rate_per_second": rate,
         "requested_deadline_seconds": capped_deadline,
         "launch_request_fingerprint": launch_request_fingerprint,
-        "status_message": "queued for compute-job launch",
+        "status_message": _LAUNCH_PLACEHOLDER_STATUS_MESSAGE,
         "park_deadline_seconds": park_deadline_seconds,
     }
     if setup_step is not None:
@@ -1025,6 +1025,54 @@ _NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
 _NO_USABLE_GPU_TERMINAL_REASON = (
     "container reported no usable GPU — host GPU/image compatibility mismatch"
 )
+
+# Seeded into polling_metadata["status_message"] at job-creation time (see the
+# launch metadata builder). It is a launch-time placeholder, NOT a terminal
+# diagnostic — a terminal reason must never fall back to it, or completed and
+# failed runs alike get recorded with this misleading "still queued" string.
+_LAUNCH_PLACEHOLDER_STATUS_MESSAGE = "queued for compute-job launch"
+
+
+def _honest_terminal_default_reason(outcome: "ComputeJobOutcome | None") -> str:
+    """An honest per-outcome terminal reason for when the backend is silent.
+
+    Used when a job reaches a terminal state but the backend poll returns an
+    empty status message, so the terminal_reason still reflects how the run
+    actually ended instead of a generic/stale placeholder.
+    """
+    if outcome == ComputeJobOutcome.SUCCESS:
+        return "compute job succeeded"
+    if outcome == ComputeJobOutcome.TIMED_OUT:
+        return "compute job timed out"
+    if outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED:
+        return "compute job terminated at spend cap"
+    if outcome == ComputeJobOutcome.CANCELLED:
+        return "compute job cancelled"
+    if outcome in (ComputeJobOutcome.FAILURE, ComputeJobOutcome.SMOKE_FAILED):
+        return "compute job reported failure"
+    return "compute job finished"
+
+
+def _resolve_terminal_reason(
+    *,
+    status_message: str | None,
+    outcome: "ComputeJobOutcome | None",
+) -> str:
+    """Resolve an honest terminal reason for a job reaching a terminal state.
+
+    Precedence: the terminal poll's own status message, then an honest
+    per-outcome default. It deliberately does NOT fall back to the persisted
+    ``polling_metadata["status_message"]``: that field only ever holds a
+    launch/intermediate value — the launch-time placeholder
+    ("queued for compute-job launch"), the launch result message, or a
+    provisioning-retry message — none of which is a terminal reason. Inheriting
+    it (as the previous ``_meta_message`` fallback did) recorded completed and
+    failed runs alike with a misleading "still queued"/"launched" diagnostic
+    that then propagated verbatim into the durable knowledge/evidence record.
+    """
+    if status_message:
+        return status_message
+    return _honest_terminal_default_reason(outcome)
 
 
 def _status_reports_no_usable_gpu(status: ComputeStatusResult) -> bool:
@@ -2056,7 +2104,9 @@ async def _process_single_compute_job(
                 else (
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
-                    else status.message or _meta_message(job) or "compute job finished"
+                    else _resolve_terminal_reason(
+                        status_message=status.message, outcome=outcome
+                    )
                 )
             ),
             exit_code=status.exit_code,
