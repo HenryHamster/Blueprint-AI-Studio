@@ -933,8 +933,6 @@ export async function handleStrategicResident(
         const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
         if (turnWedgedSession(r)) break;
         await persistReply(r);
-        // Check context-window pressure after the turn: compact if needed.
-        if (await maybeCompact(r)) break;
         // Collect the ids of the messages we just consumed so the backend can
         // mark them handled — they stop counting as open backlog and won't be
         // re-delivered to a restarted session.
@@ -945,6 +943,13 @@ export async function handleStrategicResident(
         const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
         if (hb?.stop_requested) break;
         if (r.processGone) { stopReason = 'session_process_exited'; break; }
+        // Check context-window pressure AFTER the decision is registered and the
+        // handled-marking heartbeat has landed. Compacting earlier would build the
+        // checkpoint from decisionsReg before this turn's OPERATOR-DECISION is
+        // pushed AND fetch checkpoint-state open_messages before the backend marks
+        // the just-answered message handled — priming the fresh session blind to
+        // the settled decision and re-surfacing the answered message as still-open.
+        if (await maybeCompact(r)) break;
         // A just-finished operator turn arms one autonomous follow-through tick.
         operatorTurnJustCompleted = true;
         continue;
@@ -1093,8 +1098,6 @@ export async function handleStrategicResident(
         const or = await runTurn(combineOperatorMessages(watch.messages), true);
         if (turnWedgedSession(or)) break;
         await persistReply(or);
-        // Check context-window pressure after the turn: compact if needed.
-        if (await maybeCompact(or)) break;
         // Extract the ids of the messages we just consumed so the backend can mark
         // them handled — same as the fast-path operator-message pre-emption above.
         const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
@@ -1104,6 +1107,11 @@ export async function handleStrategicResident(
         const hb2 = await heartbeat(true, consumedIds);
         if (hb2?.stop_requested) break;
         if (or.processGone) { stopReason = 'session_process_exited'; break; }
+        // Compact only AFTER the decision is registered and the handled-marking
+        // heartbeat has landed — identical ordering invariant as the fast path
+        // above, so a compaction on this interrupt turn primes the fresh session
+        // WITH the settled decision and WITHOUT the just-answered message.
+        if (await maybeCompact(or)) break;
         operatorTurnJustCompleted = true;
         continue;
       }
