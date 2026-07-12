@@ -1039,6 +1039,47 @@ def test_v17_defect_class_in_place_edit():
     assert any("0309_computejob_heartbeat" in m for m in out)
 
 
+_HEAD_SHA = "deadbeefcafe0459"
+
+
+def _mock_migration_texts(
+    mocker,
+    *,
+    deployed: dict[str, str],
+    head: dict[str, str] | None = None,
+    promotion_branch: str = "main",
+    head_sha: str = _HEAD_SHA,
+):
+    """Drive the defect-class-2 byte-identical RESTORE comparison.
+
+    The comparison reads the deployed copy of a modified migration at the
+    promotion ref AND the PR's resulting bytes at the head commit, both via
+    ``get_file_text_at_ref`` (and the PR head SHA via ``get_pull_request``).
+    ``deployed`` maps basename -> deployed body (promotion ref); ``head`` maps
+    basename -> the PR head body (defaults to ``deployed`` for a byte-identical
+    restore). A basename absent from a map (or any other ref) reads as
+    unreadable (``None``). The content-immutability guard below also reads the
+    deployed copy through this same mock."""
+    if head is None:
+        head = deployed
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"head": {"sha": head_sha}}),
+    )
+
+    async def _text(
+        path, *, token, owner, repo, ref, project_id=None, use_content_cache=True
+    ):
+        basename = path.rsplit("/", 1)[-1]
+        if ref == promotion_branch:
+            return deployed.get(basename)
+        if ref == head_sha:
+            return head.get(basename)
+        return None
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_text))
+
+
 # ===========================================================================
 # _validate_rollup_migration_chain — v17 defect class integration tests.
 # Covers both tamper classes that birthed the deploy-fatal Alembic defect:
@@ -1071,6 +1112,11 @@ async def test_in_place_edit_of_deployed_migration_body_is_blocked(mocker):
         "patch": f"@@ -1,7 +1,8 @@\n{patch_body}",
     }
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[pr_file]))
+    # The PR head bytes (the tamper) differ from the deployed copy, so the
+    # restore exemption does NOT apply — this is a real in-place edit.
+    _mock_migration_texts(
+        mocker, deployed={basename: deployed_src}, head={basename: pr_src}
+    )
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=_versions_by_branch(
@@ -1227,6 +1273,18 @@ async def test_premerge_guard_blocks_inplace_edit_of_deployed_migration(mocker):
             promotion=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
         ),
     )
+    # Deployed body differs from the PR head content, so this is a genuine
+    # in-place edit (not a byte-identical restore) and must still block.
+    _mock_migration_texts(
+        mocker,
+        deployed={
+            "0143_vm_contact_last_tool_use.py": _migration_source("0143", "0142")
+            + "# deployed body differs\n"
+        },
+        head={
+            "0143_vm_contact_last_tool_use.py": _migration_source("0143", "0142")
+        },
+    )
     status, reason = await _validate_rollup_migration_chain(
         "tok", "acme", "widget", 1, "automain", promotion_target="main"
     )
@@ -1317,3 +1375,171 @@ async def test_premerge_guard_blocks_pre_pr_rename_not_removed_by_pr(mocker):
     )
     assert status == "block"
     assert "0458" in reason
+
+
+# ===========================================================================
+# Defect class 2 — content-aware RESTORE exemption (v25 migration-identity
+# reconciliation). A "modified" deployed migration is normally a deploy-fatal
+# in-place tamper, but a modification that reinstates the deployed copy
+# BYTE-IDENTICALLY (a restore of the deployed identity) changes nothing on the
+# live DB and must NOT block. Exact byte equality only — a real difference,
+# even a single byte, still blocks; a fetch failure defers (fail-safe).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_defect_class_2_byte_identical_restore_is_not_blocked(mocker):
+    """A modified deployed migration whose PR head content is EXACTLY identical to
+    the promotion target's deployed copy is a restore of the deployed identity —
+    it must pass ('ok'), not block on the in-place-edit rule.
+
+    This is the v25 reconciliation shape: the candidate branch had an unauthorized
+    down_revision renumber; the PR restores the file to byte-for-byte parity with
+    what the live DB already applied."""
+    basename = "0459_add_alert_project_created_index.py"
+    modified_path = f"{_VERSIONS_DIR}/{basename}"
+    deployed_src = _migration_source("0459", "0458")
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0459", "0458")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Integration head is 0458; the restored 0459 is not yet on it, so the
+            # combined-chain check sees a clean linear extension onto the head.
+            integration=["0457_x.py", "0458_add_perf_indexes.py"],
+            # Deployed main carries the migration whose identity is being restored.
+            promotion=[
+                "0457_x.py",
+                "0458_add_perf_indexes.py",
+                basename,
+            ],
+        ),
+    )
+    # The PR's head bytes are byte-identical to the deployed copy on main →
+    # restore, not a tamper (head defaults to deployed in the mock).
+    _mock_migration_texts(mocker, deployed={basename: deployed_src})
+    assert await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    ) == ("ok", None)
+
+
+@pytest.mark.asyncio
+async def test_defect_class_2_real_content_difference_still_blocks(mocker):
+    """A modified deployed migration whose PR head content differs from the
+    deployed copy — even by a single appended byte — is a real in-place edit and
+    must still BLOCK. The restore exemption is exact-equality only."""
+    basename = "0459_add_alert_project_created_index.py"
+    modified_path = f"{_VERSIONS_DIR}/{basename}"
+    head_src = _migration_source("0459", "0458")
+    # Deployed copy has an extra line the PR head does not restore.
+    deployed_src = head_src + "# deployed-only line\n"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0459", "0458")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=["0457_x.py", "0458_add_perf_indexes.py"],
+            promotion=["0457_x.py", "0458_add_perf_indexes.py", basename],
+        ),
+    )
+    _mock_migration_texts(
+        mocker, deployed={basename: deployed_src}, head={basename: head_src}
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert basename in reason
+    assert "immutable" in reason or "deployed" in reason
+
+
+@pytest.mark.asyncio
+async def test_defect_class_2_restore_defers_on_fetch_failure(mocker):
+    """Fail-safe: an inability to fetch the deployed copy for the byte-identical
+    restore comparison HOLDS the merge (defer), never waves it through."""
+    basename = "0459_add_alert_project_created_index.py"
+    modified_path = f"{_VERSIONS_DIR}/{basename}"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0459", "0458")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=["0457_x.py", "0458_add_perf_indexes.py"],
+            promotion=["0457_x.py", "0458_add_perf_indexes.py", basename],
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"head": {"sha": _HEAD_SHA}}),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 503 fetching deployed copy")),
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "defer"
+    assert "byte-identical restore" in reason
+    assert "GitHub 503 fetching deployed copy" in reason
+
+
+@pytest.mark.asyncio
+async def test_defect_class_2_mixed_restore_and_real_edit_blocks(mocker):
+    """A PR that restores one deployed migration byte-identically AND truly edits
+    another must BLOCK — but only name the genuinely-edited file. The restored
+    file is exempt; the tampered one is not."""
+    restored = "0459_add_alert_project_created_index.py"
+    edited = "0460_add_task_dispatch_index.py"
+    restored_path = f"{_VERSIONS_DIR}/{restored}"
+    edited_path = f"{_VERSIONS_DIR}/{edited}"
+    restored_src = _migration_source("0459", "0458")
+    # The PR head body for the edited file (full source via patch).
+    edited_head_src = _migration_source("0460", "0459")
+    # Deployed copy of the edited file differs from the PR head → real tamper.
+    edited_deployed_src = edited_head_src + "# deployed-only line\n"
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[
+                _modified_migration_file(restored_path, "0459", "0458"),
+                _modified_migration_file(edited_path, "0460", "0459"),
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=["0457_x.py", "0458_add_perf_indexes.py"],
+            promotion=[
+                "0457_x.py",
+                "0458_add_perf_indexes.py",
+                restored,
+                edited,
+            ],
+        ),
+    )
+    _mock_migration_texts(
+        mocker,
+        deployed={restored: restored_src, edited: edited_deployed_src},
+        head={restored: restored_src, edited: edited_head_src},
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert edited in reason
+    # The byte-identical restore must NOT be named as a tamper.
+    assert restored not in reason

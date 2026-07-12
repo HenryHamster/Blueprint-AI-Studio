@@ -361,13 +361,94 @@ async def _validate_rollup_migration_chain(
             and f["filename"].rsplit("/", 1)[-1] in promotion_basenames
         ]
         if modified_deployed:
-            return (
-                "block",
-                f"PR modifies deployed migration(s) present on promotion target "
-                f"'{promotion_target}' (deployed migrations are immutable — they "
-                f"have already been applied to the production DB and cannot be "
-                f"changed in-place): " + ", ".join(sorted(modified_deployed)),
-            )
+            # Content-aware RESTORE exemption. A "modified" deployed migration is
+            # normally a deploy-fatal in-place tamper. But the v25 migration-
+            # identity reconciliation deliberately RESTORES a candidate-branch
+            # migration back to BYTE-IDENTICAL parity with the deployed
+            # promotion-target copy (reverting an unauthorized down_revision
+            # renumber that made the candidate copy diverge from what the live DB
+            # already applied). When the PR's resulting head content for the file
+            # is EXACTLY identical to the promotion target's deployed copy, the
+            # "modification" reinstates the deployed identity and changes nothing
+            # that could corrupt a live DB — it must NOT block. Any real byte
+            # difference is still a tamper and blocks with the original message.
+            #
+            # Both sides are read as the file's ACTUAL bytes with
+            # ``get_file_text_at_ref`` (the same mechanism the content-immutability
+            # guard below uses): the deployed copy at the promotion ref and the
+            # PR's resulting content at the head commit. The patch-reconstructed
+            # post-image in ``added_sources`` is NOT used here — it drops the
+            # file's trailing newline and so cannot be compared byte-for-byte.
+            # Comparison is EXACT byte equality — no whitespace normalisation, no
+            # fuzzy matching. Any fetch failure defers (fail-safe), mirroring the
+            # other promotion-target reads.
+            try:
+                pr = await github.get_pull_request(gh_token, owner, repo, pr_number)
+            except Exception as e:
+                return (
+                    "defer",
+                    f"could not fetch PR #{pr_number} detail to check for a "
+                    f"byte-identical migration restore: {_exc_detail(e)}",
+                )
+            head_sha = (pr.get("head") or {}).get("sha") or ""
+            if not head_sha:
+                return (
+                    "defer",
+                    f"PR #{pr_number} has no head SHA — cannot check for a "
+                    f"byte-identical migration restore",
+                )
+            real_edits: list[str] = []
+            for filename in sorted(modified_deployed):
+                basename = filename.rsplit("/", 1)[-1]
+                full_path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+                try:
+                    deployed_text = await github.get_file_text_at_ref(
+                        full_path,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=promotion_target,
+                    )
+                    head_text = await github.get_file_text_at_ref(
+                        filename,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=head_sha,
+                    )
+                except Exception as e:
+                    return (
+                        "defer",
+                        f"could not fetch migration '{basename}' to check for a "
+                        f"byte-identical restore against promotion target "
+                        f"'{promotion_target}': {_exc_detail(e)}",
+                    )
+                if not deployed_text:
+                    return (
+                        "defer",
+                        f"empty response fetching deployed migration '{basename}' "
+                        f"from promotion target '{promotion_target}' — deferring "
+                        f"restore comparison",
+                    )
+                if not head_text:
+                    return (
+                        "defer",
+                        f"empty response fetching migration '{basename}' at the PR "
+                        f"head commit — deferring byte-identical restore comparison",
+                    )
+                # A restore requires the PR head to be an EXACT byte copy of the
+                # deployed body. Any byte difference is a real modification and
+                # still blocks with the original immutability message.
+                if head_text != deployed_text:
+                    real_edits.append(filename)
+            if real_edits:
+                return (
+                    "block",
+                    f"PR modifies deployed migration(s) present on promotion target "
+                    f"'{promotion_target}' (deployed migrations are immutable — they "
+                    f"have already been applied to the production DB and cannot be "
+                    f"changed in-place): " + ", ".join(sorted(real_edits)),
+                )
 
         # Defect class 1: pre-PR rename/renumber on the FULL integration branch.
         # The PR-diff checks above compare only the PR's added/modified files
