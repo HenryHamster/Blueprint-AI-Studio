@@ -86,6 +86,7 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
     _UNDECLARED_REASON_KEYS,
+    _is_test_path,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
@@ -102,7 +103,7 @@ try:  # pragma: no cover - exercised once the sibling ledger module lands
 except Exception:  # noqa: BLE001 - sibling module not yet landed in this checkout
     _category_ledger = None  # type: ignore[assignment]
 
-from app.landed_signal import landed_signal_predicate
+from app.landed_signal import is_verified_merge, landed_signal_predicate
 from app.models import (
     ArtifactType,
     Project,
@@ -2949,6 +2950,57 @@ async def _compute_acceptance_window_aggregate(
     }
 
 
+async def _collect_verified_merge_test_evidence(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> dict[str, list[str]]:
+    """Gather the candidate's VERIFIED-merged test + production-seam file paths.
+
+    Feeds the v2 machine-tier upgrade in ``evaluate_merge_grade``: a merge-grade
+    ``{"kind": "test"}`` citation earns the machine tier only when the cited test
+    is among these ``test_files`` (a test that shipped in a merge gated by a REAL
+    CI/test verdict — ``landed_signal.is_verified_merge``) AND semantically maps to
+    one of these ``seam_files``.  Restricting to verified merges is how "ran green
+    on the candidate SHA" is machine-confirmed without re-running any test at grade
+    time: the qualifier has no live test-runner, and a verified merge is the
+    standing machine evidence that the shipped test ran green under real CI.
+
+    Scans the SAME version window as ``_compute_acceptance_window_aggregate`` — all
+    COMPLETED, landed tasks that completed at/after ``version.opened_at`` — and, for
+    those whose merge is ``verified``, splits each task's ``_pr_changed_files`` into
+    test vs non-test (production seam) paths.  Returns
+    ``{"test_files": [...], "seam_files": [...]}`` (deduplicated, sorted).
+    """
+    since = version.opened_at
+    stmt = select(Task).where(
+        Task.project_id == version.project_id,
+        Task.status == TaskStatus.COMPLETED,
+        landed_signal_predicate(session),
+        Task.updated_at >= since,
+    )
+    rows = [
+        task
+        for task in (await session.execute(stmt)).scalars().all()
+        if release_version._task_completed_at(task) >= since
+    ]
+    test_files: set[str] = set()
+    seam_files: set[str] = set()
+    for task in rows:
+        if not is_verified_merge(task):
+            continue
+        changed = (task.context or {}).get("_pr_changed_files")
+        if not isinstance(changed, list):
+            continue
+        for p in changed:
+            if not isinstance(p, str) or not p.strip():
+                continue
+            if _is_test_path(p):
+                test_files.add(p.strip())
+            else:
+                seam_files.add(p.strip())
+    return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
+
+
 async def _guard_ci_unresolved_promotion_in_flight(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4911,8 +4963,19 @@ async def _finalize_qualification(
                 merge_grade_task_id,
                 version.version_number,
             )
+        # v2 machine tier: only gather the (bounded) verified-merge test evidence
+        # when there is an ACTIVE rubric to grade categories against — otherwise
+        # the per-category grade (and thus the tier) is never computed.
+        _verified_merge_evidence = (
+            await _collect_verified_merge_test_evidence(session, version)
+            if active_categories
+            else None
+        )
         merge_grade_cert = evaluate_merge_grade(
-            version.goal, merge_grade_artifact, active_categories or None
+            version.goal,
+            merge_grade_artifact,
+            active_categories or None,
+            _verified_merge_evidence,
         )
         if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
             merge_grade_cert = {

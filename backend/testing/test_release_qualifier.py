@@ -1873,11 +1873,15 @@ class TestScoreAudit:
 
 
 class TestScoreAuditVerification:
-    """_score_audit must skip deductions for high/medium/critical findings
-    that lack a substantive verification_note (≥ 20 non-whitespace chars)."""
+    """_score_audit must skip deductions for high/medium/critical findings that
+    lack a substantive verification_note (≥ 20 non-whitespace chars) — and, when
+    that leaves the report with NO scoreable higher-severity finding, must NULL
+    the audit_score (fail-closed to the ``audit_missing`` blocker) rather than
+    return a phantom-clean 1.0 over unsubstantiated criticals."""
 
-    def test_unverified_high_finding_not_deducted(self):
-        """A high finding without verification_note is excluded → score stays 1.0."""
+    def test_unverified_high_finding_nulls_audit_score(self):
+        """A lone high finding without verification_note is dropped, leaving the
+        report unscoreable → audit_score is NULLED (was a false-clean 1.0)."""
         report = {
             "findings": [
                 {
@@ -1888,10 +1892,10 @@ class TestScoreAuditVerification:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0)
+        assert audit is None
 
-    def test_unverified_medium_finding_not_deducted(self):
-        """A medium finding without verification_note is excluded → score stays 1.0."""
+    def test_unverified_medium_finding_nulls_audit_score(self):
+        """A lone medium finding without verification_note → unscoreable → nulled."""
         report = {
             "findings": [
                 {
@@ -1902,7 +1906,7 @@ class TestScoreAuditVerification:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0)
+        assert audit is None
 
     def test_low_finding_always_deducted_without_verification_note(self):
         """Low findings do not require verification_note — deduction applies."""
@@ -1915,7 +1919,8 @@ class TestScoreAuditVerification:
         assert audit == pytest.approx(1.0 - 0.02)
 
     def test_short_verification_note_not_counted(self):
-        """A verification_note with fewer than 20 non-whitespace chars is treated as absent."""
+        """A verification_note with fewer than 20 non-whitespace chars is treated
+        as absent — the lone critical is dropped → unscoreable → nulled."""
         report = {
             "findings": [
                 {
@@ -1927,7 +1932,7 @@ class TestScoreAuditVerification:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0)
+        assert audit is None
 
     def test_verified_critical_finding_deducted(self):
         """A critical finding WITH a substantive verification_note is deducted normally."""
@@ -1967,7 +1972,8 @@ class TestScoreAuditVerification:
         assert audit == pytest.approx(1.0 - 0.15)
 
     def test_empty_string_verification_note_not_counted(self):
-        """An empty verification_note is treated the same as absent."""
+        """An empty verification_note is treated the same as absent — the lone
+        high finding is dropped → unscoreable → nulled."""
         report = {
             "findings": [
                 {
@@ -1979,22 +1985,28 @@ class TestScoreAuditVerification:
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0)
+        assert audit is None
 
-    def test_all_findings_unverified_audit_missing_reason_fires(self):
-        """When _score_audit returns 1.0 due to all-unverified findings,
-        _audit_missing_reason must return 'all_findings_unverified'."""
+    def test_all_findings_unverified_nulls_score_and_reason_fires(self):
+        """An all-unverified-critical report must NOT read clean: _score_audit
+        NULLs the score (fail-closed to audit_missing) AND _audit_missing_reason
+        returns 'all_findings_unverified' for the observability row."""
         report = {
             "findings": [
                 {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                },
+                {
                     "severity": "high",
-                    "summary": "Potential issue.",
-                    "file": "app/foo.py",
+                    "summary": "Auth bypass.",
+                    "file": "app/auth.py",
                 },
             ]
         }
         audit, _ = rq._score_audit(report)
-        assert audit == pytest.approx(1.0), "unverified high must not be deducted"
+        assert audit is None, "all-unverified criticals must not read as a clean 1.0"
         assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 

@@ -192,9 +192,65 @@ def _normalize_citations(raw: Any) -> list[dict[str, str]]:
     return out
 
 
+def _cited_test_is_machine_verified(
+    citations: list[dict[str, str]],
+    verified_merge_evidence: dict[str, Any] | None,
+) -> str | None:
+    """Return the validated test ref proving a category at the MACHINE tier, else None.
+
+    The grader's ``{"kind": "test", "ref": ...}`` citation is a SOFT claim ("test
+    X covers category C").  It is upgraded to the machine tier only when the cited
+    test is machine-CONFIRMED against the candidate — the same fail-closed proof
+    shape as the ``named_test`` acceptance gate, applied to the merge-grade's
+    cross-task candidate window:
+
+      1. the cited test file is among the candidate's VERIFIED-merged test files —
+         a test that shipped in a merge gated by a REAL CI/test verdict (see
+         ``landed_signal.is_verified_merge``), which is how "ran green on the
+         candidate SHA" is machine-confirmed here; AND
+      2. it semantically corresponds to a changed production seam that shipped in
+         those verified merges (reuses ``acceptance_gate._test_semantically_grounded``
+         so the test module maps to a real changed production module).
+
+    ``verified_merge_evidence`` is ``{"test_files": [...], "seam_files": [...]}``
+    gathered by the qualifier from the version window (both restricted to verified
+    merges).  When it is absent/empty — no candidate CI evidence available at grade
+    time — NO citation validates and the caller keeps ``tier="judged"``: machine
+    tier is never granted on an unvalidated claim (fail toward the lower tier).
+
+    ``ref`` is read like ``_evaluate_named_test`` reads a declared test: a pytest
+    node id (``path::test_name``) or a bare file path, split on ``::`` to the path.
+    """
+    if not verified_merge_evidence:
+        return None
+    test_files = verified_merge_evidence.get("test_files") or []
+    seam_files = verified_merge_evidence.get("seam_files") or []
+    if not test_files:
+        return None
+    # Reuse the PURE named_test proof helpers (no I/O).  Lazy import keeps this
+    # scoring module free of the heavier ``acceptance_gate`` import graph at load.
+    from app.acceptance_gate import _paths_match, _test_semantically_grounded
+
+    seam_list = [str(s) for s in seam_files]
+    for c in citations:
+        if c.get("kind") != "test":
+            continue
+        cited_path = str(c.get("ref") or "").partition("::")[0].strip()
+        if not cited_path:
+            continue
+        if not any(_paths_match(str(vf), cited_path) for vf in test_files):
+            # The cited test is NOT among the candidate's verified-merged tests —
+            # it may never have run green under real CI on this candidate.
+            continue
+        if _test_semantically_grounded(cited_path, seam_list):
+            return cited_path
+    return None
+
+
 def _normalize_category_verdicts(
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]],
+    verified_merge_evidence: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Grade the artifact's per-category verdicts against the ACTIVE rubric.
 
@@ -211,8 +267,16 @@ def _normalize_category_verdicts(
         identically to ``not_met`` downstream.
       * An unknown/absent status → ``not_met``.
 
-    Every returned verdict stubs ``tier="judged"`` — the machine/test-citation
-    tier is v2.  Returns ``(category_verdicts, residual_uncaptured_gap)`` where
+    Tier (v2 machine/test-citation upgrade): a ``met`` category defaults to
+    ``tier="judged"`` (an LLM read the diff).  It is upgraded to ``tier="machine"``
+    ONLY when the grader attached a ``{"kind": "test", "ref": ...}`` citation whose
+    test is machine-validated against ``verified_merge_evidence`` (the candidate's
+    verified-merged test + seam files) — see :func:`_cited_test_is_machine_verified`.
+    A test citation that cannot be validated (or no evidence supplied) keeps the
+    category at ``judged`` — machine tier is never granted on an unvalidated claim.
+    ``not_met`` / ``partial`` verdicts are always ``judged``.
+
+    Returns ``(category_verdicts, residual_uncaptured_gap)`` where
     ``residual_uncaptured_gap`` is the grader's answer to "is there a goal aspect
     that NONE of the categories capture?" (a non-empty string hard-blocks).
     """
@@ -260,11 +324,19 @@ def _normalize_category_verdicts(
             )
         if status in ("not_met", "partial") and not gap:
             gap = "No gap description supplied by the grader."
+        # Tier: a MET category whose test citation is machine-validated against the
+        # candidate's verified merges earns the machine tier; everything else stays
+        # judged (fail toward the lower tier).
+        tier = "judged"
+        if status == "met" and _cited_test_is_machine_verified(
+            citations, verified_merge_evidence
+        ):
+            tier = "machine"
         verdicts.append(
             {
                 "category_key": key,
                 "status": status,
-                "tier": "judged",
+                "tier": tier,
                 # ``met`` may legitimately carry no gap; not_met/partial always do.
                 "gap": gap if status != "met" else (gap or None),
                 "citations": citations,
@@ -288,6 +360,7 @@ def evaluate_merge_grade(
     goal: str | None,
     artifact: dict[str, Any] | None,
     active_categories: list[dict[str, Any]] | None = None,
+    verified_merge_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalise a blind merge-grade artifact into a goal-coverage verdict.
 
@@ -317,6 +390,14 @@ def evaluate_merge_grade(
     These drive the NEW hard gate in :func:`compute_composite`.  When
     ``active_categories`` is absent/empty (no rubric) both are ``None`` and only
     the holistic signal applies — preserving the pre-redesign no-criteria path.
+
+    ``verified_merge_evidence`` (v2 machine tier) — an optional
+    ``{"test_files": [...], "seam_files": [...]}`` snapshot of the candidate's
+    VERIFIED-merged test + production-seam files, gathered by the qualifier.  It
+    upgrades a ``met`` category's ``tier`` from ``judged`` to ``machine`` when the
+    grader cited a test that validates against it (see
+    :func:`_cited_test_is_machine_verified`); ``None`` leaves every met category at
+    the judged tier (v1 behaviour).
 
     Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail,
     category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
@@ -381,7 +462,7 @@ def evaluate_merge_grade(
     residual_uncaptured_gap: str | None = None
     if active_categories:
         category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
-            artifact, active_categories
+            artifact, active_categories, verified_merge_evidence
         )
     return {
         "status": "pass" if covers_goal else "fail",
@@ -1073,9 +1154,20 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     derived = _clamp01(derived)
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
-    if missing_reason == "parseable_but_unscoreable":
-        # The report parsed, but no findings entry carried a usable severity.
-        # Treat that as an unusable audit signal instead of a clean 1.0.
+    if missing_reason in ("parseable_but_unscoreable", "all_findings_unverified"):
+        # The report parsed but yields NO trustworthy score, so returning the
+        # clean-looking ``derived`` would fail GREEN over real defects:
+        #   * ``parseable_but_unscoreable`` — no finding carried a usable severity.
+        #   * ``all_findings_unverified`` — EVERY higher-severity (critical/high/…)
+        #     finding was dropped for lacking a ≥20-char verification_note, so the
+        #     deduction loop left ``derived`` at 1.0 while unsubstantiated criticals
+        #     go unsurfaced (the false-green class this fix closes).
+        # NULL the score in both cases so ``compute_composite`` routes to the
+        # ``audit_missing`` hard blocker (surface it, don't fail green) instead of
+        # promoting on a phantom-clean audit.  A report with at least ONE verified
+        # higher-severity finding is still scoreable and keeps its derived score
+        # (``all_findings_unverified`` does not fire) — correct scoring is preserved
+        # whenever verification notes are present.
         audit_score = None
     else:
         # Observability: log when the model's self-reported score diverges materially.
