@@ -50,6 +50,10 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   const revisionRef = useRef(0);
   const drawingRef = useRef(false);
   const currentStrokeRef = useRef<Stroke | null>(null);
+  // Serialized snapshot of the last strokes we successfully persisted (or
+  // loaded). The autosave effect diffs CONTENT against this — not state object
+  // identity — so a save-triggered revision refresh never re-fires a save.
+  const lastSavedRef = useRef<string>('');
 
   // Keep refs in sync with state.
   useEffect(() => {
@@ -73,9 +77,12 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         );
         if (cancelled) return;
         const strokes = data.content?.strokes;
+        revisionRef.current = data.content_revision;
+        lastSavedRef.current = JSON.stringify({ strokes: strokes ?? [] });
         if (!strokes || strokes.length === 0) {
           setState({ status: 'empty' });
         } else {
+          strokesRef.current = strokes;
           setState({ status: 'ok', strokes, revision: data.content_revision });
         }
       } catch (err) {
@@ -172,11 +179,12 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       if (state.status !== 'ok' && state.status !== 'empty') return;
       e.preventDefault();
 
-      // Promote empty → ok so drawing can begin.
+      // Promote empty → ok so drawing can begin. Preserve the revision loaded
+      // from the server (empty content can still carry a non-zero revision) so
+      // the first save uses the correct optimistic-concurrency base.
       if (state.status === 'empty') {
-        setState({ status: 'ok', strokes: [], revision: 0 });
+        setState({ status: 'ok', strokes: [], revision: revisionRef.current });
         strokesRef.current = [];
-        revisionRef.current = 0;
       }
 
       drawingRef.current = true;
@@ -230,25 +238,44 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
 
   const doSave = useCallback(async () => {
     if (state.status !== 'ok') return;
+    const payload = { strokes: strokesRef.current };
+    const serialized = JSON.stringify(payload);
     setSaving(true);
     setSaveError(null);
     try {
-      const result = await saveToolContent(projectId, tool.id, { strokes: strokesRef.current }, revisionRef.current);
+      const result = await saveToolContent(projectId, tool.id, payload, revisionRef.current);
       revisionRef.current = result.content_revision;
+      lastSavedRef.current = serialized;
       setState(prev => (prev.status === 'ok' ? { ...prev, revision: result.content_revision } : prev));
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Save failed';
       setSaveError(msg);
-      // Reload on conflict to get the latest revision.
+      // On a 409 conflict, MERGE rather than discard — never silently drop the
+      // losing writer's strokes. Strokes are additive, so the union of the
+      // server's strokes and our local ones preserves both viewers' work.
+      // Duplicate strokes (identical serialization) are deduped so a repeated
+      // merge does not accumulate copies. The merged set differs from the
+      // last-saved snapshot, so the autosave effect persists it against the
+      // freshly-adopted server base revision.
       if (err instanceof ConflictError) {
         try {
           const data: ToolContent<WhiteboardContent> = await fetchToolContent<WhiteboardContent>(projectId, tool.id);
-          strokesRef.current = data.content?.strokes ?? [];
+          const serverStrokes = data.content?.strokes ?? [];
+          const merged: Stroke[] = [...serverStrokes];
+          const seen = new Set(serverStrokes.map(s => JSON.stringify(s)));
+          for (const s of strokesRef.current) {
+            const key = JSON.stringify(s);
+            if (!seen.has(key)) {
+              merged.push(s);
+              seen.add(key);
+            }
+          }
+          strokesRef.current = merged;
           revisionRef.current = data.content_revision;
-          setState({ status: 'ok', strokes: strokesRef.current, revision: data.content_revision });
+          setState({ status: 'ok', strokes: merged, revision: data.content_revision });
           redraw();
         } catch {
-          // If reload fails too, keep the existing state.
+          // If reload fails too, keep the existing (local) state and error.
         }
       }
     } finally {
@@ -256,9 +283,12 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     }
   }, [state.status, projectId, tool.id, redraw]);
 
-  // Auto-save after a pause in drawing (debounced).
+  // Auto-save after a pause in drawing (debounced). Fires only when the strokes
+  // actually differ from the last-saved snapshot — a bare revision refresh
+  // after a successful save leaves content unchanged and does NOT re-fire.
   useEffect(() => {
     if (state.status !== 'ok') return;
+    if (JSON.stringify({ strokes: state.strokes }) === lastSavedRef.current) return;
     const timer = setTimeout(() => {
       void doSave();
     }, 1500);

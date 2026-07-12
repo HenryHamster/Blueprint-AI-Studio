@@ -33,10 +33,18 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // A conflict surfaced by a 409 on save: another viewer committed a newer
+  // revision. We keep the LOCAL edits intact and let the operator reconcile.
+  const [conflict, setConflict] = useState<{ serverText: string; serverRevision: number } | null>(null);
+
   // Latest text/revision refs so the debounced saver always reads fresh values
   // without re-binding on every keystroke (same pattern as WhiteboardTool).
   const textRef = useRef('');
   const revisionRef = useRef(0);
+  // Serialized snapshot of the last content we successfully persisted (or
+  // loaded). The autosave effect compares CONTENT to this — not state object
+  // identity — so a save-triggered revision refresh never re-fires a save.
+  const lastSavedRef = useRef<string>('');
 
   // Keep refs in sync with the committed state.
   useEffect(() => {
@@ -62,6 +70,7 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
         const text = data.content?.text ?? '';
         textRef.current = text;
         revisionRef.current = data.content_revision;
+        lastSavedRef.current = JSON.stringify({ text });
         if (!text) {
           setState({ status: 'empty' });
         } else {
@@ -105,32 +114,39 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
 
   const doSave = useCallback(async () => {
     if (state.status !== 'ok') return;
+    // Snapshot the exact payload we are about to persist. On success this
+    // becomes the "last saved" baseline the autosave effect diffs against.
+    const payload = { text: textRef.current };
+    const serialized = JSON.stringify(payload);
     setSaving(true);
     setSaveError(null);
     try {
       const result = await saveToolContent(
         projectId,
         tool.id,
-        { text: textRef.current },
+        payload,
         revisionRef.current,
       );
       revisionRef.current = result.content_revision;
+      lastSavedRef.current = serialized;
+      setConflict(null);
       setState(prev => (prev.status === 'ok' ? { ...prev, revision: result.content_revision } : prev));
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Save failed';
       setSaveError(msg);
-      // On a 409 conflict, reload server content and discard local edits.
+      // On a 409 conflict, PRESERVE the local edits — never silently discard a
+      // losing writer's work. Fetch the server's version so the operator can
+      // reconcile, adopt the server revision as the new save base (so a
+      // deliberate "keep mine" retry can land), and pause autosave until the
+      // operator resolves the conflict.
       if (err instanceof ConflictError) {
         try {
           const data: ToolContent<NotesContent> = await fetchToolContent<NotesContent>(projectId, tool.id);
-          const text = data.content?.text ?? '';
-          textRef.current = text;
+          const serverText = data.content?.text ?? '';
           revisionRef.current = data.content_revision;
-          setState(text
-            ? { status: 'ok', text, revision: data.content_revision }
-            : { status: 'empty' });
+          setConflict({ serverText, serverRevision: data.content_revision });
         } catch {
-          // If reload fails too, keep the existing state.
+          // If reload fails too, keep the existing (local) state and error.
         }
       }
     } finally {
@@ -138,14 +154,40 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
     }
   }, [state.status, projectId, tool.id]);
 
-  // Auto-save after a pause in typing (debounced).
+  // Keep my local text; overwrite the server with it (base revision was already
+  // advanced to the server's during conflict handling, so this retry lands).
+  const resolveKeepMine = useCallback(() => {
+    setConflict(null);
+    void doSave();
+  }, [doSave]);
+
+  // Discard my local text in favour of the server's version — an EXPLICIT
+  // operator choice, not a silent drop.
+  const resolveUseTheirs = useCallback(() => {
+    const c = conflict;
+    if (!c) return;
+    textRef.current = c.serverText;
+    revisionRef.current = c.serverRevision;
+    lastSavedRef.current = JSON.stringify({ text: c.serverText });
+    setConflict(null);
+    setSaveError(null);
+    setState(c.serverText
+      ? { status: 'ok', text: c.serverText, revision: c.serverRevision }
+      : { status: 'empty' });
+  }, [conflict]);
+
+  // Auto-save after a pause in typing (debounced). Fires only when the CONTENT
+  // actually differs from the last-saved snapshot (not on a bare revision
+  // refresh), and never while a conflict awaits operator resolution.
   useEffect(() => {
     if (state.status !== 'ok') return;
+    if (conflict) return;
+    if (JSON.stringify({ text: state.text }) === lastSavedRef.current) return;
     const timer = setTimeout(() => {
       void doSave();
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [state, doSave]);
+  }, [state, doSave, conflict]);
 
   // -----------------------------------------------------------------------
   // Render
@@ -207,9 +249,34 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
 
         {/* Save status */}
         <span className="ml-auto text-xs text-neutral-500">
-          {saving ? 'Saving…' : saveError ? 'Save failed' : 'Saved'}
+          {saving ? 'Saving…' : conflict ? 'Conflict' : saveError ? 'Save failed' : 'Saved'}
         </span>
       </div>
+
+      {/* Conflict banner: another viewer saved a newer revision. Local edits
+          are preserved above; the operator explicitly picks a resolution. */}
+      {conflict && (
+        <div className="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-300" role="alert">
+          <p className="font-medium">Another viewer saved a newer version while you were editing.</p>
+          <p className="mt-1 text-amber-400/80">Your unsaved edits are kept above. Choose how to resolve:</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={resolveKeepMine}
+              className="min-h-[44px] rounded border border-amber-500/50 px-2 py-1 hover:bg-amber-500/20"
+            >
+              Keep mine (overwrite theirs)
+            </button>
+            <button
+              type="button"
+              onClick={resolveUseTheirs}
+              className="min-h-[44px] rounded border border-neutral-600 px-2 py-1 text-neutral-300 hover:border-neutral-400"
+            >
+              Discard mine, load theirs
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Editor / preview */}
       {mode === 'edit' ? (

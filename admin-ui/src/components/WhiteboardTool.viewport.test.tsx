@@ -13,7 +13,7 @@ vi.mock('../api/projectTools', async () => {
   };
 });
 
-import { fetchToolContent, saveToolContent, ConflictError } from '../api/projectTools';
+import { fetchToolContent, saveToolContent } from '../api/projectTools';
 import WhiteboardTool from './WhiteboardTool';
 
 const SAMPLE_STROKES = [
@@ -180,21 +180,15 @@ describe('WhiteboardTool — viewport regression', () => {
   // -----------------------------------------------------------------------
 
   // -----------------------------------------------------------------------
-  // Conflict recovery
+  // Autosave loop guard: unchanged content must not autosave
   // -----------------------------------------------------------------------
 
-  test('recovers from 409 save conflict by reloading content from server', async () => {
-    vi.mocked(fetchToolContent)
-      .mockResolvedValueOnce({
-        content: { strokes: SAMPLE_STROKES },
-        content_revision: 3,
-      })
-      .mockResolvedValueOnce({
-        content: { strokes: SAMPLE_STROKES },
-        content_revision: 5,
-      });
-
-    vi.mocked(saveToolContent).mockRejectedValueOnce(new ConflictError());
+  test('does not autosave when loaded content is never edited', async () => {
+    vi.mocked(fetchToolContent).mockResolvedValue({
+      content: { strokes: SAMPLE_STROKES },
+      content_revision: 3,
+    });
+    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 4 });
 
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -206,11 +200,11 @@ describe('WhiteboardTool — viewport regression', () => {
     if (!host) throw new Error('host not mounted');
     expect(host.querySelector('canvas')).toBeTruthy();
 
-    // Wait for auto-save debounce (1500ms) + conflict reload
+    // Well beyond several debounce cycles — a reference-identity dependency
+    // would have fired a continuous save loop here.
     await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
 
-    // fetchToolContent: 1st call (initial load) + 2nd call (conflict reload)
-    expect(fetchToolContent).toHaveBeenCalledTimes(2);
+    expect(saveToolContent).not.toHaveBeenCalled();
   });
 
   test('controls meet minimum touch target at 1280px', async () => {

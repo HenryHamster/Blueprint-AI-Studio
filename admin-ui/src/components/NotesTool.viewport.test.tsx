@@ -186,7 +186,7 @@ describe('NotesTool — viewport regression', () => {
   // Conflict recovery
   // -----------------------------------------------------------------------
 
-  test('recovers from 409 save conflict by reloading content from server', async () => {
+  test('a 409 save conflict preserves local edits and surfaces a conflict banner', async () => {
     vi.mocked(fetchToolContent)
       .mockResolvedValueOnce({
         content: { text: SAMPLE_TEXT },
@@ -197,7 +197,6 @@ describe('NotesTool — viewport regression', () => {
         content_revision: 7,
       });
 
-    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 8 });
     vi.mocked(saveToolContent).mockRejectedValueOnce(new ConflictError());
 
     host = document.createElement('div');
@@ -208,15 +207,25 @@ describe('NotesTool — viewport regression', () => {
     await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
 
     if (!host) throw new Error('host not mounted');
-    expect(host.querySelector('textarea')).toBeTruthy();
+    const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).toBeTruthy();
+
+    // Make a local edit so autosave has changed content to persist.
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')!.set!;
+    await act(async () => {
+      setter.call(textarea, 'my local edit');
+      textarea!.dispatchEvent(new Event('input', { bubbles: true }));
+    });
 
     // Wait for auto-save debounce (1500ms) + conflict reload.
     await act(async () => await new Promise(resolve => setTimeout(resolve, 3000)));
 
     // fetchToolContent: 1st call (initial load) + 2nd call (conflict reload).
     expect(fetchToolContent).toHaveBeenCalledTimes(2);
-    // The reloaded server content replaced local edits.
-    const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
-    expect(textarea!.value).toBe('server wins');
+    // Local edits are NEVER silently discarded — the losing writer keeps its work.
+    expect(textarea!.value).toBe('my local edit');
+    expect(textarea!.value).not.toBe('server wins');
+    // A conflict banner is surfaced for the operator to resolve.
+    expect(host.textContent).toContain('Another viewer saved a newer version');
   });
 });
