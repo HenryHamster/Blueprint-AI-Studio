@@ -7,14 +7,14 @@ only adds the vm_dispatched_at partial index.
 
 - ix_task_vm_dispatched_at   (task.vm_dispatched_at, WHERE vm_dispatched_at IS NOT NULL)
 
-Revision ID: 0458
-Revises: 0457
+Revision ID: 0458b
+Revises: 0458
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0458"
-down_revision = "0457"
+revision = "0458b"
+down_revision = "0458"
 branch_labels = None
 depends_on = None
 
