@@ -416,6 +416,36 @@ async def get_criteria_for_version(
     return list(result.scalars().all())
 
 
+async def get_active_criteria_rubric(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Return the ACTIVE-criteria rubric for a version.
+
+    A lightweight, coverage-free accessor: a plain SELECT of the ``active``
+    :class:`~app.models.VersionAcceptanceCriterion` rows on ``version_id``,
+    projected to the stable rubric fields the merge-grade agent keys its
+    per-category verdicts on (``criterion_key`` + ``text``).
+
+    Deliberately does NOT join :class:`~app.models.CriterionEvidence` or compute
+    any coverage classification — callers that only need the rubric must not pay
+    for the full :func:`get_version_coverage_summary` join.  Ordered by
+    ``created_at`` to match the criterion ordering used elsewhere.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.release_version_id == version_id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+        .order_by(VersionAcceptanceCriterion.created_at)
+    )
+    return [
+        {"criterion_key": c.criterion_key, "text": c.text}
+        for c in result.scalars().all()
+    ]
+
+
 async def get_criterion_by_text(
     session: AsyncSession,
     project_id: uuid.UUID,

@@ -90,7 +90,10 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
-from app.acceptance_criteria import get_version_coverage_summary
+from app.acceptance_criteria import (
+    get_active_criteria_rubric,
+    get_version_coverage_summary,
+)
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -2304,11 +2307,11 @@ async def run_qualification(
             # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
             # (stable ``criterion_key`` + text) into the payload.  The agent keys
             # its per-category verdicts back on these keys.
-            _mg_criteria = await get_version_coverage_summary(session, version.id)
+            _mg_criteria = await get_active_criteria_rubric(session, version.id)
             _mg_categories = [
                 {"category_key": c.get("criterion_key"), "text": c.get("text")}
-                for c in (_mg_criteria.get("criteria") or [])
-                if c.get("status") == "active" and c.get("criterion_key")
+                for c in _mg_criteria
+                if c.get("criterion_key")
             ]
             merge_grade_task = await _spawn_release_merge_grade_task(
                 session,

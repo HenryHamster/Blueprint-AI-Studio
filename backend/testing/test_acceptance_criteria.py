@@ -164,6 +164,51 @@ async def test_get_criteria_for_version_ordered(db_session):
 
 
 # ---------------------------------------------------------------------------
+# get_active_criteria_rubric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_active_criteria_rubric_returns_active_rubric_ordered(db_session):
+    """get_active_criteria_rubric returns {criterion_key, text} for ACTIVE rows,
+    ordered by created_at, excluding retracted/superseded criteria."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "First")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Second")
+    c3 = await ac.create_criterion(db_session, project.id, version.id, "Retracted")
+
+    # Retract c3 — the rubric accessor must exclude non-active rows.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=c3.criterion_key,
+        reason="stale",
+        retracted_by="test",
+    )
+
+    rubric = await ac.get_active_criteria_rubric(db_session, version.id)
+
+    # Only active criteria, in created_at order, projected to the rubric fields.
+    assert rubric == [
+        {"criterion_key": c1.criterion_key, "text": "First"},
+        {"criterion_key": c2.criterion_key, "text": "Second"},
+    ]
+    # No coverage/status/evidence keys leak into the lightweight rubric.
+    assert all(set(entry.keys()) == {"criterion_key", "text"} for entry in rubric)
+
+
+@pytest.mark.asyncio
+async def test_get_active_criteria_rubric_empty(db_session):
+    """get_active_criteria_rubric returns [] when the version has no criteria."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    assert await ac.get_active_criteria_rubric(db_session, version.id) == []
+
+
+# ---------------------------------------------------------------------------
 # count_criteria_for_version
 # ---------------------------------------------------------------------------
 
