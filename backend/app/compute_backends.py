@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -32,13 +33,13 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
-from app.models import ComputeJob, ComputeJobStatus
+from app.models import ComputeJob, ComputeJobStatus, Project
 from app.vm_lifecycle import _ensure_vm_deleted
 
 # Scripts baked into the GCP compute-job startup script as base64 blobs.
@@ -2588,3 +2589,182 @@ def _launch_spawn_subprocess(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+# ── Per-project compute image build (PRODUCE side of images-first) ───────────
+#
+# Bakes a digest-pinned container image from a project's own lockfiles. The
+# reusable, stdlib-only logic lives in :mod:`app.compute_image_build` (also the
+# home the standalone ``scripts/build_compute_image.py`` CLI loads by path). The
+# backend reads the project's manifest ``compute.image.build`` section, checks
+# out the repo, and drives the hash-gated build.
+
+from app import compute_image_build  # noqa: E402
+
+# Files, in priority order, that count as dependency inputs when the manifest
+# does not enumerate them. Any that exist in the checkout are hashed.
+_DEFAULT_DEP_FILES = (
+    "requirements.txt",
+    "requirements.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "pyproject.toml",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "environment.yml",
+    "conda-lock.yml",
+)
+
+
+def resolve_project_compute_image_build(
+    manifest_compute: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Extract the buildable ``compute.image`` config from a manifest result.
+
+    *manifest_compute* is the ``compute`` dict returned by
+    ``admin_project_tools._discover_manifest_tools`` (shape
+    ``{"image": {"name": ..., "build": {...} | None}}``). Returns a dict
+    ``{"name", "dockerfile", "parent", "build_args"}`` when the project declares
+    a ``build`` section, or ``None`` when it only points at a prebuilt image
+    (or declares no compute image at all).
+    """
+    if not isinstance(manifest_compute, dict):
+        return None
+    image = manifest_compute.get("image")
+    if not isinstance(image, dict):
+        return None
+    build = image.get("build")
+    if not isinstance(build, dict):
+        return None
+    name = image.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return {
+        "name": name.strip(),
+        "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
+        "parent": build.get("parent"),
+        "build_args": dict(build.get("build_args") or {}),
+    }
+
+
+def _discover_dep_files(repo_dir: str) -> list[str]:
+    """Return the default dependency files that actually exist in *repo_dir*."""
+    present: list[str] = []
+    for rel in _DEFAULT_DEP_FILES:
+        if os.path.isfile(os.path.join(repo_dir, rel)):
+            present.append(rel)
+    return present
+
+
+def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
+    """Shallow-clone *clone_url* at *ref* into *dest*. Raises on failure."""
+    proc = subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", ref, clone_url, dest],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        # --branch fails for a raw SHA; fall back to full clone + checkout.
+        proc2 = subprocess.run(
+            ["git", "clone", clone_url, dest],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if proc2.returncode != 0:
+            raw = (proc.stderr or proc2.stderr or "")[-1000:]
+            # Redact any embedded credentials from the URL before surfacing in logs.
+            safe = re.sub(r"//[^@\s]+@", "//***@", raw)
+            raise RuntimeError(f"git clone failed: {safe}")
+        co = subprocess.run(
+            ["git", "-C", dest, "checkout", ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if co.returncode != 0:
+            raise RuntimeError(f"git checkout {ref} failed: {(co.stderr or '')[-500:]}")
+
+
+async def build_project_compute_image(
+    project: "Project",
+    *,
+    registry_repo: str,
+    build_config: dict[str, Any],
+    ref: str | None = None,
+    dep_files: Sequence[str] | None = None,
+    dry_run: bool = False,
+    _token_fn=None,
+    _clone_fn=None,
+    _build_fn=None,
+) -> Any:
+    """Bake (or reuse) the project's compute image, returning a ``BuildResult``.
+
+    Clones the project repo at *ref* into a temp dir, then delegates to
+    ``scripts/build_compute_image.build_and_push`` which content-hashes the
+    dependency inputs, no-ops if an image already exists for that hash, scans
+    for platform credentials, and otherwise builds + pushes a digest-pinned
+    image. Returns the build script's ``BuildResult`` (carries ``pinned_ref``).
+
+    *build_config* is the dict from :func:`resolve_project_compute_image_build`.
+    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``) exist for tests; production
+    resolves an installation token and uses git + the real build script.
+    """
+    import tempfile as _tempfile
+
+    build_fn = _build_fn or compute_image_build.build_and_push
+
+    owner = (getattr(project, "github_owner", None) or "").strip()
+    repo = (getattr(project, "github_repo", None) or "").strip()
+    if not owner or not repo:
+        raise ValueError("project has no connected GitHub repo — cannot build image")
+
+    resolved_ref = (
+        ref or getattr(project, "promotion_target", None) or "main"
+    )
+    image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+
+    with _tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
+        repo_dir = os.path.join(tmp, "repo")
+
+        # Resolve a short-lived read token and clone (unless a hook overrides).
+        if _clone_fn is not None:
+            await asyncio.to_thread(_clone_fn, owner, repo, resolved_ref, repo_dir)
+        else:
+            token = None
+            if _token_fn is not None:
+                token = await _token_fn(project)
+            else:
+                try:
+                    from app.branch_cleanup import _get_project_github_token
+                    from app.database import AsyncSessionLocal
+
+                    async with AsyncSessionLocal() as session:
+                        db_project = await session.get(Project, project.id)
+                        token = await _get_project_github_token(
+                            db_project or project, session
+                        )
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"could not mint repo token: {e}") from e
+            if not token:
+                raise RuntimeError("no GitHub token available for repo clone")
+            clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+            await asyncio.to_thread(_git_clone_ref, clone_url, resolved_ref, repo_dir)
+
+        resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
+
+        result = await asyncio.to_thread(
+            build_fn,
+            repo_dir=repo_dir,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            dockerfile=build_config.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            dep_files=resolved_dep_files,
+            parent=build_config.get("parent"),
+            build_args=dict(build_config.get("build_args") or {}),
+            dry_run=dry_run,
+        )
+    return result

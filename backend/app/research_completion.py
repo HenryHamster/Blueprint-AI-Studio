@@ -3535,6 +3535,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
+
+    _project_default_container_image: str | None = None
+    if _scope_cal_project:
+        try:
+            from app.routers.admin_project_tools import _discover_manifest_tools as _dmt
+            _manifest = await _dmt(_scope_cal_project)
+            _ci = ((_manifest.get("compute") or {}).get("image") or {})
+            if isinstance(_ci, dict):
+                _project_default_container_image = _ci.get("name") or None
+        except Exception:
+            logger.debug("[RESEARCH] manifest fetch for compute image default failed")
+
     _directions_by_id: dict = {}
     if _scope_cal_project:
         for _d in _scope_cal_project.directions or []:
@@ -4112,6 +4124,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _compute_threshold = 0.0
         if task_type == "compute_experiment":
             _compute_contract = _author_compute_launch_contract(finding)
+            if not _compute_contract.get("container_image") and _project_default_container_image:
+                _compute_contract["container_image"] = _project_default_container_image
             _cc_ok, _cc_reason = _validate_compute_launch_contract(_compute_contract)
             if not _cc_ok:
                 _compute_contract_deferred.append(finding)

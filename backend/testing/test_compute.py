@@ -13862,3 +13862,610 @@ async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_
     # Explicitly suppressed: task completes without follow-on.
     assert task.status == TaskStatus.COMPLETED
     spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_defaults_container_image_to_project_image(
+    db_session, mocker
+):
+    """When a project's manifest declares compute.image.name and a plan subtask omits
+    container_image, _handle_plan_completion must default the spawned child's
+    container_image to the project's declared image."""
+    from sqlmodel import select as _select
+    from app.plan_completion import _handle_plan_completion
+    from testing.factories import make_project, make_task
+
+    _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
+
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new=AsyncMock(
+            return_value={
+                "tools": [],
+                "skills": [],
+                "compute": {"image": {"name": _PROJECT_IMAGE}},
+                "error": None,
+            }
+        ),
+    )
+
+    project = make_project(
+        name="ComputeImageDefaultProject",
+        github_owner="myorg",
+        github_repo="myrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    plan_task = make_task(
+        project_id=project.id,
+        title="Plan: compute image default test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+
+    plan_logs = json.dumps(
+        {
+            "subtasks": [
+                {
+                    "title": "Run training experiment",
+                    "prompt": "run the training script",
+                    "type": "compute_experiment",
+                    "command": "python train.py",
+                    "spend_cap_usd": 1.0,
+                    "deadline_seconds": 300,
+                }
+            ]
+        }
+    )
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    child_tasks = (
+        (
+            await db_session.execute(
+                _select(Task).where(Task.parent_task_id == plan_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    compute_children = [
+        t
+        for t in child_tasks
+        if (t.first_payload or {}).get("type") == "compute_experiment"
+    ]
+    assert len(compute_children) == 1, (
+        f"Expected 1 compute_experiment child, got {len(compute_children)}: {child_tasks}"
+    )
+    payload = compute_children[0].first_payload or {}
+    assert payload.get("container_image") == _PROJECT_IMAGE, (
+        f"Expected container_image={_PROJECT_IMAGE!r}, got {payload.get('container_image')!r}"
+    )
+
+
+# ===========================================================================
+# Per-project compute image BUILD+PUBLISH substrate
+#
+# Covers (PRODUCE side of the images-first direction):
+#   * manifest compute.image.build parsing + normalization
+#   * dependency-hash computation (scripts/build_compute_image.compute_dependency_hash)
+#   * credential scanner (no-platform-creds-in-layers security constraint)
+#   * build script hash-check-before-build orchestration (build_and_push)
+#   * backend orchestration (compute_backends.build_project_compute_image)
+# ===========================================================================
+
+# The reusable build/publish logic lives in a backend module (stdlib-only,
+# self-contained) so the DB-backed suite can exercise it directly; the
+# standalone scripts/build_compute_image.py CLI loads the same module by path.
+from app import compute_image_build as _bci  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Manifest compute.image.build parsing
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_compute_image_build_wellformed():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {
+        "name": "us-docker.pkg.dev/proj/compute-images/p:latest",
+        "build": {
+            "dockerfile": ".blueprint/Dockerfile.compute",
+            "parent": "python:3.11-slim",
+            "build_args": {"CUDA": "12.4", "PY": "3.11"},
+        },
+    }
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["name"] == "us-docker.pkg.dev/proj/compute-images/p:latest"
+    assert norm["build"]["dockerfile"] == ".blueprint/Dockerfile.compute"
+    assert norm["build"]["parent"] == "python:3.11-slim"
+    assert norm["build"]["build_args"] == {"CUDA": "12.4", "PY": "3.11"}
+
+
+def test_manifest_compute_image_build_defaults_when_fields_missing():
+    """An empty build object defaults dockerfile and empty build_args."""
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+        _DEFAULT_COMPUTE_DOCKERFILE,
+    )
+
+    spec = {"name": "reg/repo/img:tag", "build": {}}
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["dockerfile"] == _DEFAULT_COMPUTE_DOCKERFILE
+    assert norm["build"]["parent"] is None
+    assert norm["build"]["build_args"] == {}
+
+
+def test_manifest_compute_image_build_absent_is_none():
+    """No build section -> normalized build is None (prebuilt-image project)."""
+    from app.routers.admin_project_tools import _normalize_manifest_compute_image
+
+    norm = _normalize_manifest_compute_image({"name": "reg/repo/img:tag"})
+    assert norm["build"] is None
+
+
+def test_manifest_compute_image_build_invalid_dockerfile_type():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"dockerfile": 123}}
+    )
+    assert err is not None
+    assert "dockerfile" in err
+
+
+def test_manifest_compute_image_build_dockerfile_traversal_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"dockerfile": "../etc/passwd"}}
+    )
+    assert err is not None
+    assert "dockerfile" in err
+
+
+def test_manifest_compute_image_build_invalid_parent_type():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"parent": ["python"]}}
+    )
+    assert err is not None
+    assert "parent" in err
+
+
+def test_manifest_compute_image_build_invalid_build_args_type():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"build_args": ["not", "a", "dict"]}}
+    )
+    assert err is not None
+    assert "build_args" in err
+
+    err2 = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"build_args": {"k": 5}}}
+    )
+    assert err2 is not None
+    assert "build_args" in err2
+
+
+def test_manifest_compute_image_build_not_a_dict():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": "notanobject"}
+    )
+    assert err is not None
+    assert "build" in err
+
+
+# ---------------------------------------------------------------------------
+# Dependency-hash computation
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_hash_same_inputs_same_hash():
+    a = _bci.compute_dependency_hash({"requirements.txt": b"numpy==1\n", "Dockerfile": b"FROM x\n"})
+    b = _bci.compute_dependency_hash({"Dockerfile": b"FROM x\n", "requirements.txt": b"numpy==1\n"})
+    assert a == b
+    assert len(a) == _bci.DEP_HASH_LEN
+
+
+def test_dependency_hash_different_content_different_hash():
+    base = {"requirements.txt": b"numpy==1\n", "Dockerfile": b"FROM x\n"}
+    changed_dep = {"requirements.txt": b"numpy==2\n", "Dockerfile": b"FROM x\n"}
+    changed_dockerfile = {"requirements.txt": b"numpy==1\n", "Dockerfile": b"FROM y\n"}
+    h0 = _bci.compute_dependency_hash(base)
+    assert h0 != _bci.compute_dependency_hash(changed_dep)
+    assert h0 != _bci.compute_dependency_hash(changed_dockerfile)
+
+
+def test_dependency_hash_filename_matters():
+    """Renaming a dep file changes the hash even with identical content."""
+    h1 = _bci.compute_dependency_hash({"requirements.txt": b"x", "Dockerfile": b"y"})
+    h2 = _bci.compute_dependency_hash({"poetry.lock": b"x", "Dockerfile": b"y"})
+    assert h1 != h2
+
+
+def test_dependency_hash_empty_raises():
+    with pytest.raises(ValueError):
+        _bci.compute_dependency_hash({})
+
+
+# ---------------------------------------------------------------------------
+# Credential scanner
+# ---------------------------------------------------------------------------
+
+
+def test_credential_scanner_flags_known_patterns():
+    findings = _bci.scan_inputs_for_credentials(
+        {
+            "config": b"token = ghs_abcdefghijklmnopqrstuvwxyz0123",
+            "keys": b"AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234567",
+            "sa.json": b'{"type": "service_account", "project_id": "x"}',
+        }
+    )
+    joined = " ".join(findings)
+    assert "config" in joined and "github" in joined
+    assert "google_api_key" in joined
+    assert "gcp_sa_json" in joined
+
+
+def test_credential_scanner_flags_secret_env_in_dockerfile():
+    findings = _bci.scan_inputs_for_credentials(
+        {"Dockerfile": b"FROM python:3.11\nENV ORCHESTRATOR_TOKEN=abc123secret\nRUN pip install x"},
+        dockerfile_names=["Dockerfile"],
+    )
+    assert any("ORCHESTRATOR_TOKEN" in f for f in findings)
+
+
+def test_credential_scanner_flags_secret_path_copy():
+    findings = _bci.scan_inputs_for_credentials(
+        {"Dockerfile": b"FROM x\nCOPY /secrets/token.txt /app/token\n"},
+        dockerfile_names=["Dockerfile"],
+    )
+    assert any("secret path" in f for f in findings)
+
+
+def test_credential_scanner_no_false_positive_on_benign_env():
+    """Benign env vars and normal deps do not trip the scanner."""
+    findings = _bci.scan_inputs_for_credentials(
+        {
+            "Dockerfile": b"FROM python:3.11\nENV PYTHONUNBUFFERED=1\nENV LANG=C.UTF-8\nENV PATH=/usr/bin\n",
+            "requirements.txt": b"numpy==1.26.0\ntorch==2.3.0\nscipy==1.13\n",
+        },
+        dockerfile_names=["Dockerfile"],
+    )
+    assert findings == []
+
+
+def test_credential_scanner_allows_env_var_reference():
+    """ENV pinned to a $VAR reference (build-arg indirection) is not a leak."""
+    findings = _bci.scan_inputs_for_credentials(
+        {"Dockerfile": b"FROM x\nENV ANTHROPIC_API_KEY=$SOME_BUILD_ARG\n"},
+        dockerfile_names=["Dockerfile"],
+    )
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Build script hash-check-before-build orchestration
+# ---------------------------------------------------------------------------
+
+
+def _write_repo(tmp_path, dockerfile=b"FROM python:3.11-slim\nRUN pip install numpy\n",
+                deps=None):
+    repo = tmp_path / "repo"
+    (repo / ".blueprint").mkdir(parents=True)
+    (repo / ".blueprint" / "Dockerfile.compute").write_bytes(dockerfile)
+    deps = deps if deps is not None else {"requirements.txt": b"numpy==1.26\n"}
+    for name, content in deps.items():
+        (repo / name).write_bytes(content)
+    return str(repo)
+
+
+def test_build_and_push_skips_when_image_present(tmp_path):
+    """When the hash-tagged image already exists, no build/push happens."""
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = "reg/repo/img@sha256:" + "a" * 64
+            stderr = ""
+        return P()
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda repo_repo, tag, _run=None: True,
+    )
+    assert result.already_present is True
+    assert result.built is False
+    # No `docker build` / `docker push` was invoked.
+    assert not any("build" in c for c in run_calls)
+    assert not any("push" in c for c in run_calls)
+    assert result.pinned_ref.startswith("reg/repo/img@sha256:")
+
+
+def test_build_and_push_builds_when_hash_new(tmp_path):
+    """A new dependency hash triggers build + push and returns a pinned ref."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stderr = ""
+            # docker image inspect --format returns the RepoDigest.
+            stdout = "reg/repo/img@sha256:" + "b" * 64
+        return P()
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        parent="python:3.11-slim",
+        _run=fake_run,
+        _tag_exists=lambda repo_repo, tag, _run=None: False,
+        _scan_layers_fn=lambda *a, **k: [],  # no-op layer scan in unit test
+    )
+    assert result.built is True
+    assert result.already_present is False
+    flat = [" ".join(c) for c in cmds]
+    assert any(c.startswith("docker build") for c in flat)
+    assert any(c.startswith("docker push") for c in flat)
+    # The declared parent is threaded through as a build-arg.
+    assert any("PARENT_IMAGE=python:3.11-slim" in c for c in flat)
+    assert result.pinned_ref == "reg/repo/img@sha256:" + "b" * 64
+
+
+def test_build_and_push_credential_leak_fails_before_push(tmp_path):
+    """A leaked credential in the Dockerfile fails the build BEFORE any push."""
+    repo = _write_repo(
+        tmp_path,
+        dockerfile=b"FROM python:3.11\nENV RUNNER_TOKEN=supersecretvalue\n",
+    )
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    with pytest.raises(_bci.CredentialLeakError):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda repo_repo, tag, _run=None: False,
+        )
+    # Nothing was pushed.
+    assert not any("push" in c for c in cmds)
+
+
+def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
+    """A credential in built image layers fails the push AFTER build but BEFORE push."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    layer_scan_called_with = []
+
+    def fake_layer_scan(image_ref, **kw):
+        layer_scan_called_with.append(image_ref)
+        return ["layer:some/layer.tar!root/.creds: contains github_app_token credential pattern"]
+
+    with pytest.raises(_bci.CredentialLeakError, match="built image layers"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _scan_layers_fn=fake_layer_scan,
+        )
+    # Build was called, push was NOT.
+    flat = [" ".join(c) for c in cmds]
+    assert any(c.startswith("docker build") for c in flat)
+    assert not any("push" in c for c in flat)
+    assert len(layer_scan_called_with) == 1
+
+
+def test_build_and_push_missing_dockerfile_raises(tmp_path):
+    repo = str(tmp_path / "empty")
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=[],
+            _tag_exists=lambda *a, **k: False,
+        )
+
+
+def test_build_and_push_dry_run_does_not_build(tmp_path):
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        dry_run=True,
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+    )
+    assert result.built is False
+    assert result.already_present is False
+    assert not any("build" in c or "push" in c for c in cmds)
+
+
+# ---------------------------------------------------------------------------
+# Backend orchestration (compute_backends.build_project_compute_image)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_compute_image_build_extracts_config():
+    from app import compute_backends as cb
+
+    manifest_compute = {
+        "image": {
+            "name": "reg/repo/img:tag",
+            "build": {
+                "dockerfile": ".blueprint/Dockerfile.compute",
+                "parent": "python:3.11-slim",
+                "build_args": {"A": "1"},
+            },
+        }
+    }
+    cfg = cb.resolve_project_compute_image_build(manifest_compute)
+    assert cfg is not None
+    assert cfg["name"] == "reg/repo/img:tag"
+    assert cfg["parent"] == "python:3.11-slim"
+    assert cfg["build_args"] == {"A": "1"}
+
+
+def test_resolve_project_compute_image_build_none_without_build():
+    from app import compute_backends as cb
+
+    assert cb.resolve_project_compute_image_build({"image": {"name": "reg/img:t", "build": None}}) is None
+    assert cb.resolve_project_compute_image_build({"image": None}) is None
+    assert cb.resolve_project_compute_image_build(None) is None
+
+
+@pytest.mark.asyncio
+async def test_build_project_compute_image_orchestrates_clone_and_build():
+    from app import compute_backends as cb
+    from app.models import Project
+
+    project = Project(
+        name="p",
+        github_owner="octo",
+        github_repo="proj",
+    )
+
+    clone_seen = {}
+
+    def fake_clone(owner, repo, ref, dest):
+        clone_seen["owner"] = owner
+        clone_seen["repo"] = repo
+        clone_seen["ref"] = ref
+        # Materialize a minimal repo so _discover_dep_files finds inputs.
+        os.makedirs(os.path.join(dest, ".blueprint"), exist_ok=True)
+        with open(os.path.join(dest, ".blueprint", "Dockerfile.compute"), "wb") as fh:
+            fh.write(b"FROM python:3.11-slim\n")
+        with open(os.path.join(dest, "requirements.txt"), "wb") as fh:
+            fh.write(b"numpy==1.26\n")
+
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return _bci.BuildResult(
+            pinned_ref="reg/repo/proj@sha256:" + "c" * 64,
+            tag="deadbeef",
+            dep_hash="deadbeef",
+            already_present=False,
+            built=True,
+        )
+
+    result = await cb.build_project_compute_image(
+        project,
+        registry_repo="reg/repo",
+        build_config={
+            "name": "reg/repo/proj:latest",
+            "dockerfile": ".blueprint/Dockerfile.compute",
+            "parent": "python:3.11-slim",
+            "build_args": {},
+        },
+        ref="main",
+        _clone_fn=fake_clone,
+        _build_fn=fake_build,
+    )
+    assert clone_seen["owner"] == "octo"
+    assert clone_seen["ref"] == "main"
+    assert result.pinned_ref == "reg/repo/proj@sha256:" + "c" * 64
+    # Discovered requirements.txt was passed as a dependency input.
+    assert "requirements.txt" in captured["dep_files"]
+    assert captured["image_name"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_build_project_compute_image_requires_repo():
+    from app import compute_backends as cb
+    from app.models import Project
+
+    project = Project(name="p", github_owner="", github_repo="")
+    with pytest.raises(ValueError):
+        await cb.build_project_compute_image(
+            project,
+            registry_repo="reg/repo",
+            build_config={"name": "reg/repo/proj:latest"},
+            _clone_fn=lambda *a: None,
+            _build_fn=lambda **k: None,
+        )

@@ -853,6 +853,80 @@ def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
     return free is not None and free < min_free_bytes
 
 
+def _compute_image_keep_days() -> int:
+    """Minimum age (days) of Docker images protected from cache-hygiene pruning.
+
+    Configurable via ``BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS`` (default 7). Images
+    younger than this — and any image backing a running container — are never
+    pruned. The dgx-1 has ~30 GB of image-layer storage, so unbounded growth of
+    per-project compute images would eventually wedge the runner; this bounds it
+    without evicting images that a recent or in-flight job still needs.
+    """
+    raw = os.environ.get("BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS", "").strip()
+    if not raw:
+        return 7
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 7
+
+
+def _prune_docker_images(
+    workspace_root: str | None,
+    min_free_bytes: int,
+    *,
+    keep_days: int | None = None,
+    _run=subprocess.run,
+    _disk_below=None,
+) -> dict:
+    """Best-effort: reclaim Docker image storage when disk runs low.
+
+    Runs ONLY when *workspace_root*'s free space is below *min_free_bytes* — the
+    same guard the agent-claim path uses (:func:`_disk_below_min`). Delegates to
+    ``docker image prune -a`` with an ``until=<keep_days>`` filter, so Docker
+    removes only images that are (a) not referenced by any running/active
+    container and (b) older than the keep window. Images backing an in-flight
+    compute job run inside a live container and are therefore protected; recent
+    images (last *keep_days*) are also kept.
+
+    Returns a small status dict for logging/testing. Never raises — a missing
+    ``docker`` binary or a prune error degrades to ``{"pruned": False, ...}``.
+    """
+    keep = _compute_image_keep_days() if keep_days is None else keep_days
+    disk_below = _disk_below if _disk_below is not None else _disk_below_min
+    if not disk_below(workspace_root, min_free_bytes):
+        return {"pruned": False, "reason": "disk_above_threshold"}
+    until_hours = max(1, keep * 24)
+    try:
+        proc = _run(
+            [
+                "docker",
+                "image",
+                "prune",
+                "-a",
+                "-f",
+                "--filter",
+                f"until={until_hours}h",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"pruned": False, "reason": f"prune_error:{type(e).__name__}"}
+    if proc.returncode != 0:
+        return {
+            "pruned": False,
+            "reason": "prune_nonzero",
+            "stderr": (proc.stderr or "")[-500:],
+        }
+    return {
+        "pruned": True,
+        "keep_days": keep,
+        "output": (proc.stdout or "").strip()[-500:],
+    }
+
+
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
 
 def _post(url: str, token: str, body: dict, *, return_headers: bool = False):
@@ -2449,6 +2523,20 @@ def _run_compute_job(
         _release_capacity(capacity)
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        # Cache hygiene: reclaim Docker image storage if disk is low. No-op when
+        # free space is above threshold; protects in-use and recent images.
+        try:
+            prune_result = _prune_docker_images(
+                _workspace_root(), _min_free_disk_bytes()
+            )
+            if prune_result.get("pruned"):
+                print(
+                    f"[compute] job {job_id}: pruned Docker images (low disk) "
+                    f"keep_days={prune_result.get('keep_days')}",
+                    flush=True,
+                )
+        except Exception:  # noqa: BLE001 — cache hygiene must never fail a job
+            pass
 
 
 def _compute_poll_loop(

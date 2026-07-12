@@ -366,6 +366,18 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     from app.task_completion import _ensure_branch
 
     project = await session.get(Project, task.project_id)
+
+    _project_default_container_image: str | None = None
+    if project:
+        try:
+            from app.routers.admin_project_tools import _discover_manifest_tools as _dmt
+            _manifest = await _dmt(project)
+            _ci = ((_manifest.get("compute") or {}).get("image") or {})
+            if isinstance(_ci, dict):
+                _project_default_container_image = _ci.get("name") or None
+        except Exception:
+            logger.debug("[PLAN] manifest fetch for compute image default failed")
+
     plan_data = _parse_plan_output(logs)
     if not plan_data or not plan_data.get("subtasks"):
         # Affirmative plan no-op (mirrors the #7021 `./done --already-done`
@@ -672,6 +684,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             continue
         if raw_type == "compute_experiment":
             compute_contract = _author_compute_launch_contract(subtask_def)
+            if not compute_contract.get("container_image") and _project_default_container_image:
+                compute_contract["container_image"] = _project_default_container_image
             contract_ok, contract_reason = _validate_compute_launch_contract(
                 compute_contract
             )
@@ -929,6 +943,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         )
         if subtask_type == "compute_experiment":
             compute_contract = _author_compute_launch_contract(subtask_def)
+            if not compute_contract.get("container_image") and _project_default_container_image:
+                compute_contract["container_image"] = _project_default_container_image
             child_payload = validate_internal_payload(
                 {
                     "type": "compute_experiment",

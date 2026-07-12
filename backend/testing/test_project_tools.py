@@ -2369,7 +2369,8 @@ def test_normalize_manifest_compute_image_shape():
     from app.routers.admin_project_tools import _normalize_manifest_compute_image
 
     result = _normalize_manifest_compute_image({"name": "  ghcr.io/org/img:latest  "})
-    assert result == {"name": "ghcr.io/org/img:latest"}
+    # ``build`` is None when the manifest declares only a prebuilt image name.
+    assert result == {"name": "ghcr.io/org/img:latest", "build": None}
 
 
 # ---------------------------------------------------------------------------

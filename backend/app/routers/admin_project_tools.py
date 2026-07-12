@@ -180,8 +180,57 @@ _SLUG_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
 #
 # The ``name`` field is the only required key; it is the OCI image reference
 # (registry/repo:tag or :tag@digest).
+#
+# An optional ``build`` object declares how the per-project compute image is
+# baked from the repo's own lockfiles (the PRODUCE side of the images-first
+# direction).  A project that points at an externally pre-built image omits it.
+#
+#   {
+#     "compute": {
+#       "image": {
+#         "name": "us-docker.pkg.dev/proj/compute-images/my-project:latest",
+#         "build": {
+#           "dockerfile": ".blueprint/Dockerfile.compute",
+#           "parent": "python:3.11-slim",
+#           "build_args": { "CUDA": "12.4" }
+#         }
+#       }
+#     }
+#   }
 
 _MANIFEST_COMPUTE_IMAGE_REQUIRED = {"name"}
+
+# Default Dockerfile path (relative to repo root) when ``build`` omits it.
+_DEFAULT_COMPUTE_DOCKERFILE = ".blueprint/Dockerfile.compute"
+
+
+def _validate_manifest_compute_image_build(spec: Any) -> str | None:
+    """Validate the optional ``compute.image.build`` object.
+
+    Returns an error message string on failure, or ``None`` on success.
+    """
+    if not isinstance(spec, dict):
+        return f"compute.image.build: must be an object, got {type(spec).__name__}"
+    dockerfile = spec.get("dockerfile")
+    if dockerfile is not None and (
+        not isinstance(dockerfile, str) or not dockerfile.strip()
+    ):
+        return "compute.image.build: dockerfile must be a non-empty string"
+    if isinstance(dockerfile, str) and (
+        ".." in dockerfile or dockerfile.startswith("/")
+    ):
+        return "compute.image.build: dockerfile must be a relative path without '..'"
+    parent = spec.get("parent")
+    if parent is not None and (not isinstance(parent, str) or not parent.strip()):
+        return "compute.image.build: parent must be a non-empty string"
+    build_args = spec.get("build_args")
+    if build_args is not None:
+        if not isinstance(build_args, dict):
+            return "compute.image.build: build_args must be an object of string->string"
+        for k, v in build_args.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                return "compute.image.build: build_args keys and values must be strings"
+    return None
 
 
 def _validate_manifest_compute_image(spec: Any) -> str | None:
@@ -197,12 +246,36 @@ def _validate_manifest_compute_image(spec: Any) -> str | None:
     name = spec.get("name")
     if not isinstance(name, str) or not name.strip():
         return "compute.image: name must be a non-empty string"
+    raw_build = spec.get("build")
+    if raw_build is not None:
+        build_err = _validate_manifest_compute_image_build(raw_build)
+        if build_err:
+            return build_err
     return None
 
 
 def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a validated ``compute.image`` entry into the response shape."""
-    return {"name": spec["name"].strip()}
+    result: Dict[str, Any] = {"name": spec["name"].strip(), "build": None}
+    raw_build = spec.get("build")
+    if isinstance(raw_build, dict):
+        dockerfile = raw_build.get("dockerfile")
+        parent = raw_build.get("parent")
+        raw_args = raw_build.get("build_args")
+        result["build"] = {
+            "dockerfile": (
+                dockerfile.strip()
+                if isinstance(dockerfile, str) and dockerfile.strip()
+                else _DEFAULT_COMPUTE_DOCKERFILE
+            ),
+            "parent": parent.strip() if isinstance(parent, str) else None,
+            "build_args": (
+                {str(k): str(v) for k, v in raw_args.items()}
+                if isinstance(raw_args, dict)
+                else {}
+            ),
+        }
+    return result
 
 
 def _validate_manifest_tool(entry: Dict[str, Any], index: int) -> Optional[str]:

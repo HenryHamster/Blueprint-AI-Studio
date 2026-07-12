@@ -5746,5 +5746,71 @@ class TestCredentialFileTraversalGuard(unittest.TestCase):
             self.assertNotIn("skipping", output.lower())
 
 
+class TestDockerImageCacheHygiene(unittest.TestCase):
+    """Runner Docker image cache hygiene (_prune_docker_images)."""
+
+    def test_noop_when_disk_above_threshold(self):
+        result = local_runner._prune_docker_images(
+            "/tmp", 100, keep_days=7, _disk_below=lambda root, m: False
+        )
+        self.assertFalse(result["pruned"])
+        self.assertEqual(result["reason"], "disk_above_threshold")
+
+    def test_runs_when_disk_low(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+
+            class P:
+                returncode = 0
+                stdout = "Total reclaimed space: 5GB"
+                stderr = ""
+            return P()
+
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=3, _run=fake_run, _disk_below=lambda root, m: True
+        )
+        self.assertTrue(result["pruned"])
+        self.assertEqual(result["keep_days"], 3)
+        # until filter is keep_days*24 hours; Docker protects in-use + recent images.
+        self.assertIn("until=72h", seen["cmd"])
+        self.assertIn("-a", seen["cmd"])
+
+    def test_handles_docker_failure(self):
+        def fake_run(cmd, **kw):
+            raise OSError("docker not found")
+
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=7, _run=fake_run, _disk_below=lambda root, m: True
+        )
+        self.assertFalse(result["pruned"])
+        self.assertIn("prune_error", result["reason"])
+
+    def test_nonzero_exit_reported(self):
+        def fake_run(cmd, **kw):
+            class P:
+                returncode = 1
+                stdout = ""
+                stderr = "permission denied"
+            return P()
+
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=7, _run=fake_run, _disk_below=lambda root, m: True
+        )
+        self.assertFalse(result["pruned"])
+        self.assertEqual(result["reason"], "prune_nonzero")
+
+    def test_keep_days_from_env(self):
+        with patch.dict(
+            os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "2"}
+        ):
+            self.assertEqual(local_runner._compute_image_keep_days(), 2)
+        with patch.dict(
+            os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "notanint"}
+        ):
+            self.assertEqual(local_runner._compute_image_keep_days(), 7)
+
+
 if __name__ == "__main__":
     unittest.main()

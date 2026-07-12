@@ -55,6 +55,15 @@ resource "google_artifact_registry_repository_iam_member" "github_actions_ar_wri
   member     = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
 
+resource "google_artifact_registry_repository_iam_member" "github_actions_compute_images_writer" {
+  count      = var.enable_cicd ? 1 : 0
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
 resource "google_project_iam_member" "github_actions_run_admin" {
   count   = var.enable_cicd ? 1 : 0
   project = var.project_id

@@ -54,6 +54,11 @@ output "cloud_sql_instance_name" {
   description = "The Cloud SQL instance name (used by gcloud sql commands)"
 }
 
+output "compute_images_repository_url" {
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.compute_images_repo.repository_id}"
+  description = "The Artifact Registry URL for the project-baked compute images repository"
+}
+
 output "artifact_bucket_name" {
   value       = google_storage_bucket.artifacts.name
   description = "The GCS bucket for agent payloads and credentials"

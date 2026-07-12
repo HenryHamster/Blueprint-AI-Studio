@@ -10894,6 +10894,64 @@ async def test_compute_experiment_with_gpu_or_material_spend_is_adversarially_ch
     )
 
 
+@_pytest.mark.asyncio
+async def test_compute_experiment_defaults_container_image_to_project_image_research(
+    db_session, mocker
+):
+    """When a project's manifest declares compute.image.name and a research finding
+    omits container_image, _handle_research_completion must default the spawned
+    compute_experiment child's container_image to the project's declared image."""
+    from test_autonomous_research import _patch_research_externals
+
+    _PROJECT_IMAGE = "us-central1-docker.pkg.dev/myproject/compute/base:sha256-abc123"
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new=AsyncMock(
+            return_value={
+                "tools": [],
+                "skills": [],
+                "compute": {"image": {"name": _PROJECT_IMAGE}},
+                "error": None,
+            }
+        ),
+    )
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-cx-img-default-01"
+    )
+
+    finding = _compute_finding(
+        direction["id"],
+        spend_cap_usd=2.0,
+        deadline_seconds=3600,
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"compute_experiment_spend_threshold_usd": 5.0},
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = await _children_of(db_session, task)
+    compute_children = [
+        c
+        for c in children
+        if (c.first_payload or {}).get("type") == "compute_experiment"
+    ]
+    assert len(compute_children) == 1, (
+        f"Expected 1 compute_experiment child, got {len(compute_children)}: {children}"
+    )
+    payload = compute_children[0].first_payload or {}
+    assert payload.get("container_image") == _PROJECT_IMAGE, (
+        f"Expected container_image={_PROJECT_IMAGE!r}, got {payload.get('container_image')!r}"
+    )
+
+
 class TestAcceptanceEvidencePropagation:
     """Plan-time acceptance_evidence rides each surviving finding to its child.
 
