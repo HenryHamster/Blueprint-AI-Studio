@@ -18,14 +18,20 @@ import pytest
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     _PROOF_KIND_BACKING_PATH,
+    _PROOF_KIND_NAMED_TEST,
     _PROOF_KIND_TRIAL_ADOPTION,
+    _candidate_test_paths,
     _extract_proof_ref,
+    _module_dotted_path,
+    _named_tests_covering_paths,
     _proof_kind_from_verdict,
+    _test_references_source,
     annotate_capability_proof_status,
     carry_proof_records_for_consolidation,
     commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
     record_capability_backing_path_proof,
+    record_capability_named_test_proof,
     record_capability_proof,
     record_capability_proof_from_trial,
     record_gap_evidence,
@@ -2365,3 +2371,350 @@ class TestProofEarnLoopDedup:
         assert set(second["path_proven_stuck"]) == {fresh_cap, stuck_cap}, (
             f"both caps should be in path_proven_stuck, got {second['path_proven_stuck']}"
         )
+
+
+# ── named_test-tier automated proof earning (c-e9ef1da6 / d-2b95bef1) ──────────
+#
+# The earn loop's higher tier: when a capability's backing_paths are not merely
+# present at HEAD but are exercised by real test files, mint a machine-verified
+# ``named_test`` proof (graded ``proven`` by classify_evidence_tiered) so
+# auto-graduation coverage can move off 0 and enforce mode can graduate.
+
+
+class TestNamedTestCoverageHelpers:
+    """Convention-based test-file discovery + reference checking."""
+
+    def test_module_dotted_path_backend_app(self):
+        assert _module_dotted_path("backend/app/capability_proof.py") == "app.capability_proof"
+        assert (
+            _module_dotted_path("backend/app/routers/admin_compute_jobs.py")
+            == "app.routers.admin_compute_jobs"
+        )
+
+    def test_module_dotted_path_non_derivable(self):
+        # scripts/ and non-python paths have no derivable dotted import name.
+        assert _module_dotted_path("scripts/local_runner.py") is None
+        assert _module_dotted_path("agent/src/handlers/x.ts") is None
+        assert _module_dotted_path("backend/app/foo.txt") is None
+
+    def test_module_dotted_path_strips_symbol_suffix(self):
+        assert (
+            _module_dotted_path("backend/app/capability_proof.py:record_capability_proof")
+            == "app.capability_proof"
+        )
+
+    def test_candidate_test_paths_backend(self):
+        # Backend modules flatten to backend/testing/test_<stem>.py.
+        assert _candidate_test_paths("backend/app/capability_proof.py") == [
+            "backend/testing/test_capability_proof.py"
+        ]
+        assert _candidate_test_paths("backend/app/routers/admin_compute_jobs.py") == [
+            "backend/testing/test_admin_compute_jobs.py"
+        ]
+
+    def test_candidate_test_paths_scripts(self):
+        assert _candidate_test_paths("scripts/local_runner.py") == [
+            "scripts/test_local_runner.py"
+        ]
+
+    def test_candidate_test_paths_ts_sibling(self):
+        assert _candidate_test_paths("agent/src/handlers/strategic-resident-lib.ts") == [
+            "agent/src/handlers/strategic-resident-lib.test.ts"
+        ]
+        assert _candidate_test_paths("admin-ui/src/components/KnowledgeBrowser.tsx") == [
+            "admin-ui/src/components/KnowledgeBrowser.test.tsx"
+        ]
+
+    def test_candidate_test_paths_junk(self):
+        assert _candidate_test_paths("") == []
+        assert _candidate_test_paths("no-extension") == []
+        assert _candidate_test_paths("README.md") == []
+
+    def test_test_references_source_dotted_import(self):
+        content = "from app.capability_proof import record_capability_proof\n"
+        assert _test_references_source(content, "backend/app/capability_proof.py")
+
+    def test_test_references_source_bare_stem_import(self):
+        # scripts import the module by bare name.
+        content = "import sys\nimport local_runner as lr\n"
+        assert _test_references_source(content, "scripts/local_runner.py")
+
+    def test_test_references_source_js_require(self):
+        content = "const foo = require('./strategic-resident-lib')\n"
+        assert _test_references_source(content, "agent/src/handlers/strategic-resident-lib.ts")
+
+    def test_test_references_source_no_match(self):
+        # File exists but does not import the module → not a real coverage signal.
+        content = "import os\nimport unrelated_module\n# strategic-resident-lib mentioned only in a comment\n"
+        assert not _test_references_source(content, "backend/app/capability_proof.py")
+        assert not _test_references_source("", "backend/app/capability_proof.py")
+
+
+class TestNamedTestsCoveringPaths:
+    """_named_tests_covering_paths: all-or-nothing coverage discovery."""
+
+    @staticmethod
+    def _fakes(present, read_map):
+        async def _verify(p):
+            return p in present
+
+        async def _read(p):
+            return read_map.get(p)
+
+        return _verify, _read
+
+    @pytest.mark.asyncio
+    async def test_all_paths_covered_returns_refs(self):
+        present = {"backend/testing/test_capability_proof.py"}
+        read_map = {
+            "backend/testing/test_capability_proof.py": "from app.capability_proof import x\n"
+        }
+        verify, read = self._fakes(present, read_map)
+        refs = await _named_tests_covering_paths(
+            ["backend/app/capability_proof.py"], verify_path=verify, read_head=read
+        )
+        assert refs == ["backend/testing/test_capability_proof.py"]
+
+    @pytest.mark.asyncio
+    async def test_one_uncovered_path_returns_empty(self):
+        # First path covered, second path's test file absent → all-or-nothing → [].
+        present = {"backend/testing/test_capability_proof.py"}
+        read_map = {
+            "backend/testing/test_capability_proof.py": "from app.capability_proof import x\n"
+        }
+        verify, read = self._fakes(present, read_map)
+        refs = await _named_tests_covering_paths(
+            ["backend/app/capability_proof.py", "backend/app/uncovered.py"],
+            verify_path=verify,
+            read_head=read,
+        )
+        assert refs == []
+
+    @pytest.mark.asyncio
+    async def test_test_exists_but_does_not_reference_returns_empty(self):
+        present = {"backend/testing/test_capability_proof.py"}
+        read_map = {"backend/testing/test_capability_proof.py": "import os\n# unrelated\n"}
+        verify, read = self._fakes(present, read_map)
+        refs = await _named_tests_covering_paths(
+            ["backend/app/capability_proof.py"], verify_path=verify, read_head=read
+        )
+        assert refs == []
+
+    @pytest.mark.asyncio
+    async def test_indeterminate_read_returns_empty(self):
+        present = {"backend/testing/test_capability_proof.py"}
+        verify, read = self._fakes(present, {})  # read returns None
+        refs = await _named_tests_covering_paths(
+            ["backend/app/capability_proof.py"], verify_path=verify, read_head=read
+        )
+        assert refs == []
+
+    @pytest.mark.asyncio
+    async def test_verify_exception_is_non_fatal(self):
+        async def _verify(p):
+            raise RuntimeError("git blew up")
+
+        async def _read(p):
+            return "from app.capability_proof import x\n"
+
+        refs = await _named_tests_covering_paths(
+            ["backend/app/capability_proof.py"], verify_path=_verify, read_head=_read
+        )
+        assert refs == []
+
+
+class TestRecordCapabilityNamedTestProof:
+    """record_capability_named_test_proof: named_test-tier durable recording."""
+
+    def test_records_named_test_entry_with_correct_shape(self):
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            ok = record_capability_named_test_proof(
+                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+            )
+        assert ok is True
+        entries = project.capability_proof_records["my-cap"]
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["proof_kind"] == _PROOF_KIND_NAMED_TEST
+        assert e["task_id"] == "named_test:my-cap"
+        assert e["proof_ref"] == "backend/testing/test_capability_proof.py"
+        assert e["test_refs"] == ["backend/testing/test_capability_proof.py"]
+
+    def test_dedup_returns_false_on_repeat(self):
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            first = record_capability_named_test_proof(
+                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+            )
+            second = record_capability_named_test_proof(
+                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+            )
+        assert first is True
+        assert second is False
+        assert len(project.capability_proof_records["my-cap"]) == 1
+
+    def test_empty_refs_returns_false(self):
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            assert record_capability_named_test_proof(project, "my-cap", []) is False
+            assert record_capability_named_test_proof(project, "my-cap", ["  "]) is False
+        assert project.capability_proof_records == {}
+
+    def test_invalid_name_returns_false(self):
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            assert record_capability_named_test_proof(project, "", ["t.py"]) is False
+
+    def test_appends_named_test_evidence_ref(self):
+        project = _make_project()
+        project.problem_model = {
+            "capabilities": [{"name": "my-cap", "status": "working"}]
+        }
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_proof(
+                project, "my-cap", ["backend/testing/test_capability_proof.py"]
+            )
+        refs = project.problem_model["capabilities"][0]["evidence_refs"]
+        assert len(refs) == 1
+        assert refs[0]["kind"] == _PROOF_KIND_NAMED_TEST
+        assert refs[0]["proven"] is True
+
+    def test_named_test_proof_reads_proven(self):
+        """The synthetic ref from a named_test proof classifies as 'proven'."""
+        synthetic = [{"kind": _PROOF_KIND_NAMED_TEST, "proven": True}]
+        assert classify_evidence_tiered(synthetic) == "proven"
+
+
+class TestEarnLoopNamedTestTier:
+    """commission_proof_earn_loop mints named_test proofs → status 'proven' reachable."""
+
+    @staticmethod
+    def _project_and_demand(cap_name, backing_paths):
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {
+            "capabilities": [
+                {"name": cap_name, "status": "working", "backing_paths": backing_paths}
+            ]
+        }
+        demand = {
+            "total": 1,
+            "demands": [{"kind": "capability", "ref": cap_name, "dependent_count": 2}],
+        }
+        return project, demand
+
+    @pytest.mark.asyncio
+    async def test_test_backed_capability_earns_named_test_and_becomes_proven(self):
+        """ACCEPTANCE EVIDENCE (c-e9ef1da6): a working capability whose backing
+        path is exercised by a real test earns a named_test proof, so
+        working_capability_proof_status returns 'proven' — auto-graduation
+        coverage can now move off 0."""
+        project, demand = self._project_and_demand(
+            "capability-proof-gate", ["backend/app/capability_proof.py"]
+        )
+
+        async def _verify(p):
+            # Both the backing path and its convention test exist at HEAD.
+            return p in {
+                "backend/app/capability_proof.py",
+                "backend/testing/test_capability_proof.py",
+            }
+
+        async def _read(p):
+            if p == "backend/testing/test_capability_proof.py":
+                return "from app.capability_proof import record_capability_named_test_proof\n"
+            return None
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=_verify, read_head=_read,
+            )
+
+        assert result["earned"] == 1
+        assert result["named_test_earned"] == ["capability-proof-gate"]
+        # The recorded proof is named_test tier.
+        entry = project.capability_proof_records["capability-proof-gate"][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST
+        # And the capability now reads 'proven' — the graduation-reachable state.
+        status = working_capability_proof_status(project.problem_model)
+        assert status["capability-proof-gate"] == "proven"
+
+    @pytest.mark.asyncio
+    async def test_no_test_coverage_falls_back_to_backing_path(self):
+        """When no covering test is discoverable, the loop still records the
+        structural-only backing_path proof (path_proven), preserving prior
+        behavior — it does NOT over-claim named_test."""
+        project, demand = self._project_and_demand(
+            "no-test-cap", ["backend/app/capability_proof.py"]
+        )
+
+        async def _verify(p):
+            # Backing path present, but the test file is (pretended) absent.
+            return p == "backend/app/capability_proof.py"
+
+        async def _read(p):
+            return None
+
+        with patch("app.capability_proof.flag_modified"):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=_verify, read_head=_read,
+            )
+
+        assert result["earned"] == 1
+        assert result["named_test_earned"] == []
+        entry = project.capability_proof_records["no-test-cap"][0]
+        assert entry["proof_kind"] == _PROOF_KIND_BACKING_PATH
+        # backing_path only → path_proven, NOT proven.
+        status = working_capability_proof_status(project.problem_model)
+        assert status["no-test-cap"] == "path_proven"
+
+    @pytest.mark.asyncio
+    async def test_second_sweep_excludes_now_proven_capability(self):
+        """Once a named_test proof is earned, the capability reads 'proven' and
+        drops out of the demanded-unproven intersection — the second sweep finds
+        nothing to do and records no duplicate proof (graduation is terminal)."""
+        project, demand = self._project_and_demand(
+            "dedup-nt", ["backend/app/capability_proof.py"]
+        )
+
+        async def _verify(p):
+            return p in {
+                "backend/app/capability_proof.py",
+                "backend/testing/test_capability_proof.py",
+            }
+
+        async def _read(p):
+            return "from app.capability_proof import x\n"
+
+        with patch("app.capability_proof.flag_modified"):
+            first = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=_verify, read_head=_read,
+            )
+            second = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=_verify, read_head=_read,
+            )
+
+        assert first["named_test_earned"] == ["dedup-nt"]
+        # Now proven → excluded from the intersection on the next sweep.
+        assert second["total_demanded_unproven"] == 0
+        assert second["earned"] == 0
+        assert second["named_test_earned"] == []
+        # No duplicate proof entry was written.
+        assert len(project.capability_proof_records["dedup-nt"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_named_test_earned_key_present_on_empty_return(self):
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = {}
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result={"total": 0, "demands": []},
+            problem_model={"capabilities": [{"name": "c", "status": "working"}]},
+        )
+        assert result["named_test_earned"] == []

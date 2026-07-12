@@ -1263,17 +1263,30 @@ class TestSchemaRevisionSync:
         assert len(heads) == 1, f"Expected 1 head, got {len(heads)}: {heads}"
 
         head = heads[0]
-        max_revision = max(chain, key=int)
+
+        # Natural-order key: a revision id is a numeric prefix plus an optional
+        # lowercase letter suffix used by dedup/linearisation revisions (e.g.
+        # ``0458b`` is deliberately inserted strictly between ``0458`` and
+        # ``0459``). A bare ``int()`` sort crashes on such ids; this tuple key
+        # orders ``0458`` < ``0458b`` < ``0459`` while remaining identical to
+        # integer order for all-numeric chains.
+        def _rev_key(rev: str) -> tuple[int, str]:
+            m = re.match(r"(\d+)([a-z]*)$", rev or "")
+            if not m:
+                return (-1, rev or "")
+            return (int(m.group(1)), m.group(2))
+
+        max_revision = max(chain, key=_rev_key)
 
         # Every revision number must be greater than its down_revision's number
         # (for revisions that are part of the chain).
         violations: list[str] = []
         for rev, down_rev in chain.items():
             if down_rev is not None and down_rev in chain:
-                if int(rev) <= int(down_rev):
+                if _rev_key(rev) <= _rev_key(down_rev):
                     violations.append(
-                        f"  {rev} (numeric {int(rev)}) → down_revision {down_rev} "
-                        f"(numeric {int(down_rev)}) — revision must be numerically "
+                        f"  {rev} (key {_rev_key(rev)}) → down_revision {down_rev} "
+                        f"(key {_rev_key(down_rev)}) — revision must be numerically "
                         f"greater than its down_revision"
                     )
 
