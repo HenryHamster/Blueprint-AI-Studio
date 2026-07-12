@@ -1896,3 +1896,155 @@ class TestBackingPathTieringInEnforceGate:
         }
         proof = working_capability_proof_status(problem_model)
         assert proof["paths-field-cap"] == "partial"
+
+
+# ── TRIAL_DEFINITIONS disjointness from gating registry capabilities ──────────
+
+
+def test_trial_cap_names_disjoint_from_gating_registry_caps():
+    """ACCEPTANCE EVIDENCE (finding design:capability-proof-earning-loop):
+    TRIAL_DEFINITIONS cap_names are internal agent behaviors and do NOT overlap
+    with the business-capability names a strategist would register as ``working``
+    in the project's problem_model.  Trial adoption therefore can NEVER prove a
+    gating registry capability — only ``record_capability_proof`` (a task
+    advertises ``provides_capability`` + proven acceptance verdict) or
+    ``record_capability_backing_path_proof`` (reaper Step 22 / earn loop) can.
+
+    This test verifies the structural invariant: ``working_capability_proof_status``
+    on a model containing ONLY business-style registry caps returns zero proof
+    from a trial adoption record keyed under a TRIAL_DEFINITIONS cap_name.
+    """
+    from app.capability_trial_verdict import get_trial_definitions
+    from app.capability_registry import normalize_capability_name
+    from unittest.mock import MagicMock, patch
+
+    trial_cap_names = {
+        normalize_capability_name(td["cap_name"])
+        for td in get_trial_definitions()
+        if normalize_capability_name(td["cap_name"])
+    }
+
+    # Typical business-capability registry: these MUST NOT overlap with
+    # TRIAL_DEFINITIONS cap_names for the gate invariant to hold.
+    registry_cap_names = [
+        "code-review", "test-generation", "documentation-writing",
+        "dependency-management", "security-scanning", "performance-profiling",
+        "database-migration", "api-design", "deployment-automation",
+    ]
+    registry_normalized = {
+        normalize_capability_name(n) for n in registry_cap_names
+        if normalize_capability_name(n)
+    }
+
+    overlap = trial_cap_names & registry_normalized
+    assert not overlap, (
+        f"TRIAL_DEFINITIONS cap_names must be disjoint from registry capability "
+        f"names — overlap detected: {overlap}. Trial adoption can only prove a "
+        f"capability that shares its exact name."
+    )
+
+    # Mechanical verification: a trial ADOPT for a trial cap_name does NOT
+    # stamp evidence on a registry capability with a different name.
+    project = MagicMock()
+    project.capability_proof_records = {}
+    project.problem_model = {
+        "capabilities": [
+            {"name": cap, "status": "working"} for cap in registry_cap_names
+        ]
+    }
+
+    trial_cap = next(iter(trial_cap_names))  # e.g. "repo-map"
+    with patch("app.capability_proof.flag_modified"):
+        record_capability_proof_from_trial(
+            project,
+            trial_cap,
+            {"verdict": "adopt", "lift": 0.1, "n_with": 50, "n_without": 50},
+        )
+
+    # Proof was recorded under the trial cap_name key only.
+    assert trial_cap in project.capability_proof_records
+    # No registry capability received a proof record.
+    for reg_cap in registry_normalized:
+        assert reg_cap not in project.capability_proof_records, (
+            f"trial adoption for {trial_cap!r} must not stamp proof "
+            f"on registry capability {reg_cap!r}"
+        )
+
+
+# ── Earn-loop end-to-end: demand detection → proof earning ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_earn_loop_demand_driven_intersection_and_proof():
+    """ACCEPTANCE EVIDENCE (finding feat:earn-proof-for-demanded-unproven):
+    commission_proof_earn_loop computes the intersection of demanded capabilities
+    and unproven working capabilities and earns backing_path proof for demanded
+    unproven caps that declare backing_paths.
+
+    Specifically verifies:
+    - compute_unproven_demanded_capabilities is used to filter to the intersection
+    - proof is earned (via record_capability_backing_path_proof) only for the
+      intersection, not for all demanded caps
+    - caps NOT in the intersection (already proven) are excluded
+    - the return summary reports earned, no_backing_paths, still_unproven correctly
+    """
+    project = MagicMock()
+    project.capability_proof_records = {}
+    problem_model = {
+        "capabilities": [
+            # demanded + unproven working + has backing_paths → WILL be earned
+            {
+                "name": "demanded-unproven",
+                "status": "working",
+                "backing_paths": ["backend/app/capability_proof.py"],
+            },
+            # demanded + already proven → excluded from earn loop
+            {
+                "name": "demanded-proven",
+                "status": "working",
+                "evidence_refs": [_named_test_ref()],
+            },
+            # demanded + unproven working + NO backing_paths → reported as gap
+            {
+                "name": "demanded-no-paths",
+                "status": "working",
+            },
+        ]
+    }
+    project.problem_model = problem_model
+    demand_result = {
+        "total": 3,
+        "demands": [
+            {"kind": "capability", "ref": "demanded-unproven", "dependent_count": 5},
+            {"kind": "capability", "ref": "demanded-proven", "dependent_count": 2},
+            {"kind": "capability", "ref": "demanded-no-paths", "dependent_count": 1},
+        ],
+    }
+
+    async def _all_paths_present(p: str) -> bool:
+        return True
+
+    with patch("app.capability_proof.flag_modified"):
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result=demand_result,
+            problem_model=problem_model,
+            verify_path=_all_paths_present,
+        )
+
+    # Only the 2 unproven working demanded caps are in the intersection.
+    assert result["total_demanded_unproven"] == 2
+
+    # demanded-unproven was earned (backing_paths present + all resolve).
+    assert result["earned"] >= 1
+
+    # demanded-no-paths is reported as needing backing_paths.
+    assert "demanded-no-paths" in result["no_backing_paths"]
+
+    # demanded-proved is NOT in any failure list (it was excluded from the
+    # intersection by compute_unproven_demanded_capabilities, not counted at all).
+    assert "demanded-proven" not in result["no_backing_paths"]
+    assert "demanded-proven" not in result["still_unproven"]
+
+    # Proof was recorded on the project for demanded-unproven.
+    assert "demanded-unproven" in project.capability_proof_records
