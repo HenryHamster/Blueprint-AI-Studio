@@ -4599,6 +4599,25 @@ async def test_stuck_cycle_refactor_uses_higher_rephrased_threshold(db_session, 
     assert result.status == TaskStatus.QUEUED
 
 
+def test_pilot_propagate_keys_wired_into_underscore_allowlist():
+    """The lane-pilot's canonical PILOT_PROPAGATE_KEYS must be the source of
+    truth for the spawn-time _PROPAGATE_UNDERSCORE_KEYS allow-list, not a
+    re-typed pair of literals. The spawn-time context copy drops underscore keys
+    by default, so the intent-to-treat arm (_review_fix_lane_arm) and the
+    chain-private lane id (_review_fix_lane_id) only survive iterations because
+    they are listed here — a drift between the two sets would silently
+    de-populate the trial's arm/receipt subpopulations."""
+    from app.review_fix_lane_pilot import PILOT_PROPAGATE_KEYS
+    from app.review_pipeline import _PROPAGATE_UNDERSCORE_KEYS
+
+    assert PILOT_PROPAGATE_KEYS, "pilot propagate set must be non-empty"
+    # Every pilot key is carried by the spawn-time allow-list (no drift).
+    assert PILOT_PROPAGATE_KEYS <= _PROPAGATE_UNDERSCORE_KEYS
+    # These are underscore-internal keys; without the allow-list the default
+    # spawn copy would strip them, so wiring them here is load-bearing.
+    assert all(k.startswith("_") for k in PILOT_PROPAGATE_KEYS)
+
+
 # ── Strategic context propagation ─────────────────────────────────────────────
 
 

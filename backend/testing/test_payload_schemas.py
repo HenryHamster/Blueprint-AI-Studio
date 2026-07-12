@@ -1466,6 +1466,34 @@ def test_acceptance_evidence_unknown_kind_rejected():
     _invalid(raw)
 
 
+def test_acceptance_evidence_viewport_width_bound_from_constants():
+    """The visual viewport_width bound is sourced from the canonical
+    VIEWPORT_WIDTH_MIN/MAX constants (viewport_evidence), so a declared width
+    outside those bounds fails closed at validation time — keeping this
+    declaration-time bound in lock-step with the upload endpoint's Field(ge,le).
+    """
+    from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
+
+    def _visual(width):
+        return {
+            "type": "create",
+            "prompt": "p",
+            "acceptance_evidence": {
+                "kind": "visual",
+                "component": "MetricsDashboard",
+                "viewport_width": width,
+            },
+        }
+
+    # Boundary values inside [MIN, MAX] validate.
+    _valid(_visual(VIEWPORT_WIDTH_MIN))
+    _valid(_visual(VIEWPORT_WIDTH_MAX))
+    # Just outside either bound fails closed — proving the bound IS the constant,
+    # not a wider/absent limit.
+    _invalid(_visual(VIEWPORT_WIDTH_MIN - 1))
+    _invalid(_visual(VIEWPORT_WIDTH_MAX + 1))
+
+
 def test_acceptance_evidence_extra_field_forbidden():
     """AcceptanceEvidence is a closed shape (extra='forbid')."""
     raw = {

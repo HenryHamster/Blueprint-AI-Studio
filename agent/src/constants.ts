@@ -122,20 +122,14 @@ export const CONFLICT_CHECK_TIMEOUT = 10_000;
 // successes that don't need cross-VM remediation.
 export const MAX_LINT_FIX_ATTEMPTS = 5;
 
-// Frontend checks (admin-ui)
+// Node dependency preinstall for review-prep (`npm ci`) in preinstallNodeDeps.
+// The only per-check timeout the agent process applies directly; the actual
+// lint/typecheck/build/test check STEPS run inside the model-driven `./check`
+// bash script (bounded by the stream-stall + wall-clock guards above) or the
+// acceptance-probe runner in verify-tests.ts (GENERIC_PROBE_TIMEOUT /
+// DECLARED_BUILD_TIMEOUT), so no separate eslint/tsc/ruff/build timeout
+// constants are consumed here.
 export const FRONTEND_NPM_TIMEOUT = 120_000;
-export const FRONTEND_ESLINT_TIMEOUT = 60_000;
-export const FRONTEND_BUILD_TIMEOUT = 120_000;
-// Fresh VMs may need to apt-install Playwright deps and download Chromium
-// before the viewport suite can start, which is materially slower than a build.
-export const FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT = 600_000;
-
-// Agent checks (agent/)
-export const AGENT_NPM_TIMEOUT = 120_000;
-export const AGENT_TSC_TIMEOUT = 60_000;
-
-// Backend ruff checks
-export const RUFF_TIMEOUT = 60_000;
 
 // Test fix loop. 2026-05-03: bumped 2 → 3 alongside MAX_LINT_FIX_ATTEMPTS.
 // Test failures are typically more semantically rich than lint, so the

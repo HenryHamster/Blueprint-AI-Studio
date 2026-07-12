@@ -687,6 +687,29 @@ async def test_mark_phase2_completed_stores_knowledge_counts(db_session):
 
 
 @pytest.mark.asyncio
+async def test_mark_phase2_completed_caps_summary_text(db_session):
+    """summary_text is stored under the declared CYCLE_SUMMARY_MAX cap, so an
+    oversized cycle summary can never bloat the row (mirrors the cycle_reasoning
+    cap applied alongside it)."""
+    from app.strategic_constants import CYCLE_SUMMARY_MAX
+
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    oversized = "x" * (CYCLE_SUMMARY_MAX + 500)
+    updated = await strategic_cycle.mark_phase2_completed(
+        db_session,
+        cycle.id,
+        summary_text=oversized,
+    )
+    await db_session.commit()
+    assert updated is not None
+    assert updated.summary_text == oversized[:CYCLE_SUMMARY_MAX]
+    assert len(updated.summary_text) == CYCLE_SUMMARY_MAX
+
+
+@pytest.mark.asyncio
 async def test_ever_cited_memo_no_cycles(db_session):
     """Project with no cycles returns ever_cited=False."""
     project = await _make_project(db_session)

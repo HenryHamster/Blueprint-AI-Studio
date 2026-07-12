@@ -7849,3 +7849,27 @@ async def test_compute_strategic_state_revision_deterministic(
     assert rev5 != rev4, (
         "changing active_cycle_summary must produce a different revision"
     )
+
+
+def test_task_summary_caps_latest_status_message():
+    """_task_summary enforces the declared STATUS_LATEST_MESSAGE_MAX cap on the
+    primary strategic status message it surfaces. This exposure was previously
+    unbounded, unlike the sibling _task_focus_item which already compacted the
+    same field."""
+    from app.strategic_constants import STATUS_LATEST_MESSAGE_MAX
+    from app.strategic_state_read_model import _task_summary
+    from testing.factories import make_task
+
+    oversized = "x" * (STATUS_LATEST_MESSAGE_MAX + 500)
+    task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        latest_status_message=oversized,
+    )
+    summary = _task_summary(task)
+    assert summary is not None
+    msg = summary["latest_status_message"]
+    assert msg is not None
+    # _compact_text truncates to exactly max_chars (max_chars-1 chars + ellipsis).
+    assert len(msg) == STATUS_LATEST_MESSAGE_MAX
+    assert msg.endswith("…")
