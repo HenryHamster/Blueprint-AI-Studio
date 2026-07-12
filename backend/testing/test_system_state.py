@@ -685,7 +685,9 @@ async def test_all_surfaces_agree_serving_status(db_session):
     surface2_status = surface2_entry["aggregate_serving_status"]
 
     # Surface 3: strategic-spawning version entry.
-    surface3_entry = _strategic_recent_version_entry(version_row, project)
+    surface3_entry = await _strategic_recent_version_entry(
+        db_session, version_row, project
+    )
     surface3_status = surface3_entry["serving_status"]
 
     # Surface 4: deployment_state block promoted_serving_status

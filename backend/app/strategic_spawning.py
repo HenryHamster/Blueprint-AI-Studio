@@ -280,14 +280,19 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
             )
 
 
-def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
+async def _strategic_recent_version_entry(
+    session, version, project=None
+) -> dict[str, Any]:
     from app.qualification_state_resolver import (
-        resolve_effective_qualification_state,
+        resolve_open_version_qualification_state,
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate, artifacts)
+    # Route through the shared seam so this surface's qualification_state carries
+    # the ledger-backed per-dimension sub_score overlay instead of the mutable
+    # last_qualification blob, matching the dimension_states shown elsewhere.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate, artifacts)
     )
     return {
         "version_number": version.version_number,
@@ -6148,7 +6153,9 @@ async def _spawn_strategic_review(
                     if _version_phase_block is None:
                         _version_phase_block = {}
                     _version_phase_block["recent_versions"] = [
-                        _strategic_recent_version_entry(version, project)
+                        await _strategic_recent_version_entry(
+                            session, version, project
+                        )
                         for version in _closed
                     ]
             except Exception:

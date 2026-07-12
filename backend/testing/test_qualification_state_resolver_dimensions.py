@@ -1219,3 +1219,108 @@ async def test_open_version_seam_threaded_dimension_states_equal_auto(db_session
     assert auto_state["sub_scores"] == threaded_state["sub_scores"], (
         "threading a pre-resolved dimension_states must match auto-resolution"
     )
+
+
+# ---------------------------------------------------------------------------
+# _strategic_recent_version_entry — the strategic recent-versions read surface
+# must carry the same ledger sub_score overlay as the other open-version reads,
+# instead of returning the stale last_qualification blob's sub_scores.
+# ---------------------------------------------------------------------------
+
+
+async def _reload_version_with_artifacts(db_session, version_id):
+    """Re-fetch a version with deploy_artifacts eager-loaded, mirroring how the
+    real strategic read path loads closed versions (include_artifacts=True), so
+    version_serving_summary does not trip an async lazy-load."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.models import ReleaseVersion
+
+    return (
+        await db_session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(ReleaseVersion.id == version_id)
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_strategic_recent_version_entry_applies_ledger_overlay(db_session):
+    """_strategic_recent_version_entry routes qualification_state through the
+    shared seam, so a stale/reset last_qualification blob is overlaid with the
+    ledger-preserved per-dimension sub_scores it emits to the strategist."""
+    from app.models import QualificationDimensionResult
+    from app.strategic_spawning import _strategic_recent_version_entry
+
+    project, version = await _make_project_and_version(
+        db_session,
+        {
+            "status": "infra_failure",
+            "candidate_sha": "sha-recent-overwrite",
+            # Stale sub_scores left by a blob-overwriting infra failure.
+            "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+            "error": "vm_timeout",
+        },
+    )
+
+    # Ledger preserved the resolved facts from before the infra failure.
+    for dim, status, sub_score in [
+        ("audit", "passed", 0.92),
+        ("test_erosion", "passed", 0.81),
+    ]:
+        db_session.add(QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-recent-overwrite",
+            dimension=dim,
+            status=status,
+            sub_score=sub_score,
+            blocker=None,
+        ))
+    await db_session.flush()
+
+    version = await _reload_version_with_artifacts(db_session, version.id)
+    entry = await _strategic_recent_version_entry(db_session, version, project)
+
+    qual_state = entry["qualification_state"]
+    assert qual_state is not None
+    # sub_scores reflect the LEDGER (0.92 / 0.81), NOT the stale blob (0.0 / 0.0).
+    assert qual_state["sub_scores"]["audit"] == pytest.approx(0.92), (
+        "strategic recent-version entry must overlay the ledger audit score"
+    )
+    assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.81), (
+        "strategic recent-version entry must overlay the ledger test_erosion score"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_recent_version_entry_no_ledger_matches_blob(db_session):
+    """With NO ledger rows, the overlay is a no-op: the strategic entry's
+    qualification_state sub_scores mirror the blob-derived scores unchanged."""
+    from app.strategic_spawning import _strategic_recent_version_entry
+
+    project, version = await _make_project_and_version(
+        db_session,
+        {
+            "status": "not_promoted",
+            "candidate_sha": "sha-recent-no-ledger",
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    # Deliberately NO ledger rows for this candidate_sha.
+
+    version = await _reload_version_with_artifacts(db_session, version.id)
+    entry = await _strategic_recent_version_entry(db_session, version, project)
+
+    qual_state = entry["qualification_state"]
+    assert qual_state is not None
+    assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
+    assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)

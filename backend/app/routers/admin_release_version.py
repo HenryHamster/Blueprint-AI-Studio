@@ -1455,8 +1455,12 @@ async def get_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate_serving, artifacts)
+    # Route through the shared open-version seam so the returned
+    # qualification_state carries the ledger-backed per-dimension sub_score
+    # overlay rather than the mutable last_qualification blob, keeping it
+    # consistent with the dimension_states other surfaces expose.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate_serving, artifacts)
     )
 
     highlights = _release_version.build_version_highlights(
@@ -1813,8 +1817,12 @@ async def get_release_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state, _ = resolve_effective_qualification_state(
-        version, project, serving=(aggregate_serving, artifacts)
+    # Route through the shared open-version seam so the returned
+    # qualification_state carries the ledger-backed per-dimension sub_score
+    # overlay rather than the mutable last_qualification blob, keeping it
+    # consistent with the dimension_states other surfaces expose.
+    qualification_state, _ = await resolve_open_version_qualification_state(
+        session, version, project, serving=(aggregate_serving, artifacts)
     )
 
     # Derive highlights from the data above — no extra I/O. Shared helper so the
