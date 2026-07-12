@@ -18,6 +18,7 @@ from sqlmodel import select
 
 from app.message_convergence import OPEN_STATUS
 from app.acceptance_criteria import (
+    UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
     get_criteria_for_version,
     get_version_coverage_summary,
 )
@@ -2160,28 +2161,41 @@ async def build_operator_attention(
                         e.get("source_kind") == "operator_attestation"
                         for e in evidence
                     )
-                    if has_operator_attestation:
-                        ck = criterion["criterion_key"]
-                        if ck in failed_corroboration_keys:
-                            corroboration_failed_count += 1
-                            corroboration_failed_items.append(
-                                _corroboration_failed_attention_item(
-                                    project.id,
-                                    open_version,
-                                    ck,
-                                    criterion.get("text", ""),
-                                )
+                    has_backfill = any(
+                        e.get("source_kind") == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+                        for e in evidence
+                    )
+                    ck = criterion["criterion_key"]
+                    if (
+                        has_operator_attestation or has_backfill
+                    ) and ck in failed_corroboration_keys:
+                        # A spawned Verify: {key} task failed, downgrading either an
+                        # operator attestation or an unverified-merge backfill from
+                        # its lower-confidence tier to 'partial'.  Both surface as a
+                        # corroboration_failed item so the operator can re-verify or
+                        # provide real machine evidence.
+                        corroboration_failed_count += 1
+                        corroboration_failed_items.append(
+                            _corroboration_failed_attention_item(
+                                project.id,
+                                open_version,
+                                ck,
+                                criterion.get("text", ""),
                             )
-                        else:
-                            attestation_expired_count += 1
-                            attestation_expired_items.append(
-                                _attestation_expired_attention_item(
-                                    project.id,
-                                    open_version,
-                                    ck,
-                                    criterion.get("text", ""),
-                                )
+                        )
+                    elif has_operator_attestation:
+                        # An operator attestation lapsed without a failed
+                        # corroboration (the attestation window expired).  Backfill
+                        # coverage has no time-window expiry, so it never lands here.
+                        attestation_expired_count += 1
+                        attestation_expired_items.append(
+                            _attestation_expired_attention_item(
+                                project.id,
+                                open_version,
+                                ck,
+                                criterion.get("text", ""),
                             )
+                        )
                 # Detect attestations approaching expiry: active criteria with
                 # 'attested' coverage whose TTL is close to lapsing.  Unlike the
                 # 'partial' branches above (already-lapsed), this is a proactive

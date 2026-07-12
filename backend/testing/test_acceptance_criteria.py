@@ -7524,6 +7524,298 @@ async def test_corroboration_child_inherits_criterion_ids_and_upgrades_attested_
 
 
 # ---------------------------------------------------------------------------
+# backfill corroboration loop: spawn, dedup, failed-downgrade, re-verify
+# ---------------------------------------------------------------------------
+
+
+async def _make_backfill_task(
+    db_session,
+    project,
+    criterion_key,
+    *,
+    direction_key="d-backfill-corrob",
+    test_path="testing/test_backfill_corrob.py::test_seam",
+):
+    """Create a COMPLETED unverified-merge task whose named_test shipped.
+
+    Mirrors the fixture shape used by the backfill unit tests so
+    ``backfill_unverified_merge_evidence`` records a 'backfilled' evidence row
+    for ``criterion_key``.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Backfill corrob", "status": "active"},
+        status="active",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add(dir_row)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {"kind": "named_test", "test_path": test_path},
+        }],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                test_path.rpartition("::")[0],
+                "backend/app/target_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "merge fell open without verification",
+                "proof_ref": test_path,
+            },
+        },
+        criterion_ids=[criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    return task
+
+
+async def _verify_tasks_for(db_session, project, criterion_key):
+    """Return all corroboration ``Verify: {key}`` tasks for a criterion."""
+    from app.models import Task as _Task
+
+    rows = (
+        (await db_session.execute(
+            select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.title == f"Verify: {criterion_key}",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    return list(rows)
+
+
+@pytest.mark.asyncio
+async def test_backfill_spawns_corroboration_task(db_session):
+    """Recording backfill evidence must spawn a corroboration task for the criterion.
+
+    Mirrors the operator-attestation earn-up loop: the lower-confidence
+    'backfilled' tier gets a ``Verify: {key}`` research task tagged
+    ``spawned_by=unverified_merge_backfill`` so it can be re-verified toward
+    real machine-verified coverage instead of staying covering indefinitely.
+    """
+    project = await _make_project(db_session, "Backfill-Spawn")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 1, f"Expected 1 backfill evidence row, got {recorded}"
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1, (
+        f"Expected exactly 1 corroboration task, got {len(verify_tasks)}"
+    )
+    spawned = verify_tasks[0]
+    assert spawned.context.get("corroboration_of") == criterion.criterion_key
+    assert spawned.context.get("spawned_by") == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND, (
+        f"Expected spawned_by=unverified_merge_backfill, got "
+        f"{spawned.context.get('spawned_by')!r}"
+    )
+    assert spawned.criterion_ids == [criterion.criterion_key]
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW"
+    assert "backfill" in spawned.first_payload["prompt"].lower(), (
+        "Backfill corroboration prompt must describe the backfill provenance"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_corroboration_task_is_deduped(db_session):
+    """A second backfill reconcile must not create a duplicate corroboration task."""
+    project = await _make_project(db_session, "Backfill-Dedup")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+
+    # First reconcile: records evidence and spawns one corroboration task.
+    first = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert first == 1
+    # Second reconcile: evidence already present (0 new rows) but the criterion
+    # is still backfilled, so the spawn path runs again — the title dedup guard
+    # must prevent a duplicate task.
+    second = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert second == 0, f"Second backfill must record 0 new rows, got {second}"
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1, (
+        f"Backfill corroboration must dedup; expected 1 task, got {len(verify_tasks)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_failed_corroboration_downgrades_coverage(db_session):
+    """A FAILED backfill corroboration task downgrades 'backfilled' to 'partial'.
+
+    Acceptance test for the backfill corroboration loop. Before this change the
+    'backfilled' tier had no re-verification path: it stayed covering forever and
+    was never caught if false. Now the spawned ``Verify: {key}`` task feeds the
+    same failed-corroboration downgrade as operator attestation — when it FAILS,
+    the backfill coverage must drop to 'partial' and no longer count as covering.
+    """
+    project = await _make_project(db_session, "Backfill-Downgrade")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion to downgrade"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 1
+
+    # Before failure: coverage is the distinct lower-confidence 'backfilled' tier.
+    summary1 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary1["backfilled"] == 1, (
+        f"Expected 1 backfilled before corroboration failure, got {summary1['backfilled']}"
+    )
+    crit1 = next(
+        c for c in summary1["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit1["coverage"] == "backfilled"
+
+    # The backfill spawned a corroboration task; mark it FAILED.
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    assert len(verify_tasks) == 1
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    # After failure: the backfill coverage is downgraded to 'partial'.
+    summary2 = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary2["backfilled"] == 0, (
+        f"Expected 0 backfilled after corroboration failure, got {summary2['backfilled']}"
+    )
+    assert summary2["partial"] >= 1, (
+        f"Expected >=1 partial after corroboration failure, got {summary2['partial']}"
+    )
+    crit2 = next(
+        c for c in summary2["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit2["coverage"] == "partial", (
+        f"Expected 'partial' after failed backfill corroboration, got {crit2['coverage']}"
+    )
+    assert criterion.criterion_key in summary2["failed_corroboration_keys"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_corroboration_failure_surfaces_in_operator_attention(db_session):
+    """A failed backfill corroboration surfaces a corroboration_failed attention item.
+
+    Parity with operator attestation: the operator sees that a lower-confidence
+    coverage's verification failed and can act.  (Runs against Postgres in CI —
+    build_operator_attention uses a compound SELECT SQLite cannot parse.)
+    """
+    project = await _make_project(db_session, "Backfill-Attention")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion surfacing failure"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+    corrob_id = (
+        f"version:{version.id}:corroboration_failed:{criterion.criterion_key}"
+    )
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert corrob_id in items_by_id, (
+        f"Expected corroboration_failed item for backfill, got {list(items_by_id)}"
+    )
+    assert attention["counts"]["corroboration_failed"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_reattempt_after_failed_backfill_restores_backfilled(db_session):
+    """A newer non-terminal corroboration task un-stales a failed backfill downgrade.
+
+    Parity with the operator-attestation re-attest path: once a fresh
+    ``Verify: {key}`` task is in flight, the stale FAILED task no longer keeps the
+    criterion pinned at 'partial' — coverage returns to 'backfilled'.
+    """
+    project = await _make_project(db_session, "Backfill-Restore")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Backfilled criterion re-verified"
+    )
+
+    await _make_backfill_task(db_session, project, criterion.criterion_key)
+    await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    verify_tasks = await _verify_tasks_for(db_session, project, criterion.criterion_key)
+    verify_tasks[0].status = TaskStatus.FAILED
+    await db_session.commit()
+
+    summary_fail = await ac.get_version_coverage_summary(db_session, version.id)
+    crit_fail = next(
+        c for c in summary_fail["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit_fail["coverage"] == "partial"
+
+    # A newer QUEUED corroboration task (a later reconcile re-spawns after the
+    # failed one is no longer non-terminal).
+    from app.models import Task as _Task
+
+    queued = _Task(
+        project_id=project.id,
+        title=f"Verify: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        },
+        payloads=[{"type": "research", "prompt": "re-verify"}],
+        created_by="SYSTEM_AUTO_REVIEW",
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(queued)
+    await db_session.commit()
+
+    summary_ok = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_ok["backfilled"] == 1, (
+        f"Expected backfilled restored after re-verify, got {summary_ok['backfilled']}"
+    )
+    crit_ok = next(
+        c for c in summary_ok["criteria"]
+        if c["criterion_key"] == criterion.criterion_key
+    )
+    assert crit_ok["coverage"] == "backfilled"
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert criterion.criterion_key not in failed_keys
+
+
+# ---------------------------------------------------------------------------
 # MissingGreenlet fidelity: attest / re-attest with real ORM expiry
 # ---------------------------------------------------------------------------
 

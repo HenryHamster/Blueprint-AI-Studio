@@ -1376,6 +1376,12 @@ async def backfill_unverified_merge_evidence(
         total = 0
         offset = 0
         open_version: Any = None
+        # Criteria (key -> text) covered by backfill this run — each gets a
+        # corroboration task so the 'backfilled' tier has an earn-up-or-downgrade
+        # path, mirroring operator attestation.  Populated even for criteria whose
+        # evidence row already existed so a pre-existing backfilled tail is closed
+        # idempotently (spawn dedup guards against duplicate tasks).
+        corroboration_targets: dict[str, str] = {}
         while True:
             query = (
                 select(Task)
@@ -1508,6 +1514,10 @@ async def backfill_unverified_merge_evidence(
                 task_id_str = str(task.id)
                 unverified_reason = _task_unverified_reason(task) or "unknown"
                 for criterion in active:
+                    # Queue a corroboration task for every active backfilled
+                    # criterion, whether or not its evidence row is new — this
+                    # earns-up or downgrades pre-existing backfill too.
+                    corroboration_targets[criterion.criterion_key] = criterion.text
                     if criterion.id in already_present:
                         continue
 
@@ -1529,6 +1539,22 @@ async def backfill_unverified_merge_evidence(
             if evidence_batch:
                 batch_recorded = await _record_evidence_batch(session, evidence_batch)
                 total += batch_recorded
+
+        # Give each backfilled criterion an earn-up path: spawn a corroboration
+        # task (deduped by the existing ``Verify: {key}`` title guard) so the
+        # lower-confidence backfill tier is re-verified toward machine-verified
+        # coverage — and downgraded to 'partial' if that verification fails —
+        # exactly as an operator attestation is.
+        for _ck, _ctext in corroboration_targets.items():
+            await spawn_corroboration_task(
+                session,
+                project_id,
+                _ck,
+                _ctext,
+                "unverified-merge backfill: named_test shipped in the PR's changed "
+                "files but the merge was not CI-verified",
+                spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+            )
 
         if total:
             logger.info(
@@ -2140,11 +2166,17 @@ async def get_version_coverage_summary(
                 inactive_counts.get(criterion.status, 0) + 1
             )
 
-    # Downgrade 'attested' to 'partial' for criteria whose operator-attestation
-    # corroboration task FAILED or was CANCELLED — the system explicitly attempted
-    # to verify the waiver and failed, so the attestation must not remain trusted.
+    # Downgrade 'attested'/'backfilled' to 'partial' for criteria whose
+    # corroboration task FAILED or was CANCELLED — the system explicitly
+    # attempted to verify the lower-confidence coverage and failed, so it must
+    # not remain trusted.  Both an operator attestation and an unverified-merge
+    # backfill earn a spawned ``Verify: {key}`` task (see
+    # :func:`spawn_corroboration_task`) and are downgraded here identically:
+    # neither tier may claim coverage once its verification attempt has failed.
     failed_corroboration: set[str] = set()
-    if criteria_in_order and counts.get("attested", 0) > 0:
+    if criteria_in_order and (
+        counts.get("attested", 0) > 0 or counts.get("backfilled", 0) > 0
+    ):
         failed_corroboration = await get_failed_corroboration_keys(
             session, criteria_in_order[0].project_id
         )
@@ -2153,9 +2185,12 @@ async def get_version_coverage_summary(
                 if criterion.status != "active":
                     continue
                 co = coverage_by_criterion.get(criterion.id)
-                if co == "attested" and criterion.criterion_key in failed_corroboration:
+                if (
+                    co in ("attested", "backfilled")
+                    and criterion.criterion_key in failed_corroboration
+                ):
                     coverage_by_criterion[criterion.id] = "partial"
-                    counts["attested"] -= 1
+                    counts[co] -= 1
                     counts["partial"] = counts.get("partial", 0) + 1
 
     # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
@@ -2224,23 +2259,28 @@ async def get_failed_corroboration_keys(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> set[str]:
-    """Return criterion_keys whose operator-attestation corroboration task has
-    FAILED or been CANCELLED **and** no newer non-terminal task exists for the
-    same key.
+    """Return criterion_keys whose corroboration task has FAILED or been
+    CANCELLED **and** no newer non-terminal task exists for the same key.
 
-    When a spawned ``Verify: {criterion_key}`` task (see :func:`spawn_corroboration_task`)
-    ends in FAILED or CANCELLED status, the operator's attestation should no longer be
-    fully trusted — the system explicitly attempted to verify it and that attempt
-    failed.  Callers use this set to downgrade coverage from ``'attested'`` to
+    A corroboration task is spawned for both lower-confidence coverage tiers —
+    operator attestation and unverified-merge backfill (see
+    :func:`spawn_corroboration_task`).  This function is provenance-agnostic: it
+    keys purely on ``context["corroboration_of"]``, so it returns keys for a
+    failed verification regardless of which tier spawned it.
+
+    When such a ``Verify: {criterion_key}`` task ends in FAILED or CANCELLED
+    status, the lower-confidence coverage should no longer be fully trusted — the
+    system explicitly attempted to verify it and that attempt failed.  Callers use
+    this set to downgrade coverage from ``'attested'``/``'backfilled'`` to
     ``'partial'`` and to surface operator-attention items.
 
-    However, if the operator re-attests the criterion after a failure, a new
-    ``Verify: {criterion_key}`` task is spawned (the dedup in
-    :func:`spawn_corroboration_task` only excludes COMPLETED/FAILED/CANCELLED,
-    so a fresh QUEUED task is created).  The old failed task remains in the
-    database but is *stale* — this function excludes keys that have a newer
-    non-terminal task so that re-attested criteria are not stuck at ``'partial'``
-    coverage indefinitely.
+    However, if a newer corroboration attempt is spawned after a failure (e.g. the
+    operator re-attests, or a later backfill reconcile re-spawns), a fresh
+    non-terminal ``Verify: {criterion_key}`` task exists (the dedup in
+    :func:`spawn_corroboration_task` only excludes COMPLETED/FAILED/CANCELLED).
+    The old failed task remains in the database but is *stale* — this function
+    excludes keys that have a newer non-terminal task so that re-verified criteria
+    are not stuck at ``'partial'`` coverage indefinitely.
     """
     from app.models import Task, TaskStatus  # noqa: PLC0415
 
@@ -2286,19 +2326,30 @@ async def spawn_corroboration_task(
     criterion_key: str,
     criterion_text: str,
     reason: str,
+    spawned_by: str = "operator_attestation",
 ) -> None:
     """Spawn a research task to investigate and earn real coverage for a criterion.
 
-    Called after an operator attests a criterion (see
-    :func:`~app.routers.admin_acceptance_criteria.attest_criterion`).  The spawned
-    task carries ``criterion_ids=[criterion_key]`` so that, when it later completes
-    and merges with a proven acceptance verdict, the existing
+    Called for the two lower-confidence coverage tiers that need re-verification:
+    after an operator attests a criterion (see
+    :func:`~app.routers.admin_acceptance_criteria.attest_criterion`,
+    ``spawned_by="operator_attestation"``) and after unverified-merge backfill
+    evidence is recorded (see :func:`backfill_unverified_merge_evidence`,
+    ``spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND``).  The spawned task
+    carries ``criterion_ids=[criterion_key]`` so that, when it later completes and
+    merges with a proven acceptance verdict, the existing
     :func:`record_task_merge_evidence` machinery writes ``task_merge`` +
-    ``reachability`` evidence, transitioning the criterion from ``'attested'`` to
-    ``'covered'``.
+    ``reachability`` evidence, transitioning the criterion from its lower tier to
+    ``'covered'``.  If the task instead FAILS or is CANCELLED,
+    :func:`get_failed_corroboration_keys` reports the key and coverage is
+    downgraded to ``'partial'``.
+
+    ``spawned_by`` is recorded in the task ``context`` for provenance and selects
+    the prompt phrasing; it does not affect dedup (keyed on the ``Verify: {key}``
+    title) or the failed-corroboration downgrade (keyed on ``corroboration_of``).
 
     The task is best-effort: any failure is logged and swallowed so the
-    attestation itself is never blocked by a spawn failure.
+    attestation or backfill itself is never blocked by a spawn failure.
     """
     try:
         from app.models import Task, TaskStatus  # noqa: PLC0415
@@ -2325,21 +2376,34 @@ async def spawn_corroboration_task(
             )
             return
 
+        if spawned_by == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND:
+            prompt = (
+                f"Verify acceptance criterion: {criterion_text}\n\n"
+                f"Unverified-merge backfill reason: {reason}\n\n"
+                "The declared named_test shipped in the PR's changed files but the "
+                "merge fell open without a green CI verdict, so coverage is recorded "
+                "at the lower-confidence 'backfilled' tier.  Re-run or repair the "
+                "declared test so the criterion can transition from backfill to real "
+                "machine-verified coverage."
+            )
+        else:
+            prompt = (
+                f"Verify acceptance criterion: {criterion_text}\n\n"
+                f"Operator attestation reason: {reason}\n\n"
+                "Determine what test or automated check would prove this "
+                "criterion is satisfied, and implement it so the criterion "
+                "can transition from operator attestation to real machine-verified coverage."
+            )
+
         task = Task(
             project_id=project_id,
             title=f"Verify: {criterion_key}",
             criterion_ids=[criterion_key],
-            context={"corroboration_of": criterion_key, "spawned_by": "operator_attestation"},
+            context={"corroboration_of": criterion_key, "spawned_by": spawned_by},
             payloads=[
                 {
                     "type": "research",
-                    "prompt": (
-                        f"Verify acceptance criterion: {criterion_text}\n\n"
-                        f"Operator attestation reason: {reason}\n\n"
-                        "Determine what test or automated check would prove this "
-                        "criterion is satisfied, and implement it so the criterion "
-                        "can transition from operator attestation to real machine-verified coverage."
-                    ),
+                    "prompt": prompt,
                 }
             ],
             created_by="SYSTEM_AUTO_REVIEW",
