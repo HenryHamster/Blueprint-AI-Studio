@@ -4077,3 +4077,175 @@ async def test_capability_proof_gate_gap_skips_with_no_capabilities(db):
     pid = str(project.id)
     skipped = [r for r in results if r.subject in (pid, "global") and r.status == CheckStatus.SKIPPED]
     assert len(skipped) >= 1
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_enrolls_research_for_no_backing_paths(db):
+    """ENFORCE mode: each unproven working capability with NO file-like
+    backing_paths and no proof (the ``needs_backing_paths`` bucket) enrolls
+    exactly one deduped per-capability proof-earn research obligation, and
+    re-running the check enrolls nothing new (idempotent across ticks).
+
+    This is the named acceptance test for the gate-gap research-enrollment
+    feature. It exercises the enforce-gated production path in
+    ``check_capability_proof_gate_gap`` end-to-end against a real
+    EvergreenBacklogItem ledger.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Two working capabilities, both unproven with NO backing_paths → both land
+    # in needs_backing_paths and must each get a research obligation.
+    project.problem_model = {
+        "capabilities": [
+            {"name": "repo-map", "status": "working", "evidence_refs": []},
+            {"name": "ci-integration", "status": "working", "evidence_refs": []},
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    research_rows = [
+        r
+        for r in rows
+        if r.finding_key.startswith(mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX)
+    ]
+    # Exactly one deduped item per unproven capability that needs proof research.
+    assert len(research_rows) == 2, (
+        f"expected 2 per-capability research obligations, got "
+        f"{[r.finding_key for r in research_rows]}"
+    )
+    keys = {r.finding_key for r in research_rows}
+    assert keys == {
+        mis._capability_proof_research_finding_key(pid, "repo-map"),
+        mis._capability_proof_research_finding_key(pid, "ci-integration"),
+    }
+    # Provenance is the dedicated proof-research value, distinct from the generic
+    # metrics-integrity drift provenance.
+    for r in research_rows:
+        assert r.provenance == mis.CAPABILITY_PROOF_RESEARCH_PROVENANCE
+        assert r.provenance != mis.METRICS_INTEGRITY_PROVENANCE
+        assert r.status == "enrolled"
+        assert "repo-map" in r.detail or "ci-integration" in r.detail
+    # finding_key distinct from the generic per-check drift finding key.
+    generic_key = flagged[0].finding_key()
+    assert generic_key not in keys
+    assert generic_key == f"metrics-integrity:capability_proof_gate_gap:{pid}"
+
+    # Idempotency: a second tick creates NO new rows (deduped on finding_key).
+    ctx2 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    await mis.check_capability_proof_gate_gap(ctx2)
+    rows_after = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    assert len(rows_after) == 2, (
+        "second enforce tick must not create duplicate research obligations, "
+        f"got {[r.finding_key for r in rows_after]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_observe_does_not_enroll(db):
+    """OBSERVE mode: the same no-backing-paths capability enrolls NO backlog item
+    (enrollment is enforce-gated), while the always-on backing-path self-heal
+    still records a proof for a cap whose backing_path is present at HEAD.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            # No backing_paths → would enroll research in enforce mode only.
+            {"name": "repo-map", "status": "working", "evidence_refs": []},
+            # Backing path present at HEAD → self-heals in observe mode unchanged.
+            {
+                "name": "ci-integration",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    # No enrollment in observe mode: zero research obligations created.
+    research_rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    assert research_rows == [], (
+        f"observe mode must enroll no research obligations, got "
+        f"{[r.finding_key for r in research_rows]}"
+    )
+
+    # Backing-path self-heal still fires in observe mode: ci-integration proven.
+    await db.refresh(project)
+    proof_records = project.capability_proof_records or {}
+    assert "ci-integration" in proof_records, (
+        f"expected observe-mode self-heal proof for 'ci-integration', got "
+        f"{proof_records}"
+    )
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    # repo-map remains an unresolved gap (needs_backing_paths), so still flagged.
+    assert len(flagged) == 1
+    assert "repo-map" in flagged[0].detail

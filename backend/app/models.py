@@ -1656,7 +1656,6 @@ class Task(SQLModel, table=True):
             postgresql_where=text("status = 'COMPLETED'"),
             sqlite_where=text("status = 'COMPLETED'"),
         ),
-        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in

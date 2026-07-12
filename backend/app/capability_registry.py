@@ -208,7 +208,14 @@ def annotate_capability_proof_status(
         if isinstance(ev_refs, list) and ev_refs:
             entry2["proof_status"] = classify_evidence(ev_refs)
         elif isinstance(cap_name, str) and records.get(cap_name):
-            entry2["proof_status"] = "proven"
+            # Use tier-aware classification so backing_path-only proof_records
+            # return "path_proven" (not "proven"), matching enrich_problem_model_capability_proofs.
+            synthetic_refs = [
+                {"kind": e.get("proof_kind"), "proven": True}
+                for e in records[cap_name]
+                if isinstance(e, dict)
+            ]
+            entry2["proof_status"] = classify_evidence_tiered(synthetic_refs) if synthetic_refs else "unproven"
         else:
             entry2["proof_status"] = "unproven"
         annotated.append(entry2)

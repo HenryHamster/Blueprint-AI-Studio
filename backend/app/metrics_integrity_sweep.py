@@ -113,6 +113,12 @@ SWEEP_MODES = frozenset({"off", "observe", "enforce"})
 #: from other enrollment provenances so drift findings are attributable.
 METRICS_INTEGRITY_PROVENANCE = "metrics_integrity"
 
+#: Provenance for per-capability proof-earn research obligations enrolled by the
+#: capability_proof_gate_gap check in enforce mode. Distinct from the generic
+#: drift provenance so proof-research probes are attributable and never conflated
+#: with counter-drift findings.
+CAPABILITY_PROOF_RESEARCH_PROVENANCE = "capability_proof_research"
+
 # --- Defaults (operator-overridable via runtime_config / PATCH settings) ------
 
 DEFAULT_MODE = "observe"
@@ -397,6 +403,69 @@ async def _enroll_flag_finding(session, result: CheckResult) -> bool:
         title=title,
         detail=detail,
         provenance=METRICS_INTEGRITY_PROVENANCE,
+    )
+    return True
+
+
+#: Stable finding_key prefix for per-capability proof-earn research obligations.
+#: Distinct from :meth:`CheckResult.finding_key` (``metrics-integrity:<check>:<pid>``)
+#: so a research probe per unproven capability never collides with the single
+#: per-check drift finding.
+CAPABILITY_PROOF_RESEARCH_KEY_PREFIX = "metrics-integrity:capability-proof-research"
+
+
+def _capability_proof_research_finding_key(project_id: str, cap_name: str) -> str:
+    """Stable per-(project, capability) key so re-running the sweep on every tick
+    dedupes onto the same ledger row instead of spawning duplicate research."""
+    return f"{CAPABILITY_PROOF_RESEARCH_KEY_PREFIX}:{project_id}:{cap_name}"
+
+
+async def _enroll_capability_proof_research(
+    session, *, project_id, cap_name: str
+) -> bool:
+    """Enroll ONE deduped proof-earn research obligation for a working capability
+    that has no file-like backing_paths and no proof (the ``needs_backing_paths``
+    bucket). Returns True when a NEW row was created.
+
+    Idempotent via the stable per-capability finding_key: ``enroll_backlog_item``
+    dedupes on ``(project_id, finding_key)``, so repeated ticks never create
+    duplicate obligations. The enrolled item drives ``check_evergreen_fill`` ->
+    ``spawn_evergreen_probe`` to later spawn a low-priority ``type:"research"``
+    task that determines how machine-verified proof can be earned.
+    """
+    from app.evergreen_backlog import enroll_backlog_item
+    from app.models import EvergreenBacklogItem
+
+    finding_key = _capability_proof_research_finding_key(str(project_id), cap_name)
+    existing = (
+        await session.execute(
+            select(EvergreenBacklogItem.status).where(
+                EvergreenBacklogItem.project_id == project_id,
+                EvergreenBacklogItem.finding_key == finding_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None and existing != "retired":
+        return False
+
+    title = f"Earn machine-verified proof for capability: {cap_name}"
+    detail = (
+        f"Working capability '{cap_name}' is declared 'working' but carries no "
+        "proven evidence and no file-like backing_paths, so the always-on "
+        "backing-path self-heal cannot auto-resolve it. Determine how "
+        "machine-verified proof (a named test exercising the capability, or "
+        "verifiable file-like backing_paths that resolve at HEAD) can be earned "
+        "for this specific capability, and propose concrete backing_paths when "
+        "they can be identified. Recording that proof moves the capability out of "
+        "the capability_proof_gate gap and lets dependents rely on it."
+    )
+    await enroll_backlog_item(
+        session,
+        project_id=project_id,
+        finding_key=finding_key,
+        title=title,
+        detail=detail,
+        provenance=CAPABILITY_PROOF_RESEARCH_PROVENANCE,
     )
     return True
 
@@ -3368,6 +3437,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
     Bounded to ``ctx.max_projects`` projects.
     """
+    import uuid as _uuid
+
     from app.capability_proof import record_capability_backing_path_proof
     from app.capability_registry import (
         exempt_capability_names,
@@ -3536,6 +3607,48 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 # Move auto_resolved to still_unproven since the commit failed.
                 still_unproven.extend(auto_resolved)
                 auto_resolved.clear()
+
+        # ENFORCE mode only: for caps that cannot be auto-proven (no file-like
+        # backing_paths, no proof), enroll ONE deduped per-capability research
+        # obligation so the evergreen fill loop later spawns a proof-earn probe.
+        # Never crashes the check: a per-enroll failure is logged + rolled back
+        # and the sweep continues; enrolled rows are committed in their own
+        # commit (the auto-resolve proofs, if any, already committed above).
+        enrolled_research: list[str] = []
+        if ctx.mode == "enforce" and needs_backing_paths:
+            # Reconstruct the UUID from the captured pid string so we never touch
+            # a (possibly commit-expired) ORM attribute after the auto-resolve commit.
+            project_uuid = _uuid.UUID(pid)
+            for cap_name in needs_backing_paths:
+                try:
+                    if await _enroll_capability_proof_research(
+                        ctx.session, project_id=project_uuid, cap_name=cap_name
+                    ):
+                        enrolled_research.append(cap_name)
+                except Exception:  # noqa: BLE001 — enrollment must not abort the check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "proof-research enroll failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+            if enrolled_research:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: enroll "
+                        "commit failed for project %s after enrolling %d research "
+                        "obligation(s): %s",
+                        pid,
+                        len(enrolled_research),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
 
         new_proven = proven_count + len(auto_resolved)
         unresolved = needs_backing_paths + still_unproven

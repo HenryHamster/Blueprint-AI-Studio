@@ -1687,13 +1687,20 @@ def test_capability_proof_gate_full_cycle():
     proven=True ref), the same capability now satisfies the need — the need
     routes to completed_needs so the task can resume.
 
-    This exercises the TRANSITION rather than each state in isolation:
+    Phase 3 (badge consistency): annotate_capability_proof_status reflects the
+    same tiered classification — a named_test proof_record yields "proven", a
+    backing_path-only proof_record yields "path_proven" (not "proven"), matching
+    the gate's decision.  This exercises the fix to the proof-records fallback
+    path that previously over-reported backing_path-only records as "proven".
 
-      working_capability_proof_status → classify_evidence →
+    The chain exercised end-to-end:
+
+      working_capability_proof_status → classify_evidence_tiered →
       capability_need_blocked_by_proof_gate → _classify_blocker_needs →
-      enforce-mode routing
+      enforce-mode routing → annotate_capability_proof_status (badge)
     """
     from app.capability_registry import (
+        annotate_capability_proof_status,
         capability_need_blocked_by_proof_gate,
         working_capability_proof_status,
     )
@@ -1709,6 +1716,7 @@ def test_capability_proof_gate_full_cycle():
     assert proof == {"container-runtime": "unproven"}
 
     need = {"kind": "capability", "ref": "container-runtime"}
+    vocab = [{"name": "container-runtime", "status": "working"}]
 
     # The gate blocks an unproven capability under enforce mode.
     assert capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
@@ -1721,6 +1729,10 @@ def test_capability_proof_gate_full_cycle():
         {"kind": "capability", "ref": "container-runtime"}
     ]
     assert disp_blocked["completed_needs"] == []
+
+    # Badge also reads unproven before proof lands.
+    badge_before = annotate_capability_proof_status(vocab, {})
+    assert badge_before[0]["proof_status"] == "unproven"
 
     # ── Phase 2: proof recorded (evidence_refs populated with a proven ref) ──
     proven_model = ProblemModel(
@@ -1746,6 +1758,44 @@ def test_capability_proof_gate_full_cycle():
         {"kind": "capability", "ref": "container-runtime"}
     ]
     assert disp_unblocked["residual"] == []
+
+    # ── Phase 3: badge consistency — proof_records path uses tiered classification ──
+    # A named_test proof_record should yield "proven" in the badge.
+    named_test_records = {
+        "container-runtime": [
+            {
+                "task_id": "provider-task-1",
+                "proof_kind": "named_test",
+                "proof_ref": "testing/test_blocked_need_resolution.py::test_capability_proof_gate_full_cycle",
+                "proved_at": "2026-07-11T00:00:00Z",
+                "commit_sha": "",
+            }
+        ]
+    }
+    badge_named_test = annotate_capability_proof_status(vocab, named_test_records)
+    assert badge_named_test[0]["proof_status"] == "proven", (
+        "named_test proof_records must yield 'proven' in the badge"
+    )
+
+    # A backing_path-only proof_record must yield "path_proven" (not "proven"):
+    # file-existence proof is structural, not machine-verified, so it must not
+    # clear the enforce gate as strongly as a green test.
+    backing_only_records = {
+        "container-runtime": [
+            {
+                "task_id": "backing:container-runtime",
+                "proof_kind": "backing_path",
+                "proof_ref": "container-runtime",
+                "proved_at": "2026-07-11T00:00:00Z",
+                "commit_sha": "",
+            }
+        ]
+    }
+    badge_backing = annotate_capability_proof_status(vocab, backing_only_records)
+    assert badge_backing[0]["proof_status"] == "path_proven", (
+        "backing_path-only proof_records must yield 'path_proven', not 'proven' — "
+        "the badge must not over-report structural-only evidence as machine-verified"
+    )
 
 
 def test_backing_path_only_capability_stays_gated_under_enforce():
