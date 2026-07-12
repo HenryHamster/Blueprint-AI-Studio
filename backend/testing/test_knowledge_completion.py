@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from app.knowledge_completion import (
     _build_compute_experiment_document,
     _compute_evidence_tier,
+    _extract_job_terminal_diagnostics,
 )
 from testing.factories import make_task
 
@@ -140,3 +141,54 @@ class TestBuildComputeExperimentDocumentEvidenceTier:
             evidence_tier="partial",
         )
         assert doc["verdict_record"]["evidence_tier"] == "partial"
+
+
+# ── _extract_job_terminal_diagnostics: clean-SUCCESS provenance ──────────────
+
+
+def test_success_job_without_terminal_reason_has_run_provenance():
+    """A clean-SUCCESS job with no terminal_reason must still surface
+    executing_backend, runner_target_id, and runner_hostname so the
+    run-provenance panel is not blank on successful runs."""
+    job = MagicMock()
+    job.terminal_reason = None
+    job.started_at = None
+    job.accelerator_type = None
+    job.machine_type = None
+    job.backend = "runner-subprocess"
+    job.polling_metadata = {
+        "runner_target_id": "runner-xyz-456",
+        "runner_hostname": "gpu-host-1",
+    }
+
+    diag = _extract_job_terminal_diagnostics(job)
+
+    assert diag is not None, "provenance must be non-None even without terminal_reason"
+    assert diag["executing_backend"] == "runner-subprocess"
+    assert diag["runner_target_id"] == "runner-xyz-456"
+    assert diag["runner_hostname"] == "gpu-host-1"
+    assert "terminal_reason" not in diag, "terminal_reason must be absent on SUCCESS run"
+    assert "vm_phase" not in diag, "vm_phase must be absent when no terminal_reason"
+
+    # _build_compute_experiment_document must surface the provenance in body
+    task = _base_task()
+    doc = _build_compute_experiment_document(
+        task,
+        outcome="SUCCESS",
+        cost=0.12,
+        criterion=None,
+        result_reference=None,
+        terminal_diagnostics=diag,
+    )
+
+    body = doc["body"]
+    assert "Executing backend:" in body, "body must show executing backend"
+    assert "runner-subprocess" in body
+    assert "Runner:" in body, "body must show runner identity"
+    assert "runner-xyz-456" in body
+    assert "gpu-host-1" in body
+
+    td = doc["verdict_record"].get("terminal_diagnostics", {})
+    assert td["executing_backend"] == "runner-subprocess"
+    assert td["runner_target_id"] == "runner-xyz-456"
+    assert td["runner_hostname"] == "gpu-host-1"

@@ -647,4 +647,155 @@ describe('VersionSummaryPanel — viewport regression', () => {
     const label = host.querySelector('[data-testid="stuck-reason-crit-c"]');
     if (label !== null) throw new Error('Expected no stuck-reason label when stuck_reason is null');
   });
+
+  // ── merge-evidence-gap breakdown ──────────────────────────────────────────
+
+  test('merge evidence gap breakdown renders reason counts when present', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 3,
+      covered: 1,
+      partial: 1,
+      uncovered: 1,
+      merge_evidence_gaps: {
+        no_criteria: 5,
+        verdict_not_proven: 2,
+        no_active_criteria: 1,
+      },
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+        { criterion_key: 'c2', text: 'Partial criterion', coverage: 'partial', evidence_count: 1 },
+        { criterion_key: 'c3', text: 'Uncovered criterion', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection === null) throw new Error('Expected merge-evidence-gap-breakdown when gaps present');
+    expect(gapSection.textContent).toContain('5 no criteria');
+    expect(gapSection.textContent).toContain('2 verdict not proven');
+    expect(gapSection.textContent).toContain('1 no active criteria');
+  });
+
+  test('merge evidence gap breakdown shows unmatched criterion IDs tooltip', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 2,
+      covered: 1,
+      partial: 0,
+      uncovered: 1,
+      merge_evidence_gaps: {
+        no_criteria: 3,
+        unmatched_criterion_ids: ['crit-a', 'crit-b'],
+      },
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+        { criterion_key: 'c2', text: 'Uncovered criterion', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection === null) throw new Error('Expected merge-evidence-gap-breakdown when gaps present');
+    const unmatched = host.querySelector('[data-testid="gap-unmatched-ids"]');
+    if (unmatched === null) throw new Error('Expected gap-unmatched-ids element');
+    expect(unmatched.textContent).toContain('2 unmatched');
+    expect(unmatched.getAttribute('title')).toContain('crit-a');
+    expect(unmatched.getAttribute('title')).toContain('crit-b');
+  });
+
+  test('merge evidence gap breakdown absent when merge_evidence_gaps is null', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      merge_evidence_gaps: null,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection !== null) throw new Error('Expected no merge-evidence-gap-breakdown when gaps is null');
+  });
+
+  test('merge evidence gap breakdown absent when merge_evidence_gaps is undefined (older backend)', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection !== null) throw new Error('Expected no merge-evidence-gap-breakdown when gaps is undefined');
+  });
+
+  test('merge evidence gap breakdown absent when merge_evidence_gaps is empty object', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      merge_evidence_gaps: {},
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection !== null) throw new Error('Expected no merge-evidence-gap-breakdown when gaps is empty');
+  });
+
+  test('merge evidence gap breakdown absent when all counts are zero', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      merge_evidence_gaps: { no_criteria: 0 },
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const gapSection = host.querySelector('[data-testid="merge-evidence-gap-breakdown"]');
+    if (gapSection !== null) throw new Error('Expected no merge-evidence-gap-breakdown when all gap counts are zero');
+  });
 });

@@ -2331,24 +2331,17 @@ async def _persist_compute_knowledge_document(
 def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
     """Extract attributable terminal diagnostics from a ComputeJob row.
 
-    Returns a dict with ``terminal_reason``, ``vm_phase`` (``provisioning`` when
-    the VM never started, ``runtime`` otherwise), plus ``accelerator_type`` and
-    ``machine_type`` when known.  For provisioning-phase failures also adds a
-    sanitized ``provisioning_cause`` (from ``polling_metadata["compute_rpc_diagnostic"]``)
-    and a ``launch_contract`` echo (``requested_deadline_seconds``,
-    ``provisioning_model``).  Returns ``None`` when the job has no terminal_reason.
+    Always populates execution-location fields (``executing_backend``,
+    ``runner_target_id``, ``runner_hostname``, ``accelerator_type``,
+    ``machine_type``) when present, so clean-SUCCESS runs surface provenance
+    in the run-provenance panel.  Adds ``terminal_reason``, ``vm_phase``, and
+    failure-specific fields (``provisioning_cause``, ``launch_contract``) only
+    when ``terminal_reason`` is non-empty.  Returns ``None`` only when ``job``
+    is ``None``.
     """
     if job is None:
         return None
-    reason = getattr(job, "terminal_reason", None)
-    if not reason:
-        return None
-    started_at = getattr(job, "started_at", None)
-    vm_phase = "provisioning" if started_at is None else "runtime"
-    diag: dict[str, Any] = {
-        "terminal_reason": reason,
-        "vm_phase": vm_phase,
-    }
+    diag: dict[str, Any] = {}
     accel = getattr(job, "accelerator_type", None)
     if accel:
         diag["accelerator_type"] = accel
@@ -2368,25 +2361,31 @@ def _extract_job_terminal_diagnostics(job: Any) -> dict[str, Any] | None:
             diag["runner_hostname"] = str(runner_hostname)
     except Exception:
         pass
-    if vm_phase == "provisioning":
-        try:
-            meta = getattr(job, "polling_metadata", None) or {}
-            raw_diag = meta.get("compute_rpc_diagnostic")
-            cause = sanitize_rpc_diagnostic(raw_diag)
-            if cause:
-                diag["provisioning_cause"] = cause
-            deadline = meta.get("requested_deadline_seconds")
-            prov_model = meta.get("provisioning_model")
-            contract: dict[str, Any] = {}
-            if deadline is not None:
-                contract["requested_deadline_seconds"] = deadline
-            if prov_model is not None:
-                contract["provisioning_model"] = prov_model
-            if contract:
-                diag["launch_contract"] = contract
-        except Exception:
-            pass
-    return diag
+    reason = getattr(job, "terminal_reason", None)
+    if reason:
+        started_at = getattr(job, "started_at", None)
+        vm_phase = "provisioning" if started_at is None else "runtime"
+        diag["terminal_reason"] = reason
+        diag["vm_phase"] = vm_phase
+        if vm_phase == "provisioning":
+            try:
+                meta = getattr(job, "polling_metadata", None) or {}
+                raw_diag = meta.get("compute_rpc_diagnostic")
+                cause = sanitize_rpc_diagnostic(raw_diag)
+                if cause:
+                    diag["provisioning_cause"] = cause
+                deadline = meta.get("requested_deadline_seconds")
+                prov_model = meta.get("provisioning_model")
+                contract: dict[str, Any] = {}
+                if deadline is not None:
+                    contract["requested_deadline_seconds"] = deadline
+                if prov_model is not None:
+                    contract["provisioning_model"] = prov_model
+                if contract:
+                    diag["launch_contract"] = contract
+            except Exception:
+                pass
+    return diag if diag else None
 
 
 # Defensive bound on how many reported metric keys are captured verbatim into a

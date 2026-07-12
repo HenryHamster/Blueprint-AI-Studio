@@ -3173,7 +3173,7 @@ def test_timestampless_attestation_expires_by_recorded_at():
     expected = recent + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
     assert abs((expires_dt - expected).total_seconds()) < 2
 
-    # recorded_at=None → valid (no reference point) and expires_at=None.
+    # recorded_at=None → no reference point means NOT attested (not perpetual trust).
     ev_no_rec = CriterionEvidence(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -3182,8 +3182,49 @@ def test_timestampless_attestation_expires_by_recorded_at():
         detail=None,
         recorded_at=None,
     )
-    assert ac._evidence_is_attested(ev_no_rec) is True
+    assert ac._evidence_is_attested(ev_no_rec) is False
     assert ac._compute_attestation_expires_at([ev_no_rec]) is None
+
+
+def test_attestation_without_timestamps_not_perpetual():
+    """An operator_attestation with no timestamps must NOT grant perpetual trust.
+
+    When both attested_at (in detail) and recorded_at are absent, _evidence_is_attested
+    must return False — a missing timestamp cannot be treated as forever-valid.
+    This covers both the no-attested_at branch and the unparseable-attested_at branch.
+    """
+    # No attested_at in detail, no recorded_at → must NOT be treated as attested.
+    ev_no_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail=None,
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_no_ts) is False, (
+        "operator_attestation with no timestamps must not grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_no_ts]) == "partial"
+
+    # Unparseable attested_at, no recorded_at → also must NOT be attested.
+    ev_bad_ts = CriterionEvidence(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        criterion_id=uuid.uuid4(),
+        source_kind="operator_attestation",
+        detail={"attested_at": "not-a-date"},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_attested(ev_bad_ts) is False, (
+        "operator_attestation with unparseable attested_at and no recorded_at must not "
+        "grant perpetual trust"
+    )
+    assert ac.compute_criterion_coverage([ev_bad_ts]) == "partial"
+
+    # _compute_attestation_expires_at returns None (no reference point).
+    assert ac._compute_attestation_expires_at([ev_no_ts]) is None
+    assert ac._compute_attestation_expires_at([ev_bad_ts]) is None
 
 
 @pytest.mark.asyncio

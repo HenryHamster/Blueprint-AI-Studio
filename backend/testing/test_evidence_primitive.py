@@ -8,6 +8,7 @@ The module is IO-free, so these are plain synchronous unit tests.
 from typing import get_args
 
 from app.evidence_primitive import (
+    ATTESTATION_ONLY_KINDS,
     BACKING_ONLY_KINDS,
     PATH_BACKED_KINDS,
     EvidenceStatus,
@@ -59,6 +60,17 @@ def test_backing_only_kinds_is_backing_path():
     assert set(BACKING_ONLY_KINDS) == {"backing_path"}
     # Every backing-only kind is a real ProofKind.
     assert set(get_args(ProofKind)) >= BACKING_ONLY_KINDS
+
+
+def test_attestation_only_kinds_is_operator_attestation():
+    # Only bare human-attestation kinds belong here; an operator_attestation
+    # alone carries no structural machine-check.
+    assert set(ATTESTATION_ONLY_KINDS) == {"operator_attestation"}
+    # Every attestation-only kind is a real ProofKind.
+    assert set(get_args(ProofKind)) >= ATTESTATION_ONLY_KINDS
+    # Structural-only and attestation-only tiers are disjoint — a backing_path
+    # (file exists at HEAD) is a strictly different, higher tier than bare word.
+    assert set(ATTESTATION_ONLY_KINDS).isdisjoint(BACKING_ONLY_KINDS)
 
 
 # --- classify_evidence -------------------------------------------------------
@@ -203,6 +215,76 @@ def test_tiered_backing_path_truthy_not_true_is_partial():
 def test_tiered_never_returns_contradicted():
     refs = [{"kind": "backing_path", "ref": "a/b.py", "proven": True}]
     assert classify_evidence_tiered(refs) != "contradicted"
+
+
+# --- attestation-only tiering ------------------------------------------------
+
+
+def test_tiered_demotes_attestation_only():
+    """A proven set whose ONLY proof is operator_attestation is demoted below
+    ``proven`` — a human's word is not machine-verified corroboration and, unlike
+    a backing_path, does not even prove a file exists at HEAD, so it is the
+    weakest tier: ``partial`` (not ``path_proven``, not ``proven``). Both
+    classifiers agree so no surface adopting the shared contract launders an
+    attestation into proven-parity."""
+    refs = [
+        {"kind": "operator_attestation", "ref": "c-abc123", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "partial"
+    assert classify_evidence(refs) == "partial"
+
+
+def test_tiered_multiple_attestation_only_returns_partial():
+    # Several attestation proofs together are still bare word → partial; there is
+    # no structural backing to lift them, even in aggregate.
+    refs = [
+        {"kind": "operator_attestation", "ref": "c-a", "proven": True},
+        {"kind": "operator_attestation", "ref": "c-b", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "partial"
+    assert classify_evidence(refs) == "partial"
+
+
+def test_tiered_attestation_plus_named_test_returns_proven():
+    # A machine-verified named_test corroborating an attestation lifts the whole
+    # set to proven — the mixed-with-machine case is NOT demoted.
+    refs = [
+        {"kind": "operator_attestation", "ref": "c-abc123", "proven": True},
+        {"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "proven"
+    assert classify_evidence(refs) == "proven"
+
+
+def test_tiered_attestation_plus_backing_path_returns_path_proven():
+    # Attestation gives nothing structural, but a backing_path alongside it does
+    # prove a file exists at HEAD → path_proven (the structural floor), never
+    # proven (still no machine-verification).
+    refs = [
+        {"kind": "operator_attestation", "ref": "c-abc123", "proven": True},
+        {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "path_proven"
+    assert classify_evidence(refs) == "path_proven"
+
+
+def test_tiered_attestation_truthy_not_true_is_partial():
+    # A truthy-but-not-True proven flag is not proof at all → partial (no proven
+    # ref exists), matching the backing_path truthy case.
+    refs = [{"kind": "operator_attestation", "ref": "c-abc123", "proven": 1}]
+    assert classify_evidence_tiered(refs) == "partial"
+    assert classify_evidence(refs) == "partial"
+
+
+def test_attestation_only_done_claim_is_contradicted():
+    # v25 intent: an attestation-only proof set no longer backs a done-type claim.
+    # classify_evidence returns partial, which claim_contradicts_evidence flags as
+    # the "claimed not earned" contradiction.
+    refs = [{"kind": "operator_attestation", "ref": "c-abc123", "proven": True}]
+    assert claim_contradicts_evidence("closed", classify_evidence(refs)) is True
+    assert (
+        claim_contradicts_evidence("closed", classify_evidence_tiered(refs)) is True
+    )
 
 
 # --- claim_contradicts_evidence ----------------------------------------------
