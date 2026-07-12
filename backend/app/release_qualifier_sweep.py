@@ -1401,6 +1401,73 @@ async def _run_auto_qualification_trigger_for_version(
         )
 
 
+async def _run_lifecycle_stall_alerts(
+    open_versions,
+    *,
+    session_factory=None,
+) -> None:
+    """Run the per-version lifecycle-stall alert checks on fresh row state.
+
+    For each open version this opens its OWN dedicated session and RE-SELECTs the
+    version row inside that transaction rather than merging the sweep-START
+    snapshot.  The stall checks that mutate ``last_qualification``
+    (``_check_version_auto_merge_stall`` / ``_check_version_managed_check_wait_stall``)
+    rebuild the verdict from ``version.last_qualification``; if that value is the
+    stale sweep-start snapshot (as it was under the old ``merge(load=False)`` of
+    the outer-scan object), the rebuilt verdict clobbers a ``last_qualification``
+    that another writer committed between sweep start and now — the re-driver
+    loops in ``sweep_stuck_qualifications`` (finalize, initial-fire, auto-trigger)
+    and out-of-band completion handlers all write that column on this same row in
+    their own sessions.  Re-selecting fresh makes every check operate on current
+    state, so a concurrently committed verdict is never overwritten.
+
+    A messaging failure on one version is logged and cannot affect another (each
+    version is fully isolated in its own session/transaction).
+    """
+    factory = session_factory or AsyncSessionLocal
+    for version in open_versions:
+        try:
+            async with factory() as alert_session:
+                v = (
+                    await alert_session.execute(
+                        select(release_version.ReleaseVersion).where(
+                            release_version.ReleaseVersion.id == version.id
+                        )
+                    )
+                ).scalar_one_or_none()
+                # The row could have been deleted between the outer scan and now;
+                # nothing to alert on if it is gone.
+                if v is None:
+                    continue
+                alerted = await _check_version_calcification(alert_session, v)
+                alerted = (
+                    await _check_version_ci_unresolved_stall(alert_session, v)
+                    or alerted
+                )
+                alerted = await _check_version_build_stall(alert_session, v) or alerted
+                alerted = (
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_promotion_readiness(alert_session, v)
+                    or alerted
+                )
+                alerted = (
+                    await _check_version_auto_merge_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_managed_check_wait_stall(alert_session, v)
+                    or alerted
+                )
+                if alerted:
+                    await alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
+                version.id,
+            )
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -2199,47 +2266,11 @@ async def sweep_stuck_qualifications(
 
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
-    # failures) or stalled in build (sitting too long without advancing).  The
-    # two checks are mutually exclusive per version (each early-returns on the
-    # wrong phase) but both run so whichever applies fires.  Each version gets
-    # its own dedicated session (same isolation pattern as the finalize loop
-    # above) so a messaging failure on one version can't affect another.
-    factory = session_factory or AsyncSessionLocal
-    for version in open_versions:
-        try:
-            async with factory() as alert_session:
-                # Merge the already-loaded version into this session to avoid a
-                # separate SELECT per version. load=False is safe because the
-                # version was just loaded in the outer scan (line 1429) and the
-                # DB row cannot change between the two accesses (no concurrent
-                # writers run inside the same sweep cycle).
-                v = await alert_session.merge(version, load=False)
-                alerted = await _check_version_calcification(alert_session, v)
-                alerted = (
-                    await _check_version_ci_unresolved_stall(alert_session, v)
-                    or alerted
-                )
-                alerted = await _check_version_build_stall(alert_session, v) or alerted
-                alerted = (
-                    await _check_version_stabilize_stall(alert_session, v) or alerted
-                )
-                alerted = (
-                    await _check_version_promotion_readiness(alert_session, v)
-                    or alerted
-                )
-                alerted = (
-                    await _check_version_auto_merge_stall(alert_session, v) or alerted
-                )
-                alerted = (
-                    await _check_version_managed_check_wait_stall(alert_session, v)
-                    or alerted
-                )
-                if alerted:
-                    await alert_session.commit()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
-                version.id,
-            )
+    # failures) or stalled in build (sitting too long without advancing).  Each
+    # version gets its own dedicated session (same isolation pattern as the
+    # finalize loop above) so a messaging failure on one version can't affect
+    # another.  Extracted to a helper so the fresh-per-version re-read is
+    # independently testable.
+    await _run_lifecycle_stall_alerts(open_versions, session_factory=session_factory)
 
     return finalized

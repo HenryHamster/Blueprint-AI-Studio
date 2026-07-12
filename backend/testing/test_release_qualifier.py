@@ -19462,6 +19462,113 @@ async def test_sweep_skips_version_with_running_child(db_session):
 
 
 @pytest.mark.asyncio
+async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
+    db_session,
+):
+    """Regression: the lifecycle-stall loop must NOT clobber a ``last_qualification``
+    committed concurrently between sweep start and the stall check.
+
+    The loop used to ``merge(load=False)`` the sweep-START snapshot of the version
+    into the alert session, so ``_check_version_auto_merge_stall`` rebuilt the
+    promotion-pending verdict from that STALE snapshot and wrote it back — erasing
+    a ``last_qualification`` another writer had committed in the interim.  The fix
+    re-``SELECT``s the row fresh inside the stall-check transaction, so the alert
+    is layered onto the CURRENT verdict.
+
+    Interleaving reproduced exactly: the sweep snapshot (``open_versions`` object)
+    carries the STALE verdict (PR #111), a different writer commits a fresh verdict
+    (PR #222) to the row, and the stall loop then runs on its own dedicated session
+    (fresh identity map, as in production).  The concurrently committed PR #222 must
+    survive with the auto-merge-stall alert layered on top of it — never reverting
+    to #111.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import update as sa_update
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+    from app import release_qualifier_sweep as rqs
+    from app import shared_state
+
+    # promotion-readiness check short-circuits when promotion is enabled; keep it
+    # disabled so the stall loop exercises the auto-merge-stall path deterministically.
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # A stall-eligible promotion_pending anchored >4h ago (past
+    # _AUTO_MERGE_STALL_SECONDS) with no prior alert, so _check_version_auto_merge_stall
+    # fires. This is the SWEEP-START snapshot (PR #111) carried in open_versions.
+    enabled_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+    ).isoformat()
+    stale_qual = {
+        "status": "pending",
+        "promotion_pending": {
+            "pr_number": 111,
+            "pr_url": "http://pr/111",
+            "enabled_at": enabled_at,
+        },
+    }
+    version.last_qualification = stale_qual
+    db_session.add(version)
+    await db_session.commit()
+
+    # The sweep-start snapshot the stall loop is handed (still holds PR #111).
+    open_versions = [version]
+
+    # Another writer commits a FRESH verdict (PR #222) to the row between sweep
+    # start and the stall check. synchronize_session=False updates the DB row only
+    # and deliberately leaves the in-memory `version` snapshot on PR #111 — exactly
+    # reproducing a commit that landed on a different session.
+    concurrent_qual = {
+        "status": "pending",
+        "promotion_pending": {
+            "pr_number": 222,
+            "pr_url": "http://pr/222",
+            "enabled_at": enabled_at,
+        },
+    }
+    await db_session.execute(
+        sa_update(rv.ReleaseVersion)
+        .where(rv.ReleaseVersion.id == version.id)
+        .values(last_qualification=concurrent_qual)
+        .execution_options(synchronize_session=False)
+    )
+    await db_session.commit()
+    # Sanity: the in-memory snapshot is genuinely stale (still PR #111).
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 111
+
+    # Dedicated-session factory on the SAME test engine: genuinely independent
+    # transactions and identity map (as the production per-version alert session
+    # is), so the stall loop's re-SELECT actually reads the committed row.
+    test_engine = db_session.bind
+
+    @asynccontextmanager
+    async def _dedicated_factory():
+        async with _AsyncSession(test_engine, expire_on_commit=False) as s:
+            yield s
+
+    await rqs._run_lifecycle_stall_alerts(
+        open_versions, session_factory=_dedicated_factory
+    )
+
+    # The concurrently committed verdict SURVIVES: the auto-merge-stall alert was
+    # layered onto the CURRENT row (PR #222), not the stale snapshot (PR #111).
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["pr_number"] == 222, (
+        "stall handling clobbered a concurrently committed last_qualification "
+        "with the stale sweep-start snapshot"
+    )
+    # And the alert genuinely fired (so the assertion above is not vacuous).
+    assert version.last_qualification["status"] == "pending"
+    assert "last_alerted_at" in pending
+    assert pending["alert_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mocker):
     """A version stranded in ``deferred_unsynced`` whose integration branch has
     SINCE absorbed the promotion target is re-driven by the sweep: it re-enters
