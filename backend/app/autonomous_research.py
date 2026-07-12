@@ -144,7 +144,7 @@ async def _project_spend_ceiling_spawn_defer_reason(
         project_id=project.id,
         window_days=spend_window_days,
     )
-    recent_spend = spend_breakdown["total"]
+    recent_spend = spend_breakdown.get("ceiling_gate_total", spend_breakdown["total"])
     if recent_spend >= spend_ceiling:
         from app.alert_dispatch import _maybe_create_spend_ceiling_alert
 

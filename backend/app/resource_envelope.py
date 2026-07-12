@@ -162,7 +162,10 @@ async def get_project_recent_spend_usd(
     """
     from app.compute_jobs import get_recent_terminal_compute_spend_usd
     from app.efficiency_snapshot import _compute_windowed_idle_cost
-    from app.llm_cost_attribution import _task_llm_cost
+    from app.llm_cost_attribution import (
+        NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER,
+        _task_llm_cost_split,
+    )
     from app.models import Task, get_task_total_vm_cost_usd
 
     now = _utcnow()
@@ -183,7 +186,14 @@ async def get_project_recent_spend_usd(
     )
     tasks = result.scalars().all()
     task_vm_spend = sum(get_task_total_vm_cost_usd(t) for t in tasks)
-    task_llm_spend = sum(_task_llm_cost(t)[0] for t in tasks)
+
+    task_llm_anthropic = 0.0
+    task_llm_non_anthropic = 0.0
+    for t in tasks:
+        a, na, _ = _task_llm_cost_split(t)
+        task_llm_anthropic += a
+        task_llm_non_anthropic += na
+    task_llm_spend = task_llm_anthropic + task_llm_non_anthropic
 
     idle_cost_result = await _compute_windowed_idle_cost(session, project_id, since)
     idle_spend = idle_cost_result["total"]
@@ -192,10 +202,18 @@ async def get_project_recent_spend_usd(
     agent_vm_f = float(task_vm_spend)
     idle_f = float(idle_spend)
     llm_f = float(task_llm_spend)
+    total = compute_f + agent_vm_f + idle_f + llm_f
+    # Non-Anthropic LLM cost cannot be independently verified (no per-call usage
+    # probe), so the ceiling gate uses a conservative total that inflates the
+    # non-Anthropic portion. Raw total and llm keys are unchanged for reporting.
+    non_anthropic_buffer = (NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER - 1.0) * float(
+        task_llm_non_anthropic
+    )
     return {
-        "total": compute_f + agent_vm_f + idle_f + llm_f,
+        "total": total,
         "compute": compute_f,
         "agent_vm": agent_vm_f,
         "idle": idle_f,
         "llm": llm_f,
+        "ceiling_gate_total": total + non_anthropic_buffer,
     }

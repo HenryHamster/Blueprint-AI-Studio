@@ -399,6 +399,170 @@ async def test_dispatch_gate_ceiling_exceeded_defers_tasks(db_session, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
+    """When pause_on_ceiling_exceeded=True and spend exceeds the ceiling,
+    _filter_project_resource_dispatch_eligible must set project.paused=True
+    and broadcast project_spend_ceiling_exceeded.
+
+    This directly tests the hard-pause path (orchestrator.py lines 788-812)
+    that was identified as having no dedicated coverage.
+    """
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    # Reset shared state so prior tests don't affect the ceiling-deferred set.
+    _shared_state.project_ceiling_deferred_ids = set()
+
+    project = make_project(
+        name="hard-pause-test",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "hard-pause test task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = task.id
+
+    # Spend exceeds ceiling → hard-pause must fire.
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+    broadcast_mock = AsyncMock()
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task_id],
+        [task],
+        {},
+        broadcast_mock,
+    )
+
+    # Task must be excluded from dispatch (deferred).
+    assert task_id not in result, (
+        "task must be deferred when project spend ceiling is exceeded"
+    )
+
+    # Project must now be paused in the DB.
+    await db_session.refresh(project)
+    assert project.paused is True, (
+        "project must be hard-paused when pause_on_ceiling_exceeded=True "
+        "and spend ceiling is breached"
+    )
+
+    # broadcast_to_project must have been called with project_spend_ceiling_exceeded.
+    broadcast_calls = [
+        call.args[1]
+        for call in broadcast_mock.call_args_list
+        if len(call.args) >= 2
+    ]
+    assert "project_spend_ceiling_exceeded" in broadcast_calls, (
+        f"expected project_spend_ceiling_exceeded broadcast; calls={broadcast_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_no_refire_when_already_paused(db_session, mocker):
+    """When the project is already paused, the hard-pause guard must not
+    re-fire the project_spend_ceiling_exceeded broadcast.
+
+    Guards the no-refire condition at orchestrator.py line 794:
+    `if not _project.paused:` prevents spamming the broadcast every cycle.
+    """
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    _shared_state.project_ceiling_deferred_ids = set()
+
+    project = make_project(
+        name="hard-pause-already-paused",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    project.paused = True  # Project is already paused.
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "already-paused task"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = task.id
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+    broadcast_mock = AsyncMock()
+
+    await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task_id],
+        [task],
+        {},
+        broadcast_mock,
+    )
+
+    # The project_spend_ceiling_exceeded broadcast must NOT fire again
+    # since the project was already paused before this cycle.
+    broadcast_calls = [
+        call.args[1]
+        for call in broadcast_mock.call_args_list
+        if len(call.args) >= 2
+    ]
+    assert "project_spend_ceiling_exceeded" not in broadcast_calls, (
+        "project_spend_ceiling_exceeded must not be re-broadcast when "
+        f"project is already paused; calls={broadcast_calls}"
+    )
+
+
 # ── Degraded-runner dispatch deprioritization ─────────────────────────────────
 
 

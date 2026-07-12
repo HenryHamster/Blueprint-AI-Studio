@@ -102,6 +102,12 @@ LLM_CACHE_READ_INPUT_PRICING: dict[tuple[str, str], float] = {
 # Key read by efficiency_snapshot consumers.
 SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
 
+# Applied to non-Anthropic LLM cost in the ceiling gate only (not in reporting).
+# Non-Anthropic providers have no independent per-call usage probe, so their
+# self-reported token counts cannot be verified; the buffer makes the gate err
+# toward earlier deferral rather than silent overspend.
+NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER: float = 1.25
+
 
 def _bounded_cache_input_counts(
     input_tokens: int,
@@ -724,6 +730,52 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
         else:
             any_unpriced = True
     return cost, any_unpriced
+
+
+def _task_llm_cost_split(task: Task) -> tuple[float, float, bool]:
+    """Return (anthropic_cost, non_anthropic_cost, any_unpriced) for a single task.
+
+    Splits LLM cost by provider so ceiling-gate callers can apply a conservatism
+    buffer to non-Anthropic spend without inflating raw cost reporting.
+    """
+    anthropic_cost = 0.0
+    non_anthropic_cost = 0.0
+    any_unpriced = False
+    for (
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        _call_count,
+        cache_creation,
+        cache_read,
+    ) in _task_llm_attempts(task):
+        if input_tokens <= 0 and output_tokens <= 0:
+            continue
+        if not provider or not model:
+            any_unpriced = True
+            continue
+        key = (provider.lower(), model.lower())
+        pricing = LLM_TOKEN_PRICING.get(key)
+        if pricing:
+            input_rate, output_rate = pricing
+            cost = _price_llm_attempt(
+                input_tokens,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                input_rate,
+                output_rate,
+                provider=key[0],
+                model=key[1],
+            )
+            if key[0] == "anthropic":
+                anthropic_cost += cost
+            else:
+                non_anthropic_cost += cost
+        else:
+            any_unpriced = True
+    return anthropic_cost, non_anthropic_cost, any_unpriced
 
 
 def _pr_number_for_task(task: Task) -> int | None:

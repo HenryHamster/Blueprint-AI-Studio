@@ -685,7 +685,9 @@ async def _project_resource_dispatch_defer_message(
                 project_id=task.project_id,
                 window_days=spend_window_days,
             )
-            recent_spend = spend_breakdown["total"]
+            recent_spend = spend_breakdown.get(
+                "ceiling_gate_total", spend_breakdown["total"]
+            )
             if spend_cache is not None:
                 spend_cache[task.project_id] = (
                     recent_spend,
