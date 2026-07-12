@@ -1154,7 +1154,11 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     derived = _clamp01(derived)
     missing_reason = _audit_missing_reason(report)
     audit_score: float | None = derived
-    if missing_reason in ("parseable_but_unscoreable", "all_findings_unverified"):
+    if missing_reason in (
+        "parseable_but_unscoreable",
+        "all_findings_unverified",
+        "no_findings_key",
+    ):
         # The report parsed but yields NO trustworthy score, so returning the
         # clean-looking ``derived`` would fail GREEN over real defects:
         #   * ``parseable_but_unscoreable`` — no finding carried a usable severity.
@@ -1162,6 +1166,14 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         #     finding was dropped for lacking a ≥20-char verification_note, so the
         #     deduction loop left ``derived`` at 1.0 while unsubstantiated criticals
         #     go unsurfaced (the false-green class this fix closes).
+        #   * ``no_findings_key`` — the artifact carries NEITHER a "findings" nor
+        #     an "issues" key, so the deduction loop never ran and ``derived``
+        #     stayed 1.0.  A report missing the findings section entirely is
+        #     MALFORMED, not clean (contrast ``empty_findings_list``, where an
+        #     explicit ``findings: []`` legitimately says the auditor found
+        #     nothing) — score it unmeasured so ``compute_composite`` routes to
+        #     the ``audit_missing`` hard blocker instead of promoting on a
+        #     phantom-clean audit.
         # NULL the score in both cases so ``compute_composite`` routes to the
         # ``audit_missing`` hard blocker (surface it, don't fail green) instead of
         # promoting on a phantom-clean audit.  A report with at least ONE verified

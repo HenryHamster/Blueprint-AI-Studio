@@ -320,6 +320,27 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
     }
 
 
+def _fail_closed_category_verdicts(
+    active_keys: set[str | None],
+) -> list[dict[str, Any]] | None:
+    """Build a fail-CLOSED per-category gate input from the active criterion keys.
+
+    ``compute_composite``'s goal-verification gate BLOCKS when any category's
+    ``status`` is not ``"met"`` and SKIPS entirely when handed ``None``.  When the
+    per-category verdicts cannot be read back (ledger read raised, or returned no
+    row for any active criterion), returning ``None`` would silently SKIP the gate
+    and let an unverified candidate promote — the fail-open this closes.  Instead,
+    synthesise one ``"unverified"`` verdict per active criterion so the gate blocks
+    with ``criterion_coverage_incomplete`` (unverified != verified).  Returns
+    ``None`` only when there are genuinely no active criterion keys to gate on.
+    """
+    verdicts = [
+        {"category_key": k, "status": "unverified", "tier": "unverified"}
+        for k in sorted(k for k in active_keys if k)
+    ]
+    return verdicts or None
+
+
 def _is_audited_surface_path(path: str) -> bool:
     """True when a file is part of the code surface a release audit judges.
 
@@ -2266,6 +2287,32 @@ async def run_qualification(
                 "blocker": row.blocker,
                 "detail": row.detail,
             }
+    # Audit-challenge parity on reuse: a stored audit fact with status "failed"
+    # carries a finding-driven DEDUCTION that is only trustworthy once the
+    # audit-challenge gate CONFIRMED the underlying findings.  The audit
+    # dimension is upserted to the ledger EARLY (before the challenge gate runs
+    # in _finalize_qualification), so a prior attempt that HELD on a
+    # missing/uncertain/SHA-mismatched challenge leaves audit="failed" while the
+    # "challenge" dimension is never written "passed" (its dual-write is only
+    # reached on a terminal finalize).  Reusing that audit verbatim would
+    # compose an unconfirmed deduction and silently drop the challenge gate the
+    # fresh-run path enforces.  Force a fresh audit+challenge re-measurement
+    # instead — drop audit+test_erosion from the reuse set so BOTH the spawn
+    # decision below AND the finalize composition route through the same gate.
+    if (
+        resolved_dims.get("audit", {}).get("status") == "failed"
+        and resolved_dims.get("challenge", {}).get("status") != "passed"
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reused a 'failed' audit whose "
+            "challenge gate never resolved 'passed' — forcing a fresh "
+            "audit+challenge re-measurement instead of composing the "
+            "unconfirmed deduction",
+            version.version_number,
+            candidate_sha[:8],
+        )
+        resolved_dims.pop("audit", None)
+        resolved_dims.pop("test_erosion", None)
     # A child task is needed only when NOT ALL of its produced dimensions are
     # already resolved.  audit task → {audit, test_erosion}; smoketest task →
     # {smoketest}; merge_grade task → {merge_grade}.
@@ -4118,7 +4165,16 @@ async def _finalize_qualification(
         audit_report = None
         audit_score = resolved_dims["audit"].get("sub_score")
         test_erosion_score = resolved_dims["test_erosion"].get("sub_score")
-        if test_erosion_score is None:
+        # A resolved test_erosion fact with status "blocked" carries the
+        # hard-blocker sentinel (sub_score None == test_file_deleted); it must
+        # propagate as None so compute_composite re-raises the block, never
+        # coerce to a clean 1.0 (the same-SHA ledger-reuse fail-open).  Only a
+        # non-blocked reuse whose score is genuinely absent falls back to the
+        # neutral 1.0.
+        if (
+            test_erosion_score is None
+            and resolved_dims["test_erosion"].get("status") != "blocked"
+        ):
             test_erosion_score = 1.0
         audit_findings: list[dict[str, Any]] = []
         excluded_audit_findings: list[dict[str, Any]] = []
@@ -4230,7 +4286,18 @@ async def _finalize_qualification(
     if "smoketest" in resolved_dims:
         smoketest_result = None
         _smoke_score = resolved_dims["smoketest"].get("sub_score")
-        smoketest_score = _smoke_score if _smoke_score is not None else 1.0
+        # A resolved smoketest fact with status "blocked" carries the
+        # hard-blocker sentinel (sub_score None == startup-suite failure); it
+        # must propagate as None so compute_composite re-raises the block,
+        # never coerce to a clean 1.0 (the same-SHA ledger-reuse fail-open).
+        # A non-blocked reuse with an absent score falls back to neutral 1.0.
+        if (
+            _smoke_score is None
+            and resolved_dims["smoketest"].get("status") == "blocked"
+        ):
+            smoketest_score = None
+        else:
+            smoketest_score = _smoke_score if _smoke_score is not None else 1.0
         smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
     else:
         smoketest_result: dict[str, Any] | None = None
@@ -5089,6 +5156,16 @@ async def _finalize_qualification(
             for c in active_categories
             if c.get("category_key")
         }
+        # The goal-verification gate only APPLIES when a merge-grade grade exists
+        # for this candidate (fresh child this finalize, or a grade reused from
+        # the per-dimension ledger on a re-drive).  When no merge-grade ran (e.g.
+        # the version has no gradeable goal), the per-category verdicts are
+        # legitimately absent and the gate stays inert — criteria are governed by
+        # the evidence-coverage path, not this gate — so an empty/unreadable
+        # read-back falls back to None (skip) rather than fail-closed.  Fail-closed
+        # only guards the case where a grade DID run but its verdicts cannot be
+        # trusted (absent for active keys, or the read raised).
+        _merge_grade_ran = bool(merge_grade_task_id) or ("merge_grade" in resolved_dims)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
         _ledger_write_failed = False
         if _fresh_category_verdicts is not None:
@@ -5127,6 +5204,11 @@ async def _finalize_qualification(
             # category gate entirely, letting a ``not_met`` candidate promote.  The
             # freshly-computed in-memory grade is authoritative: feed it to the gate
             # directly (filtered to the active keys, exactly like the read-back).
+            # Fail-open state 1/3: the write failed AND the freshly-computed
+            # verdicts do not cover any currently-active criterion (e.g. the
+            # grader only graded now-retracted categories).  Absent evidence for
+            # every active category is UNVERIFIED, not clean — fail closed rather
+            # than skip the gate (None).
             _gate_category_verdicts = [
                 cv
                 for cv in (
@@ -5134,7 +5216,7 @@ async def _finalize_qualification(
                     for _v in (_fresh_category_verdicts or [])
                 )
                 if cv.get("category_key") in _active_keys
-            ] or None
+            ] or _fail_closed_category_verdicts(_active_keys)
             _gate_residual = merge_grade_cert.get("residual_uncaptured_gap")
         else:
             # Read the gate inputs back FROM the ledger (canonical source; covers
@@ -5149,6 +5231,12 @@ async def _finalize_qualification(
                 # permanently re-block this gate even though the sweep's
                 # ``is_candidate_fully_met`` (which filters the same way) reports the
                 # candidate FULLY MET — a permanent finalize wedge + re-qual loop.
+                # Fail-open state 2/3: the read-back succeeded but returned NO
+                # row for any currently-active criterion.  When a merge-grade
+                # grade ran for this candidate, that means active criteria were
+                # never graded into the ledger — UNVERIFIED, not clean — so fail
+                # closed rather than skip the gate (None).  When no grade ran the
+                # gate is inert (evidence-coverage path governs), so skip.
                 _gate_category_verdicts = [
                     cv
                     for cv in (
@@ -5156,17 +5244,32 @@ async def _finalize_qualification(
                         for _v in (_ledger_verdicts or [])
                     )
                     if cv.get("category_key") in _active_keys
-                ] or None
+                ] or (
+                    _fail_closed_category_verdicts(_active_keys)
+                    if _merge_grade_ran
+                    else None
+                )
                 _gate_residual = await _category_ledger.get_residual(
                     session, version.id, candidate_sha
                 )
-            except Exception:  # noqa: BLE001 — a read failure falls back to no-gate (safe)
+            except Exception:  # noqa: BLE001 — a read failure fails CLOSED (below)
+                # Fail-open state 3/3: the ledger read itself raised, so the
+                # verdicts are UNREADABLE.  When a grade ran for this candidate,
+                # skipping the gate (None) would let a candidate promote on a
+                # transient DB error masking the goal-verification result — fail
+                # closed so an unreadable gate input blocks instead of promotes.
+                # (No grade ran → gate inert → skip, matching the no-goal path.)
                 logger.warning(
                     "[RELEASE_QUALIFIER] v%d failed to read per-category verdicts back "
-                    "from the ledger — falling back to the holistic gate",
+                    "from the ledger — %s the goal-verification gate",
                     version.version_number,
+                    "failing closed on" if _merge_grade_ran else "skipping (no grade ran)",
                 )
-                _gate_category_verdicts = None
+                _gate_category_verdicts = (
+                    _fail_closed_category_verdicts(_active_keys)
+                    if _merge_grade_ran
+                    else None
+                )
                 _gate_residual = None
 
     # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---

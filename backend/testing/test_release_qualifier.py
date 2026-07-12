@@ -1520,11 +1520,20 @@ class TestScoreAudit:
         audit, _ = rq._score_audit(report)
         assert audit == pytest.approx(0.0)
 
-    def test_missing_findings_key_scores_1_0(self):
-        """A report with no findings key derives score 1.0 (no deductions)."""
+    def test_missing_findings_key_scores_unmeasured(self):
+        """A report missing the findings key scores unmeasured (None), not clean.
+
+        A report carrying NEITHER a "findings" nor an "issues" key is malformed —
+        the deduction loop never runs — so scoring it a clean 1.0 fails GREEN over
+        an audit that never actually surfaced findings.  It must null the score so
+        compute_composite routes to the ``audit_missing`` hard blocker.  (Contrast
+        ``empty_findings_list``: an explicit ``findings: []`` legitimately says the
+        auditor found nothing and keeps its clean 1.0.)
+        """
         report = {"audit_score": 0.5, "test_erosion": {"deleted_test_files": []}}
         audit, erosion = rq._score_audit(report)
-        assert audit == pytest.approx(1.0)
+        assert audit is None
+        # test-erosion is scored independently and remains neutral.
         assert erosion == pytest.approx(1.0)
 
     def test_deleted_test_file_returns_none_erosion(self):
@@ -1733,9 +1742,30 @@ class TestScoreAudit:
         assert erosion is not None
         assert erosion < 1.0
 
-    def test_missing_audit_score_no_findings_scores_1_0(self):
-        """An absent self-reported audit_score still yields derived 1.0 (no findings)."""
+    def test_missing_audit_score_no_findings_scores_unmeasured(self):
+        """A report with neither audit_score nor findings key scores unmeasured.
+
+        No findings key AND no self-reported score is a malformed artifact, not a
+        clean audit — it must null the score (fail closed) rather than derive a
+        phantom-clean 1.0.
+        """
         report = {"test_erosion": {"deleted_test_files": []}}
+        audit, erosion = rq._score_audit(report)
+        assert audit is None
+        assert erosion == pytest.approx(1.0)
+
+    def test_empty_findings_list_still_scores_clean(self):
+        """An EXPLICIT empty findings list is a legitimately-clean audit (1.0).
+
+        Guards the no_findings_key fix from over-reaching: an auditor that ran and
+        found nothing emits ``findings: []`` and must keep its clean score, unlike
+        a report that omits the findings key entirely.
+        """
+        report = {
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+        }
         audit, erosion = rq._score_audit(report)
         assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
@@ -9172,11 +9202,23 @@ async def _seed_qualification_children(
     await db_session.refresh(smoke_task)
 
     if audit_logs is not None:
+        # Normalise to the real RELEASE_AUDIT_REPORT contract: a clean audit
+        # emits an explicit ``findings: []`` (the agent always includes the key).
+        # A fixture that omits the key entirely is the malformed ``no_findings_key``
+        # shape that _score_audit now scores as unmeasured — inject the empty list
+        # so "clean audit" fixtures keep meaning clean, while fixtures that supply
+        # findings/issues are left untouched.
+        _audit_logs = dict(audit_logs)
+        # An empty-dict report is intentionally left as-is (it exercises the
+        # audit_report_empty_dict infra-failure path); only a NON-empty report
+        # missing the findings section gets the empty-list normalization.
+        if _audit_logs and "findings" not in _audit_logs and "issues" not in _audit_logs:
+            _audit_logs["findings"] = []
         db_session.add(
             Artifact(
                 task_id=audit_task.id,
                 artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
-                logs=json.dumps(audit_logs),
+                logs=json.dumps(_audit_logs),
             )
         )
     if smoke_logs is not None:
@@ -10481,6 +10523,315 @@ async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, moc
     # Fail-open: promoted despite empty ledger (first qualification).
     assert result["status"] == "promoted"
     promote_spy.assert_called_once()
+
+
+# Fully-controlled gate inputs for finalize reuse-path tests: CI green, both
+# migration gates OK.  Keeps the composite dependent ONLY on the resolved-
+# dimension facts under test (audit / test_erosion / smoketest), never on live
+# GitHub reads.
+_REUSE_PATH_PRE_GATES = {
+    "ci_green": True,
+    "ci_resolution": {"state": "green"},
+    "ci_required": True,
+    "migration_verdict": "ok",
+    "migration_detail": {},
+    "apply_verdict": "ok",
+    "apply_detail": {},
+}
+
+
+@pytest.mark.asyncio
+async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
+    db_session, mocker
+):
+    """Same-SHA ledger reuse of a BLOCKED smoketest fact must propagate the
+    hard-blocker sentinel (None), never coerce to a clean 1.0.
+
+    A prior finalize resolved smoketest as 'blocked' (startup-suite failure) and
+    stored sub_score=None to the per-dimension ledger.  On a re-drive at the same
+    candidate_sha the smoketest child is NOT re-spawned; finalize composes the
+    dimension from the ledger.  The fail-open this closes coerced the None
+    sub_score to 1.0, silently dropping the smoketest_startup_failed hard blocker
+    and letting a candidate that can't even boot promote.  Blocked must stay
+    blocked.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    sha = _LEDGER_SHA_A
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        "audit_task_id": None,
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "resolved_dimensions": {
+            "audit": {"status": "passed", "sub_score": 1.0},
+            "test_erosion": {"status": "passed", "sub_score": 1.0},
+            # A prior startup-suite failure: blocked with the None sentinel.
+            "smoketest": {"status": "blocked", "sub_score": None},
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    # The blocked smoketest re-raises the hard blocker rather than composing 1.0.
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "smoketest_startup_failed"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
+    db_session, mocker
+):
+    """Same-SHA ledger reuse of a BLOCKED test_erosion fact must propagate the
+    hard-blocker sentinel (None), never coerce to a clean 1.0.
+
+    A prior finalize resolved test_erosion as 'blocked' (a real test file was
+    deleted → the test_file_deleted hard blocker) and stored sub_score=None.  On
+    a re-drive the audit child is not re-spawned and finalize composes from the
+    ledger; the fail-open coerced None→1.0, dropping the test_file_deleted
+    blocker.  Blocked must stay blocked.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    sha = _LEDGER_SHA_A
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        "audit_task_id": None,
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "resolved_dimensions": {
+            "audit": {"status": "passed", "sub_score": 1.0},
+            # A prior genuine test-file deletion: blocked with the None sentinel.
+            "test_erosion": {"status": "blocked", "sub_score": None},
+            "smoketest": {"status": "passed", "sub_score": 1.0},
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "test_file_deleted"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reused_passed_smoketest_with_absent_score_still_neutral(
+    db_session, mocker
+):
+    """Guard the blocked-fact fix from over-reaching: a resolved smoketest fact
+    whose status is 'passed' but whose sub_score is absent still falls back to the
+    neutral 1.0 (only a 'blocked' status propagates the None sentinel)."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    sha = _LEDGER_SHA_A
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        "audit_task_id": None,
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "resolved_dimensions": {
+            "audit": {"status": "passed", "sub_score": 1.0},
+            "test_erosion": {"status": "passed", "sub_score": 1.0},
+            # passed + absent score → neutral 1.0, NOT the blocked sentinel.
+            "smoketest": {"status": "passed", "sub_score": None},
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    # No smoketest hard blocker — the passed dimension composes neutrally.
+    assert result.get("blocker") != "smoketest_startup_failed"
+    assert result["status"] == "promoted"
+    promote_spy.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_category_gate_read_back_exception_fails_closed(db_session, mocker):
+    """Fail-open state 3/3: when the per-category verdict ledger read RAISES, the
+    goal-verification gate must fail CLOSED (block), not skip.
+
+    The candidate has an active acceptance criterion, so its category MUST be
+    verified.  Making the ledger read-back raise used to null the gate input
+    (_gate_category_verdicts=None), which compute_composite treats as "no rubric"
+    and SKIPS — letting an unverified candidate promote on a transient DB error.
+    The fix synthesises a fail-closed 'unverified' verdict per active criterion so
+    the gate blocks with criterion_coverage_incomplete.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        version_goal="Ship the widget end to end",
+        seed_merge_grade=True,
+        # A fresh grade would normally write the verdicts; force the READ-BACK
+        # path (no fresh verdicts) so the ledger read is what decides the gate.
+        merge_grade_logs={
+            "covers_goal": True,
+            "coverage_score": 0.9,
+            "biggest_gap": None,
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-needs-verify",
+        text="Widget path must be verified",
+    )
+
+    # Make the ledger read-back raise (unreadable evidence).
+    from app import category_verdict_ledger as _cvl
+
+    mocker.patch.object(
+        _cvl,
+        "get_category_verdicts",
+        new=AsyncMock(side_effect=RuntimeError("ledger read boom")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Fail closed: an unreadable category gate BLOCKS instead of promoting.
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "criterion_coverage_incomplete"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
+    db_session, mocker
+):
+    """Fail-open state 2/3: when the read-back succeeds but returns NO verdict row
+    for any currently-active criterion, the gate must fail CLOSED.
+
+    Exercised on the re-drive shape: merge_grade is composed from the per-dimension
+    ledger (no fresh grade → no fresh category verdicts), and the category-verdict
+    ledger is empty for the active criterion.  Active criteria that were never
+    graded into the ledger are UNVERIFIED, not clean.  The old code fell back to
+    None (skip gate) via ``... or None``; the fix synthesises fail-closed
+    'unverified' verdicts so promotion is blocked.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    sha = _LEDGER_SHA_A
+    # An active criterion that was never graded into the category-verdict ledger.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-ungraded",
+        text="This criterion was never graded into the ledger",
+    )
+    version.goal = "Ship the widget end to end"
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        "audit_task_id": None,
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "merge_grade_task_id": None,
+        # Re-drive: every quality gate already resolved for this tree, including
+        # merge_grade — so no fresh merge-grade artifact / category verdicts are
+        # produced and the gate must read the (empty) category ledger back.
+        "resolved_dimensions": {
+            "audit": {"status": "passed", "sub_score": 1.0},
+            "test_erosion": {"status": "passed", "sub_score": 1.0},
+            "smoketest": {"status": "passed", "sub_score": 1.0},
+            "merge_grade": {"status": "passed", "sub_score": 0.9},
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "criterion_coverage_incomplete"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -16909,6 +17260,7 @@ class TestFinalizeInfraFailure:
                 logs=json.dumps(
                     {
                         "audit_score": 1.0,
+                        "findings": [],
                         "test_erosion": {"deleted_test_files": []},
                     }
                 ),
@@ -18572,6 +18924,7 @@ async def test_maybe_finalize_both_children_terminal_calls_finalize(db_session, 
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 2,
@@ -19040,6 +19393,7 @@ async def test_sweep_finalizes_version_stuck_pending(db_session):
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 3,
@@ -19794,6 +20148,186 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     assert qual["audit_task_id"] is None
     assert qual["smoketest_task_id"] is None
     assert qual["merge_grade_task_id"] is not None
+
+
+async def _seed_redrive_common_dimensions(db_session, project, version, sha):
+    """Seed the non-audit gates as resolved 'passed' for a re-drive at ``sha``."""
+    for dim in ("test_erosion", "smoketest", "ci", "migration_identity",
+                "migration_apply"):
+        await _seed_dimension_row(
+            db_session, project, version, dim, status="passed", candidate_sha=sha,
+        )
+
+
+@pytest.mark.asyncio
+async def test_redrive_failed_audit_without_passed_challenge_re_measures(
+    db_session, mocker,
+):
+    """Audit-challenge parity on reuse: a stored audit fact with status 'failed'
+    whose challenge gate never resolved 'passed' must NOT be reused verbatim — a
+    fresh audit+challenge re-measurement is forced so both paths pass through the
+    same gate.
+
+    The audit dimension is upserted to the ledger BEFORE the challenge gate runs,
+    so a prior attempt that held on a missing/uncertain challenge leaves
+    audit='failed' while 'challenge' is never written 'passed'.  Reusing that
+    audit would compose an unconfirmed finding-driven deduction and silently drop
+    the audit-challenge gate.  On re-drive, the audit child MUST be re-spawned
+    (challenge re-driven too), not skipped.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "beefcafe" * 5
+
+    # Audit resolved 'failed' (a finding-driven deduction) — but the challenge
+    # dimension is NOT resolved 'passed' (the prior attempt held on it, so no
+    # challenge row was ever written).
+    await _seed_dimension_row(
+        db_session, project, version, "audit",
+        status="failed", sub_score=0.7, candidate_sha=sha,
+    )
+    await _seed_redrive_common_dimensions(db_session, project, version, sha)
+    await _seed_dimension_row(
+        db_session, project, version, "merge_grade",
+        status="passed", candidate_sha=sha,
+    )
+    await db_session.commit()
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha,
+        "error": "audit_challenge_missing",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version.qualification_attempts = 1
+    version.goal = "Deliver the audit-challenge parity guard on reuse"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    smoketest_spawn = mocker.patch(
+        "app.release_qualifier._spawn_qualifier_smoketest_task",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-beef",
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert result is True
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["status"] == "pending"
+
+    # Core assertion: the 'failed' audit was NOT reused — a fresh audit child was
+    # spawned to re-measure it through the challenge gate.
+    audit_spawn.assert_awaited_once()
+    # smoketest (independently 'passed') is still reused — the guard is scoped to
+    # the unconfirmed audit only.
+    smoketest_spawn.assert_not_called()
+
+    # The challenge is re-driven (spawn pending) once the fresh audit lands.
+    assert qual.get("audit_challenge_spawn_pending") is True
+    # audit + test_erosion are dropped from the reuse set; smoketest stays.
+    resolved = qual.get("resolved_dimensions") or {}
+    assert "audit" not in resolved
+    assert "test_erosion" not in resolved
+    assert "smoketest" in resolved
+    assert qual["audit_task_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_redrive_failed_audit_with_passed_challenge_is_reused(
+    db_session, mocker,
+):
+    """Control for the audit-challenge parity guard: a 'failed' audit whose
+    challenge gate DID resolve 'passed' is a CONFIRMED deduction — it is reused
+    verbatim and the audit child is NOT re-spawned (no over-firing)."""
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "d00dfeed" * 5
+
+    await _seed_dimension_row(
+        db_session, project, version, "audit",
+        status="failed", sub_score=0.7, candidate_sha=sha,
+    )
+    await _seed_redrive_common_dimensions(db_session, project, version, sha)
+    # The challenge gate CONFIRMED the deduction — challenge dimension 'passed'.
+    await _seed_dimension_row(
+        db_session, project, version, "challenge",
+        status="passed", candidate_sha=sha,
+    )
+    # Leave merge_grade unavailable so the re-drive still has something to spawn.
+    await _seed_dimension_row(
+        db_session, project, version, "merge_grade",
+        status="unavailable", candidate_sha=sha,
+    )
+    await db_session.commit()
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha,
+        "error": "merge_grade_report_unparseable",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version.qualification_attempts = 1
+    version.goal = "Confirmed-deduction audit reuse stays cheap"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    merge_grade_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_merge_grade_task",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-d00d",
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert result is True
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # The confirmed 'failed' audit is reused — no expensive re-audit.
+    audit_spawn.assert_not_called()
+    merge_grade_spawn.assert_awaited_once()
+    resolved = qual.get("resolved_dimensions") or {}
+    assert resolved.get("audit", {}).get("status") == "failed"
+    assert "test_erosion" in resolved
+    assert qual["audit_task_id"] is None
 
 
 @pytest.mark.asyncio
@@ -21582,6 +22116,7 @@ async def test_finalize_smoketest_disabled_drops_dimension(db_session):
         version,
         audit_logs={
             "audit_score": 1.0,
+            "findings": [],
             "test_erosion": {
                 "deleted_test_files": [],
                 "assertion_delta": 4,
@@ -21624,6 +22159,7 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
         audit_status=TaskStatus.COMPLETED,
         audit_logs={
             "audit_score": 1.0,
+            "findings": [],
             "test_erosion": {"deleted_test_files": []},
         },
     )
@@ -21658,6 +22194,7 @@ async def test_sweep_smoketest_disabled_audit_only(db_session):
         audit_status=TaskStatus.COMPLETED,
         audit_logs={
             "audit_score": 1.0,
+            "findings": [],
             "test_erosion": {"deleted_test_files": []},
         },
     )
@@ -22337,7 +22874,7 @@ async def test_sweep_commits_each_version_independently(db_session, mocker):
             task_id=audit_a.id,
             artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
             logs=json.dumps(
-                {"audit_score": 1.0, "test_erosion": {"deleted_test_files": []}}
+                {"audit_score": 1.0, "test_erosion": {"deleted_test_files": []}, "findings": []}
             ),
         )
     )
@@ -23832,7 +24369,7 @@ async def test_maybe_finalize_takes_no_caller_session(db_session, mocker):
             task_id=audit_task.id,
             artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
             logs=json.dumps(
-                {"audit_score": 1.0, "test_erosion": {"deleted_test_files": []}}
+                {"audit_score": 1.0, "test_erosion": {"deleted_test_files": []}, "findings": []}
             ),
         )
     )
@@ -24219,6 +24756,7 @@ async def test_concurrent_finalize_does_not_double_promote(db_session, mocker):
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 8,
@@ -35056,6 +35594,7 @@ async def test_sweep_finalized_count_excludes_redrives(db_session, mocker):
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 0,
