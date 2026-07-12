@@ -204,6 +204,90 @@ async def _handle_approval_gate_timeout(
                 return True
         hours = round(approval_elapsed / 3600, 1)
 
+        # CREDIT-BLINDNESS GUARD: before FAILing, check whether the parent's
+        # rollup PR has ALREADY MERGED. The preserve block below only handles
+        # an OPEN mergeable PR — an already-merged PR is not "preservable", so
+        # without this guard control falls through to FAILED and marks landed
+        # work as a failure, costing the direction its merge credit (real
+        # incident: research be331963 / PR #14342 merged, then FAILED 36s
+        # later). A merged rollup is a SUCCESS: reconcile to COMPLETED via the
+        # canonical rollup-merge path (never classify_failure/record_task_result/
+        # failure alert).
+        _merged_pr_num = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
+            "pr_number"
+        )
+        if _merged_pr_num:
+            _merged_pr_data = None
+            try:
+                from app.routers.agent import get_github_token_for_task
+                from app.github import get_pull_request
+
+                _gh_tok, _gh_owner, _gh_repo = await services._bounded(
+                    get_github_token_for_task(task.id, session),
+                    services._GH_CALL_TIMEOUT_S,
+                    what=f"approval-gate merged-check token {str(task.id)[:8]}",
+                )
+                _merged_pr_data = await services._bounded(
+                    get_pull_request(
+                        _gh_tok, _gh_owner, _gh_repo, int(_merged_pr_num)
+                    ),
+                    services._GH_CALL_TIMEOUT_S,
+                    what=f"approval-gate get_pull_request #{_merged_pr_num}",
+                )
+            except Exception:
+                logger.debug(
+                    f"[EVAL TIMEOUT] Approval-gate merged-PR check failed for "
+                    f"{str(task.id)[:8]} PR #{_merged_pr_num} — falling through "
+                    f"to preserve/FAIL",
+                    exc_info=True,
+                )
+            if _merged_pr_data is not None and bool(_merged_pr_data.get("merged")):
+                from app.models import Project
+                from app.rollup_state import _clear_rollup_transient_state
+                from app.recovery_evaluating_helpers import (
+                    _apply_rollup_merge_classification,
+                )
+
+                _merged_proj = await session.get(Project, task.project_id)
+                # Clear the approval hold — the work landed; this is terminal.
+                task.requires_approval = False
+                _merged_ctx = _clear_rollup_transient_state({**ctx})
+                _merged_ctx["rollup_pr_number"] = int(_merged_pr_num)
+                task.context = _merged_ctx
+                await _apply_rollup_merge_classification(
+                    task,
+                    _merged_proj,
+                    session,
+                    pr_number=int(_merged_pr_num),
+                    merged_base_branch=(
+                        (_merged_pr_data.get("base") or {}).get("ref")
+                    ),
+                    source="recovery_evaluating.approval_gate_merged",
+                    msg_terminal=(
+                        f"✓ rollup PR #{_merged_pr_num} merged; reconciled "
+                        f"from approval-gate timeout (landed to {{landed}})"
+                    ),
+                    msg_non_terminal=(
+                        f"Approval-gate reconcile: rollup PR #{_merged_pr_num} "
+                        f"merged into {{landed}}; awaiting downstream landing"
+                    ),
+                    hotfix_lane=None,
+                )
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                logger.info(
+                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} approval-gate "
+                    f"timeout after {hours}h — rollup PR #{_merged_pr_num} "
+                    f"ALREADY MERGED; reconciled to {task.status} (not FAILED)"
+                )
+                await services.broadcast_to_project(
+                    str(task.project_id),
+                    "task_updated",
+                    {"task_id": str(task.id), "status": task.status},
+                )
+                return True
+
         # If the PR is still clean/mergeable and not yet preserved, leave it
         # open for hand-merge instead of silently abandoning it. Guard with
         # the preserve flag so re-entering sweeps are idempotent (no repeat

@@ -2155,6 +2155,75 @@ async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
     assert rec.call_args.kwargs.get("success") is False
 
 
+@pytest.mark.asyncio
+async def test_approval_gate_timeout_reconciles_already_merged_rollup_pr(
+    eval_db, mocker
+):
+    """CREDIT-BLINDNESS: when the approval-gate timeout fires on an EVALUATING
+    parent whose rollup PR has ALREADY MERGED, the parent must be reconciled to
+    COMPLETED — never FAILED. Landed work counted as a failure costs the
+    direction its merge credit (real incident: research be331963 / PR #14342
+    merged, then FAILED 36s later). No failure result/alert must be recorded on
+    this success path."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Merged-PR check returns merged=True (state closed, merged, base ref set).
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "closed",
+            "merged": True,
+            "number": 474,
+            "base": {"ref": "automain"},
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Rollup Already Merged", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent, PR merged"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            "rollup_pr_number": 474,
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Already-merged rollup PR must reconcile to COMPLETED, not FAILED — "
+        f"got {parent.status}: {parent.latest_status_message!r}"
+    )
+    assert "474" in (parent.latest_status_message or "")
+    assert "merged" in (parent.latest_status_message or "").lower()
+    # The approval hold is cleared — the work landed, this is terminal.
+    assert parent.requires_approval is False
+    # SUCCESS path: never counted as a task failure.
+    rec.assert_not_called()
+    alert_mock.assert_not_awaited()
+
+
 # ── Spend/budget approval holds: clean non-failure decline ────────────────────
 
 
