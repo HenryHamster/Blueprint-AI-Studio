@@ -8645,6 +8645,24 @@ async def test_run_qualification_criterion_supersession_clears_coverage_bypasses
     assert coverage["covered"] == 1
     assert coverage["superseded"] == 1
 
+    # Goal-verification redesign: the same-SHA recovery valve now clears iff the
+    # sha-keyed ledger reports the candidate FULLY MET.  The successor category
+    # is graded ``met`` (a re-grade against the fresher rubric), so
+    # is_candidate_fully_met flips True and the cache is bypassed.
+    from app import category_verdict_ledger as _cvl
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=candidate_sha,
+        category_key=successor.criterion_key,
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[{"kind": "diff", "ref": "app/mod.py:1"}],
+        grader_run_id="regrade-test",
+    )
+    await db_session.commit()
+
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
@@ -8818,6 +8836,25 @@ async def test_coverage_recovery_backfills_stranded_evidence_before_check(
         ),
     )
 
+    # Goal-verification redesign: the reconciler clears the gate iff the sha-keyed
+    # ledger reports the candidate FULLY MET.  The stranded criterion is graded
+    # ``met`` on this candidate (a re-grade), so is_candidate_fully_met flips True.
+    # The vestigial evidence-backfill machinery still runs and records the merge
+    # evidence (asserted below), but the ledger verdict is what drives recovery.
+    from app import category_verdict_ledger as _cvl
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=candidate_sha,
+        category_key=criterion.criterion_key,
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[{"kind": "diff", "ref": "app/mod.py:1"}],
+        grader_run_id="regrade-test",
+    )
+    await db_session.commit()
+
     reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
         version.id, session_factory=_shared_session_factory(db_session)
     )
@@ -8918,6 +8955,24 @@ async def test_coverage_recovery_records_acceptance_window_evidence_before_check
             }
         ),
     )
+
+    # Goal-verification redesign: recovery clears iff the sha-keyed ledger reports
+    # the candidate FULLY MET.  The acceptance-window category is graded ``met`` on
+    # this candidate (a re-grade); the vestigial window-recompute machinery still
+    # runs and records the acceptance_window_recompute evidence (asserted below).
+    from app import category_verdict_ledger as _cvl
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=candidate_sha,
+        category_key=criterion.criterion_key,
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[{"kind": "diff", "ref": "app/mod.py:1"}],
+        grader_run_id="regrade-test",
+    )
+    await db_session.commit()
 
     reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
         version.id, session_factory=_shared_session_factory(db_session)
@@ -9237,7 +9292,9 @@ async def _add_version_criterion(
 async def test_criterion_coverage_incomplete_blocks_qualification(
     db_session, mocker
 ):
-    """Uncovered canonical criteria hard-block qualification via coverage summary."""
+    """An active acceptance CATEGORY graded not_met by the blind merge-grade
+    hard-blocks qualification via the goal-verification gate (per-category verdict
+    ledger), re-emitting the preserved criterion_coverage_incomplete blocker."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -9259,6 +9316,24 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
             "passed": True,
             "tests": [{"name": "a", "status": "pass"}],
             "suites": {"startup": {"passed": True}},
+        },
+        # Goal-verification redesign: the merge-grade agent grades the merged diff
+        # per ACTIVE acceptance-criterion category.  Give the version a goal and a
+        # merge-grade artifact that grades c-missing1 not_met (its criterion had no
+        # merge evidence) so the per-category gate fires from the ledger.
+        version_goal="Ship the widget end to end",
+        seed_merge_grade=True,
+        merge_grade_logs={
+            "covers_goal": True,
+            "coverage_score": 0.9,
+            "biggest_gap": None,
+            "category_verdicts": [
+                {"category_key": "c-covered1", "status": "met",
+                 "citations": [{"kind": "diff", "ref": "app/widget.py:10"}]},
+                {"category_key": "c-missing1", "status": "not_met",
+                 "gap": "No reachability evidence for the widget path.",
+                 "citations": []},
+            ],
         },
     )
     await _add_version_criterion(
@@ -9288,9 +9363,18 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
 
     await db_session.refresh(version)
     assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
+    # Coverage summary is still computed for observability (evidence-based).
     assert version.last_qualification["criterion_coverage"]["total"] == 2
     assert version.last_qualification["criterion_coverage"]["covered"] == 1
     assert version.last_qualification["criterion_coverage"]["uncovered"] == 1
+    # The per-category verdicts that actually DROVE the gate are persisted + the
+    # uncovered category grades not_met.
+    _cv = {
+        v["category_key"]: v
+        for v in version.last_qualification["category_verdicts"]
+    }
+    assert _cv["c-missing1"]["status"] == "not_met"
+    assert _cv["c-covered1"]["status"] == "met"
 
 
 @pytest.mark.asyncio
@@ -10877,6 +10961,9 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "superseded": 0,
         "criteria": [],
         "failed_corroboration_keys": [],
+        # get_version_coverage_summary surfaces the open version's persisted
+        # merge-evidence drop reasons (None when the version recorded none).
+        "merge_evidence_gaps": None,
     }
     promote_spy.assert_not_called()
 
@@ -31899,18 +31986,22 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out["confidence"] > 0.0
 
     def test_ci_unresolved_preserves_criterion_coverage_blocker(self):
-        """Recovery keeps criterion_coverage_incomplete when uncovered criteria exist."""
+        """Recovery re-runs the goal-verification gate on the persisted per-category
+        verdicts: an active category still ``not_met`` keeps the
+        criterion_coverage_incomplete blocker after CI clears."""
         record = {
             "blocker": "ci_unresolved",
             "confidence": 0.0,
             "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
             "smoketest_enabled": True,
-            "criterion_coverage": {
-                "total": 2,
-                "covered": 1,
-                "partial": 0,
-                "uncovered": 1,
-            },
+            # The finalize persists the sha-keyed per-category verdicts on the
+            # base_record; the recompute re-runs the SAME gate over them.
+            "category_verdicts": [
+                {"category_key": "c-1", "status": "met", "tier": "judged",
+                 "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+                {"category_key": "c-2", "status": "not_met", "tier": "judged",
+                 "gap": "not delivered", "citations": []},
+            ],
         }
         out = self._fn(record)
         assert out["blocker"] == "criterion_coverage_incomplete"
@@ -32613,38 +32704,39 @@ class TestBlindMergeGradeBlock:
     # --- Unit tests: compute_composite integration --------------------------
 
     def test_compute_composite_criterion_coverage_incomplete_fires(self):
-        """Uncovered criteria force confidence=0.0 and the criterion blocker label."""
+        """Goal-verification gate: any active CATEGORY not ``met`` forces
+        confidence=0.0 and re-emits the preserved criterion_coverage_incomplete
+        blocker (replaces the retired coverage-count gate)."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 2,
-                "covered": 1,
-                "partial": 0,
-                "uncovered": 1,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "met", "tier": "judged",
+                 "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+                {"category_key": "c-2", "status": "not_met", "tier": "judged",
+                 "gap": "endpoint not added", "citations": []},
+            ],
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
         assert result["blocker"] == "criterion_coverage_incomplete"
+        assert result["sub_scores"]["unmet_categories"] == ["c-2"]
 
     def test_compute_composite_criterion_coverage_partial_only_fires(self):
-        """Partial-only coverage also blocks because the criterion is not covered."""
+        """A ``partial`` category gates identically to ``not_met`` — only ``met`` clears."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 1,
-                "covered": 0,
-                "partial": 1,
-                "uncovered": 0,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "partial", "tier": "judged",
+                 "gap": "only half wired", "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+            ],
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
@@ -32677,81 +32769,74 @@ class TestBlindMergeGradeBlock:
         assert result["blocker"] == "merge_grade_misses"
 
     def test_compute_composite_criterion_coverage_no_criteria_skips_gate(self):
-        """A version with no criteria does not emit the criterion blocker."""
+        """A version with no active categories (empty rubric) does not emit the
+        criterion blocker — the empty verdict list has no unmet category."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 0,
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 0,
-            },
+            category_verdicts=[],
         )
         assert result["blocker"] is None
         assert result["promote"] is True
 
-    # --- Attestation tier: penalize instead of hard-block ------------------
+    # --- Goal-verification redesign: residual gate + judged-tier penalty -----
+    # (These replace the retired ``uncorroborated_attestation`` hard-block: a
+    # low-confidence acceptance set no longer hard-blocks — it is folded into the
+    # judged-tier confidence penalty; an uncaptured RESIDUAL gap hard-blocks.)
 
-    def test_compute_composite_attested_only_hard_blocks_and_zeroes_confidence(self):
-        """Zero-machine-evidence attestation-only coverage now hard-blocks.
-
-        With perfect sub-scores (existing_confidence == 1.0), one fully-attested
-        criterion, and NO machine-verified evidence (covered=0, attested=1), the
-        uncorroborated_attestation blocker fires and forces confidence to 0.0 —
-        promotion is impossible on attestations alone without at least one
-        criterion carrying machine-verified evidence.
-        The uncorroborated_attested sub-score and attested_count remain recorded
-        for observability even under the blocker.
-        """
+    def test_compute_composite_residual_gap_hard_blocks_and_zeroes_confidence(self):
+        """Goal-verification RESIDUAL gate: even with EVERY active category ``met``,
+        a non-empty ``residual_uncaptured_gap`` (a goal aspect no category captures)
+        hard-blocks and forces confidence to 0.0, re-emitting the preserved
+        criterion_coverage_incomplete blocker.  This REPLACES one half of the
+        retired uncorroborated_attestation hard-block."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 1,
-                "covered": 0,
-                "attested": 1,
-                "partial": 0,
-                "uncovered": 0,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "met", "tier": "judged",
+                 "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+            ],
+            residual_uncaptured_gap="The goal's rollback path is untested by any criterion.",
         )
-        assert result["blocker"] == "uncorroborated_attestation"
+        assert result["blocker"] == "criterion_coverage_incomplete"
         assert result["confidence"] == 0.0
         assert result["promote"] is False
-        assert result["sub_scores"]["attested_count"] == 1
-        assert result["sub_scores"].get("uncorroborated_attested") is True
+        assert (
+            result["sub_scores"]["residual_uncaptured_gap"]
+            == "The goal's rollback path is untested by any criterion."
+        )
 
-    def test_attestation_only_zero_machine_coverage_cannot_promote(self):
-        """Zero machine-verified evidence across ALL criteria hard-blocks promotion.
+    def test_all_judged_tier_met_promotes_with_penalty_not_hard_block(self):
+        """The redesign REPLACED the uncorroborated_attestation hard-block with a
+        confidence PENALTY: an acceptance set that is fully ``met`` but only at the
+        low-confidence JUDGED tier (the v1 uninvested-LLM grade) is NO LONGER
+        hard-blocked — it promotes with a proportional judged-tier penalty."""
+        from app.release_scoring import JUDGED_TIER_PENALTY_WEIGHT
 
-        When every acceptance criterion is covered only by operator attestation
-        (covered=0 across all criteria), the uncorroborated_attestation blocker
-        fires regardless of how high other sub-scores are.  This is the named
-        acceptance evidence for the uncorroborated-attestation-hard-block feature.
-        """
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 3,
-                "covered": 0,
-                "attested": 3,
-                "partial": 0,
-                "uncovered": 0,
-            },
+            category_verdicts=[
+                {"category_key": f"c-{i}", "status": "met", "tier": "judged",
+                 "citations": [{"kind": "diff", "ref": f"c{i}.py:1"}]}
+                for i in range(3)
+            ],
         )
-        assert result["blocker"] == "uncorroborated_attestation"
-        assert result["confidence"] == 0.0
-        assert result["promote"] is False
+        assert result["blocker"] is None
+        assert result["promote"] is True
+        # All 3 met categories rest on the judged tier → full judged penalty.
+        assert result["sub_scores"]["judged_tier_met_fraction"] == 1.0
+        assert result["confidence"] == round(1.0 * (1.0 - JUDGED_TIER_PENALTY_WEIGHT), 4)
 
     def test_attested_criterion_still_penalizes_when_machine_evidence_exists(self):
         """Mixed coverage (covered>0, attested>0) gets the penalty but no blocker.
@@ -32802,43 +32887,42 @@ class TestBlindMergeGradeBlock:
         assert result["confidence"] == 0.925
         assert result["sub_scores"]["attested_count"] == 1
 
-    def test_compute_composite_genuinely_uncovered_still_blocks_despite_attestation(self):
-        """A truly-uncovered criterion hard-blocks even when another is attested."""
+    def test_compute_composite_one_unmet_category_among_met_still_blocks(self):
+        """One not_met category among otherwise-met categories still hard-blocks,
+        regardless of the others' tier."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 2,
-                "covered": 0,
-                "attested": 1,
-                "partial": 0,
-                "uncovered": 1,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "met", "tier": "machine",
+                 "citations": [{"kind": "test", "ref": "t.py::x"}]},
+                {"category_key": "c-2", "status": "not_met", "tier": "judged",
+                 "gap": "reachability path missing", "citations": []},
+            ],
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
         assert result["blocker"] == "criterion_coverage_incomplete"
-        # attested_count is still recorded for observability under a blocker.
-        assert result["sub_scores"]["attested_count"] == 1
+        assert result["sub_scores"]["unmet_categories"] == ["c-2"]
 
-    def test_compute_composite_partial_criterion_still_blocks_with_attestation(self):
-        """A 'partial' criterion (evidence but not covering/attested) still blocks."""
+    def test_compute_composite_partial_category_among_met_still_blocks(self):
+        """A 'partial' category among met categories still blocks (partial gates
+        identically to not_met); a machine-tier met alongside does not rescue it."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            criterion_coverage={
-                "total": 2,
-                "covered": 0,
-                "attested": 1,
-                "partial": 1,
-                "uncovered": 0,
-            },
+            category_verdicts=[
+                {"category_key": "c-1", "status": "met", "tier": "machine",
+                 "citations": [{"kind": "test", "ref": "t.py::x"}]},
+                {"category_key": "c-2", "status": "partial", "tier": "judged",
+                 "gap": "half done", "citations": [{"kind": "diff", "ref": "b.py:2"}]},
+            ],
         )
         assert result["confidence"] == 0.0
         assert result["blocker"] == "criterion_coverage_incomplete"

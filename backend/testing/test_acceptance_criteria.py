@@ -1881,13 +1881,21 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert before["covered"] == 1
     assert before["uncovered"] == 1
     assert before["retracted"] == 0
+    # Goal-verification gate: the acceptance criteria ARE the merge-grade's
+    # categories.  Before retraction the stale criterion grades not_met (no
+    # feasible evidence) → the gate hard-blocks; the covered one is met.
     before_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=before,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+            {"category_key": stale.criterion_key, "status": "not_met", "tier": "judged",
+             "gap": "no feasible evidence", "citations": []},
+        ],
     )
     assert before_gate["blocker"] == "criterion_coverage_incomplete"
 
@@ -1915,13 +1923,18 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert by_key[stale.criterion_key]["coverage"] == "uncovered"
     assert by_key[stale.criterion_key]["stuck_reason"] is None
 
+    # After retracting the stale criterion only the covered category remains
+    # active and grades met → the gate no longer fires.
     after_gate = compute_composite(
         ci_green=True,
         audit_score=1.0,
         test_erosion=1.0,
         smoketest_score=1.0,
         policy={"threshold": 0.8},
-        criterion_coverage=after,
+        category_verdicts=[
+            {"category_key": covered.criterion_key, "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "app/covered.py:1"}]},
+        ],
     )
     assert after_gate["blocker"] is None
     assert after_gate["promote"] is True
