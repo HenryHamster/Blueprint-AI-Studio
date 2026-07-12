@@ -14,7 +14,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -173,6 +175,44 @@ _LIVE_PROOF_MARKER_KEYS = (
     "requires_live_release",
 )
 
+# Progress-metric ring buffer — bounded time-series written into polling_metadata.
+_PROGRESS_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_PROGRESS_SERIES_MAX_SAMPLES = 50
+
+# Stable terminal-kind label for a no-progress early-cut.  Callers that cut a
+# job for a stalled progress trend pass this as terminal_kind to
+# _finalize_terminal_job so the disposition is distinct from a wall-clock expiry.
+NO_PROGRESS_TERMINAL_REASON = "no_progress"
+
+
+def append_progress_sample(
+    meta: dict, *, metric: str, value: float, t: str
+) -> dict:
+    """Append a progress sample to the ring buffer in a polling_metadata dict.
+
+    Returns a new dict with the sample appended (drop-oldest at 50 entries).
+    Silently ignores non-finite values, bad metric keys, or any other error
+    so the caller never raises on malformed input.
+    """
+    try:
+        if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.match(metric):
+            return meta
+        float_val = float(value)
+        if not math.isfinite(float_val):
+            return meta
+        if not isinstance(t, str) or not t:
+            return meta
+        meta = dict(meta)
+        series: list = list(meta.get("progress_series") or [])
+        series.append({"t": t, "name": metric, "value": float_val})
+        if len(series) > _PROGRESS_SERIES_MAX_SAMPLES:
+            series = series[-_PROGRESS_SERIES_MAX_SAMPLES:]
+        meta["progress_series"] = series
+        return meta
+    except Exception:
+        return meta
+
+
 # Wake-source kind for the task park-and-wake primitive. A compute_experiment
 # task parks on this kind with ``wake_source_ref=str(job.id)`` after launching
 # its budgeted job instead of poll-pinning its agent VM; the monitor fires the
@@ -193,6 +233,17 @@ _COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] =
     ComputeJobOutcome.SPEND_CAP_EXCEEDED: (True, "budget"),
     ComputeJobOutcome.FAILURE: (False, None),
     ComputeJobOutcome.SMOKE_FAILED: (False, None),
+}
+
+# Default terminal_kind label per outcome, used when the caller does not
+# supply an explicit terminal_kind to _finalize_terminal_job.
+_OUTCOME_TO_TERMINAL_KIND: dict[ComputeJobOutcome, str | None] = {
+    ComputeJobOutcome.SUCCESS: None,
+    ComputeJobOutcome.CANCELLED: "operator",
+    ComputeJobOutcome.TIMED_OUT: "deadline",
+    ComputeJobOutcome.SPEND_CAP_EXCEEDED: "spend_cap",
+    ComputeJobOutcome.FAILURE: "failure",
+    ComputeJobOutcome.SMOKE_FAILED: "failure",
 }
 
 
@@ -2612,6 +2663,7 @@ def _finalize_terminal_job(
     now,
     exit_code: int | None = None,
     terminate_ok: bool = True,
+    terminal_kind: str | None = None,
 ) -> None:
     job.status = status
     job.outcome = outcome
@@ -2620,7 +2672,8 @@ def _finalize_terminal_job(
     job.terminal_reason = terminal_reason
     job.final_cost_usd = job.accrued_cost_usd
     job.updated_at = now
-    extra: dict[str, Any] = {"terminal_status": status.value}
+    resolved_kind = terminal_kind or _OUTCOME_TO_TERMINAL_KIND.get(outcome, "failure")
+    extra: dict[str, Any] = {"terminal_status": status.value, "terminal_kind": resolved_kind}
     if exit_code is not None:
         extra["exit_code"] = exit_code
     if not terminate_ok:

@@ -13864,6 +13864,245 @@ async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_
     spawn_mock.assert_not_called()
 
 
+# ── Progress-series ring buffer + terminal_kind disposition ──────────────────
+
+def test_append_progress_sample_basic():
+    """A valid metric+value is appended as {t, name, value} into progress_series."""
+    from app.compute_jobs import append_progress_sample
+
+    meta = {}
+    result = append_progress_sample(meta, metric="loss", value=0.42, t="2026-01-01T00:00:00")
+    series = result["progress_series"]
+    assert len(series) == 1
+    assert series[0]["name"] == "loss"
+    assert series[0]["value"] == 0.42
+    assert series[0]["t"] == "2026-01-01T00:00:00"
+
+
+def test_append_progress_sample_invalid_metric_key():
+    """Bad metric keys (spaces, exclamation marks) are silently ignored."""
+    from app.compute_jobs import append_progress_sample
+
+    meta = {}
+    result = append_progress_sample(meta, metric="bad key!", value=1.0, t="2026-01-01T00:00:00")
+    assert result == {}
+
+
+def test_append_progress_sample_non_finite_value():
+    """NaN and Inf values are silently ignored."""
+    from app.compute_jobs import append_progress_sample
+
+    for bad_val in (float("inf"), float("-inf"), float("nan")):
+        result = append_progress_sample({}, metric="acc", value=bad_val, t="2026-01-01T00:00:00")
+        assert result == {}, f"expected no mutation for value={bad_val}"
+
+
+def test_append_progress_sample_ring_buffer_cap():
+    """After 55 samples only the last 50 are retained (drop-oldest)."""
+    from app.compute_jobs import append_progress_sample
+
+    meta: dict = {}
+    for i in range(55):
+        meta = append_progress_sample(meta, metric="step", value=float(i), t=f"t{i}")
+    series = meta["progress_series"]
+    assert len(series) == 50
+    assert series[0]["value"] == 5.0, "oldest 5 samples should have been dropped"
+    assert series[-1]["value"] == 54.0
+
+
+def test_append_progress_sample_does_not_mutate_input():
+    """append_progress_sample returns a new dict, never mutates the input."""
+    from app.compute_jobs import append_progress_sample
+
+    original = {"other": "data"}
+    result = append_progress_sample(original, metric="loss", value=0.1, t="t0")
+    assert "progress_series" not in original
+    assert "progress_series" in result
+    assert original["other"] == "data"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_stores_progress_sample(
+    client, db_session, monkeypatch
+):
+    """A heartbeat carrying a progress object appends it to polling_metadata['progress_series']."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Progress HB Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+        json={"progress": {"metric": "loss", "value": 0.42}},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    series = (job.polling_metadata or {}).get("progress_series")
+    assert series is not None, "progress_series must be stored in polling_metadata"
+    assert len(series) == 1
+    assert series[0]["name"] == "loss"
+    assert series[0]["value"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_invalid_progress_still_204(
+    client, db_session, monkeypatch
+):
+    """A heartbeat with an invalid progress object still returns 204 and leaves series empty."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="Bad Progress HB Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    # Invalid: metric key has a space, value is a non-numeric string
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+        json={"progress": {"metric": "bad key!", "value": "not a number"}},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(job)
+    series = (job.polling_metadata or {}).get("progress_series")
+    assert series is None or series == [], "no progress_series should be written for invalid input"
+
+
+def test_finalize_terminal_job_no_progress_distinct_from_deadline(db_session):
+    """_finalize_terminal_job with terminal_kind='no_progress' stamps a distinct
+    terminal_kind compared to the wall-clock deadline path."""
+    from app.compute_jobs import _finalize_terminal_job
+
+    now = _utcnow()
+
+    deadline_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    _finalize_terminal_job(
+        deadline_job,
+        status=ComputeJobStatus.TIMED_OUT,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason="compute job exceeded runtime deadline",
+        now=now,
+    )
+    deadline_kind = (deadline_job.polling_metadata or {}).get("terminal_kind")
+    assert deadline_kind == "deadline"
+
+    no_progress_job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    _finalize_terminal_job(
+        no_progress_job,
+        status=ComputeJobStatus.TIMED_OUT,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason="no progress detected",
+        now=now,
+        terminal_kind="no_progress",
+    )
+    no_progress_kind = (no_progress_job.polling_metadata or {}).get("terminal_kind")
+    assert no_progress_kind == "no_progress"
+    assert deadline_kind != no_progress_kind, (
+        "no_progress and deadline cuts must have distinct terminal_kind"
+    )
+
+
+def test_serialize_compute_job_response_safe_promotes_progress_series_and_terminal_kind():
+    """serialize_compute_job_response_safe promotes progress_series and terminal_kind
+    as first-class fields on the operator-facing payload."""
+    from app.schemas import serialize_compute_job_response_safe
+
+    progress_series = [{"t": "2026-01-01T00:00:00", "name": "loss", "value": 0.5}]
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.TIMED_OUT,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason="compute job exceeded runtime deadline",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "terminal_kind": "deadline",
+            "progress_series": progress_series,
+        },
+    )
+
+    data = serialize_compute_job_response_safe(job)
+    assert data["terminal_kind"] == "deadline", "terminal_kind must be promoted"
+    assert data["progress_series"] == progress_series, "progress_series must be promoted"
+
+
+def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
+    """Legacy rows without terminal_kind or progress_series surface as None."""
+    from app.schemas import serialize_compute_job_response_safe
+
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        outcome=ComputeJobOutcome.SUCCESS,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+
+    data = serialize_compute_job_response_safe(job)
+    assert data["terminal_kind"] is None
+    assert data["progress_series"] is None
 @pytest.mark.asyncio
 async def test_compute_experiment_defaults_container_image_to_project_image(
     db_session, mocker

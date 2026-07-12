@@ -137,7 +137,8 @@
     "acceptance_criteria.py": 2150,
     "runner_health_alerts.py": 1950,
     "routers/agent_strategic_fetch.py": 1750,
-    "runner_health_monitors.py": 1001
+    "runner_health_monitors.py": 1001,
+    "strategic_context_package.py": 1800
   },
   "agent": {
     "index.ts": 4600,

@@ -143,6 +143,24 @@ describe('ComputeJobsPanel helpers', () => {
     expect(computeJobTerminalLabel(makeJob({ outcome: 'SUCCESS' }))).toBe('Succeeded');
   });
 
+  test('computeJobTerminalLabel returns Killed: no progress when terminal_kind is no_progress', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'no_progress' })),
+    ).toBe('Killed: no progress');
+  });
+
+  test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with terminal_kind deadline', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'deadline' })),
+    ).toBe('Killed: deadline');
+  });
+
+  test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with absent terminal_kind (backward compat)', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT' })),
+    ).toBe('Killed: deadline');
+  });
+
   test('fmtCountdown renders compact remaining time and expiry', () => {
     const now = Date.now();
     expect(fmtCountdown(new Date(now + 90_000).toISOString(), now)).toBe('1m 30s');
@@ -686,6 +704,50 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(log.textContent).toContain('done');
     // Once terminal, the live-output section disappears.
     expect(queryByTestId('compute-live-output')).toBeNull();
+  });
+
+  test('renders progress series block with metric name, latest value, and sample count', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        progress_series: [
+          { t: '2026-07-01T10:00:00Z', name: 'reward', value: 0.1 },
+          { t: '2026-07-01T10:01:00Z', name: 'reward', value: 0.3 },
+          { t: '2026-07-01T10:02:00Z', name: 'reward', value: 0.5 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-progress-series');
+    expect(block.textContent).toContain('reward');
+    expect(block.textContent).toContain('0.5');
+    expect(block.textContent).toContain('3 samples');
+  });
+
+  test('no-progress cut tag appears on stalled terminal job with terminal_kind=no_progress', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'TIMED_OUT',
+        outcome: 'TIMED_OUT',
+        final_cost_usd: 0.5,
+        terminal_kind: 'no_progress',
+        progress_series: [
+          { t: '2026-07-01T10:00:00Z', name: 'loss', value: 1.0 },
+          { t: '2026-07-01T10:05:00Z', name: 'loss', value: 1.0 },
+        ],
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-progress-series');
+    expect(block.textContent).toContain('no-progress cut');
+    expect(block.textContent).toContain('loss');
+  });
+
+  test('absent progress_series renders no progress block', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-progress-series')).toBeNull();
   });
 
   test('terminal job with exit_code shows exit code chip', async () => {

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
     _COMPUTE_JOB_TERMINAL_STATUSES,
+    append_progress_sample,
     create_compute_job,
     get_compute_job_for_task,
 )
@@ -214,11 +215,24 @@ async def compute_job_vm_heartbeat(
     # ~30 s and includes it in the heartbeat body. Parse and store it so the
     # operator can see partial output while the job runs. All failures degrade
     # gracefully — a malformed or missing body never causes a non-204 response.
-    live_output = _parse_live_output_tail(await request.body())
+    body_bytes = await request.body()
+    live_output = _parse_live_output_tail(body_bytes)
     if live_output is not None:
         meta = dict(job.polling_metadata or {})
         meta["live_output"] = live_output
         job.polling_metadata = meta
+    # Optional progress sample: the runner may include {"progress": {"metric": ...,
+    # "value": ...}} in the heartbeat body. Malformed or missing fields are silently
+    # ignored — older runners that never send this keep working byte-for-byte.
+    progress_sample = _parse_progress_sample(body_bytes)
+    if progress_sample is not None:
+        metric, value = progress_sample
+        job.polling_metadata = append_progress_sample(
+            dict(job.polling_metadata or {}),
+            metric=metric,
+            value=value,
+            t=_utcnow().isoformat(),
+        )
     await session.commit()
     return Response(status_code=204)
 
@@ -252,3 +266,32 @@ def _parse_live_output_tail(body: bytes) -> dict[str, Any] | None:
         return None
     text = redact_command_log_text(text[: _LIVE_TAIL_MAX_TEXT_CHARS])
     return {"text": text, "truncated": truncated}
+
+
+def _parse_progress_sample(body: bytes) -> tuple[str, float] | None:
+    """Extract a (metric, value) progress sample from a heartbeat body, or None.
+
+    Accepts ``{"progress": {"metric": <str>, "value": <number>}}`` at the top
+    level of the JSON body.  Any missing, non-string, or non-numeric field
+    returns None so callers degrade gracefully.
+    """
+    if not body:
+        return None
+    try:
+        body_json = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(body_json, dict):
+        return None
+    progress = body_json.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    metric = progress.get("metric")
+    if not isinstance(metric, str) or not metric:
+        return None
+    raw_value = progress.get("value")
+    try:
+        float_val = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return metric, float_val

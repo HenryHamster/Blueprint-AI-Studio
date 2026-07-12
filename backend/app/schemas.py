@@ -754,6 +754,18 @@ def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
         data["exit_code"] = None
         data["command_log"] = None
 
+    # Promote progress_series and terminal_kind as first-class fields so the
+    # frontend has a stable shape and does not reach into the opaque bag.
+    # Both are absent/None on legacy rows that predate these fields.
+    if isinstance(metadata, dict):
+        progress_series = metadata.get("progress_series")
+        data["progress_series"] = progress_series if isinstance(progress_series, list) else None
+        terminal_kind = metadata.get("terminal_kind")
+        data["terminal_kind"] = terminal_kind if isinstance(terminal_kind, str) else None
+    else:
+        data["progress_series"] = None
+        data["terminal_kind"] = None
+
     return data
 
 

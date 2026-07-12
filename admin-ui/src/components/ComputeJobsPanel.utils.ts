@@ -14,13 +14,13 @@ export function isComputeJobActive(job: ComputeJob): boolean {
 }
 
 /** Human-readable terminal reason for a finished job, distinguishing the three
- *  kill paths (operator / budget / deadline) plus natural success/failure. */
+ *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {
   switch (job.outcome) {
     case 'SPEND_CAP_EXCEEDED':
       return 'Killed: budget cap';
     case 'TIMED_OUT':
-      return 'Killed: deadline';
+      return job.terminal_kind === 'no_progress' ? 'Killed: no progress' : 'Killed: deadline';
     case 'CANCELLED':
       return (job.terminal_reason || '').toLowerCase().includes('operator')
         ? 'Killed by operator'

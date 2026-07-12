@@ -2357,6 +2357,58 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 );
               })()}
               {(() => {
+                const ps = job.progress_series;
+                if (!ps || ps.length === 0) return null;
+                const latest = ps[ps.length - 1];
+                const name = latest.name;
+                // Collect values for the same metric name (most common case), falling back to all values
+                const seriesForMetric = ps.filter((s) => s.name === name);
+                const vals = seriesForMetric.map((s) => s.value);
+                const minVal = Math.min(...vals);
+                const maxVal = Math.max(...vals);
+                const range = maxVal - minVal || 1;
+                const W = 80;
+                const H = 20;
+                const points = vals
+                  .map((v, i) => {
+                    const x = vals.length === 1 ? W / 2 : (i / (vals.length - 1)) * W;
+                    const y = H - ((v - minVal) / range) * H;
+                    return `${x.toFixed(1)},${y.toFixed(1)}`;
+                  })
+                  .join(' ');
+                const isStalled = !active && job.terminal_kind === 'no_progress';
+                return (
+                  <div className="mt-1.5" data-testid="compute-progress-series">
+                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
+                      <span>{name}</span>
+                      <span className="text-neutral-300">{latest.value}</span>
+                      <span className="text-neutral-600">({ps.length} samples)</span>
+                      {isStalled && (
+                        <span className="rounded border border-amber-800 bg-amber-950 px-1 py-0.5 text-ui-xs text-amber-400">
+                          no-progress cut
+                        </span>
+                      )}
+                    </div>
+                    <svg
+                      width={W}
+                      height={H}
+                      viewBox={`0 0 ${W} ${H}`}
+                      className="overflow-visible"
+                      aria-hidden="true"
+                    >
+                      <polyline
+                        points={points}
+                        fill="none"
+                        stroke={isStalled ? '#92400e' : '#38bdf8'}
+                        strokeWidth="1.5"
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  </div>
+                );
+              })()}
+              {(() => {
                 if (active) return null;
                 const cl = job.command_log ?? (job.polling_metadata?.command_log as ComputeJobCommandLog | undefined | null);
                 if (!cl || typeof cl.text !== 'string' || !cl.text.trim()) return null;

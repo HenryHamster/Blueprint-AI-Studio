@@ -279,6 +279,79 @@ const armsJobs: ComputeJob[] = [
   },
 ];
 
+const progressSeriesJobs: ComputeJob[] = [
+  {
+    id: 'job-progress',
+    project_id: 'proj-1',
+    task_id: 'task-progress',
+    backend: 'local-gpu',
+    external_compute_id: null,
+    machine_type: 'a3-highgpu-1g',
+    status: 'TIMED_OUT',
+    terminal_reason: 'no progress detected over 30m window',
+    outcome: 'TIMED_OUT',
+    terminal_kind: 'no_progress',
+    accelerator_type: 'H100',
+    accelerator_count: 1,
+    spend_cap_usd: 10.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 3_600_000).toISOString(),
+    updated_at: new Date(Date.now() - 300_000).toISOString(),
+    started_at: new Date(Date.now() - 3_590_000).toISOString(),
+    completed_at: new Date(Date.now() - 300_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+    accrued_cost_usd: 2.1,
+    final_cost_usd: 2.1,
+    result_reference: null,
+    task_title: 'compute_experiment: RL training run — reward plateau detected',
+    task_type: 'compute_experiment',
+    experiment: 'rl-reward-v1',
+    progress_series: [
+      { t: new Date(Date.now() - 3_000_000).toISOString(), name: 'reward', value: 0.12 },
+      { t: new Date(Date.now() - 2_700_000).toISOString(), name: 'reward', value: 0.18 },
+      { t: new Date(Date.now() - 2_400_000).toISOString(), name: 'reward', value: 0.21 },
+      { t: new Date(Date.now() - 2_100_000).toISOString(), name: 'reward', value: 0.22 },
+      { t: new Date(Date.now() - 1_800_000).toISOString(), name: 'reward', value: 0.22 },
+      { t: new Date(Date.now() - 1_500_000).toISOString(), name: 'reward', value: 0.21 },
+      { t: new Date(Date.now() - 1_200_000).toISOString(), name: 'reward', value: 0.22 },
+      { t: new Date(Date.now() - 900_000).toISOString(), name: 'reward', value: 0.22 },
+    ],
+  },
+  {
+    id: 'job-progress-active',
+    project_id: 'proj-1',
+    task_id: 'task-progress-active',
+    backend: 'local-gpu',
+    external_compute_id: null,
+    machine_type: 'a3-highgpu-1g',
+    status: 'RUNNING',
+    terminal_reason: null,
+    outcome: null,
+    accelerator_type: 'H100',
+    accelerator_count: 1,
+    spend_cap_usd: 20.0,
+    wall_clock_deadline: new Date(Date.now() + 4 * 3_600_000).toISOString(),
+    created_at: new Date(Date.now() - 1_800_000).toISOString(),
+    updated_at: new Date(Date.now() - 30_000).toISOString(),
+    started_at: new Date(Date.now() - 1_790_000).toISOString(),
+    completed_at: null,
+    last_polled_at: new Date(Date.now() - 30_000).toISOString(),
+    accrued_cost_usd: 1.8,
+    final_cost_usd: null,
+    result_reference: null,
+    task_title: 'compute_experiment: RL training — actively improving',
+    task_type: 'compute_experiment',
+    experiment: 'rl-reward-v2',
+    progress_series: [
+      { t: new Date(Date.now() - 1_500_000).toISOString(), name: 'reward', value: 0.05 },
+      { t: new Date(Date.now() - 1_200_000).toISOString(), name: 'reward', value: 0.12 },
+      { t: new Date(Date.now() - 900_000).toISOString(), name: 'reward', value: 0.21 },
+      { t: new Date(Date.now() - 600_000).toISOString(), name: 'reward', value: 0.35 },
+      { t: new Date(Date.now() - 300_000).toISOString(), name: 'reward', value: 0.49 },
+    ],
+  },
+];
+
 let jobsToReturn: ComputeJob[] = stressJobs;
 
 vi.mock('../api', async (importOriginal) => {
@@ -492,6 +565,32 @@ describe('ComputeJobsPanel — viewport regression', () => {
         const text = host.textContent ?? '';
         if (!text.includes('met')) throw new Error('met criterion chip not rendered');
         if (!text.includes('unmet')) throw new Error('unmet criterion chip not rendered');
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders progress series sparkline and no-progress stall tag at 1280px', async () => {
+    jobsToReturn = progressSeriesJobs;
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('reward')) throw new Error('progress metric name not rendered');
+        if (!text.includes('no-progress cut')) throw new Error('no-progress cut tag not rendered for stalled job');
+        const seriesBlocks = host.querySelectorAll('[data-testid="compute-progress-series"]');
+        if (seriesBlocks.length < 2) throw new Error(`Expected 2 progress-series blocks, got ${seriesBlocks.length}`);
+        const sparklines = host.querySelectorAll('polyline');
+        if (sparklines.length < 2) throw new Error(`Expected 2 sparkline polylines, got ${sparklines.length}`);
       },
       { waitMs: 60 },
     );

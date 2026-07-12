@@ -863,6 +863,15 @@ export interface ComputeJob {
    *  videos) as individually-addressable storage objects. Absent on legacy rows
    *  or jobs without viewable output. */
   viewable_artifacts?: ViewableArtifact[] | null;
+  /** Bounded time-series of intermediate progress samples emitted during the
+   *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
+   *  Absent on legacy rows or jobs that did not emit progress. */
+  progress_series?: Array<{ t: string; name: string; value: number }> | null;
+  /** Stable terminal disposition marker set when a job ends. Distinguishes a
+   *  no-progress watchdog cut ('no_progress') from a full wall-clock expiry
+   *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
+   *  natural failure ('failure'). Absent on legacy rows. */
+  terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
 }
 
 export interface ComputeJobsSummary {
