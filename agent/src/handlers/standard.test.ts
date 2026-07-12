@@ -663,8 +663,23 @@ describe('module interface extraction', () => {
     vi.mocked(extractModuleInterfaces).mockReturnValue('## Module Interfaces\nfoo\n\n');
   });
 
-  it('calls extractModuleInterfaces for handleCreate with scope=medium', async () => {
+  // Default-OFF (2026-07-10 futility bound): absent an explicit project holdback
+  // fraction, module_interfaces is suppressed even at medium scope — the discovery
+  // function is NOT invoked and the section is absent from the prompt.
+  it('does not call extractModuleInterfaces for handleCreate with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Module Interfaces');
+  });
+
+  // Opt-in: an explicit holdback fraction < 1.0 (0.0 = always-treatment) re-enables
+  // the section — the discovery function is invoked and the section is injected.
+  it('calls extractModuleInterfaces for handleCreate with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Task', description: '', context: { scope: 'medium' },
+      project_metadata: { module_interfaces_holdback_fraction: 0.0 },
+    };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(extractModuleInterfaces, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
@@ -682,8 +697,18 @@ describe('module interface extraction', () => {
     expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
   });
 
-  it('calls extractModuleInterfaces for handleRefactor with scope=medium', async () => {
+  it('does not call extractModuleInterfaces for handleRefactor with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Module Interfaces');
+  });
+
+  it('calls extractModuleInterfaces for handleRefactor with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Refactor', description: '', context: { scope: 'medium' },
+      project_metadata: { module_interfaces_holdback_fraction: 0.0 },
+    };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(extractModuleInterfaces, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
@@ -703,8 +728,19 @@ describe('affected consumer discovery', () => {
     vi.mocked(discoverAffectedConsumers).mockReturnValue('## Affected Consumers\nbar\n\n');
   });
 
-  it('calls discoverAffectedConsumers for handleCreate with scope=medium', async () => {
+  // Default-OFF (2026-07-10 futility bound): suppressed by default at medium scope.
+  it('does not call discoverAffectedConsumers for handleCreate with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Affected Consumers');
+  });
+
+  it('calls discoverAffectedConsumers for handleCreate with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Task', description: '', context: { scope: 'medium' },
+      project_metadata: { affected_consumers_holdback_fraction: 0.0 },
+    };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(discoverAffectedConsumers, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
@@ -722,8 +758,18 @@ describe('affected consumer discovery', () => {
     expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
   });
 
-  it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
+  it('does not call discoverAffectedConsumers for handleRefactor with scope=medium and no holdback config (default-off)', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(capturedPrompt()).not.toContain('## Affected Consumers');
+  });
+
+  it('calls discoverAffectedConsumers for handleRefactor with scope=medium when explicitly opted in (fraction 0.0)', async () => {
+    const task = {
+      title: 'Refactor', description: '', context: { scope: 'medium' },
+      project_metadata: { affected_consumers_holdback_fraction: 0.0 },
+    };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(discoverAffectedConsumers, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
@@ -4502,12 +4548,20 @@ describe('receipt-only capability trial arm assignment', () => {
   });
 
   it('suppresses held-back refactor sections before prompt assembly', async () => {
+    // related_tests explicitly held back (1.0); module_interfaces + affected_consumers
+    // explicitly opted back in (0.0) — proves the arm is per-capability, only the
+    // held-back section is suppressed. (Under default-off, the other two must be
+    // explicitly opted in to remain injected.)
     const task = {
       title: 'Task',
       description: '',
       context: { scope: 'medium' },
       project_context: {},
-      project_metadata: { related_tests_holdback_fraction: 1.0 },
+      project_metadata: {
+        related_tests_holdback_fraction: 1.0,
+        module_interfaces_holdback_fraction: 0.0,
+        affected_consumers_holdback_fraction: 0.0,
+      },
     };
 
     await handleRefactor(TASK_ID, { prompt: 'Refactor this' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -4585,6 +4639,69 @@ describe('receipt-only capability trial arm assignment', () => {
     expect(refactorOpts?.affected_consumers_arm).toBeUndefined();
     expect(refactorOpts?.had_related_tests).toBe(true);
     expect(refactorOpts?.related_tests_arm).toBe(true);
+  });
+});
+
+// ── Default-OFF: all five futility-proven context blocks suppressed absent config ─
+// (2026-07-10 futility bound: repo_map, related_tests, module_interfaces,
+// affected_consumers, diagnostics_after_edit all evaluated no_effect.) With no
+// project holdback config, none of the five discovery functions is invoked (saving
+// compute) and every section is absent (saving tokens), while the heartbeat honestly
+// reports the suppression: had_*=false and *_arm=false.
+describe('futility-proven context blocks default-off (no project holdback config)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'Claude Code', provider: 'anthropic' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(writeDiagnosticsAfterEditHook).mockReturnValue(true);
+    // Non-empty discovery results so any accidental invocation would surface as
+    // injected sections / had_*=true — the test proves they are NOT called.
+    vi.mocked(buildRepoMap).mockReturnValue('REPO_MAP_CONTENT');
+    vi.mocked(extractModuleInterfaces).mockReturnValue('MODULE_INTERFACE_CONTEXT');
+    vi.mocked(discoverRelatedTests).mockReturnValue('RELATED_TEST_CONTEXT');
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('AFFECTED_CONSUMERS_CONTEXT');
+  });
+
+  it('suppresses all five sections and skips their discovery functions for a medium-scope Blueprint self-repo create task', async () => {
+    // scope=medium → module_interfaces/affected_consumers are scope-eligible;
+    // anthropic + Blueprint self-repo → diagnostics_after_edit is capability-eligible.
+    // No *_holdback_fraction keys → every capability falls to the default-off (1.0) arm.
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+      project_metadata: { diagnostics_after_edit_enabled: true },
+    };
+
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, 'HenryHamster', 'BlueprintAIStudio', WS, STATUS_REF());
+
+    // Discovery functions are not invoked (compute saved).
+    expect(vi.mocked(buildRepoMap)).not.toHaveBeenCalled();
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+    expect(vi.mocked(discoverRelatedTests)).not.toHaveBeenCalled();
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeDiagnosticsAfterEditHook)).not.toHaveBeenCalled();
+
+    // No section content is injected into the prompt (tokens saved).
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('REPO_MAP_CONTENT');
+    expect(prompt).not.toContain('MODULE_INTERFACE_CONTEXT');
+    expect(prompt).not.toContain('RELATED_TEST_CONTEXT');
+    expect(prompt).not.toContain('AFFECTED_CONSUMERS_CONTEXT');
+
+    // Heartbeat honestly reflects suppression: arm=false, receipt (had_*)=false.
+    const opts = capturedRepoMapHeartbeatOpts();
+    expect(opts).toBeDefined();
+    expect(opts?.had_repo_map).toBe(false);
+    expect(opts?.repo_map_arm).toBe(false);
+    expect(opts?.had_module_interfaces).toBe(false);
+    expect(opts?.module_interfaces_arm).toBe(false);
+    expect(opts?.had_related_tests).toBe(false);
+    expect(opts?.related_tests_arm).toBe(false);
+    expect(opts?.had_affected_consumers).toBe(false);
+    expect(opts?.affected_consumers_arm).toBe(false);
+    expect(opts?.diagnostics_after_edit_arm).toBe(false);
+    expect(opts?.had_diagnostics_after_edit).toBeUndefined();
   });
 });
 

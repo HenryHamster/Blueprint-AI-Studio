@@ -188,7 +188,12 @@ type CapabilityHoldbackName = 'module_interfaces' | 'related_tests' | 'affected_
 
 function holdbackFraction(meta: Record<string, unknown> | undefined, capability: CapabilityHoldbackName): number {
   const value = meta?.[`${capability}_holdback_fraction`];
-  return typeof value === 'number' ? value : 0.0;
+  // Default-OFF: absent an explicit per-project runtime_config holdback fraction,
+  // these context blocks were evaluated no_effect at the futility bound (2026-07-10)
+  // and are suppressed by default (holdback fraction 1.0 => holdback arm). A project
+  // can re-enable a section by setting its `<capability>_holdback_fraction` to a
+  // value < 1.0 (0.0 = always-treatment/opt-in).
+  return typeof value === 'number' ? value : 1.0;
 }
 
 /**
@@ -533,7 +538,6 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-  let repoMap = buildRepoMap(ws, { taskPrompt: rawPrompt, relatedFiles: repoMapRelatedFiles });
   const providerRunner = getProviderRunner();
 
   // ── Deterministic repo-map holdback arm ──────────────────────────────────
@@ -543,25 +547,35 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // independent of whether buildRepoMap returns content. This ensures intent-to-treat
   // analysis can use the assignment signal rather than the receipt boolean.
   // repoMapArm=true → treatment (map injected); false → holdback; null → no trial.
+  //
+  // Default-OFF (2026-07-10 futility bound: repo_map evaluated no_effect): absent an
+  // explicit project fraction, the default is 1.0 (holdback), so buildRepoMap is NOT
+  // called and no repo map is injected — saving both tokens and the discovery compute.
+  // A project re-enables by setting repo_map_holdback_fraction < 1.0 (0.0 = always-on).
   const projectMetaForHoldback = task.project_metadata as Record<string, unknown> | undefined;
   const holdbackFraction = typeof projectMetaForHoldback?.repo_map_holdback_fraction === 'number'
     ? projectMetaForHoldback.repo_map_holdback_fraction
-    : 0.0;
+    : 1.0;
   let repoMapArm: boolean | null = null;
   if (holdbackFraction > 0) {
     repoMapArm = assignCapabilityHoldbackArm(taskId, 'repo_map', holdbackFraction) ?? true;
-    if (!repoMapArm) {
-      sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
-      repoMap = '';
-    }
+  }
+  let repoMap = '';
+  if (repoMapArm === false) {
+    sendLog(ws, `[RepoMap] holdback arm for task ${taskId} (fraction=${holdbackFraction}) — suppressing repo map\n`);
+  } else {
+    repoMap = buildRepoMap(ws, { taskPrompt: rawPrompt, relatedFiles: repoMapRelatedFiles });
   }
 
   // ── Deterministic diagnostics-after-edit holdback arm ───────────────────
   // Claude-Code-only, Blueprint self-repo-only trial. Codex/foreign repos are
   // capability-not-applicable and intentionally receive no arm or receipt keys.
+  // Default-OFF (2026-07-10 futility bound: diagnostics_after_edit evaluated no_effect):
+  // absent an explicit project fraction, default to 1.0 (holdback) so the post-edit
+  // diagnostics hook is not materialized. Re-enable via a fraction < 1.0.
   const diagnosticsHoldbackFraction = typeof projectMetaForHoldback?.diagnostics_after_edit_holdback_fraction === 'number'
     ? projectMetaForHoldback.diagnostics_after_edit_holdback_fraction
-    : 0.0;
+    : 1.0;
   const diagnosticsEnabled = projectMetaForHoldback?.diagnostics_after_edit_enabled === true;
   const diagnosticsEligible = providerRunner.provider === 'anthropic' && isBlueprintSelfRepo(owner, repo);
   let diagnosticsAfterEditArm: boolean | null = null;

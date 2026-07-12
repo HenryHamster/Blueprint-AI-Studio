@@ -322,7 +322,6 @@ Each cycle you look at what's happening and decide whether it's still on the rig
 # Project: ${p.projectName}
 ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
-${p.userStateLine}
 ${p.contextPrefix}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
@@ -343,7 +342,7 @@ ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSecti
 ${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
-${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
+${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -586,6 +585,12 @@ Retractions are processed before additions this cycle. Omit the \`retract\` key 
 
 Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 
+# Current user activity & open messages
+
+The following reflects the live wall clock (relative-time strings such as "N days ago" / message ages). It is deliberately placed AFTER the stable guidance above so those clock-derived strings do not change the cacheable prompt prefix each turn — identical underlying payloads then render an identical prefix regardless of the current time.
+
+${p.userStateLine}
+${p.questionSection}${p.feedbackSection}${p.threadSection}
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;

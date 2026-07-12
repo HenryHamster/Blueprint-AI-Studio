@@ -202,6 +202,49 @@ describe('buildThinkerPrompt', () => {
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
   });
 
+  // Prompt-cache prefix stability: the wall-clock-derived userStateLine
+  // (formatRelativeDays) and the calcMessageAge-fed message sections
+  // (question/feedback/thread) must render AFTER the stable guidance body so
+  // they no longer poison the cacheable prefix each turn.
+  it('relocates clock-derived userStateLine + message sections below the stable guidance body', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      userStateLine: 'User last active: 3 days ago',
+      questionSection: '## Operator Questions\nQ-MARKER',
+      feedbackSection: '## User Feature Requests\nF-MARKER',
+      threadSection: '## Conversation History\nT-MARKER',
+    });
+    const idx = (s: string) => prompt.indexOf(s);
+    // Every clock-derived block now sits after # Your job (the stable body).
+    expect(idx('# Your job')).toBeLessThan(idx('User last active: 3 days ago'));
+    expect(idx('# Your job')).toBeLessThan(idx('Q-MARKER'));
+    expect(idx('# Your job')).toBeLessThan(idx('F-MARKER'));
+    expect(idx('# Your job')).toBeLessThan(idx('T-MARKER'));
+    // They land in the dedicated tail block, after acceptance criteria (## 8).
+    expect(idx('## 8. Acceptance criteria')).toBeLessThan(idx('# Current user activity & open messages'));
+    // Content is preserved, not dropped.
+    expect(prompt).toContain('User last active: 3 days ago');
+    expect(prompt).toContain('Q-MARKER');
+  });
+
+  // The cacheable prefix (everything up to and including the stable guidance
+  // body) must be byte-identical across turns whose only difference is the wall
+  // clock — i.e. userStateLine and the message-age sections varying.
+  it('cacheable prefix is invariant to clock-only changes in userStateLine/message sections', () => {
+    const common = {
+      ...base,
+      questionSection: '## Operator Questions\nWhen can we ship?',
+      feedbackSection: '',
+      threadSection: '',
+    };
+    const turnA = buildThinkerPrompt({ ...common, userStateLine: 'User last active: today' });
+    const turnB = buildThinkerPrompt({ ...common, userStateLine: 'User last active: 5 days ago' });
+    const marker = '# Your job';
+    const prefixA = turnA.slice(0, turnA.indexOf(marker) + marker.length);
+    const prefixB = turnB.slice(0, turnB.indexOf(marker) + marker.length);
+    expect(prefixA).toBe(prefixB);
+  });
+
   it('renders cycleStartReconciliationSection after the problem_model and before # Your job', () => {
     const prompt = buildThinkerPrompt({
       ...base,

@@ -2947,6 +2947,33 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(rubricHeadings).toBe(1);
   });
 
+  // ── prompt-cache prefix stability (research handler) ─────────────────────────
+  // Regression guard for the cache-buster fix: the stable "You are a codebase
+  // research agent" guidance body must LEAD the prompt, ahead of the
+  // task-variable context prefix (strategic intent, playbook, retry, codebase
+  // instructions). Previously those variable sections were concatenated in
+  // front of the guidance, defeating the LLM prompt-cache prefix on every turn.
+  it('handleResearch prompt leads with the stable guidance body, not the task-variable context prefix', async () => {
+    // Inject a detectable marker where the volatile context prefix renders. The
+    // reorder must place the stable guidance intro AHEAD of this task-variable
+    // content (previously it was concatenated in front, busting the cache).
+    const CTX_MARKER = 'CTX_PREFIX_MARKER_9f21';
+    vi.mocked(buildContextPrefix).mockReturnValue(CTX_MARKER);
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const guidanceIdx = p.indexOf('You are a codebase research agent');
+    const contextIdx = p.indexOf(CTX_MARKER);
+    // The context-prefix marker must actually be present (proves the prefix
+    // rendered and the assertion is not vacuously true)...
+    expect(contextIdx).toBeGreaterThanOrEqual(0);
+    expect(guidanceIdx).toBeGreaterThanOrEqual(0);
+    // ...and the stable guidance body must now precede it.
+    expect(guidanceIdx).toBeLessThan(contextIdx);
+    // The context prefix is relocated into the CODEBASE CONTEXT region, which
+    // itself follows the guidance intro.
+    expect(guidanceIdx).toBeLessThan(p.indexOf('# CODEBASE CONTEXT'));
+  });
+
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
   // Regression: the plan prompt previously told the agent that any subtask
   // touching backend/app/models.py (or adding tables/columns) must spawn a

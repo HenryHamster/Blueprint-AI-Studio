@@ -909,7 +909,12 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
-  const researchPrompt = `${codebaseSummary}${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
+  // Prompt-cache prefix stability: the stable, reusable guidance body leads so
+  // identical instruction text forms a cacheable prefix across turns. The
+  // task-variable / retry-variable sections (codebaseSummary, contextPrefix,
+  // playbook, retry) are relocated below into the CODEBASE CONTEXT region — same
+  // rendered content, order-only change — so they no longer poison the prefix.
+  const researchPrompt = `You are a codebase research agent inside an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
 
@@ -945,7 +950,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 
 # CODEBASE CONTEXT
 
-${fileTreeSection}${gitHistorySection}
+${codebaseSummary}${contextPrefix}${researchPlaybookSection}${researchRetryContext}${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}${researchAvailableCapabilitiesSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${priorKnowledgeSection}${pipelineScopeRatesSection}${anomalySection}
