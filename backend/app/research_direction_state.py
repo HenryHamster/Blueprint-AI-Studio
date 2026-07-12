@@ -75,32 +75,6 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_INDETERMINATE,
 )
 
-# ── Criterion-coverage gate: auto-complete paths ──────────────────────────
-# Every direction retirement path — auto-complete (exhaustion, proven-merge,
-# no-findings refractory) and strategist-authored retire_direction — must
-# call direction_owns_uncovered_criterion before retiring a direction. A
-# criterion-carrying direction with an uncovered criterion must not reach
-# success_evidence_met, saturated, or deadlock completion, nor be manually
-# retired. This frozenset declares all gated paths; the invariant test
-# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
-# verifies structurally that every declared path contains the gate call.
-_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
-    {
-        "exhaustion",  # _maybe_autocomplete_exhausted_direction (this module)
-        "proven_merge",  # apply_post_spawn_state >=3-merge completion (this module)
-        "no_findings",  # _stamp_no_findings_refractory (research_completion.py)
-        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
-    }
-)
-
-#: The criterion key that gates all autocomplete paths. Any direction carrying
-#: this key in its ``criterion_keys`` is blocked from reaching any auto-complete
-#: terminal state (exhaustion, proven-merge, no-findings, strategist retire)
-#: until the criterion is satisfied. Carried by direction d-12f7d408, which
-#: owns the acceptance-outcome tracking for the AST-invariant gate tests.
-_CRITERION_COVERAGE_GATE_KEY: str = "c-560ec27e"
-
-
 def _empty_finding_challenge_summary() -> dict:
     return {
         "challenged_findings": 0,
@@ -337,22 +311,6 @@ async def _maybe_autocomplete_exhausted_direction(
     )
 
     if not _should_autocomplete_exhausted(d, exhausted=exhausted):
-        return False
-
-    # Gate exhaustion auto-complete on criterion coverage: a direction that owns
-    # uncovered acceptance criteria must not retire via exhaustion — the criteria
-    # must be satisfied first. Fail-closed (helper returns True on error)
-    # defers auto-completion until the query succeeds.
-    from app.acceptance_criteria import (  # noqa: PLC0415
-        direction_owns_uncovered_criterion,
-    )
-
-    if await direction_owns_uncovered_criterion(session, task.project_id, did):
-        logger.warning(
-            f"[RESEARCH] Exhaustion auto-complete deferred for direction {did}: "
-            f"owns uncovered acceptance criteria (task {task.id})"
-        )
-        d["_exhaustion_gated_by_criterion"] = True
         return False
 
     reason = _exhaustion_complete_reason(d)
@@ -1029,24 +987,12 @@ async def apply_post_spawn_state(
                             )
                             - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
-                        # Gate the PROVEN-merge SUCCESS route on outcome
-                        # coverage: a saturated direction must not retire
-                        # declaring success while an acceptance criterion it
-                        # owns is still uncovered. Fail-closed (helper returns
-                        # True) blocks completion for directions that own
-                        # uncovered criteria or on any query error. When gated, the
-                        # direction simply stays active — do NOT fall through to
-                        # the exhaustion route, which declares deadlock (not
-                        # success), not an unmet-but-productive outcome.
-                        _owns_uncovered = False
-                        if total_merged >= 3:
-                            from app.acceptance_criteria import (  # noqa: PLC0415
-                                direction_owns_uncovered_criterion,
-                            )
-
-                            _owns_uncovered = await direction_owns_uncovered_criterion(
-                                session, task.project_id, did
-                            )
+                        # The PROVEN-merge SUCCESS route and the exhaustion
+                        # route each fall back to their own merge-count /
+                        # deadlock logic. The acceptance contract is enforced
+                        # only at qualify (the ledger gate in compute_composite),
+                        # so there is no pre-qualification coverage precondition
+                        # on direction retirement here.
                         if total_merged < 3:
                             await _maybe_autocomplete_exhausted_direction(
                                 session,
@@ -1055,7 +1001,7 @@ async def apply_post_spawn_state(
                                 did,
                                 _pending_archived_diagnoses,
                             )
-                        elif total_merged >= 3 and not _owns_uncovered:
+                        elif total_merged >= 3:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
                             d["status"] = "completed"
                             d["completed_at"] = _utcnow().isoformat()
@@ -1094,12 +1040,6 @@ async def apply_post_spawn_state(
                                 logger.warning(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
-                        elif total_merged >= 3 and _owns_uncovered:
-                            logger.warning(
-                                f"[RESEARCH] Criterion-coverage gate: direction {did} "
-                                f"saturated ({total_merged} verified merges) but owns "
-                                f"an uncovered acceptance criterion — staying active"
-                            )
 
             # Also apply sub-research annotation directly on the in-memory
             # `directions` list before the locked write so both updates land

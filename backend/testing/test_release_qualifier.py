@@ -10839,9 +10839,10 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     client, db_session
 ):
     """The agent qualification read surfaces ``qualification_trigger_state`` and
-    explains BOTH an armed trigger (stabilize phase, no prior attempt, complete
-    criterion coverage) and a blocked trigger (coverage incomplete) with the
-    correct machine-readable reason and coverage counts.
+    explains BOTH an armed trigger (stabilize phase, no prior attempt) and a
+    held trigger (a not_promoted/criterion_coverage verdict whose sha-keyed
+    acceptance ledger is not yet fully met) with the correct machine-readable
+    reason.
 
     Exercises the production read-surface wiring in
     ``routers/agent_strategic_fetch.py`` (which threads the shared
@@ -10875,14 +10876,15 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     headers = {"x-agent-token": token}
     url = f"/api/agent/projects/{project.id}/qualification"
 
-    # ARMED: one active criterion, fully covered by proven merge-test evidence,
-    # no prior attempt → the initial trigger would fire now.
+    # ARMED: stabilize phase, no prior attempt → the initial trigger fires now
+    # (Stage-1 decoupling: no pre-qualification coverage precondition). A
+    # criterion is present but does not gate arming.
     await _add_version_criterion(
         db_session,
         project,
         version,
         key="c-covered-armed",
-        text="Covered criterion",
+        text="A criterion",
         source_kind="task_merge",
     )
 
@@ -10896,16 +10898,26 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert armed["decision"]["fire"] is True
     assert armed["decision"]["blocking"] == []
 
-    # BLOCKED: add a second active criterion with no covering evidence →
-    # coverage becomes incomplete (1/2) so the trigger is blocked, and the
-    # surface explains exactly why with the live coverage counts.
+    # HELD: a not_promoted verdict whose only blocker was criterion coverage
+    # holds until the sha-keyed acceptance ledger reports the candidate fully
+    # met. With an active criterion that has no ledger verdict for the candidate
+    # sha, is_candidate_fully_met is False → the redrive leg holds
+    # (reason=criterion_not_met).
     await _add_version_criterion(
         db_session,
         project,
         version,
         key="c-uncovered-blocked",
-        text="Uncovered criterion",
+        text="Ungraded criterion",
     )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "criterion_coverage_incomplete",
+        "candidate_sha": "deadbeef" * 5,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     res = await client.get(url, headers=headers)
     assert res.status_code == 200, res.text
@@ -10914,18 +10926,23 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert blocked["auto_trigger"] == "waiting"
     assert blocked["next_expected_trigger"] is not None
     assert blocked["attempts"]["count"] == 0
-    assert blocked["decision"]["reason"] == "coverage_incomplete"
+    assert blocked["decision"]["reason"] == "criterion_not_met"
     assert blocked["decision"]["fire"] is False
     assert any(
-        "criterion coverage incomplete" in b for b in blocked["decision"]["blocking"]
-    ), f"expected coverage message in blocking list: {blocked['decision']['blocking']}"
+        "ledger" in b.lower() for b in blocked["decision"]["blocking"]
+    ), f"expected ledger message in blocking list: {blocked['decision']['blocking']}"
 
 
 @pytest.mark.asyncio
-async def test_criterion_coverage_all_covered_passes_qualification(
+async def test_ungraded_acceptance_contract_fails_closed(
     db_session, mocker
 ):
-    """All criteria covered by task-merge evidence lets the normal decision pass."""
+    """Active criteria with NO merge-grade verdict block — they do not sail through.
+
+    Replaces ``test_criterion_coverage_all_covered_passes_qualification``, which
+    asserted the RETIRED mechanism (task-merge evidence "covers" a criterion ⇒ the
+    gate passes).  Evidence rows no longer certify a criterion.
+    """
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = False
@@ -10970,12 +10987,23 @@ async def test_criterion_coverage_all_covered_passes_qualification(
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "dry_run"
+    # This test used to assert that task-merge EVIDENCE ("2/2 covered") satisfied the
+    # gate and let the candidate pass.  That mechanism is retired: evidence rows no
+    # longer certify a criterion — the per-category merge-grade does, at qualify time.
+    #
+    # These two criteria are ACTIVE and were never graded (this fixture's version has
+    # no usable goal, so no merge-grade child is spawned and no CategoryVerdict rows
+    # exist for the candidate).  An ungraded acceptance contract must FAIL CLOSED, not
+    # sail through on a `None` gate input — otherwise the version promotes over a
+    # contract nothing ever checked.
+    assert result["status"] == "not_promoted", result
     await db_session.refresh(version)
-    assert version.last_qualification["blocker"] is None
-    assert version.last_qualification["criterion_coverage"]["total"] == 2
-    assert version.last_qualification["criterion_coverage"]["covered"] == 2
-    assert version.last_qualification["criterion_coverage"]["uncovered"] == 0
+    assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
+    # And the WHY is recorded per category, not just a bare blocker code.
+    _verdicts = version.last_qualification["category_verdicts"]
+    assert {v["category_key"] for v in _verdicts} == {"c-covered1", "c-covered2"}
+    assert all(v["status"] == "not_met" for v in _verdicts)
+    assert all("never graded" in v["gap"] for v in _verdicts)
     promote_spy.assert_not_called()
 
 
@@ -11476,14 +11504,14 @@ async def _seed_green_finalize_candidate(db_session, project, version):
             "suites": {"startup": {"passed": True}},
         },
     )
-    await _add_version_criterion(
-        db_session,
-        project,
-        version,
-        key="merge-test-ci-self-clear",
-        text="Release candidate has merge-test evidence.",
-        source_kind="task_merge",
-    )
+    # NOTE: this fixture used to seed a criterion carrying task_merge evidence,
+    # purely so the RETIRED coverage gate ("covered ⇒ pass") would not block these
+    # CI-composite tests.  Coverage evidence no longer satisfies the acceptance
+    # contract — the per-category grade does — so an ungraded criterion would now
+    # (correctly) fail the gate closed and these tests would never reach the CI
+    # composite they exist to exercise.  A version with NO criteria has no
+    # acceptance contract to grade, which is exactly the clean baseline these
+    # tests want.
     await db_session.refresh(version)
 
 
@@ -35504,14 +35532,18 @@ async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
 
 @pytest.mark.asyncio
 async def test_compute_qualification_trigger_state_armed(db_session, mocker):
-    """open stabilize-phase version, no prior attempt, coverage complete → armed."""
+    """open stabilize-phase version, no prior attempt → armed.
+
+    Stage-1 decoupling: the initial trigger arms on phase + no-prior-attempt
+    alone — there is no pre-qualification criterion-coverage precondition. A
+    criterion is present here but does not affect arming.
+    """
     from app.release_readiness import compute_qualification_trigger_state
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # Add a covered criterion so total > 0 and covered == total.
     await _add_version_criterion(
         db_session, project, version,
-        key="c-trig-armed", text="Covered criterion",
+        key="c-trig-armed", text="A criterion",
         source_kind="task_merge",
     )
     assert version.last_qualification is None
@@ -35522,8 +35554,6 @@ async def test_compute_qualification_trigger_state_armed(db_session, mocker):
     assert result["trigger_state"] == "armed"
     assert result["open_version_id"] == str(version.id)
     assert result["reason"] == "armed"
-    assert result["coverage_total"] == 1
-    assert result["coverage_covered"] == 1
 
 
 @pytest.mark.asyncio
@@ -35618,10 +35648,17 @@ async def test_compute_qualification_trigger_state_blocked_prior_attempt_attempt
 
 
 @pytest.mark.asyncio
-async def test_compute_qualification_trigger_state_blocked_coverage_incomplete(
+async def test_compute_qualification_trigger_state_armed_despite_incomplete_criteria(
     db_session,
 ):
-    """total > 0 and covered < total → reason=coverage_incomplete."""
+    """Stage-1 decoupling: a stabilize-phase version with unmet criteria ARMS.
+
+    Previously an incomplete-coverage version was blocked
+    (reason=coverage_incomplete), which was the wedge — coverage measured ~0
+    forever so the initial trigger never armed. With the pre-qualification
+    coverage gate retired, the same version arms; the acceptance contract is
+    enforced INSIDE qualification (the ledger gate in compute_composite).
+    """
     from app.release_readiness import compute_qualification_trigger_state
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -35636,50 +35673,8 @@ async def test_compute_qualification_trigger_state_blocked_coverage_incomplete(
 
     result = await compute_qualification_trigger_state(db_session, project.id)
 
-    assert result["trigger_state"] == "blocked"
-    assert result["reason"] == "coverage_incomplete"
-    assert result["coverage_total"] == 2
-    assert result["coverage_covered"] == 1
-
-
-@pytest.mark.asyncio
-async def test_compute_qualification_trigger_state_armed_backfilled_only(db_session):
-    """A remaining criterion covered only by the 'backfilled' tier clears the
-    coverage gate (mirroring release_scoring) → trigger armed, with
-    coverage_backfilled surfaced. Regression: backfilled tier previously omitted
-    from the trigger-state coverage predicate, stranding the version."""
-    from app.acceptance_criteria import UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
-    from app.release_readiness import compute_qualification_trigger_state
-
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    criterion = VersionAcceptanceCriterion(
-        project_id=project.id,
-        release_version_id=version.id,
-        criterion_key="c-backfilled-only",
-        text="Covered solely by unverified-merge backfill evidence",
-        created_by="test",
-    )
-    db_session.add(criterion)
-    await db_session.flush()
-    db_session.add(
-        CriterionEvidence(
-            project_id=project.id,
-            criterion_id=criterion.id,
-            source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
-            source_id="backfill-c-backfilled-only",
-            detail={"backfilled": True, "verdict": "merge-test"},
-        )
-    )
-    await db_session.commit()
-
-    result = await compute_qualification_trigger_state(db_session, project.id)
-
     assert result["trigger_state"] == "armed"
     assert result["reason"] == "armed"
-    assert result["coverage_total"] == 1
-    assert result["coverage_covered"] == 0
-    assert result["coverage_attested"] == 0
-    assert result["coverage_backfilled"] == 1
 
 
 @pytest.mark.asyncio
@@ -35708,34 +35703,6 @@ async def test_fire_initial_qualification_if_coverage_complete_spawns(
     )
 
     assert fired is True
-
-
-@pytest.mark.asyncio
-async def test_fire_initial_qualification_if_coverage_complete_noop_coverage_incomplete(
-    db_session, mocker
-):
-    """Coverage incomplete → function returns False without calling run_qualification."""
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    await _add_version_criterion(
-        db_session, project, version,
-        key="c-partial", text="Covered", source_kind="task_merge",
-    )
-    await _add_version_criterion(
-        db_session, project, version,
-        key="c-missing-init", text="Not yet covered",
-    )
-
-    run_qual_mock = mocker.patch(
-        "app.release_qualifier.run_qualification",
-        new=AsyncMock(return_value={"status": "spawned"}),
-    )
-
-    fired = await rq._fire_initial_qualification_if_coverage_complete(
-        version.id, session_factory=_shared_session_factory(db_session)
-    )
-
-    assert fired is False
-    run_qual_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -35935,8 +35902,7 @@ async def test_fire_initial_qualification_if_coverage_complete(db_session, mocke
     assert trigger["trigger_state"] == "armed", (
         f"Expected armed trigger, got: {trigger}"
     )
-    assert trigger["coverage_total"] == 1
-    assert trigger["coverage_covered"] == 1
+    assert trigger["reason"] == "armed"
 
     # --- Part 2: sweep fires the initial qualification ---
 
@@ -35972,7 +35938,9 @@ async def test_fire_initial_qualification_if_coverage_complete(db_session, mocke
     assert blocked["trigger_state"] == "blocked"
     assert blocked["reason"] == "prior_attempt_exists"
 
-    # Coverage incomplete blocks.
+    # Stage-1 decoupling: unmet criteria no longer block the initial trigger —
+    # the pre-qualification coverage gate is retired, so this version ARMS (the
+    # acceptance contract is graded inside qualification).
     project3, version3 = await _make_project_and_version(db_session, phase="stabilize")
     await _add_version_criterion(
         db_session, project3, version3,
@@ -35983,9 +35951,9 @@ async def test_fire_initial_qualification_if_coverage_complete(db_session, mocke
         key="c-blk-missing", text="Not covered",
     )
 
-    blocked2 = await compute_qualification_trigger_state(db_session, project3.id)
-    assert blocked2["trigger_state"] == "blocked"
-    assert blocked2["reason"] == "coverage_incomplete"
+    armed2 = await compute_qualification_trigger_state(db_session, project3.id)
+    assert armed2["trigger_state"] == "armed"
+    assert armed2["reason"] == "armed"
 
 
 # ===========================================================================

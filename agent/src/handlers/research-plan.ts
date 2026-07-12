@@ -1244,6 +1244,7 @@ export {
   buildUserPausedSection,
   QUALIFICATION_STATE_VOCAB,
   buildVersionPhaseSection,
+  formatCriteriaRubric,
   buildMemoCitationsSection,
   resolveMemoHandles,
   buildEfficiencySnapshotSection,

@@ -1407,20 +1407,18 @@ async def compute_qualification_trigger_state(
       - an open release version exists for the project, AND
       - the version is in the "stabilize" phase, AND
       - no prior qualification attempt exists (``last_qualification is None``
-        AND ``qualification_attempts == 0``), AND
-      - criterion coverage is complete: NOT (total > 0 and covered + attested < total).
-        Criteria covered only by a (non-expired) operator attestation are treated as
-        sufficient for the initial trigger to arm — they clear the hard gate and let
-        the qualification proceed (the attestation penalty is applied at score time).
+        AND ``qualification_attempts == 0``).
+
+    There is no pre-qualification criterion-coverage precondition: the
+    acceptance contract is enforced INSIDE qualification (the sha-keyed ledger
+    gate in :func:`app.release_scoring.compute_composite`), so the initial
+    trigger arms on phase + no-prior-attempt alone.
 
     ``reason`` codes when ``trigger_state == "blocked"``:
       - ``"no_open_version"``       — no open release version
       - ``"wrong_phase"``           — version exists but is not in stabilize phase
       - ``"prior_attempt_exists"``  — last_qualification is set OR qualification_attempts > 0
-      - ``"coverage_incomplete"``   — coverage gate would fire (total > 0 and covered + attested < total)
     """
-    from app.acceptance_criteria import get_version_coverage_summary  # noqa: PLC0415
-
     version = await release_version.current_open_version(session, project_id)
     if version is None:
         return {
@@ -1462,41 +1460,17 @@ async def compute_qualification_trigger_state(
             "coverage_covered": 0,
         }
 
-    coverage = await get_version_coverage_summary(session, version.id)
-    total = int(coverage.get("total") or 0)
-    covered = int(coverage.get("covered") or 0)
-    attested = int(coverage.get("attested") or 0)
-    backfilled = int(coverage.get("backfilled") or 0)
-
-    # Mirror release_scoring.compute_composite: 'backfilled' clears the coverage
-    # gate alongside covered/attested, so a backfilled-only remainder is complete.
-    if total > 0 and (total - covered - attested - backfilled) > 0:
-        return {
-            "trigger_state": "blocked",
-            "open_version_id": str(version.id),
-            "reason": "coverage_incomplete",
-            "summary": (
-                f"criterion coverage incomplete for v{version.version_number}: "
-                f"{covered}/{total} active criteria covered"
-            ),
-            "coverage_total": total,
-            "coverage_covered": covered,
-            "coverage_attested": attested,
-            "coverage_backfilled": backfilled,
-        }
-
     return {
         "trigger_state": "armed",
         "open_version_id": str(version.id),
         "reason": "armed",
         "summary": (
-            f"v{version.version_number} is stabilize-phase with no prior attempt "
-            f"and complete criterion coverage ({covered}/{total if total else 'none'})"
+            f"v{version.version_number} is stabilize-phase with no prior "
+            "qualification attempt — initial trigger armed (acceptance contract "
+            "is graded inside qualification)"
         ),
-        "coverage_total": total,
-        "coverage_attested": attested,
-        "coverage_covered": covered,
-        "coverage_backfilled": backfilled,
+        "coverage_total": 0,
+        "coverage_covered": 0,
     }
 
 

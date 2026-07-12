@@ -288,20 +288,6 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
-# Declares which auto-complete code paths inside _stamp_no_findings_refractory
-# gate on criterion coverage before retiring a direction, plus the
-# strategist-authored retire_direction path in strategic_completion.py.
-# This frozenset MUST match the one in research_direction_state.py.
-# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
-# verifies structurally that all declared paths contain the gate call.
-_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
-    {
-        "exhaustion",  # _stamp_no_findings_refractory exhaustion complete (L840)
-        "proven_merge",  # _stamp_no_findings_refractory >=3-merge completion (L824)
-        "no_findings",  # _stamp_no_findings_refractory overall site (research_completion.py)
-        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
-    }
-)
 # Targeted retry: used when the non-response cause is time-based (timeout/stall).
 # A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.
@@ -822,22 +808,6 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
     _auto_complete_info: list[dict] = []
 
-    # Gate the PROVEN-merge SUCCESS route on outcome coverage (same policy as
-    # apply_post_spawn_state). The coverage query is async, but the completion
-    # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
-    # so we resolve the verdict here (outside the lock) and thread the boolean
-    # in. Fail-closed: the helper returns True on query errors (blocking
-    # completion until resolved) and False only when the direction owns no keys,
-    # no open version, no active owned criteria, or all owned active criteria
-    # are covered.
-    from app.acceptance_criteria import (  # noqa: PLC0415
-        direction_owns_uncovered_criterion,
-    )
-
-    _owns_uncovered = await direction_owns_uncovered_criterion(
-        session, task.project_id, direction_id
-    )
-
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -880,14 +850,12 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            # Gated: a direction (regardless of merge count) whose owned
-            # acceptance outcome is still uncovered is withheld from BOTH the
-            # SUCCESS route AND the exhaustion route — a criterion-carrying
-            # direction with an unmet outcome is neither proven NOR deadlocked;
-            # it stays active. The exhaustion route declares deadlock, which a
-            # productive-but-unmet direction is not.
-            _proven_gated = _owns_uncovered
-            if total_merged >= 3 and not _owns_uncovered:
+            # Direction completion falls back to its own proven-merge and
+            # exhaustion logic. The acceptance contract is enforced only at
+            # qualify (the ledger gate in compute_composite), so a direction
+            # retiring while a criterion is unmet still cannot promote an unmet
+            # version — there is no pre-qualification coverage precondition here.
+            if total_merged >= 3:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -903,7 +871,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif not _proven_gated and not _owns_uncovered and _should_autocomplete_exhausted(target):
+            elif _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso

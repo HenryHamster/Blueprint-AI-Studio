@@ -5495,8 +5495,8 @@ describe('SHARED_LIFECYCLE_REMAINDER — byte size and category coverage', () =>
     expect(byteLen).toBeLessThan(4500);
   });
 });
-describe('thinker prompt contains criterion-coverage retirement warning', () => {
-  it('includes criterion-coverage check before retirement guidance in Section 3 (Moves)', () => {
+describe('thinker prompt omits the retired criterion-coverage retirement gate', () => {
+  it('does not instruct addressing a criterion before retiring a direction (Stage-1 decoupling)', () => {
     const params: ThinkerPromptParams = {
       contextPrefix: '',
       projectName: 'Test Project',
@@ -5533,10 +5533,12 @@ describe('thinker prompt contains criterion-coverage retirement warning', () => 
       efficiencySnapshotSection: '',
     };
     const prompt = buildThinkerPrompt(params);
-    expect(prompt).toContain('Criterion-coverage before retirement');
-    expect(prompt).toContain('direction_owns_uncovered_criterion');
-    expect(prompt).toContain('retract via Section 8');
-    expect(prompt).toContain('Do NOT retire criterion-carrying without addressing the criterion first');
+    // Stage-1 decoupling: the criterion-coverage retirement gate was retired,
+    // so the thinker no longer instructs the strategist to address a criterion
+    // before retiring a criterion-carrying direction. Direction retirement is a
+    // pure judgment call; the acceptance contract is graded only at qualify.
+    expect(prompt).not.toContain('Criterion-coverage before retirement');
+    expect(prompt).not.toContain('direction_owns_uncovered_criterion');
   });
 });
 

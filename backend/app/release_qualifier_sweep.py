@@ -651,13 +651,10 @@ async def _fire_initial_qualification_if_coverage_complete(
 
             logger.info(
                 "[RELEASE_QUALIFIER] fire_initial_qualification: "
-                "coverage complete for v%d on %s (total=%d covered=%d attested=%d) "
-                "— spawning initial qualification",
+                "initial trigger armed for v%d on %s — spawning initial "
+                "qualification (acceptance contract graded inside qualification)",
                 version.version_number,
                 automain_sha[:8],
-                trigger.get("coverage_total", 0),
-                trigger.get("coverage_covered", 0),
-                trigger.get("coverage_attested", 0),
             )
             result = await release_qualifier.run_qualification(
                 session, version.project_id, version
@@ -1186,7 +1183,6 @@ async def _run_auto_qualification_trigger_sweep(
         return
 
     from app import release_qualifier
-    from app.acceptance_criteria import get_version_coverage_summary
     from app.qualification_triggers import resolve_qualification_trigger
     from app.release_readiness import compute_requalification_readiness
 
@@ -1199,7 +1195,6 @@ async def _run_auto_qualification_trigger_sweep(
                 session,
                 mode=mode,
                 release_qualifier=release_qualifier,
-                get_version_coverage_summary=get_version_coverage_summary,
                 resolve_qualification_trigger=resolve_qualification_trigger,
                 compute_requalification_readiness=compute_requalification_readiness,
                 session_factory=_factory,
@@ -1216,7 +1211,6 @@ async def _run_auto_qualification_trigger_for_version(
     *,
     mode: str,
     release_qualifier,
-    get_version_coverage_summary,
     resolve_qualification_trigger,
     compute_requalification_readiness,
     session_factory,
@@ -1230,26 +1224,33 @@ async def _run_auto_qualification_trigger_for_version(
     blocker = qual.get("blocker") if qual else None
     candidate_sha = qual.get("candidate_sha") if qual else None
     qualification_attempts = version.qualification_attempts or 0
+    # PER-ERROR-EPISODE counter (not the lifetime column) — see the T2 cap in
+    # qualification_triggers: capping on the lifetime count strands a version at
+    # status=error forever.
+    error_redrive_count = int(qual.get("error_redrive_count") or 0) if qual else 0
 
     # Determine in-flight and promotion-in-flight guards cheaply from stored state.
     in_flight = status == "pending"
     promotion_in_flight = bool(qual.get("promotion_pending")) if qual else False
 
-    # Gather coverage (DB-only, cheap).
+    # Gather the sha-keyed acceptance-ledger verdict for the last-evaluated
+    # candidate (DB-only, cheap). Only the not_promoted/criterion_coverage
+    # redrive leg consults it; the initial/error fire ignores it. Fail-closed to
+    # False (not fully met) so a ledger-fetch error never spuriously redrives.
+    is_candidate_fully_met = False
     try:
-        coverage_raw = await get_version_coverage_summary(session, version.id)
-        coverage = {
-            "total": int(coverage_raw.get("total") or 0),
-            "covered": int(coverage_raw.get("covered") or 0),
-            "attested": int(coverage_raw.get("attested") or 0),
-            "backfilled": int(coverage_raw.get("backfilled") or 0),
-        }
+        from app import category_verdict_ledger as _cvl
+
+        is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+            session, version.id, candidate_sha
+        )
     except Exception:
         logger.warning(
-            "[AUTO_QUAL_TRIGGER] coverage fetch failed for version %s — using None",
+            "[AUTO_QUAL_TRIGGER] ledger fetch failed for version %s — treating "
+            "candidate as not fully met",
             version.id,
         )
-        coverage = None
+        is_candidate_fully_met = False
 
     # Gather requalification_ready (DB-only, cheap).
     requalification_ready: bool | None = None
@@ -1264,11 +1265,20 @@ async def _run_auto_qualification_trigger_for_version(
             version.id,
         )
 
-    # For T3 (dry_run + candidate advancement), fetch automain SHA and CI state.
+    # Candidate-advancement paths need the integration-branch HEAD + its CI state.
     # This is the only path that requires GitHub I/O in the sweep.
+    #
+    # BOTH advancement legs need it, not just T3:
+    #   * T3  — dry_run superseded by a new automain HEAD.
+    #   * T1  — a ``not_promoted`` version blocked on the acceptance grade. Its
+    #           CategoryVerdict rows are SHA-KEYED and nothing re-grades a PAST
+    #           candidate, so the not-met verdict is frozen; only a NEW candidate
+    #           can change it. Without automain_sha here that leg could never fire
+    #           (candidate_superseded would be permanently False) — i.e. the escape
+    #           would be dead code and the version would sit blocked.
     automain_sha: str | None = None
     automain_ci_state: str | None = None
-    if status == "dry_run" and candidate_sha:
+    if status in ("dry_run", "not_promoted") and candidate_sha:
         project = (
             (
                 await session.execute(
@@ -1316,7 +1326,8 @@ async def _run_auto_qualification_trigger_for_version(
         status=status,
         error_code=error_code,
         qualification_attempts=qualification_attempts,
-        coverage=coverage,
+        error_redrive_count=error_redrive_count,
+        is_candidate_fully_met=is_candidate_fully_met,
         requalification_ready=requalification_ready,
         candidate_sha=candidate_sha,
         automain_sha=automain_sha,

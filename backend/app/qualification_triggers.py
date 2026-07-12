@@ -8,7 +8,10 @@ dict for use in the admin lifecycle endpoint, strategic payload, and attention s
 The resolver implements the ordered rule table from the design doc (efbe4182):
 
     T0 hold      — phase/in-flight/promotion guards
-    T1 coverage_complete — first-ever or error state + coverage now complete
+    T1 initial fire — first-ever (unconditional), or not_promoted whose only
+                      blocker was the acceptance grade, once EITHER the ledger
+                      reports the candidate fully met OR the candidate advanced
+                      (new work to re-grade).  No pre-qualification coverage gate.
     T2 error_redrive — transient/non-transient error under attempt cap
     T3 post_dry_run_advance — dry_run + automain has advanced (+ CI-red gate)
     T4 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved
@@ -45,7 +48,7 @@ class TriggerDecision:
         "post_dry_run_advance", "blockers_cleared".
     reason:
         Machine-readable code for the decision (e.g. "ci_red", "in_flight",
-        "wrong_phase", "coverage_incomplete", "error_attempt_cap", "armed",
+        "wrong_phase", "criterion_not_met", "error_attempt_cap", "armed",
         "not_applicable").
     blocking:
         Human-readable list of reasons why fire=False (empty when fire=True).
@@ -81,7 +84,8 @@ def resolve_qualification_trigger(
     status: str | None,
     error_code: str | None,
     qualification_attempts: int,
-    coverage: dict[str, int] | None,
+    error_redrive_count: int,
+    is_candidate_fully_met: bool,
     requalification_ready: bool | None,
     candidate_sha: str | None,
     automain_sha: str | None,
@@ -105,12 +109,20 @@ def resolve_qualification_trigger(
     error_code:
         The error code from last_qualification when status="error", else None.
     qualification_attempts:
-        Total qualification attempt count recorded on the version.
-    coverage:
-        Dict with integer "total", "covered", and (optionally) "attested" keys,
-        or None when unavailable.  "attested" counts criteria covered only by
-        operator attestation — those are treated as satisfying the gate for
-        coverage_complete purposes (matching release_scoring).
+        Total LIFETIME qualification attempt count recorded on the version.  NOT
+        used for the error cap (see ``error_redrive_count``) — kept for
+        observability and any rule that legitimately wants the lifetime figure.
+    error_redrive_count:
+        The PER-ERROR-EPISODE redrive counter from
+        ``last_qualification["error_redrive_count"]`` (reset when an error episode
+        clears).  This is what T2's cap reads — capping on the lifetime counter is
+        a known bug that strands a version at status=error forever.
+    is_candidate_fully_met:
+        The sha-keyed acceptance-ledger verdict for the last-evaluated candidate
+        (from :func:`app.category_verdict_ledger.is_candidate_fully_met`): True
+        iff every active acceptance category is ``met`` and no residual gap.
+        Used ONLY to gate the ``not_promoted``/``criterion_coverage_incomplete``
+        redrive leg — the initial/error T1 fire does not depend on it.
     requalification_ready:
         True when all gating not_promoted findings are ledger-resolved/stale;
         False or None when not.
@@ -152,62 +164,117 @@ def resolve_qualification_trigger(
             blocking=["a promotion PR is in flight — qualification locked"],
         )
 
-    # Convenience helpers
-    total = int((coverage or {}).get("total") or 0)
-    covered = int((coverage or {}).get("covered") or 0)
-    attested = int((coverage or {}).get("attested") or 0)
-    backfilled = int((coverage or {}).get("backfilled") or 0)
-    # release_scoring.compute_composite no longer treats attestation as count-clearing;
-    # it applies a confidence penalty instead.  Mirror that: only machine-verified
-    # (covered) and backfilled evidence clear the coverage gate here.  Attested-only
-    # criteria do NOT arm the T1 trigger — attestation is a lower-confidence tier.
-    coverage_complete = not (total > 0 and (total - covered - backfilled) > 0)
-
-    # T1 — coverage_complete: fire when coverage gate is met AND the version has
-    # no conclusive verdict (never attempted, sitting at error, or not_promoted
-    # with a coverage-incomplete blocker).  ``uncorroborated_attestation`` was
-    # retired from ``compute_composite`` (folded into the per-category confidence
-    # penalty), so it is no longer a blocker any verdict can carry — dropped here.
-    _T1_ELIGIBLE_STATUSES = {None, "error"}
+    # T1 — initial fire (coverage gate retired). The pre-qualification
+    # criterion-coverage precondition is gone: the acceptance contract is
+    # enforced INSIDE qualification (the sha-keyed ledger gate in
+    # release_scoring.compute_composite). A never-attempted version fires
+    # unconditionally; a version sitting at ``error`` falls through to the T2
+    # redrive path (which keeps the transient/readiness distinction and the
+    # attempt cap — bounding a persistently-failing candidate).
     _T1_NOT_PROMOTED_BLOCKERS = {"criterion_coverage_incomplete"}
-    is_t1_eligible = status in _T1_ELIGIBLE_STATUSES or (
-        status == "not_promoted"
-        and blocker in _T1_NOT_PROMOTED_BLOCKERS
-    )
-    if is_t1_eligible and coverage_complete:
+    if status is None:
         return TriggerDecision(
             fire=True,
             trigger="coverage_complete",
             reason="armed",
             blocking=[],
         )
-    # T1 blocked — coverage incomplete and no T2 fallback available.
-    # When status="error", fall through to T2 even if coverage is incomplete,
-    # because the error path may still be eligible for redrive.
-    if is_t1_eligible and not coverage_complete and status != "error":
+    # T1 redrive leg — a ``not_promoted`` version whose ONLY blocker was the
+    # acceptance grade.  Two DISTINCT things can unblock it, and the ledger
+    # verdict alone covers only the first:
+    #
+    #   (a) the ledger now reports the candidate fully met — e.g. a criterion was
+    #       retracted/superseded (it leaves the ACTIVE set, so the remaining
+    #       categories are all ``met``), or a re-grade flipped the last category.
+    #
+    #   (b) the CANDIDATE ADVANCED — new work landed since the not-met grade.
+    #       This leg is load-bearing: ``CategoryVerdict`` rows are SHA-KEYED and
+    #       nothing ever re-grades a PAST candidate, so the verdict for the
+    #       already-graded sha is frozen at not-met forever.  T4 excludes this
+    #       blocker and T3 only handles ``dry_run`` — so without (b) a version
+    #       that graded not-met could NEVER re-qualify, and only a re-qualification
+    #       can produce the verdict that would clear it.  That is a PERMANENT
+    #       wedge (and the exact circularity the coverage gate died of).
+    #
+    # Firing on (b) is bounded by the SAME guards the other redrive legs use —
+    # CI must not be definitively red, and gating audit findings must not be
+    # unresolved — and by the fact that only a genuinely NEW candidate re-fires.
+    # A re-grade of the SAME sha is suppressed: it carries no new information and
+    # would spin (there is no cooldown in the sweep to catch it).
+    if status == "not_promoted" and blocker in _T1_NOT_PROMOTED_BLOCKERS:
+        if is_candidate_fully_met:
+            return TriggerDecision(
+                fire=True,
+                trigger="coverage_complete",
+                reason="armed",
+                blocking=[],
+            )
+        candidate_superseded = (
+            automain_sha is not None
+            and candidate_sha is not None
+            and automain_sha != candidate_sha
+        )
+        if candidate_superseded:
+            if automain_ci_state == _CI_RED:
+                return TriggerDecision(
+                    fire=False,
+                    trigger="none",
+                    reason="ci_red",
+                    blocking=[
+                        "new work landed since the not-met acceptance grade but "
+                        "CI for the new SHA is red — suppressing auto-fire"
+                    ],
+                )
+            if requalification_ready is False:
+                return TriggerDecision(
+                    fire=False,
+                    trigger="none",
+                    reason="findings_unresolved",
+                    blocking=[
+                        "new work landed since the not-met acceptance grade but "
+                        "gating findings are not yet resolved"
+                    ],
+                )
+            return TriggerDecision(
+                fire=True,
+                trigger="candidate_advanced",
+                reason="armed",
+                blocking=[],
+            )
         return TriggerDecision(
             fire=False,
             trigger="none",
-            reason="coverage_incomplete",
+            reason="criterion_not_met",
             blocking=[
-                f"criterion coverage incomplete: {covered}/{total} active criteria covered, "
-                f"{attested} attested, {backfilled} backfilled"
+                "acceptance criteria not yet met for this candidate per the "
+                "category verdict ledger — awaiting new work to re-grade"
             ],
         )
 
     # T2 — error_redrive: transient errors always eligible; non-transient errors
     # eligible when requalification_ready is not False (i.e. True or None — unknown).
+    #
+    # The cap reads ``error_redrive_count`` — the PER-ERROR-EPISODE counter carried
+    # on ``last_qualification`` — NOT the lifetime ``qualification_attempts`` column.
+    # This mirrors ``release_qualifier_redrive._redrive_error_qualification``, whose
+    # docstring records that capping on the lifetime counter WAS A BUG: any version
+    # with 5+ prior qualifications of ANY kind would be barred from every
+    # transient-error re-drive, stranding it at status=error forever.  That bug is
+    # newly reachable here — pre-retirement an errored version short-circuited at T1
+    # whenever coverage was "complete" (always, for a 0-criteria version), so it
+    # never met this cap.  Routing ``error`` to T2 exposes it, so the counter must
+    # be the right one.
     if status == "error":
         is_transient = error_code in _TRANSIENT_ERROR_CODES
         is_non_transient_ready = not is_transient and requalification_ready is not False
         if is_transient or is_non_transient_ready:
-            if qualification_attempts >= _MAX_ERROR_REDRIVE_ATTEMPTS:
+            if error_redrive_count >= _MAX_ERROR_REDRIVE_ATTEMPTS:
                 return TriggerDecision(
                     fire=False,
                     trigger="none",
                     reason="error_attempt_cap",
                     blocking=[
-                        f"error redrive cap reached ({qualification_attempts}/"
+                        f"error redrive cap reached ({error_redrive_count}/"
                         f"{_MAX_ERROR_REDRIVE_ATTEMPTS} attempts)"
                     ],
                 )
@@ -293,7 +360,8 @@ def explain_qualification_trigger(
     status: str | None,
     error_code: str | None,
     qualification_attempts: int,
-    coverage: dict[str, int] | None,
+    error_redrive_count: int,
+    is_candidate_fully_met: bool,
     requalification_ready: bool | None,
     candidate_sha: str | None,
     automain_sha: str | None,
@@ -337,7 +405,8 @@ def explain_qualification_trigger(
         status=status,
         error_code=error_code,
         qualification_attempts=qualification_attempts,
-        coverage=coverage,
+        error_redrive_count=error_redrive_count,
+        is_candidate_fully_met=is_candidate_fully_met,
         requalification_ready=requalification_ready,
         candidate_sha=candidate_sha,
         automain_sha=automain_sha,
@@ -368,7 +437,10 @@ def explain_qualification_trigger(
         "wrong_phase": "operator_or_strategist_only",
         "in_flight": "in_flight",
         "promotion_in_flight": "operator_or_strategist_only",
-        "coverage_incomplete": "coverage_complete",
+        # A not-met grade is frozen against its candidate sha — the realistic
+        # unblock is new work landing (which re-grades), not the stale verdict
+        # spontaneously flipping.
+        "criterion_not_met": "new_candidate_commit",
         "error_attempt_cap": "operator_or_strategist_only",
         "ci_red": "new_candidate_commit",
         "findings_unresolved": "findings_resolved",

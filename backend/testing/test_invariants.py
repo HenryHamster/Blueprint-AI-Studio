@@ -314,6 +314,62 @@ def _is_admin_surface_route(route) -> bool:
     )
 
 
+def test_progression_never_gates_on_criterion_coverage():
+    """Version/direction PROGRESSION must never consult a per-criterion signal.
+
+    INVERSE invariant (replaces the two that structurally REQUIRED the retired
+    coverage gate).  The acceptance contract is enforced INSIDE qualification —
+    the sha-keyed per-category ledger gate in ``release_scoring.compute_composite``
+    — where it is actually graded.  A pre-qualification coverage precondition on
+    progression is what deadlocked v25: ``direction_owns_uncovered_criterion`` was
+    FAIL-CLOSED (True on query error) and withheld a criterion-carrying direction
+    from BOTH auto-complete routes AND strategist retire_direction, so the version
+    could never be cut — while the contract it purported to enforce went unchecked
+    (0 proven across 353 merges).
+
+    ``direction_owns_uncovered_criterion`` and ``get_version_coverage_summary``
+    still EXIST (other, non-progression consumers remain until the coverage machine
+    is deleted), which is exactly why this guard is needed: a dead-but-still-callable
+    helper is a re-wiring hazard.  If you are here because this test failed, do not
+    silence it — enforce the acceptance contract at QUALIFY, not before it.
+    """
+    forbidden = {
+        "direction_owns_uncovered_criterion",
+        "get_version_coverage_summary",
+        "compute_criterion_coverage",
+    }
+    progression_modules = [
+        "research_completion.py",
+        "research_direction_state.py",
+        "strategic_completion.py",
+        "release_readiness.py",
+        "qualification_triggers.py",
+    ]
+
+    violations: list[str] = []
+    for module_name in progression_modules:
+        path = BACKEND_ROOT / "app" / module_name
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=module_name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in forbidden:
+                        violations.append(f"{module_name}: imports {alias.name}")
+            elif isinstance(node, ast.Call):
+                called = _ast_called_name(node)
+                if called in forbidden:
+                    violations.append(f"{module_name}: calls {called}()")
+
+    assert not violations, (
+        "Progression code must not gate on acceptance-criterion coverage — the "
+        "acceptance contract is graded at QUALIFY (the sha-keyed category ledger "
+        "in release_scoring.compute_composite), not as a precondition for cutting "
+        "a version or retiring a direction. A pre-qualification coverage gate is "
+        "what deadlocked v25. Violations:\n  " + "\n  ".join(violations)
+    )
+
+
 def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
     from fastapi.routing import APIRoute
@@ -11872,329 +11928,6 @@ def test_v22_live_verification_evidence_wired_in_sweep():
         "_sweep_v22_finding_backfill in release_readiness.py. "
         "The live-verification evidence backfill is effectively disabled — "
         "restore the call site."
-    )
-
-
-def test_all_autocomplete_paths_gate_on_criterion_coverage():
-    """All direction auto-complete paths must gate on criterion coverage.
-
-    Regression guard: a direction that owns an uncovered acceptance criterion
-    must not auto-complete through any path — exhaustion (saturated / dedup
-    deadlock / already-fixed deadlock) or proven-merge (>=3 verified merges).
-    This invariant verifies structurally that every auto-complete code path in
-    research_direction_state.py checks ``direction_owns_uncovered_criterion``
-    before retiring a direction.
-
-    The module-level frozenset ``_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE``
-    declares the gated paths. Removing the gate from either function, or removing
-    the frozenset declaration, causes this test to fail.
-    """
-    import ast
-    from pathlib import Path
-
-    rds_path = Path(__file__).resolve().parents[1] / "app" / "research_direction_state.py"
-    source = rds_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(rds_path))
-
-    gate_func_name = "direction_owns_uncovered_criterion"
-
-    # ── 1. Verify the module-level frozenset declaration exists ───────────
-    frozenset_found = False
-    frozenset_entries: set[str] = set()
-    for stmt in ast.iter_child_nodes(tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        frozenset_found = True
-        # Extract the declared path names from the frozenset literal
-        if isinstance(value_node, ast.Call):
-            # frozenset({...}) or frozenset([...])
-            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
-                container = value_node.args[0] if value_node.args else None
-                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
-                    for elt in container.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            frozenset_entries.add(elt.value)
-        break
-
-    assert frozenset_found, (
-        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
-        "research_direction_state.py. This constant declares which auto-complete paths "
-        "are criterion-gated. Restore it."
-    )
-    assert frozenset_entries >= {
-        "exhaustion",
-        "proven_merge",
-        "no_findings",
-        "strategist_retire",
-    }, (
-        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE must contain at least "
-        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
-        f"found {frozenset_entries}. Restore the missing entries."
-    )
-
-    # ── 1b. Verify the criterion key constant that gates all paths ─────────
-    # This establishes that c-560ec27e is the unique criterion key whose
-    # coverage status gates every auto-complete path. Direction d-12f7d408
-    # carries this key; any direction owning an uncovered c-560ec27e criterion
-    # is blocked from retiring through any of the four gated paths.
-    _criterion_key_found = False
-    _criterion_key_value: str | None = None
-    for stmt in ast.iter_child_nodes(tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_CRITERION_COVERAGE_GATE_KEY":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_CRITERION_COVERAGE_GATE_KEY":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        _criterion_key_found = True
-        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
-            _criterion_key_value = value_node.value
-        break
-
-    assert _criterion_key_found, (
-        "_CRITERION_COVERAGE_GATE_KEY is missing from "
-        "research_direction_state.py. This constant declares which criterion "
-        "key gates the autocomplete paths."
-    )
-    assert _criterion_key_value == "c-560ec27e", (
-        f"_CRITERION_COVERAGE_GATE_KEY expected 'c-560ec27e', got "
-        f"{_criterion_key_value!r}"
-    )
-
-    # ── 2. Verify exhaustion path: _maybe_autocomplete_exhausted_direction ─
-    exhaustion_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_maybe_autocomplete_exhausted_direction":
-            exhaustion_func = node
-            break
-
-    assert exhaustion_func is not None, (
-        "_maybe_autocomplete_exhausted_direction not found in research_direction_state.py"
-    )
-
-    exhaustion_gated = False
-    for node in ast.walk(exhaustion_func):
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                exhaustion_gated = True
-                break
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            exhaustion_gated = True
-            break
-
-    assert exhaustion_gated, (
-        "_maybe_autocomplete_exhausted_direction does not call "
-        "direction_owns_uncovered_criterion. The exhaustion auto-complete path "
-        "(saturated / dedup-deadlock / already-fixed-deadlock) must gate on "
-        "criterion coverage before retiring a direction."
-    )
-
-    # ── 3. Verify proven-merge path: apply_post_spawn_state ───────────────
-    proven_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "apply_post_spawn_state":
-            proven_func = node
-            break
-
-    assert proven_func is not None, (
-        "apply_post_spawn_state not found in research_direction_state.py"
-    )
-
-    proven_gated = False
-    for node in ast.walk(proven_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            proven_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                proven_gated = True
-                break
-
-    assert proven_gated, (
-        "apply_post_spawn_state does not call direction_owns_uncovered_criterion. "
-        "The proven-merge auto-complete path must gate on criterion coverage before "
-        "retiring a direction."
-    )
-
-    # ── 4. Verify research_completion.py auto-complete paths ──────────────
-    rc_path = Path(__file__).resolve().parents[1] / "app" / "research_completion.py"
-    rc_source = rc_path.read_text(encoding="utf-8")
-    rc_tree = ast.parse(rc_source, filename=str(rc_path))
-
-    # 4a. Verify the module-level frozenset declaration exists
-    rc_frozenset_found = False
-    rc_frozenset_entries: set[str] = set()
-    for stmt in ast.iter_child_nodes(rc_tree):
-        target_name: str | None = None
-        value_node: ast.expr | None = None
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                    target_name = t.id
-                    value_node = stmt.value
-                    break
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
-                target_name = stmt.target.id
-                value_node = stmt.value
-        if target_name is None:
-            continue
-        rc_frozenset_found = True
-        if isinstance(value_node, ast.Call):
-            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
-                container = value_node.args[0] if value_node.args else None
-                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
-                    for elt in container.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            rc_frozenset_entries.add(elt.value)
-        break
-
-    assert rc_frozenset_found, (
-        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
-        "research_completion.py. This constant declares which auto-complete paths "
-        "are criterion-gated in _stamp_no_findings_refractory. Restore it."
-    )
-    assert rc_frozenset_entries >= {
-        "exhaustion",
-        "proven_merge",
-        "no_findings",
-        "strategist_retire",
-    }, (
-        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE in research_completion.py "
-        f"must contain at least "
-        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
-        f"found {rc_frozenset_entries}. Restore the missing entries."
-    )
-
-    # 4b. Verify _stamp_no_findings_refractory calls the gate function
-    snfr_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(rc_tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_stamp_no_findings_refractory":
-            snfr_func = node
-            break
-
-    assert snfr_func is not None, (
-        "_stamp_no_findings_refractory not found in research_completion.py"
-    )
-
-    snfr_gated = False
-    for node in ast.walk(snfr_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            snfr_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                snfr_gated = True
-                break
-
-    assert snfr_gated, (
-        "_stamp_no_findings_refractory does not call "
-        "direction_owns_uncovered_criterion. The proven-merge and exhaustion "
-        "auto-complete paths in research_completion.py must gate on criterion "
-        "coverage before retiring a direction."
-    )
-
-    # ── 5. Verify strategist retire path: _handle_strategic_completion ──────
-    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
-    sc_source = sc_path.read_text(encoding="utf-8")
-    sc_tree = ast.parse(sc_source, filename=str(sc_path))
-
-    handler_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(sc_tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
-            handler_func = node
-            break
-
-    assert handler_func is not None, (
-        "_handle_strategic_completion not found in strategic_completion.py"
-    )
-
-    handler_gated = False
-    for node in ast.walk(handler_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            handler_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                handler_gated = True
-                break
-
-    assert handler_gated, (
-        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
-        "The strategist-authored retire_direction path must gate on criterion "
-        "coverage before retiring a direction."
-    )
-
-
-def test_retire_direction_op_gates_on_criterion_coverage():
-    """The retire_direction op in strategic_completion.py must gate on criterion coverage.
-
-    Regression guard: the retire_direction handler in
-    ``_handle_strategic_completion`` must call
-    ``direction_owns_uncovered_criterion`` before setting a direction's
-    status to ``"retired"``.  This is the strategist-authored retirement
-    path (distinct from the exhaust / proven-merge auto-complete paths
-    already covered by
-    ``test_all_autocomplete_paths_gate_on_criterion_coverage``).
-
-    Removing the gate from ``_handle_strategic_completion`` causes this
-    test to fail.
-    """
-    import ast
-    from pathlib import Path
-
-    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
-    source = sc_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(sc_path))
-
-    gate_func_name = "direction_owns_uncovered_criterion"
-
-    # ── 1. Find _handle_strategic_completion ─────────────────────────────
-    handler_func: ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
-            handler_func = node
-            break
-
-    assert handler_func is not None, (
-        "_handle_strategic_completion not found in strategic_completion.py"
-    )
-
-    # ── 2. Verify it calls direction_owns_uncovered_criterion ────────────
-    handler_gated = False
-    for node in ast.walk(handler_func):
-        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
-            handler_gated = True
-            break
-        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
-            if _ast_called_name(node.value) == gate_func_name:
-                handler_gated = True
-                break
-
-    assert handler_gated, (
-        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
-        "The retire_direction op must gate on criterion coverage before retiring a "
-        "direction."
     )
 
 

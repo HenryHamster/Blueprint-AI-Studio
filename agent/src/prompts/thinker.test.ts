@@ -674,9 +674,12 @@ describe('buildThinkerPrompt', () => {
     const prompt = buildThinkerPrompt({ ...base, taskId: 'criteria-task-1' });
 
     expect(prompt).toContain('## 8. Acceptance criteria');
-    expect(prompt).toContain('criterion_coverage.total=0');
+    // Stage-1 decoupling: authoring is GOAL-driven (an aspirational rubric),
+    // not triggered by a `criterion_coverage.total=0` coverage count.
+    expect(prompt).toContain('authored RUBRIC');
+    expect(prompt).not.toContain('criterion_coverage.total=0');
     expect(prompt).toContain('non-empty `Goal:` line');
-    expect(prompt).toContain('no acceptance-criteria coverage block at all');
+    expect(prompt).toContain('no acceptance criteria have been authored yet');
     expect(prompt).toContain('active directions created this cycle have no criterion mappings');
     expect(prompt).toContain('Skip entirely if criteria already exist and are reasonably mapped');
     expect(prompt).toContain('Do NOT fabricate criteria when the version goal is unset');

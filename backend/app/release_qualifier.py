@@ -301,6 +301,41 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
 )
 
 
+_NEVER_GRADED_GAP = (
+    "No merge-grade verdict exists for this candidate — the acceptance contract "
+    "was never graded (a merge-grade runs only for a version with a usable, "
+    "non-contentless goal)."
+)
+
+
+def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
+    """Fail-CLOSED verdicts for a candidate that was NEVER graded.
+
+    ``compute_composite`` SKIPS the per-category gate when ``category_verdicts`` is
+    ``None`` — that is deliberate (it preserves the no-criteria path).  But a version
+    that HAS active acceptance criteria and simply never produced a merge-grade for
+    this candidate would hit the same ``None`` and thus promote over an acceptance
+    contract that was never checked at all.  That is reachable whenever no merge-grade
+    ran — most notably a version whose ``goal`` is empty/contentless (see
+    ``_merge_grade_goal_usable``), which spawns no merge-grade child.
+
+    Synthesising ``not_met`` for every active key mirrors
+    ``category_verdict_ledger.is_candidate_fully_met`` (an ACTIVE criterion with no
+    verdict → NOT met), so the gate and the sweep can never disagree, and it carries
+    the reason in ``gap`` rather than failing silently.
+    """
+    return [
+        {
+            "category_key": key,
+            "status": "not_met",
+            "tier": "judged",
+            "gap": _NEVER_GRADED_GAP,
+            "citations": [],
+        }
+        for key in sorted(k for k in active_keys if k)
+    ]
+
+
 def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
     """Coerce a category-verdict row read back from the ledger into a plain dict.
 
@@ -5271,6 +5306,35 @@ async def _finalize_qualification(
                     else None
                 )
                 _gate_residual = None
+
+        if _gate_category_verdicts is None:
+            # FIX 3 — fail CLOSED on a NEVER-GRADED candidate.  We are inside the
+            # guard, so this version HAS active acceptance criteria and is not
+            # merge-grade exempt — yet not one active category carries a verdict for
+            # this candidate.  A ``None`` gate input SKIPS the category gate, so
+            # leaving it would promote over an acceptance contract that was never
+            # graded at all.
+            #
+            # This is reachable whenever no merge-grade ran for the candidate — most
+            # notably a version whose ``goal`` is empty/contentless (see
+            # ``_merge_grade_goal_usable``), which spawns no merge-grade child and so
+            # produces no verdicts.  Blanking the goal is a real operator lever, and
+            # before the coverage gate was retired the pre-qualification coverage
+            # precondition happened to hold such a version back; it no longer does.
+            #
+            # Fail closed, mirroring ``category_verdict_ledger.is_candidate_fully_met``
+            # (an ACTIVE criterion with no verdict → NOT met), so the gate and the
+            # sweep cannot disagree.  The gap text carries WHY.
+            _gate_category_verdicts = _never_graded_category_verdicts(_active_keys) or None
+            if _gate_category_verdicts:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] v%d has %d ACTIVE acceptance criteria but no "
+                    "merge-grade verdict for candidate %s — failing the category gate "
+                    "CLOSED rather than promoting over an ungraded acceptance contract",
+                    version.version_number,
+                    len(_gate_category_verdicts),
+                    (candidate_sha or "?")[:8],
+                )
 
     # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
     # Reflects whether the capability proof gate is active and — in ENFORCE

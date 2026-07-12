@@ -658,9 +658,7 @@ async def agent_fetch_qualification(
     # ``qualification_trigger_state: None`` without breaking the read.
     qualification_trigger_state: dict | None = None
     try:
-        from app.acceptance_criteria import (  # noqa: PLC0415
-            get_version_coverage_summary,
-        )
+        from app import category_verdict_ledger as _cvl  # noqa: PLC0415
         from app.qualification_triggers import explain_qualification_trigger  # noqa: PLC0415
         from app.release_readiness import compute_requalification_readiness  # noqa: PLC0415
         from app.runtime_config_state import (  # noqa: PLC0415
@@ -670,18 +668,17 @@ async def agent_fetch_qualification(
 
         _lq = open_row.last_qualification or {}
         _status = _lq.get("status")
-        _coverage_raw = await get_version_coverage_summary(session, open_row.id)
-        _coverage = {
-            "total": int(_coverage_raw.get("total") or 0),
-            "covered": int(_coverage_raw.get("covered") or 0),
-        }
+        _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+            session, open_row.id, _lq.get("candidate_sha")
+        )
         _readiness = await compute_requalification_readiness(session, project_id)
         qualification_trigger_state = explain_qualification_trigger(
             phase=open_row.phase or "",
             status=_status,
             error_code=_lq.get("error") if _status == "error" else None,
             qualification_attempts=open_row.qualification_attempts or 0,
-            coverage=_coverage,
+            error_redrive_count=int(_lq.get("error_redrive_count") or 0),
+            is_candidate_fully_met=_is_candidate_fully_met,
             requalification_ready=_readiness.get("requalification_ready"),
             candidate_sha=_lq.get("candidate_sha"),
             automain_sha=None,  # not fetched in the read path (no GitHub I/O)

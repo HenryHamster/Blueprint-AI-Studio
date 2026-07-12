@@ -429,8 +429,6 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct).
 
-**Criterion-coverage before retirement.** Before retiring a direction, verify it is not sole mapper for any criterion (\`criterion_keys\` or sole mapper = criterion-carrying — backend \`direction_owns_uncovered_criterion\` blocks orphaned criteria). If sole mapper: (a) retract via Section 8 (explain why permanently uncoverable), or (b) keep direction active. Do NOT retire criterion-carrying without addressing the criterion first.
-
 Parallel moves are fine and encouraged when non-clashing. When two directions are genuinely independent (no shared files, no logical dependency, no real conflict risk), create/dispatch BOTH now rather than staging one behind the other — dispatched work runs concurrently in the pipeline and there is no context-switching cost to you; sequence only when there is a real dependency.
 
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
@@ -560,8 +558,10 @@ Omit the \`new_version_goal\` key entirely if the goal is already set.
 
 ## 8. Acceptance criteria (conditional — author only when warranted)
 
+Acceptance criteria are an authored RUBRIC — a small set of aspirational, goal-derived outcomes the qualifier grades at qualify time. They are NOT a coverage checklist to burn down during build/stabilize. Author them from the version GOAL, not from any coverage count.
+
 Author criteria only when the version needs a root acceptance contract:
-- When the Version Phase section shows \`criterion_coverage.total=0\` (no criteria exist yet for this version) AND the version has a non-empty \`Goal:\` line. If the Version Phase has a non-empty \`Goal:\` but no acceptance-criteria coverage block at all, treat that as the same no-criteria case.
+- When the version has a non-empty \`Goal:\` line but no acceptance criteria have been authored yet for this version — derive the rubric from that goal. Treat a version with a non-empty \`Goal:\` and no acceptance criteria listed as this no-criteria case.
 - OR when active directions created this cycle have no criterion mappings and need to be tied to version-level outcomes.
 
 Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.

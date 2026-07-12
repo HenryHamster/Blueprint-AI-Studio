@@ -29,7 +29,8 @@ def _resolve(**kwargs):
         status=None,
         error_code=None,
         qualification_attempts=0,
-        coverage={"total": 1, "covered": 1, "attested": 0},
+        error_redrive_count=0,
+        is_candidate_fully_met=True,
         requalification_ready=None,
         candidate_sha=None,
         automain_sha=None,
@@ -64,121 +65,109 @@ class TestT0HoldGuards:
 
     def test_wrong_phase_takes_priority_over_everything(self):
         # Even if everything else would fire, wrong phase wins.
-        d = _resolve(phase="build", status=None, coverage={"total": 1, "covered": 1})
+        d = _resolve(phase="build", status=None)
         assert not d.fire
         assert d.reason == "wrong_phase"
 
 
 # ---------------------------------------------------------------------------
-# T1 — coverage_complete
+# T1 — initial fire (coverage gate retired)
 # ---------------------------------------------------------------------------
 
-class TestT1CoverageComplete:
-    def test_never_attempted_coverage_complete_fires(self):
-        d = _resolve(status=None, coverage={"total": 1, "covered": 1})
+class TestT1InitialFire:
+    def test_never_attempted_fires_unconditionally(self):
+        # No pre-qualification coverage gate: a never-attempted stabilize-phase
+        # version arms regardless of any per-criterion signal. The acceptance
+        # contract is graded INSIDE qualification, not here.
+        d = _resolve(status=None)
         assert d.fire
         assert d.trigger == "coverage_complete"
 
-    def test_never_attempted_no_criteria_fires(self):
-        # total == 0 is not incomplete; coverage gate passes
-        d = _resolve(status=None, coverage={"total": 0, "covered": 0})
+    def test_never_attempted_fires_even_when_ledger_not_met(self):
+        # is_candidate_fully_met is irrelevant to the initial (status=None) fire.
+        d = _resolve(status=None, is_candidate_fully_met=False)
         assert d.fire
         assert d.trigger == "coverage_complete"
 
-    def test_error_status_coverage_complete_fires(self):
-        d = _resolve(status="error", error_code="sha_error",
-                     coverage={"total": 2, "covered": 2})
-        # T2 would also match but T1 comes first
-        assert d.fire
-        assert d.trigger == "coverage_complete"
-
-    def test_not_promoted_coverage_blocker_fires(self):
+    def test_not_promoted_coverage_blocker_fires_when_ledger_met(self):
+        # The not_promoted/criterion_coverage_incomplete redrive leg fires once
+        # the sha-keyed ledger reports the candidate fully met.
         d = _resolve(
             status="not_promoted",
             blocker="criterion_coverage_incomplete",
-            coverage={"total": 1, "covered": 1, "attested": 0},
+            is_candidate_fully_met=True,
         )
         assert d.fire
         assert d.trigger == "coverage_complete"
 
-    def test_coverage_incomplete_blocks(self):
-        d = _resolve(status=None, coverage={"total": 2, "covered": 1})
+    def test_not_promoted_coverage_blocker_blocks_when_ledger_not_met(self):
+        # Ledger not met AND the candidate has not advanced → hold (no new
+        # information; re-grading the same sha would spin).
+        d = _resolve(
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
+        )
         assert not d.fire
-        assert d.reason == "coverage_incomplete"
-        assert "1/2" in d.blocking[0]
+        assert d.reason == "criterion_not_met"
+        assert "ledger" in d.blocking[0].lower()
 
-    def test_coverage_none_treated_as_zero_total(self):
-        # coverage=None → total=0 → not incomplete → fires
-        d = _resolve(status=None, coverage=None)
+    def test_not_promoted_not_met_refires_when_candidate_advanced(self):
+        # REGRESSION (permanent-wedge guard): CategoryVerdict rows are SHA-KEYED
+        # and nothing re-grades a PAST candidate, so a not-met verdict is frozen
+        # against its sha.  T4 excludes this blocker and T3 only handles dry_run,
+        # so if the advanced candidate did not re-fire here, the version could
+        # NEVER re-qualify — and only a re-qualification could produce the verdict
+        # that would clear it.  New work landing MUST re-arm the grade.
+        d = _resolve(
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
+            candidate_sha="aaaa1111",
+            automain_sha="bbbb2222",
+        )
         assert d.fire
-        assert d.trigger == "coverage_complete"
+        assert d.trigger == "candidate_advanced"
+        assert d.reason == "armed"
 
-    def test_attestation_only_coverage_does_not_fire_coverage_complete(self):
-        # Attestation is a lower-confidence tier; attested-only criteria do NOT
-        # clear the coverage gate — only machine-verified (covered) and backfilled
-        # evidence arms the T1 trigger.  Regression guard for the parity bug.
-        d = _resolve(status=None, coverage={"total": 2, "covered": 0, "attested": 2})
-        assert not d.fire
-        assert d.reason == "coverage_incomplete"
-
-    def test_mixed_attested_and_covered_does_not_fire_when_attested_criteria_remain(self):
-        # Covered=1 of total=3, attested=2: the 2 attested-only criteria are not
-        # machine-verified so they do not clear the gate.
-        d = _resolve(status=None, coverage={"total": 3, "covered": 1, "attested": 2})
-        assert not d.fire
-        assert d.reason == "coverage_incomplete"
-
-    def test_attested_not_enough_when_uncovered_remains(self):
-        # Even with some attested, uncovered criteria still block.
+    def test_not_promoted_not_met_same_sha_does_not_spin(self):
+        # The candidate has NOT advanced — re-grading the identical sha carries no
+        # new information and there is no cooldown in the sweep, so it must hold.
         d = _resolve(
-            status=None,
-            coverage={"total": 2, "covered": 0, "attested": 1},
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
+            candidate_sha="aaaa1111",
+            automain_sha="aaaa1111",
         )
         assert not d.fire
-        assert d.reason == "coverage_incomplete"
-        assert "0/2" in d.blocking[0]
+        assert d.reason == "criterion_not_met"
 
-    def test_backfilled_only_coverage_arms_trigger(self):
-        # All remaining criteria covered solely by the 'backfilled' tier — the
-        # authoritative release_scoring gate treats these as clearing the
-        # coverage blocker, so the T1 trigger must arm (no strand). Regression
-        # for: backfilled tier omitted from coverage-gate sibling predicates.
+    def test_not_promoted_not_met_advanced_candidate_suppressed_on_red_ci(self):
+        # Bounded like every other redrive leg: a red new candidate does not fire.
         d = _resolve(
-            status=None,
-            coverage={"total": 2, "covered": 0, "attested": 0, "backfilled": 2},
-        )
-        assert d.fire is True
-        assert d.trigger == "coverage_complete"
-
-    def test_mixed_backfilled_and_covered_fires_when_no_uncovered_remain(self):
-        # Covered + backfilled spans all criteria (no attested-only gap): fires.
-        d = _resolve(
-            status=None,
-            coverage={"total": 2, "covered": 1, "attested": 0, "backfilled": 1},
-        )
-        assert d.fire is True
-        assert d.trigger == "coverage_complete"
-
-    def test_mixed_backfilled_covered_attested_does_not_fire_when_attested_remain(self):
-        # Even with covered+backfilled present, attested-only criteria still block.
-        d = _resolve(
-            status=None,
-            coverage={"total": 3, "covered": 1, "attested": 1, "backfilled": 1},
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
+            candidate_sha="aaaa1111",
+            automain_sha="bbbb2222",
+            automain_ci_state="red",
         )
         assert not d.fire
-        assert d.reason == "coverage_incomplete"
+        assert d.reason == "ci_red"
 
-    def test_backfilled_not_enough_when_uncovered_remains(self):
-        # Backfilled closes some but genuinely-uncovered criteria still block,
-        # and the blocking message surfaces the backfilled count.
+    def test_not_promoted_not_met_advanced_candidate_holds_on_unresolved_findings(self):
+        # Reuses the existing findings bound rather than inventing a new one.
         d = _resolve(
-            status=None,
-            coverage={"total": 3, "covered": 0, "attested": 0, "backfilled": 1},
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
+            candidate_sha="aaaa1111",
+            automain_sha="bbbb2222",
+            requalification_ready=False,
         )
         assert not d.fire
-        assert d.reason == "coverage_incomplete"
-        assert "0/3" in d.blocking[0]
-        assert "1 backfilled" in d.blocking[0]
+        assert d.reason == "findings_unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -186,15 +175,16 @@ class TestT1CoverageComplete:
 # ---------------------------------------------------------------------------
 
 class TestT2ErrorRedrive:
+    # With the coverage gate retired, a version sitting at ``error`` no longer
+    # short-circuits at T1 — it falls through to T2, which keeps the
+    # transient/readiness distinction and the attempt cap (bounding a
+    # persistently-failing candidate).
     def test_transient_error_fires(self):
         for code in _TRANSIENT_ERROR_CODES:
-            # T1 would fire if coverage is complete with no criteria, so use incomplete
-            # coverage to let T2 be the first matching rule.
             d = _resolve(
                 status="error",
                 error_code=code,
                 qualification_attempts=1,
-                coverage={"total": 2, "covered": 1},
             )
             assert d.fire
             assert d.trigger == "error_redrive"
@@ -204,7 +194,6 @@ class TestT2ErrorRedrive:
             status="error",
             error_code="spawn_failed",
             qualification_attempts=2,
-            coverage={"total": 2, "covered": 1},
             requalification_ready=None,  # not False → eligible
         )
         assert d.fire
@@ -215,7 +204,6 @@ class TestT2ErrorRedrive:
             status="error",
             error_code="spawn_failed",
             qualification_attempts=2,
-            coverage={"total": 2, "covered": 1},
             requalification_ready=False,
         )
         assert not d.fire
@@ -225,8 +213,7 @@ class TestT2ErrorRedrive:
         d = _resolve(
             status="error",
             error_code="sha_error",
-            qualification_attempts=_MAX_ERROR_REDRIVE_ATTEMPTS,
-            coverage={"total": 2, "covered": 1},
+            error_redrive_count=_MAX_ERROR_REDRIVE_ATTEMPTS,
         )
         assert not d.fire
         assert d.reason == "error_attempt_cap"
@@ -236,8 +223,37 @@ class TestT2ErrorRedrive:
         d = _resolve(
             status="error",
             error_code="sha_error",
-            qualification_attempts=_MAX_ERROR_REDRIVE_ATTEMPTS - 1,
-            coverage={"total": 2, "covered": 1},
+            error_redrive_count=_MAX_ERROR_REDRIVE_ATTEMPTS - 1,
+        )
+        assert d.fire
+        assert d.trigger == "error_redrive"
+
+    def test_lifetime_attempts_do_not_cap_error_redrive(self):
+        # REGRESSION: the cap must read the PER-EPISODE error_redrive_count, NOT the
+        # lifetime qualification_attempts column. release_qualifier_redrive documents
+        # that capping on the lifetime counter was a bug — any version with 5+ prior
+        # qualifications of ANY kind would be barred from every transient-error
+        # redrive and stranded at status=error forever. A version re-qualifies on
+        # each candidate advance, so a high lifetime count is NORMAL and healthy.
+        d = _resolve(
+            status="error",
+            error_code="sha_error",
+            qualification_attempts=99,
+            error_redrive_count=0,
+        )
+        assert d.fire
+        assert d.trigger == "error_redrive"
+
+    def test_non_transient_error_at_high_lifetime_count_still_redrives(self):
+        # The exact wedge: non-transient error + many lifetime attempts. The sibling
+        # redrive path refuses non-transient errors, so if T2 also capped this out,
+        # the version would sit at status=error with no autonomous exit.
+        d = _resolve(
+            status="error",
+            error_code="spawn_failed",
+            qualification_attempts=42,
+            error_redrive_count=1,
+            requalification_ready=True,
         )
         assert d.fire
         assert d.trigger == "error_redrive"
@@ -327,11 +343,12 @@ class TestT3PostDryRunAdvance:
 
 class TestT4BlockersCleared:
     def test_not_promoted_readiness_fires(self):
+        # blocker is NOT criterion_coverage_incomplete, so this skips the T1
+        # redrive leg and reaches T4.
         d = _resolve(
             status="not_promoted",
             blocker="high_audit_finding",
             requalification_ready=True,
-            coverage={"total": 2, "covered": 1},  # incomplete → T1 blocked
         )
         assert d.fire
         assert d.trigger == "blockers_cleared"
@@ -341,7 +358,6 @@ class TestT4BlockersCleared:
             status="not_promoted",
             blocker="high_audit_finding",
             requalification_ready=False,
-            coverage={"total": 2, "covered": 1},
         )
         assert not d.fire
         assert d.reason == "findings_unresolved"
@@ -350,7 +366,6 @@ class TestT4BlockersCleared:
         d = _resolve(
             status="promotion_failed",
             requalification_ready=True,
-            coverage={"total": 2, "covered": 1},
         )
         assert d.fire
         assert d.trigger == "blockers_cleared"
@@ -359,7 +374,6 @@ class TestT4BlockersCleared:
         d = _resolve(
             status="promotion_failed",
             requalification_ready=False,
-            coverage={"total": 2, "covered": 1},
         )
         assert not d.fire
         assert d.reason == "findings_unresolved"
@@ -404,7 +418,6 @@ def test_ci_gate_parametrized(ci_state, expect_fire):
         candidate_sha="old",
         automain_sha="new",
         automain_ci_state=ci_state,
-        coverage={"total": 0, "covered": 0},
     )
     assert d.fire == expect_fire, (
         f"ci_state={ci_state!r}: expected fire={expect_fire}, got {d.fire} "
@@ -427,7 +440,8 @@ class TestExplainQualificationTrigger:
             status=None,
             error_code=None,
             qualification_attempts=0,
-            coverage={"total": 1, "covered": 1, "attested": 0},
+            error_redrive_count=0,
+            is_candidate_fully_met=True,
             requalification_ready=None,
             candidate_sha=None,
             automain_sha=None,
@@ -455,10 +469,12 @@ class TestExplainQualificationTrigger:
         assert out["auto_trigger"] == "armed"
 
     def test_on_mode_waiting_returns_waiting(self):
+        # A not_promoted/criterion_coverage version whose ledger is NOT met holds.
         out = self._explain(
             knob="on",
-            status=None,
-            coverage={"total": 2, "covered": 1},  # incomplete
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
         )
         assert out["auto_trigger"] == "waiting"
 
@@ -467,14 +483,26 @@ class TestExplainQualificationTrigger:
         assert out["auto_trigger"] == "in_flight"
 
     def test_capped_returns_capped(self):
+        # The cap counts the ERROR EPISODE, not the version's lifetime attempts.
         out = self._explain(
             knob="on",
             status="error",
             error_code="sha_error",
-            qualification_attempts=_MAX_ERROR_REDRIVE_ATTEMPTS,
-            coverage={"total": 2, "covered": 1},
+            error_redrive_count=_MAX_ERROR_REDRIVE_ATTEMPTS,
         )
         assert out["auto_trigger"] == "capped"
+
+    def test_high_lifetime_attempts_alone_does_not_cap(self):
+        # Regression: a version re-qualifies on every candidate advance, so a large
+        # lifetime count is normal. Capping on it stranded versions at status=error.
+        out = self._explain(
+            knob="on",
+            status="error",
+            error_code="sha_error",
+            qualification_attempts=_MAX_ERROR_REDRIVE_ATTEMPTS * 10,
+            error_redrive_count=0,
+        )
+        assert out["auto_trigger"] != "capped"
 
     def test_settled_returns_settled(self):
         # A promoted version has no rule → settled
@@ -504,13 +532,18 @@ class TestExplainQualificationTrigger:
         assert out["decision"]["reason"] == "ci_red"
         assert len(out["blocking"]) > 0
 
-    def test_next_expected_trigger_for_coverage_incomplete(self):
+    def test_next_expected_trigger_for_criterion_not_met(self):
         out = self._explain(
             knob="on",
-            status=None,
-            coverage={"total": 2, "covered": 1},
+            status="not_promoted",
+            blocker="criterion_coverage_incomplete",
+            is_candidate_fully_met=False,
         )
-        assert out["next_expected_trigger"] == "coverage_complete"
+        assert out["decision"]["reason"] == "criterion_not_met"
+        # The not-met verdict is frozen against its candidate sha, so the honest
+        # next-expected unblock is NEW WORK landing (which re-grades), not the
+        # stale verdict spontaneously flipping to met.
+        assert out["next_expected_trigger"] == "new_candidate_commit"
 
     def test_next_expected_trigger_for_ci_red(self):
         out = self._explain(

@@ -601,9 +601,7 @@ async def get_version_lifecycle(
         _qualification_trigger_state: Optional[Dict[str, Any]] = None
         if open_row is not None:
             try:
-                from app.acceptance_criteria import (  # noqa: PLC0415
-                    get_version_coverage_summary as _get_coverage,
-                )
+                from app import category_verdict_ledger as _cvl  # noqa: PLC0415
                 from app.qualification_triggers import (  # noqa: PLC0415
                     explain_qualification_trigger as _explain_trigger,
                 )
@@ -617,18 +615,17 @@ async def get_version_lifecycle(
 
                 _lq = open_row.last_qualification or {}
                 _lq_status = _lq.get("status")
-                _cov_raw = await _get_coverage(session, open_row.id)
-                _cov = {
-                    "total": int(_cov_raw.get("total") or 0),
-                    "covered": int(_cov_raw.get("covered") or 0),
-                }
+                _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+                    session, open_row.id, _lq.get("candidate_sha")
+                )
                 _rdns = await _compute_readiness(session, project_id)
                 _qualification_trigger_state = _explain_trigger(
                     phase=open_row.phase or "",
                     status=_lq_status,
                     error_code=_lq.get("error") if _lq_status == "error" else None,
                     qualification_attempts=open_row.qualification_attempts or 0,
-                    coverage=_cov,
+                    error_redrive_count=int(_lq.get("error_redrive_count") or 0),
+                    is_candidate_fully_met=_is_candidate_fully_met,
                     requalification_ready=_rdns.get("requalification_ready"),
                     candidate_sha=_lq.get("candidate_sha"),
                     automain_sha=None,  # not fetched in the read path

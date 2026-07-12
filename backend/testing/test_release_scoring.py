@@ -57,6 +57,43 @@ def _perfect_kwargs(**overrides):
 # ---------------------------------------------------------------------------
 
 
+class TestNeverGradedCandidateFailsClosed:
+    """A candidate with ACTIVE criteria but NO merge-grade must not promote.
+
+    ``compute_composite`` skips the category gate on ``category_verdicts=None`` — by
+    design, to preserve the no-criteria path.  But a version that HAS active criteria
+    and simply never produced a merge-grade (e.g. its ``goal`` is empty/contentless,
+    so no merge-grade child is spawned) would hit that same ``None`` and promote over
+    an acceptance contract that was never checked.  ``_never_graded_category_verdicts``
+    closes that by synthesising ``not_met`` for every active key.
+    """
+
+    def test_synthesised_verdicts_block_promotion(self):
+        from app.release_qualifier import _never_graded_category_verdicts
+
+        verdicts = _never_graded_category_verdicts({"c-2", "c-1"})
+        # Deterministic order; every active key fails closed with a stated reason.
+        assert [v["category_key"] for v in verdicts] == ["c-1", "c-2"]
+        assert all(v["status"] == "not_met" for v in verdicts)
+        assert all("never graded" in v["gap"] for v in verdicts)
+
+        # And, fed to the real gate, they actually block.
+        result = rs.compute_composite(**_perfect_kwargs(category_verdicts=verdicts))
+        assert result["promote"] is False
+        assert result["confidence"] == 0.0
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
+    def test_no_active_criteria_yields_no_verdicts_and_does_not_block(self):
+        # The zero-criteria path must still SKIP the gate (a version with no
+        # acceptance contract is not blocked by one).
+        from app.release_qualifier import _never_graded_category_verdicts
+
+        assert _never_graded_category_verdicts(set()) == []
+        result = rs.compute_composite(**_perfect_kwargs(category_verdicts=None))
+        assert result["promote"] is True
+        assert result["blocker"] is None
+
+
 class TestCategoryGateHardBlock:
     def test_block_on_not_met_category(self):
         """Any active category not ``met`` forces confidence 0 and the
