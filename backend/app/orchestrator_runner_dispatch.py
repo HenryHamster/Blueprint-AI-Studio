@@ -71,6 +71,20 @@ from app.workbench_state import (
 logger = logging.getLogger("blueprint")
 
 
+# task.context key holding an operator's HARD runner pin for a compute_experiment.
+# Kept deliberately SEPARATE from the soft ``preferred_runner_target_id`` affinity
+# hint: a forced target NEVER silently falls back to a different runner or to
+# cloud — when it is not eligible this cycle the task is HELD QUEUED. The soft
+# preferred hint keeps its fallback behaviour untouched.
+FORCED_RUNNER_TARGET_CONTEXT_KEY = "forced_runner_target_id"
+
+# task.context marker stamped (ISO-8601) the first cycle a forced-pin
+# compute_experiment is held waiting for its target runner to become eligible —
+# the honest, operator-legible "waiting for dgx-1" signal, mirroring the
+# ``awaiting_local_runner_since`` / ``awaiting_container_runner_since`` holds.
+AWAITING_FORCED_RUNNER_CONTEXT_KEY = "awaiting_forced_runner_since"
+
+
 # A compute_experiment held for a require-local project is failed if no runner
 # claims it within this window — prevents a permanently-wedged project when the
 # operator's hardware stays offline. Generous default; operators can bring a
@@ -206,6 +220,25 @@ def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapsho
     if not isinstance(backends, dict):
         return False
     return any(backends.get(key) for key in _CONTAINER_BACKEND_KEYS)
+
+
+def _runner_has_free_vram(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    required_mib: int,
+) -> bool:
+    """Whether any GPU on this runner has at least ``required_mib`` MiB free.
+
+    Reads the heartbeat-reported ``gpu_free_vram_mib`` list (one entry per
+    GPU, index-aligned with ``gpu_names``). When the runner has not reported
+    this field (older runners, or a runner that does not expose nvidia-smi)
+    the check is skipped and the runner is treated as eligible — we only
+    gate dispatch when we have real data, not on absence of telemetry.
+    """
+    caps = runner.capabilities or {}
+    free_mib_list = caps.get("gpu_free_vram_mib")
+    if not isinstance(free_mib_list, list) or not free_mib_list:
+        return True
+    return any(mib >= required_mib for mib in free_mib_list)
 
 
 def _runner_max_concurrent_compute(
@@ -426,6 +459,11 @@ async def _try_runner_dispatch(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
+    # A declared vram_gb restricts eligibility to runners with sufficient free VRAM.
+    _vram_raw = payload.get("vram_gb") or (
+        payload.get("compute_experiment") or {}
+    ).get("vram_gb")
+    vram_gb = float(_vram_raw) if _vram_raw is not None else None
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -435,6 +473,7 @@ async def _try_runner_dispatch(
         preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
         dispatch_seed=task.id.int,
         container_image=container_image,
+        vram_gb=vram_gb,
     )
     if runner is None:
         return False
@@ -631,6 +670,33 @@ def _num_or_none(value) -> float | None:
 
 
 
+async def _lookup_runner_hostname(
+    session: AsyncSession, project_id: uuid.UUID, runner_id: str | None
+) -> str | None:
+    """Best-effort hostname for a runner id owned by ``project_id`` (else None).
+
+    Used only to build an operator-legible "waiting for <host>" hold message — a
+    lookup miss (offline/deleted/unknown/unparseable id) degrades to the raw id,
+    never raising, so a display concern can never abort a dispatch commit.
+    """
+    if not runner_id:
+        return None
+    try:
+        parsed = uuid.UUID(str(runner_id).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+    try:
+        runner = await session.get(LocalRunner, parsed)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] hostname lookup failed for runner %s", runner_id
+        )
+        return None
+    if runner is None or runner.project_id != project_id:
+        return None
+    return runner.hostname
+
+
 def _select_eligible_runner(
     active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     project_id: uuid.UUID,
@@ -640,6 +706,8 @@ def _select_eligible_runner(
     preferred_runner_target_id: str | None = None,
     dispatch_seed: int = 0,
     container_image: str | None = None,
+    forced_runner_target_id: str | None = None,
+    vram_gb: float | None = None,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
@@ -654,6 +722,13 @@ def _select_eligible_runner(
     plus pins already made to the runner this cycle — so a same-cycle burst spreads
     across a fleet instead of stacking onto one runner.
 
+    ``forced_runner_target_id`` is an operator HARD pin (distinct from the soft
+    ``preferred_runner_target_id`` hint): when set, candidate eligibility is
+    restricted to ONLY that runner id and the function returns ``None`` if that one
+    runner is not eligible this cycle — it NEVER falls through to the least-loaded
+    selection or to a different runner. The caller (``_dispatch_compute_experiment_directly``)
+    then HOLDS the task QUEUED rather than dispatching it elsewhere.
+
     When multiple runners are equally loaded, ``dispatch_seed`` (derived from the
     dispatched task/job UUID) breaks ties deterministically so repeated dispatch
     bursts rotate across the fleet rather than always landing on the same runner.
@@ -663,6 +738,13 @@ def _select_eligible_runner(
     a single eligibility / least-loaded rule.
     """
     candidates = active_runners_cache.get(project_id) or []
+    # Operator HARD pin: restrict the candidate pool to ONLY the forced runner id
+    # BEFORE any eligibility check. If that runner is offline / at capacity / the
+    # wrong task-type / lacks a required GPU it simply falls out of ``eligible``
+    # below and the function returns None — it never spills over to another runner.
+    if forced_runner_target_id:
+        forced_id = str(forced_runner_target_id).strip()
+        candidates = [r for r in candidates if str(r.id) == forced_id]
     pins = runner_pins_this_cycle
     eligible = [
         r
@@ -675,6 +757,13 @@ def _select_eligible_runner(
         eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
     if container_image:
         eligible = [r for r in eligible if _runner_has_container_capability(r)]
+    if vram_gb is not None and vram_gb > 0:
+        required_mib = int(vram_gb * 1024)
+        eligible = [
+            r
+            for r in eligible
+            if _runner_has_free_vram(r, required_mib)
+        ]
     if not eligible:
         return None
     if preferred_runner_target_id:
@@ -916,6 +1005,18 @@ async def _dispatch_compute_experiment_directly(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
+    # vram_gb (flat or nested) gates runner eligibility on free GPU memory.
+    _vram_raw = payload.get("vram_gb") or (
+        payload.get("compute_experiment") or {}
+    ).get("vram_gb")
+    vram_gb = float(_vram_raw) if _vram_raw is not None else None
+
+    # Operator HARD pin (distinct from the soft preferred hint): this job may run
+    # ONLY on this runner id. A forced target that is offline/ineligible HOLDS the
+    # task — it never falls back to another runner or to cloud (handled below).
+    forced_runner_target_id = (task.context or {}).get(
+        FORCED_RUNNER_TARGET_CONTEXT_KEY
+    )
 
     # ── Select an eligible runner (shared rule with _try_runner_dispatch) ──────
     runner = _select_eligible_runner(
@@ -929,7 +1030,47 @@ async def _dispatch_compute_experiment_directly(
         ),
         dispatch_seed=task.id.int,
         container_image=container_image,
+        forced_runner_target_id=forced_runner_target_id,
+        vram_gb=vram_gb,
     )
+
+    # ── Forced-runner hold: operator hard-pinned this job to a specific runner ──
+    # When that runner is not eligible this cycle (offline / at capacity / wrong
+    # task-type / lacks a required GPU) HOLD QUEUED with an honest, host-named
+    # reason — NEVER fall back to a different runner or to cloud, and independent
+    # of the project's enforce-local / container-image policy (checked first so a
+    # forced offline target holds regardless of those). The forced pin itself is
+    # preserved in context; only a stale CLAIMED ``runner_target_id`` is dropped.
+    if runner is None and forced_runner_target_id:
+        forced_id = str(forced_runner_target_id).strip()
+        forced_hostname = await _lookup_runner_hostname(
+            session, task.project_id, forced_id
+        )
+        target_label = forced_hostname or forced_id
+        hold_msg = (
+            f"Waiting for forced runner {target_label}: this compute experiment is "
+            "hard-pinned to that runner and will not run on any other runner or in "
+            "the cloud until it is live and eligible."
+        )
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None
+        if not ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY):
+            ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = _utcnow().isoformat()
+            changed = True
+        if task.latest_status_message != hold_msg:
+            task.latest_status_message = hold_msg
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: forced runner %s not eligible "
+            "this cycle (offline/at-capacity/ineligible) — not dispatching elsewhere",
+            task.id,
+            target_label,
+        )
+        return "held"
 
     project = await session.get(Project, task.project_id)
     require_local = bool(
@@ -994,6 +1135,7 @@ async def _dispatch_compute_experiment_directly(
         ctx["runner_hostname"] = runner.hostname
         ctx.pop("awaiting_local_runner_since", None)
         ctx.pop("awaiting_container_runner_since", None)
+        ctx.pop(AWAITING_FORCED_RUNNER_CONTEXT_KEY, None)
         task.context = ctx
         session.add(task)
     elif (task.context or {}).get("runner_target_id"):

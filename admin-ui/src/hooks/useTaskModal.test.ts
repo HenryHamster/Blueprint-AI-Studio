@@ -1,19 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useTaskModal } from './useTaskModal';
-import { authGet, fetchTaskTypeCatalog, createComputeExperiment, type TaskTypeCatalogEntry } from '../api';
+import { authGet, fetchTaskTypeCatalog, createComputeExperiment, listFleetRunners, type TaskTypeCatalogEntry } from '../api';
 
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
   authGet: vi.fn(),
   fetchTaskTypeCatalog: vi.fn(),
   createComputeExperiment: vi.fn(),
+  listFleetRunners: vi.fn(),
+  computeExperimentPreflight: vi.fn(),
   API_BASE_URL: '',
 }));
 
 const mockAuthGet = vi.mocked(authGet);
 const mockFetchTaskTypeCatalog = vi.mocked(fetchTaskTypeCatalog);
 const mockCreateComputeExperiment = vi.mocked(createComputeExperiment);
+const mockListFleetRunners = vi.mocked(listFleetRunners);
 
 function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string }): TaskTypeCatalogEntry {
   return {
@@ -64,6 +67,8 @@ describe('useTaskModal', () => {
     mockFetchTaskTypeCatalog.mockResolvedValue([]);
     // Default: the dedicated compute_experiment launch resolves to a created task.
     mockCreateComputeExperiment.mockResolvedValue({ id: 'task-ce-1' });
+    // Default: listFleetRunners resolves to an empty array.
+    mockListFleetRunners.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -1469,5 +1474,86 @@ describe('useTaskModal', () => {
     expect(result.current.computeExperiment.containerRegistryUsername).toBe('$oauthtoken');
     // Secret must never be prefilled from a stored payload.
     expect(result.current.computeExperiment.containerRegistryPassword).toBe('');
+  });
+
+  // --- runner_target_id / force-onto-runner ---
+
+  it('handleCreateTask threads runner_target_id into the compute body when forcedRunnerId is set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        forcedRunnerId: 'runner-uuid-dgx1',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.runner_target_id).toBe('runner-uuid-dgx1');
+  });
+
+  it('handleCreateTask omits runner_target_id when forcedRunnerId is empty', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        forcedRunnerId: '',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body).not.toHaveProperty('runner_target_id');
+  });
+
+  it('openDuplicateTaskModal leaves forcedRunnerId empty — forced pin is not re-applied on clone', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-ce-forced',
+        title: 'Forced experiment',
+        description: 'rerun it',
+        task_type: 'compute_experiment',
+        payloads: [
+          {
+            github_repo: 'owner/repo',
+            base_branch: 'main',
+            command: 'python train.py',
+            spend_cap_usd: 5,
+            deadline_seconds: 1800,
+            runner_target_id: 'runner-uuid-dgx1',
+          },
+        ] as unknown as Record<string, unknown>[],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    // The forced runner target from the original task must never be carried over
+    // to a clone — the operator must choose a target for each new launch.
+    expect(result.current.computeExperiment.forcedRunnerId).toBe('');
   });
 });

@@ -58,6 +58,10 @@ export interface ComputeExperimentLaunchRequest {
   idea?: string;
   draft_notes?: string;
   drafted_from_refinement?: boolean;
+  // Optional runner UUID or hostname to hard-pin this job to a specific runner.
+  // When set, the job stays QUEUED until that runner is available rather than
+  // falling back to another runner or cloud. Omit for auto-selection.
+  runner_target_id?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -937,6 +941,12 @@ export interface AwaitingLocalRunnerHold {
   container_image: string | null;
   provisioning_model: string | null;
   deadline_seconds: number | null;
+  // Fields present when the job is pinned to a specific runner (forced target).
+  // Absent on holds that are waiting for any available runner. Backend returns
+  // these as top-level scalars plus a nested forced_runner descriptor.
+  forced_runner_target_id?: string | null;
+  awaiting_forced_runner_since?: string | null;
+  forced_runner?: { id: string; hostname: string | null; status: string } | null;
 }
 
 export async function fetchAwaitingLocalRunnerHolds(

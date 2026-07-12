@@ -2591,6 +2591,69 @@ async def test_awaiting_local_runner_viewer_ok_non_member_404(
 
 
 @pytest.mark.asyncio
+async def test_awaiting_endpoint_surfaces_forced_runner_hold(
+    client: AsyncClient, db_session
+):
+    """A compute_experiment held for its FORCED runner (awaiting_forced_runner_since,
+    no awaiting_local_runner_since) is surfaced and distinguishable, exposing the
+    forced target runner id/hostname and the forced held-since stamp."""
+    from app.models import LocalRunner
+    from app import auth as auth_mod
+
+    project = await _make_project(db_session, name="Forced Hold Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        hostname="dgx-1",
+        status="active",
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        title="forced-held experiment",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python run.py",
+                "spend_cap_usd": 4.0,
+                "deadline_seconds": 600,
+            }
+        ],
+        context={
+            "forced_runner_target_id": str(runner.id),
+            "awaiting_forced_runner_since": "2026-07-05T12:00:00+00:00",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [e["id"] for e in body]
+    assert str(task.id) in ids, "forced hold must be surfaced by the awaiting endpoint"
+    entry = next(e for e in body if e["id"] == str(task.id))
+    # Distinguishable from a generic enforce-local hold.
+    assert entry["awaiting_local_runner_since"] is None
+    assert entry["awaiting_forced_runner_since"] == "2026-07-05T12:00:00+00:00"
+    assert entry["forced_runner_target_id"] == str(runner.id)
+    assert entry["forced_runner"] is not None
+    assert entry["forced_runner"]["hostname"] == "dgx-1"
+    assert entry["forced_runner"]["id"] == str(runner.id)
+
+
+@pytest.mark.asyncio
 async def test_failed_job_response_has_first_class_exit_code_and_command_log(
     client: AsyncClient, db_session
 ):

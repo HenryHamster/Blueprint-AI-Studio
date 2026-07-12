@@ -12289,6 +12289,97 @@ class TestComputeExperimentLaunchPolicyGate:
         assert resp.json()["requires_approval"] is False
 
 
+class TestComputeExperimentForcedRunnerPin:
+    """POST /api/admin/tasks/compute-experiment resolves an operator forced runner
+    pin (runner_target_id) — by hostname OR UUID — against the project's own
+    runners, stamping context['forced_runner_target_id'], and rejects an
+    unknown/foreign runner with 422."""
+
+    def _headers(self):
+        return {"x-user-id": _PREFLIGHT_TEST_USER_ID}
+
+    async def _make_runner(self, session, project_id, *, hostname):
+        from app.models import LocalRunner
+        from app import auth as auth_mod
+
+        token = auth_mod.create_runner_token(uuid.uuid4())
+        runner = LocalRunner(
+            project_id=project_id,
+            token_hash=auth_mod.hash_runner_token(token),
+            hostname=hostname,
+            capabilities={"task_types": "all", "has_gpu": False},
+        )
+        session.add(runner)
+        await session.commit()
+        await session.refresh(runner)
+        return runner
+
+    async def _launch(self, client, repo, runner_target_id):
+        return await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": repo,
+                "title": "Pinned run",
+                "prompt": "Run benchmark",
+                "command": "python bench.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+                "runner_target_id": runner_target_id,
+            },
+            headers=self._headers(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolves_hostname_to_forced_target(self, client, db_session):
+        project = await _make_preflight_project(
+            db_session, repo="acme/forced-hostname-repo"
+        )
+        runner = await self._make_runner(db_session, project.id, hostname="dgx-1")
+
+        resp = await self._launch(client, "acme/forced-hostname-repo", "dgx-1")
+        assert resp.status_code == 200, resp.text
+        task = await db_session.get(Task, uuid.UUID(resp.json()["id"]))
+        assert (task.context or {}).get("forced_runner_target_id") == str(runner.id)
+
+    @pytest.mark.asyncio
+    async def test_resolves_uuid_to_forced_target(self, client, db_session):
+        project = await _make_preflight_project(
+            db_session, repo="acme/forced-uuid-repo"
+        )
+        runner = await self._make_runner(db_session, project.id, hostname="dgx-2")
+
+        resp = await self._launch(client, "acme/forced-uuid-repo", str(runner.id))
+        assert resp.status_code == 200, resp.text
+        task = await db_session.get(Task, uuid.UUID(resp.json()["id"]))
+        assert (task.context or {}).get("forced_runner_target_id") == str(runner.id)
+
+    @pytest.mark.asyncio
+    async def test_unknown_runner_rejected_422(self, client, db_session):
+        await _make_preflight_project(db_session, repo="acme/forced-unknown-repo")
+        resp = await self._launch(
+            client, "acme/forced-unknown-repo", "no-such-host"
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "forced_runner_not_found"
+
+    @pytest.mark.asyncio
+    async def test_foreign_project_runner_rejected_422(self, client, db_session):
+        """A runner UUID that belongs to a DIFFERENT project must not resolve."""
+        await _make_preflight_project(db_session, repo="acme/forced-owner-repo")
+        other = await _make_preflight_project(
+            db_session, repo="acme/forced-other-repo"
+        )
+        foreign = await self._make_runner(db_session, other.id, hostname="foreign-1")
+
+        resp = await self._launch(
+            client, "acme/forced-owner-repo", str(foreign.id)
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["error"]["message"]
+        assert detail["error"] == "forced_runner_not_found"
+
+
 # ---------------------------------------------------------------------------
 # Live output tail: heartbeat delivery and local backend reading
 # ---------------------------------------------------------------------------

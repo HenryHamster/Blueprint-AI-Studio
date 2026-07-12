@@ -119,10 +119,14 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   const fetchDirectionsRef = useRef<() => void>(() => {});
   const defaultTaskBranchRef = useRef<string | null>(null);
   const selectedProjectRepoRef = useRef<string | null>(null);
+  const selectedProjectIdRef = useRef<string | null>(null);
   const prevTasksRef = useRef<Task[]>([]);
 
   // Moved before useDeploymentState so it can be passed as a parameter
   const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
+  // Keep the ref in sync so useTaskModal can read the current project id without
+  // being a dependency of every effect that references selectedProjectId.
+  useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
   const {
     deployState, setDeployState,
@@ -249,8 +253,9 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
+    fleetRunners, fleetRunnersLoading,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
-  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef, taskCapabilityContract);
+  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef, taskCapabilityContract, selectedProjectIdRef);
 
   const {
     allowedUsers, addAllowedUser, updateAllowedUserRole, removeAllowedUser,
@@ -644,6 +649,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     launchableTaskTypeOptions,
+    fleetRunners, fleetRunnersLoading,
     taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
     openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, openWebResearchTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults

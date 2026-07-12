@@ -869,6 +869,281 @@ def test_select_eligible_runner_no_container_image_ignores_container_cap():
     )
 
 
+# ── VRAM-fit dispatch eligibility ─────────────────────────────────────────────
+
+
+def test_select_eligible_runner_vram_filter_excludes_insufficient():
+    """A runner whose reported gpu_free_vram_mib is below the job requirement
+    must be excluded from dispatch, even when has_gpu is True.
+
+    This is the core VRAM-fit correctness guarantee: two jobs must not be
+    dispatched to the same GPU when free VRAM is insufficient for both.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    # Runner with only 4 GiB free (4096 MiB) cannot hold an 8 GiB job.
+    low_vram_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [4096],
+        },
+    )
+    cache = {project_id: [low_vram_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=8.0,
+    )
+    assert selected is None, (
+        "runner with only 4 GiB free VRAM must not be selected for an 8 GiB job"
+    )
+
+
+def test_select_eligible_runner_vram_filter_selects_sufficient():
+    """When one runner has insufficient VRAM and another has sufficient,
+    only the sufficient runner is selected."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    low_vram = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [4096],
+        },
+    )
+    high_vram = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_free_vram_mib": [20480],  # 20 GiB free
+        },
+    )
+    cache = {project_id: [low_vram, high_vram]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=16.0,
+    )
+    assert selected is not None
+    assert selected.id == high_vram.id, (
+        "runner with 20 GiB free must be preferred over runner with only 4 GiB"
+    )
+
+
+def test_select_eligible_runner_vram_filter_no_vram_declared_unaffected():
+    """When no vram_gb is declared, runners without gpu_free_vram_mib are
+    still eligible — the VRAM gate is opt-in and must not break existing dispatch."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    gpu_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    cache = {project_id: [gpu_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=None,
+    )
+    assert selected is not None, (
+        "GPU runner must remain eligible when no vram_gb is declared"
+    )
+
+
+def test_select_eligible_runner_vram_filter_absent_telemetry_passes():
+    """A runner that does not report gpu_free_vram_mib (older daemon) must
+    not be excluded even when the job declares a vram_gb requirement — we
+    only gate dispatch on real data, not on absence of telemetry."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        # has_gpu True but no gpu_free_vram_mib — old runner that never sends it
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    cache = {project_id: [old_runner]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="gpu",
+        runner_pins_this_cycle={},
+        vram_gb=24.0,
+    )
+    assert selected is not None, (
+        "runner without gpu_free_vram_mib telemetry must still be eligible "
+        "when vram_gb is declared — absence of data is not evidence of insufficiency"
+    )
+
+
+def test_runner_has_free_vram_any_gpu_sufficient():
+    """_runner_has_free_vram returns True when at least one GPU meets the
+    requirement, even if others do not (multi-GPU runner where only one
+    GPU has enough headroom)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_free_vram,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    multi_gpu = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        # GPU 0: 4 GiB free, GPU 1: 24 GiB free
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [4096, 24576]},
+    )
+    assert _runner_has_free_vram(multi_gpu, required_mib=16384) is True, (
+        "runner with at least one GPU meeting the requirement must be eligible"
+    )
+    assert _runner_has_free_vram(multi_gpu, required_mib=32768) is False, (
+        "runner where no GPU meets the requirement must not be eligible"
+    )
+
+
+# ── Forced (hard) runner pin: _select_eligible_runner ──────────────────────────
+
+
+def test_select_eligible_runner_forced_target_restricts_to_that_runner():
+    """A forced runner target restricts eligibility to ONLY that runner.
+
+    Even with another idle, eligible runner present, the forced id must win and
+    the other runner must never be chosen — the hard pin does not spill over.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+    forced = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    other = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [other, forced]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        forced_runner_target_id=str(forced.id),
+    )
+    assert selected is not None
+    assert selected.id == forced.id, "forced target must be selected, never the other runner"
+
+
+def test_select_eligible_runner_forced_target_returns_none_when_ineligible():
+    """A forced target that is not present/eligible this cycle → None.
+
+    The function must NEVER fall through to the other (eligible) runner: a hard
+    pin holds rather than silently reassigns.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+    other = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    # The forced id is NOT in the cache (offline this cycle).
+    forced_id = str(uuid.uuid4())
+    cache = {project_id: [other]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        forced_runner_target_id=forced_id,
+    )
+    assert selected is None, (
+        "an offline forced target must yield None, never fall back to the "
+        "other eligible runner"
+    )
+
+
+def test_select_eligible_runner_forced_target_respects_gpu_gate():
+    """A forced target that lacks a required GPU is NOT selected (→ None)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    cpu_forced = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={"task_types": "all", "has_gpu": False},
+        consecutive_job_failures=0,
+    )
+    cache = {project_id: [cpu_forced]}
+
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",  # requires a GPU runner
+        runner_pins_this_cycle={},
+        forced_runner_target_id=str(cpu_forced.id),
+    )
+    assert selected is None, "a GPU job forced onto a CPU-only runner must hold"
+
+
 # ── DeepSeek routing preference invariant ───────────────────────────────────
 
 

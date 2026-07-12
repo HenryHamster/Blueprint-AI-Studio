@@ -236,6 +236,7 @@ class HeartbeatRequest(BaseModel):
     cpu_load_avg: float | None = None
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
+    gpu_free_vram_mib: List[int] | None = None
 
 
 @router.post("/next-task")
@@ -617,6 +618,8 @@ async def heartbeat(
         caps["memory_free_bytes"] = max(0, int(payload.memory_free_bytes))
     if payload.gpu_utilization_pct is not None:
         caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
+    if payload.gpu_free_vram_mib is not None:
+        caps["gpu_free_vram_mib"] = [max(0, int(v)) for v in payload.gpu_free_vram_mib]
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:

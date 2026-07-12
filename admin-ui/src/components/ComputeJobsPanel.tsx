@@ -635,7 +635,7 @@ function AwaitingLocalRunnerSection({
       <div className="flex flex-col gap-1.5">
         {holds.map((hold) => {
           const capLabel = hold.spend_cap_usd != null ? ` · $${Number(hold.spend_cap_usd).toFixed(2)}` : '';
-          const waitingMs = Date.parse(hold.awaiting_local_runner_since);
+          const waitingMs = Date.parse(hold.awaiting_local_runner_since || hold.awaiting_forced_runner_since || '');
           const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
           return (
             <div
@@ -645,7 +645,10 @@ function AwaitingLocalRunnerSection({
             >
               <div className="text-xs font-semibold text-amber-200 break-words">{hold.title ?? hold.id}{capLabel}</div>
               <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="awaiting-local-runner-waiting">
-                waiting for local runner
+                {hold.forced_runner?.hostname
+                  ? <>waiting for forced runner <span className="font-semibold">{hold.forced_runner?.hostname}</span></>
+                  : 'waiting for local runner'
+                }
                 {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
               </div>
             </div>
