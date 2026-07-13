@@ -151,14 +151,14 @@ def _extract_json_object(text: str, *required_keys: str) -> Optional[str]:
     return None
 
 
-def scan_balanced_json_objects(
-    text: str, *, required_key: str | None = None, last: bool = False
-) -> dict | None:
-    """Find the first (or last when ``last=True``) balanced JSON object in
-    ``text`` that parses to a dict and, when ``required_key`` is given,
-    contains that key.  Returns ``None`` when no matching object is found.
+def _iter_balanced_json_objects(text: str, *, required_key: str | None = None):
+    """Yield, in order of appearance, each balanced JSON object in ``text`` that
+    parses to a dict and (when ``required_key`` is given) contains that key.
+
+    Shared string-aware scanner behind :func:`scan_balanced_json_objects` and
+    :func:`scan_all_balanced_json_objects` so both agree on exactly which
+    objects are recoverable.
     """
-    result: dict | None = None
     idx = text.find("{")
     while idx != -1:
         depth = 0
@@ -188,11 +188,37 @@ def scan_balanced_json_objects(
                         if isinstance(obj, dict) and (
                             required_key is None or required_key in obj
                         ):
-                            if not last:
-                                return obj
-                            result = obj
+                            yield obj
                     except (json.JSONDecodeError, ValueError):
                         pass
                     break
         idx = text.find("{", idx + 1)
+
+
+def scan_balanced_json_objects(
+    text: str, *, required_key: str | None = None, last: bool = False
+) -> dict | None:
+    """Find the first (or last when ``last=True``) balanced JSON object in
+    ``text`` that parses to a dict and, when ``required_key`` is given,
+    contains that key.  Returns ``None`` when no matching object is found.
+    """
+    result: dict | None = None
+    for obj in _iter_balanced_json_objects(text, required_key=required_key):
+        if not last:
+            return obj
+        result = obj
     return result
+
+
+def scan_all_balanced_json_objects(
+    text: str, *, required_key: str | None = None
+) -> list[dict]:
+    """Return every balanced JSON object in ``text`` (in order of appearance)
+    that parses to a dict and, when ``required_key`` is given, contains that key.
+
+    Unlike :func:`scan_balanced_json_objects`, which collapses to a single
+    (first/last) object, this preserves every emission — needed to recover an
+    A/B experiment that printed the same metric key once per arm, where
+    last-object-wins would otherwise discard every arm but the final one.
+    """
+    return list(_iter_balanced_json_objects(text, required_key=required_key))

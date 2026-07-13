@@ -7845,6 +7845,45 @@ def test_build_compute_result_logs_stdout_fallback_last_object_wins():
     assert result["accuracy"] == pytest.approx(0.88)
 
 
+def test_build_compute_result_logs_stdout_fallback_recovers_ab_metric_series():
+    """A single-command A/B experiment that prints the same metric once per arm
+    (fp32 then fp16, both emitting ``median_matmul_ms``) must keep BOTH values.
+
+    Regression guard modeled on the real V100 fp16-vs-fp32 matmul proof: the
+    command printed ``{"median_matmul_ms": 81.6...}`` then
+    ``{"median_matmul_ms": 12.5...}``. Last-object-wins keeps the fp16 value as
+    the canonical ``median_matmul_ms``, but the fp32 arm must remain recoverable
+    under ``median_matmul_ms__series`` so the comparison that IS the proof is not
+    silently reduced to a single number.
+    """
+    job = _make_job_with_command_log(
+        'pulling image...\n{"median_matmul_ms": 81.60714758560061}\n'
+        '{"median_matmul_ms": 12.5942244194448}\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    # Canonical value stays the last emission (last-object-wins unchanged).
+    assert result["median_matmul_ms"] == pytest.approx(12.5942244194448)
+    # Both arms recovered, in emission order, so fp32 (81.6) is not lost.
+    assert result["median_matmul_ms__series"] == pytest.approx(
+        [81.60714758560061, 12.5942244194448]
+    )
+    # And the A/B ratio (the actual hypothesis: fp16 >= 1.5x fp32) is now
+    # computable from structured data alone.
+    fp32, fp16 = result["median_matmul_ms__series"]
+    assert fp32 / fp16 >= 1.5
+
+
+def test_build_compute_result_logs_stdout_fallback_no_series_for_single_value():
+    """A metric emitted once (or repeatedly with the SAME value) gets no
+    ``__series`` companion — the recovery only fires for a real A/B spread."""
+    job = _make_job_with_command_log(
+        '{"accuracy": 0.9}\nepoch\n{"accuracy": 0.9}\n'
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["accuracy"] == pytest.approx(0.9)
+    assert "accuracy__series" not in result
+
+
 def test_build_compute_result_logs_stdout_fallback_skips_reserved_keys():
     """The stdout fallback can never overwrite a reserved job-level field or a
     backend-derived durable key."""

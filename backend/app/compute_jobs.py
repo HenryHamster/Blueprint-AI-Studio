@@ -60,7 +60,10 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.database import AsyncSessionLocal
-from app.json_extract import scan_balanced_json_objects
+from app.json_extract import (
+    scan_all_balanced_json_objects,
+    scan_balanced_json_objects,
+)
 from app.models import (
     Artifact,
     ArtifactType,
@@ -3269,7 +3272,30 @@ def _stdout_metrics_fallback(meta: dict) -> dict | None:
     if not isinstance(obj, dict):
         return None
     numeric = {k: v for k, v in obj.items() if _coerce_metric_number(v) is not None}
-    return numeric or None
+    if not numeric:
+        return None
+    # Recover repeated-metric series. An A/B experiment authored as a single
+    # command that prints the SAME metric key once per arm (e.g. fp32 then fp16
+    # both emitting {"median_matmul_ms": ...}) collapses under last-object-wins
+    # above: only the final arm's value survives, so the comparison that IS the
+    # proof becomes unrecoverable from structured data. For any recovered metric
+    # emitted more than once with differing values, attach the full ordered
+    # series under ``<metric>__series`` so both arms stay readable. The canonical
+    # ``<metric>`` value is left untouched (still the last emission), keeping
+    # last-object-wins backward compatible for single-value experiments.
+    series: dict[str, list[float | int]] = {}
+    all_objs = scan_all_balanced_json_objects(text)
+    for key in numeric:
+        values = [
+            num
+            for o in all_objs
+            if isinstance(o, dict)
+            for num in (_coerce_metric_number(o.get(key)),)
+            if num is not None
+        ]
+        if len(values) >= 2 and len(set(values)) >= 2:
+            series[f"{key}__series"] = values
+    return {**numeric, **series}
 
 
 def build_compute_result_logs(job: ComputeJob) -> str:
@@ -3351,6 +3377,25 @@ def build_compute_result_logs(job: ComputeJob) -> str:
             num = _coerce_metric_number(value)
             if num is not None:
                 result[name] = num
+            elif (
+                name.endswith("__series")
+                and isinstance(value, list)
+                and not isinstance(value, (str, bytes))
+            ):
+                # Ordered per-emission series for a metric a single-command A/B
+                # experiment printed once per arm (see _stdout_metrics_fallback).
+                # The numeric loop drops non-scalar values, so preserve the list
+                # explicitly — like the arms block below — keeping the full
+                # comparison structurally recoverable rather than reducing the
+                # proof to its final arm.
+                coerced = [
+                    num
+                    for v in value
+                    for num in (_coerce_metric_number(v),)
+                    if num is not None
+                ]
+                if len(coerced) >= 2:
+                    result[name] = coerced
         # Preserve the arms block intact so the success-criterion evaluator can
         # read per-arm metrics using best-arm semantics. The numeric loop above
         # drops non-numeric values; the arms block (a nested dict) must survive
