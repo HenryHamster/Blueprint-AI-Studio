@@ -1153,7 +1153,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                           {gpuAllowlistLabel(runner)}
                           <button
                             onClick={() => beginEditGpuAllowlist(runner)}
-                            className="text-purple-300/70 hover:text-purple-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
                             title="Edit GPU allowlist"
                             aria-label="Edit GPU allowlist"
                           >
@@ -1212,7 +1212,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                               setEditGpusPerJob(gpusPerJobValue(runner));
                               setEditingGpusPerJob(runner.id);
                             }}
-                            className="text-purple-300/70 hover:text-purple-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
                             title="Edit GPUs per job"
                             aria-label="Edit GPUs per job"
                           >
@@ -1278,7 +1278,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                           {taskTypesLabel(runner)}
                           <button
                             onClick={() => beginEditTaskTypes(runner)}
-                            className="text-blue-300/70 hover:text-blue-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-blue-300/70 transition-colors hover:text-blue-200 md:min-h-5 md:min-w-5"
                             title="Edit task types"
                             aria-label="Edit task types"
                           >
