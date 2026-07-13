@@ -22,6 +22,7 @@ keeps working for existing callers and tests.
 
 import asyncio
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -97,18 +98,17 @@ AWAITING_FORCED_RUNNER_CONTEXT_KEY = "awaiting_forced_runner_since"
 # literals: a third independent copy of "awaiting_local_runner_since" et al. is the
 # exact drift this aggregate exists to prevent.
 #
-# ⚠️ It is NOT (yet) in lockstep with the bounded hold-timeout sweep. The sweep's
-# predicate — ``strategic_runtime_work.local_runner_hold_task_filters`` — matches only
-# LOCAL_RUNNER_HOLD_CONTEXT_KEY and CONTAINER_RUNNER_HOLD_CONTEXT_KEY. So
-# AWAITING_FORCED_RUNNER_CONTEXT_KEY is STAMPED HERE BUT NEVER SWEPT: a forced-pin hold
-# whose target runner never returns is not bounded by the 6h timeout and waits
-# indefinitely. That is a PRE-EXISTING gap (this constant only names it; it did not
-# introduce it), and closing it belongs to the branch that extends the sweep — which
-# should widen `local_runner_hold_task_filters` to this full tuple, at which point the
-# lockstep invariant below actually holds:
+# It IS in lockstep with the bounded hold-timeout sweep: every key below is both
+# STAMPED here and SWEPT by ``_fail_stale_local_runner_holds`` (15-min early operator
+# alert, then 6h terminal PROVISION_FAILURE), upholding the invariant:
 #
 #   a key that is stamped but never swept is an unbounded hold, and a key that dispatch
 #   stops stamping but the sweep still reads is dead code.
+#
+# AWAITING_FORCED_RUNNER_CONTEXT_KEY was previously stamped but NEVER swept — a
+# forced-pin hold whose target runner never came back waited QUEUED indefinitely with
+# nothing watching it. The sweep now covers it on the same bounded-wait contract as its
+# siblings, with a forced-pin-specific terminal reason naming the pinned runner.
 COMPUTE_RUNNER_HOLD_CONTEXT_KEYS: tuple[str, ...] = (
     LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     CONTAINER_RUNNER_HOLD_CONTEXT_KEY,
@@ -158,6 +158,60 @@ _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
 # compute_experiment hold has waited past this window but before the 6h hard
 # timeout — so the operator learns the hardware is offline in minutes, not hours.
 _LOCAL_RUNNER_HOLD_ALERT_SECONDS = 15 * 60  # 15 minutes
+
+
+def _coerce_vram_gb(payload: dict) -> tuple[float | None, str | None]:
+    """Resolve the agent-authored ``vram_gb`` hint to a float, or an honest error.
+
+    ``vram_gb`` is AGENT-AUTHORED free-form payload data read in the dispatch hot
+    path, so it must be treated as untrusted. A bare ``float(raw)`` raises on the
+    values agents actually write — ``"24GB"`` (unit suffix), ``[24]``, ``{}`` —
+    and that exception propagates out of the dispatch cycle, taking down dispatch
+    for EVERY task in the cycle (blast radius: the whole fleet) while the offending
+    task itself only dies later, reasonless, via poison quarantine.
+
+    So: coerce defensively and return ``(value, None)`` on success or
+    ``(None, error)`` on a value that cannot be a VRAM figure — the caller
+    fails THAT task with a message naming the bad field and value, and the cycle
+    survives. ``None`` (unset) is not an error: it simply declares no VRAM floor.
+
+    Non-finite values are rejected too, not just non-numeric ones: ``inf`` parses
+    fine but blows up downstream at ``int(vram_gb * 1024)`` (OverflowError) in
+    :func:`_select_eligible_runner`, which is the same hot-path crash by a longer
+    route. ``bool`` is rejected explicitly — it is an ``int`` subclass, so
+    ``float(True) == 1.0`` would otherwise silently mean "1 GB".
+    """
+    raw = payload.get("vram_gb") or (payload.get("compute_experiment") or {}).get(
+        "vram_gb"
+    )
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return None, (
+            f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); "
+            f"got boolean {raw!r}"
+        )
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except (ValueError, TypeError):
+            return None, (
+                f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); got "
+                f"{raw!r} — drop the unit suffix and requeue"
+            )
+    else:
+        return None, (
+            f"vram_gb must be a number of gigabytes (e.g. 24 or 24.5); got "
+            f"{type(raw).__name__} {raw!r}"
+        )
+    if not math.isfinite(value):
+        return None, (
+            f"vram_gb must be a finite number of gigabytes (e.g. 24 or 24.5); "
+            f"got {raw!r}"
+        )
+    return value, None
 
 
 class RunnerDispatchSnapshot(NamedTuple):
@@ -656,10 +710,19 @@ async def _try_runner_dispatch(
         payload.get("compute_experiment") or {}
     ).get("container_image")
     # A declared vram_gb restricts eligibility to runners with sufficient free VRAM.
-    _vram_raw = payload.get("vram_gb") or (
-        payload.get("compute_experiment") or {}
-    ).get("vram_gb")
-    vram_gb = float(_vram_raw) if _vram_raw is not None else None
+    # Coerced defensively: this is agent-authored payload data, and a raw float()
+    # here would raise INSIDE the dispatch cycle on e.g. "24GB". Decline to pin
+    # (return False) rather than crash the cycle — the task falls through to the
+    # compute-experiment dispatch path, which fails IT with an honest validation
+    # message naming the bad field (see _dispatch_compute_experiment_task).
+    vram_gb, vram_error = _coerce_vram_gb(payload)
+    if vram_error is not None:
+        logger.warning(
+            "[RUNNERS] Not pinning task %s to a runner: invalid vram_gb — %s",
+            task.id,
+            vram_error,
+        )
+        return False
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -1568,11 +1631,19 @@ async def _dispatch_compute_experiment_directly(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
-    # vram_gb (flat or nested) gates runner eligibility on free GPU memory.
-    _vram_raw = payload.get("vram_gb") or (
-        payload.get("compute_experiment") or {}
-    ).get("vram_gb")
-    vram_gb = float(_vram_raw) if _vram_raw is not None else None
+    # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
+    # AGENT-AUTHORED, so a bad value ("24GB") must fail THIS task with an honest
+    # validation message — never raise in the dispatch hot path, which would abort
+    # the cycle for every other task and leave this one to die reasonless in poison
+    # quarantine. Same terminal-fail contract as the config_errors check above.
+    vram_gb, vram_error = _coerce_vram_gb(payload)
+    if vram_error is not None:
+        return await _fail_compute_experiment_task(
+            session,
+            task,
+            "compute_launch_failed",
+            "Compute experiment misconfigured: " + vram_error,
+        )
 
     # Launch-contract runner pin (operator or agent authored). The pin id feeds
     # the existing preferred-runner seam; ``strict`` additionally forbids any
@@ -2231,14 +2302,17 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
 
     Two hold classes share the bounded-wait contract but resolve DIFFERENTLY:
 
-    * **compute_experiment** (``context['awaiting_local_runner_since']`` or
-      ``context['awaiting_container_runner_since']``): held QUEUED instead of
-      cloud-provisioned when no live self-hosted runner claimed it (require-local)
-      or no runner advertises ``docker_usable`` for an image-declaring job
-      (container hold). A hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS``
-      (6h) is marked terminal-FAILED (PROVISION_FAILURE) — neither variant has a
-      safe cloud fallback (each needs specific operator hardware/runtime), so
-      failing is correct. Both emit an early-warning alert first.
+    * **compute_experiment** (``context['awaiting_local_runner_since']``,
+      ``context['awaiting_container_runner_since']`` or
+      ``context['awaiting_forced_runner_since']``): held QUEUED instead of
+      cloud-provisioned when no live self-hosted runner claimed it (require-local),
+      no runner advertises ``docker_usable`` for an image-declaring job
+      (container hold), or the operator's HARD ``forced_runner_target_id`` pin is
+      not eligible (forced hold). A hold older than
+      ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` (6h) is marked terminal-FAILED
+      (PROVISION_FAILURE) — no variant has a safe cloud fallback (each needs
+      specific operator hardware/runtime/host), so failing is correct. All three
+      emit an early-warning alert first.
 
     * **continuous local Strategic** (``context['awaiting_strategic_local_runner_since']``
       + ``context['strategic_local_runner_required']``): SAFETY self-heal. A hold
@@ -2280,6 +2354,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         task_type = str((task.first_payload or {}).get("type") or "")
         compute_stamp = ctx.get("awaiting_local_runner_since")
         container_stamp = ctx.get("awaiting_container_runner_since")
+        forced_stamp = ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY)
         strategic_stamp = ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
         is_compute_hold = (
             bool(compute_stamp)
@@ -2300,6 +2375,21 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
+        # Forced-runner hold: an operator HARD pin (forced_runner_target_id) whose
+        # target runner is not eligible. Same bounded-wait contract as its siblings
+        # above — it has no cloud fallback BY DESIGN (the whole point of the pin is
+        # "this host or nothing"), which is exactly why it must be bounded: without
+        # this branch the stamp was written and never read, so the task waited QUEUED
+        # forever with no timeout and no alert. Lowest precedence: a coexisting
+        # require-local / container stamp names a more specific blocker.
+        is_forced_runner_hold = (
+            bool(forced_stamp)
+            and not is_compute_hold
+            and not is_container_hold
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
         is_strategic_hold = (
             bool(strategic_stamp)
             and task_type in STRATEGIC_TASK_TYPES
@@ -2307,13 +2397,20 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
-        if not is_compute_hold and not is_container_hold and not is_strategic_hold:
+        if (
+            not is_compute_hold
+            and not is_container_hold
+            and not is_forced_runner_hold
+            and not is_strategic_hold
+        ):
             continue
 
         if is_strategic_hold:
             stamped = strategic_stamp
         elif is_container_hold:
             stamped = container_stamp
+        elif is_forced_runner_hold:
+            stamped = forced_stamp
         else:
             stamped = compute_stamp
         stamped_at = _parse_local_runner_hold_timestamp(stamped)
@@ -2324,7 +2421,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             # Within the full wait window — keep holding. For compute holds, emit a
             # proactive early-warning alert once the hold passes the shorter threshold
             # so the operator learns the hardware is offline in minutes, not 6h.
-            if is_compute_hold or is_container_hold:
+            if is_compute_hold or is_container_hold or is_forced_runner_hold:
                 alert_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS)
                 if stamped_at <= alert_cutoff:
                     held_secs = int((now - stamped_at).total_seconds())
@@ -2429,6 +2526,22 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
                 f"{pin_hold.get('detail') or 'no detail'}) — bring that runner "
                 f"online / free its capacity, or relaunch without the strict "
                 f"pin, then requeue"
+            )
+        elif is_forced_runner_hold:
+            # Name the host the operator actually pinned — "forced runner dgx-1"
+            # is actionable; "no self-hosted runner" would be a lie (other runners
+            # may well have been online and idle; the pin is what excluded them).
+            forced_id = str(ctx.get(FORCED_RUNNER_TARGET_CONTEXT_KEY) or "").strip()
+            forced_hostname = await _lookup_runner_hostname(
+                session, task.project_id, forced_id
+            )
+            target_label = forced_hostname or forced_id or "unknown"
+            reason = (
+                f"forced_runner_target_id: hard-pinned runner {target_label} did "
+                f"not become eligible within {hours}h — a forced pin never falls "
+                f"back to another runner or to cloud. Bring that runner online / "
+                f"free its capacity, or relaunch without the forced pin, then "
+                f"requeue"
             )
         elif is_container_hold:
             reason = (

@@ -12241,3 +12241,216 @@ async def test_dispatch_holds_when_container_image_declared_but_no_capable_runne
     assert "docker_usable" in (refreshed.latest_status_message or ""), (
         "status message must explain the docker_usable requirement"
     )
+
+
+# ---------------------------------------------------------------------------
+# Finding 12 — unvalidated float() coercion of the agent-authored `vram_gb`
+# payload field raised in the dispatch HOT PATH, taking down the whole dispatch
+# cycle (blast radius: every task in it) while the offending task itself only
+# died later, reasonless, via poison quarantine.
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_vram_gb_accepts_numbers_and_numeric_strings():
+    """Valid VRAM figures coerce to float with no error, in flat and nested form."""
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    assert _coerce_vram_gb({"vram_gb": 24}) == (24.0, None)
+    assert _coerce_vram_gb({"vram_gb": 24.5}) == (24.5, None)
+    assert _coerce_vram_gb({"vram_gb": "24"}) == (24.0, None)
+    assert _coerce_vram_gb({"vram_gb": " 24.5 "}) == (24.5, None)
+    # Nested compute_experiment form resolves identically.
+    assert _coerce_vram_gb({"compute_experiment": {"vram_gb": 40}}) == (40.0, None)
+    # Unset is not an error — it simply declares no VRAM floor.
+    assert _coerce_vram_gb({}) == (None, None)
+
+
+def test_coerce_vram_gb_rejects_non_numeric_without_raising():
+    """The values that used to RAISE in the dispatch cycle now return an error.
+
+    Each of these fed a bare ``float()`` before the fix: "24GB" and [24] raised
+    ValueError/TypeError straight out of the dispatch cycle. They must now come
+    back as an honest error string naming the field and the offending value.
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for bad in ("24GB", "24 GB", "lots", [24], {"gb": 24}, object()):
+        value, error = _coerce_vram_gb({"vram_gb": bad})
+        assert value is None, f"{bad!r} must not coerce to a VRAM figure"
+        assert error, f"{bad!r} must produce an honest validation error"
+        assert "vram_gb" in error, f"error must name the bad field, got {error!r}"
+
+    # The error names the offending value so an operator can see WHAT was wrong.
+    _value, error = _coerce_vram_gb({"vram_gb": "24GB"})
+    assert "24GB" in error
+
+
+def test_coerce_vram_gb_rejects_non_finite_and_bool():
+    """inf/nan and a truthy bool are rejected.
+
+    ``inf`` parses fine through float() but then blows up downstream at
+    ``int(vram_gb * 1024)`` (OverflowError) — the same hot-path crash by a longer
+    route. ``True`` is an ``int`` subclass, so ``float(True) == 1.0`` would
+    otherwise silently mean "1 GB".
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for bad in ("inf", "-inf", "nan", float("inf"), float("nan"), True):
+        value, error = _coerce_vram_gb({"vram_gb": bad})
+        assert value is None, f"{bad!r} must not coerce to a VRAM figure"
+        assert error, f"{bad!r} must produce an honest validation error"
+
+
+def test_coerce_vram_gb_treats_falsy_as_no_vram_floor():
+    """A FALSY vram_gb declares no VRAM floor — it is not an error.
+
+    ``0`` / ``False`` / ``""`` are falsy, so the flat-then-nested ``or`` lookup
+    (pre-existing precedence, deliberately preserved) reads straight past them to
+    the nested form and resolves to None = "no VRAM floor". None of these can
+    crash the dispatch cycle, so none of them should terminal-fail a task — they
+    just impose no constraint. This pins that contract so a future "tighten the
+    validation" change cannot start failing tasks that declare vram_gb: 0.
+    """
+    from app.orchestrator_runner_dispatch import _coerce_vram_gb
+
+    for falsy in (0, False, ""):
+        value, error = _coerce_vram_gb({"vram_gb": falsy})
+        assert value is None, f"{falsy!r} must impose no VRAM floor"
+        assert error is None, f"{falsy!r} must NOT be treated as a validation error"
+
+    # Documented precedence: a falsy flat value falls through to the nested form.
+    assert _coerce_vram_gb(
+        {"vram_gb": 0, "compute_experiment": {"vram_gb": 40}}
+    ) == (40.0, None)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_fails_task_honestly_on_non_numeric_vram_gb(db_session, mocker):
+    """An agent writing ``vram_gb: "24GB"`` must fail THAT task with a clear
+    validation message — NOT raise out of the dispatch cycle.
+
+    Regression cover for the hot-path crash: before the fix this call raised
+    ValueError from ``float("24GB")``, aborting the dispatch cycle for every other
+    task in it, while the offending task died later via poison quarantine with no
+    honest reason. Now it terminal-FAILs with compute_launch_failed and a message
+    naming the bad field and value, and no billable ComputeJob is ever created.
+    """
+    from sqlmodel import select as _select
+    from app.models import ComputeJob
+    from app.orchestrator_runner_dispatch import _dispatch_compute_experiment_directly
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="BadVramProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "vram_gb": "24GB",  # unit suffix — the exact poison value
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # Must NOT raise — that is the whole point of the fix.
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {}, runner_pins_this_cycle={}
+    )
+
+    assert result == "failed", f"expected 'failed', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.FAILED
+    assert (refreshed.context or {}).get("failure_category") == "compute_launch_failed"
+    message = refreshed.latest_status_message or ""
+    assert "vram_gb" in message, f"message must name the bad field, got {message!r}"
+    assert "24GB" in message, f"message must name the bad value, got {message!r}"
+
+    # A misconfigured launch must never create a (billable) compute job.
+    jobs = (
+        await db_session.execute(
+            _select(ComputeJob).where(ComputeJob.task_id == task_id)
+        )
+    ).scalars().all()
+    assert jobs == [], "a validation failure must not create a billable ComputeJob"
+
+
+# ---------------------------------------------------------------------------
+# Finding 11 — a forced-runner pin (`forced_runner_target_id`) stamped
+# `awaiting_forced_runner_since` but NO sweep or alert ever consumed the stamp,
+# so the task sat QUEUED indefinitely with nobody watching. It now rides the same
+# bounded-wait contract as its siblings: 15-min early alert, 6h terminal fail.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_held_forced_runner_compute_alerts_before_timeout(db_session, mocker):
+    """A forced-runner hold past the early-warning threshold emits a WARNING alert
+    while the task stays QUEUED, and a second sweep pass must not duplicate it.
+
+    Before the fix this hold was invisible to the sweep: no alert, no timeout — the
+    task simply waited forever.
+    """
+    from sqlmodel import select as _select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+        AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+        FORCED_RUNNER_TARGET_CONTEXT_KEY,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ForcedRunner Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="pinned to an offline box",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={
+            AWAITING_FORCED_RUNNER_CONTEXT_KEY: held_since.isoformat(),
+            FORCED_RUNNER_TARGET_CONTEXT_KEY: str(uuid.uuid4()),
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    # Still inside the 6h window — held, not failed.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    alerts = (
+        await db_session.execute(_select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 early-warning alert, got {len(alerts)}"
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # Dedup: a second sweep pass must not stack a duplicate alert.
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(_select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"

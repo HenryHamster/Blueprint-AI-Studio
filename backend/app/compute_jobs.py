@@ -12,13 +12,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import io
 import json
 import logging
 import math
 import os
 import re
-import tarfile
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -1506,7 +1504,7 @@ async def _apply_operator_kill_result(
     )
     _record_terminal_reason_history(session, live)
     await _link_terminal_artifact(session, live)
-    await _extract_viewable_files_for_job(session, live)
+    await persist_viewable_files_for_job(session, live)
     if live.task_id is not None:
         from app.task_lifecycle import fire_task_wakes
 
@@ -2747,7 +2745,7 @@ async def _apply_polled_compute_job_result(
             if compute_rpc_diagnostic is not None:
                 _set_meta(live, compute_rpc_diagnostic=compute_rpc_diagnostic)
             await _link_terminal_artifact(session, live)
-            await _extract_viewable_files_for_job(session, live)
+            await persist_viewable_files_for_job(session, live)
             if live.task_id is not None:
                 from app.task_lifecycle import fire_task_wakes
 
@@ -2797,7 +2795,7 @@ async def _apply_task_terminal_cancellation(
         else:
             _clear_compute_rpc_diagnostic(live)
         await _link_terminal_artifact(session, live)
-        await _extract_viewable_files_for_job(session, live)
+        await persist_viewable_files_for_job(session, live)
         if live.task_id is not None:
             from app.task_lifecycle import fire_task_wakes
 
@@ -3561,28 +3559,17 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
     )
     # Best-effort: persist common viewable files (images/videos) as individually-
     # addressable objects + a recorded manifest so an operator can preview them
-    # inline without untarring the bundle. Fail-soft — any error degrades to no
+    # inline without untarring the bundle. Runs the SINGLE viewable pipeline
+    # (download once, sanitize once, upload once, one cap policy) and records it on
+    # both persisted surfaces — the manifest and the ComputeJobFile rows. Idempotent:
+    # when the caller already ran the pass for this job, the stamped manifest comes
+    # back with no second download/upload. Fail-soft — any error degrades to no
     # manifest and NEVER blocks the job's terminal completion (mirrors the
-    # surrounding helpers). Stamped onto polling_metadata regardless of whether
-    # the Artifact INSERT below succeeds so the manifest survives a linkage
-    # rollback.
-    viewable_files: list[dict[str, Any]] = []
-    viewable_files_dropped: int = 0
-    try:
-        viewable_files, viewable_files_dropped = await persist_viewable_artifacts(job)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
-            "completing with no viewable manifest",
-            job.id,
-            exc_info=True,
-        )
-        viewable_files = []
-        viewable_files_dropped = 0
-    if viewable_files:
-        _set_meta(job, viewable_files=viewable_files)
-    if viewable_files_dropped:
-        _set_meta(job, viewable_files_dropped=viewable_files_dropped)
+    # surrounding helpers). Stamped onto polling_metadata regardless of whether the
+    # Artifact INSERT below succeeds, so the manifest survives a linkage rollback.
+    viewable_files, viewable_files_dropped = await persist_viewable_files_for_job(
+        session, job
+    )
     task = await session.get(Task, job.task_id)
     try:
         async with session.begin_nested():
@@ -3632,197 +3619,167 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Viewable-file extraction from durable artifact bundles
+# Viewable-file persistence from durable artifact bundles — ONE pipeline
 # ---------------------------------------------------------------------------
-
-# Cap constants for per-bundle extraction — keep extraction bounded so a job
-# with a giant bundle full of images cannot DoS the extraction path.
-_MAX_VIEWABLE_FILES_PER_BUNDLE = 50
-_MAX_VIEWABLE_FILE_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
-
-# Arcname segments that are always rejected (path traversal / absolute refs).
-_REJECTED_PATH_SEGMENTS = frozenset({".."})
-_REJECTED_PATH_PREFIX = "/"
-
-
-def _sanitize_arcname(arcname: str) -> str | None:
-    """Sanitize a tar member arcname into a safe relative path.
-
-    Strips leading ``./``, rejects paths containing ``..`` segments or starting
-    with ``/``, and normalizes a zero-length or ``.``-only result to ``None``.
-    Returns the safe relative path string, or ``None`` if the path is rejected.
-    """
-    # Pre-check for absolute paths and traversal before stripping the
-    # conventional "./" prefix — "lstrip" operates on a character set, not a
-    # prefix string, so we must guard against "/etc/passwd.png" and
-    # "../escape.png" first.
-    if arcname.startswith("/"):
-        return None
-    # Normalize "./" prefix (the tar convention).
-    if arcname.startswith("./"):
-        cleaned = arcname[2:]
-    else:
-        cleaned = arcname
-    if not cleaned or cleaned == ".":
-        return None
-    segments = cleaned.replace("\\", "/").split("/")
-    for seg in segments:
-        if seg in _REJECTED_PATH_SEGMENTS or not seg:
-            return None
-    return cleaned
+#
+# One download, one sanitizer, one cap policy, one upload.
+#
+# There used to be TWO overlapping viewable-artifact pipelines, BOTH running at
+# every terminal transition of a gcp/runner-subprocess job:
+#
+#   * ``persist_viewable_artifacts`` (app.compute_backends) — downloads the bundle,
+#     sanitizes member paths with ``storage.sanitize_viewable_relpath`` (subdir
+#     context folded to ``__``), caps at 8 MiB/file and 25 files (applied to a
+#     deterministically SORTED candidate list), uploads to the
+#     ``artifacts/viewable/`` prefix, and returns the ``viewable_files`` manifest.
+#   * a second extractor that lived HERE — downloaded the SAME bundle AGAIN,
+#     sanitized with a DIFFERENT sanitizer (kept ``/`` separators), capped at
+#     25 MB/file and 50 files (first-50 in arbitrary TAR ORDER), and uploaded every
+#     file a SECOND time to a DIFFERENT prefix (``artifacts/files/``).
+#
+# So the bundle was fetched twice and every viewable file was stored twice under
+# divergent rules — and because the caps and the sanitizers disagreed, the two
+# copies could disagree about WHICH files exist and under WHAT names: a 20 MB plot
+# was present under one prefix and absent from the other, and ``arm1/reward.png``
+# was ``arm1__reward.png`` in one and ``arm1/reward.png`` in the other.
+#
+# The ``artifacts/viewable/`` manifest is the CANONICAL surface. It is what the
+# admin UI renders (``viewable_artifacts``, normalized in
+# ``routers/admin_compute_jobs.py``), what the strategic context package reads, and
+# what the artifact download-URL endpoint signs. The ``artifacts/files/`` objects
+# were never handed to any client — nothing ever listed them — so they were
+# undiscoverable duplicates of the canonical ones.
+#
+# The canonical pipeline now runs ONCE and its single result is recorded on BOTH
+# persisted surfaces: the ``viewable_files`` manifest AND the ``ComputeJobFile``
+# rows (the DB-side signing allowlist read by the download-URL endpoint). The rows
+# now carry the SAME canonical ``viewable/`` URIs as the manifest, so the two
+# surfaces can no longer diverge.
 
 
-async def extract_viewable_files_from_bundle(
-    session, job_id, bundle_bytes: bytes
+async def _record_viewable_job_files(
+    session, job: ComputeJob, manifest: list[dict[str, Any]]
 ) -> int:
-    """Extract viewable files from a compute job's durable ``bundle.tar.gz``.
+    """Mirror a viewable manifest into ``ComputeJobFile`` rows (signing allowlist).
 
-    Iterates tar members looking for images and videos whose extension is in
-    ``storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS``, uploads each to GCS individually,
-    and creates ``ComputeJobFile`` rows. The extraction is best-effort: failures
-    on one file (upload error, oversized, unsanitary name) are logged and skipped
-    so the surviving files are still persisted.
+    One row per durably-stored file, pointing at the SAME canonical ``viewable/``
+    URI the manifest already carries — no second upload, no second sanitizer, no
+    second cap policy. Each INSERT runs in its own SAVEPOINT so one constraint
+    violation (notably the UNIQUE ``storage_uri``, which is exactly what makes a
+    re-entry a benign no-op) or DB hiccup cannot lose the rows already written, and
+    can never roll back the job's terminal completion.
 
-    Returns the number of files successfully extracted (0 if the bundle is empty,
-    unparseable, or contains no viewable files).
+    Best-effort by contract: returns the number of rows written, never raises.
     """
-    if not bundle_bytes:
+    if not manifest:
         return 0
-    extracted_count = 0
-    try:
-        with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tar:
-            for member in tar:
-                if not member.isfile():
-                    continue
-                if extracted_count >= _MAX_VIEWABLE_FILES_PER_BUNDLE:
-                    logger.info(
-                        "[COMPUTE_JOB] viewable files cap (%d) reached for job=%s",
-                        _MAX_VIEWABLE_FILES_PER_BUNDLE,
-                        job_id,
-                    )
-                    break
-                # Resolve extension from the member name (the original arcname).
-                _base, ext = os.path.splitext(member.name)
-                ext_lower = ext.lower()
-                mime_type = storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS.get(ext_lower)
-                if mime_type is None:
-                    # Not a recognised viewable extension — skip.
-                    continue
-                # Size cap: skip oversized files (a 500 MB video in a bundle
-                # shouldn't be extracted inline — the operator can download it).
-                if member.size > _MAX_VIEWABLE_FILE_SIZE_BYTES:
-                    logger.warning(
-                        "[COMPUTE_JOB] skipping oversized viewable file "
-                        "'%s' (%d bytes) for job=%s",
-                        member.name,
-                        member.size,
-                        job_id,
-                    )
-                    continue
-                safe_relpath = _sanitize_arcname(member.name)
-                if safe_relpath is None:
-                    logger.warning(
-                        "[COMPUTE_JOB] rejecting unsafe arcname '%s' in bundle for job=%s",
-                        member.name,
-                        job_id,
-                    )
-                    continue
-                # Read bounded bytes from the member.
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-                data = extracted.read(_MAX_VIEWABLE_FILE_SIZE_BYTES + 1)
-                if len(data) != member.size:
-                    # Mismatch: member grew between reading the header and the data.
-                    # Skip rather than persist a partial/corrupt file.
-                    logger.warning(
-                        "[COMPUTE_JOB] size mismatch reading '%s' from bundle for job=%s",
-                        member.name,
-                        job_id,
-                    )
-                    continue
-
-                # Upload to GCS (within a per-file try so one upload failure
-                # doesn't roll back prior successful extractions).
-                try:
-                    storage_uri = await storage.upload_compute_job_media_file(
-                        job_id, safe_relpath, data, mime_type
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "[COMPUTE_JOB] upload failed for viewable file '%s' in job=%s",
-                        safe_relpath,
-                        job_id,
-                        exc_info=True,
-                    )
-                    continue
-                if storage_uri is None:
-                    continue
-
-                # Persist the ComputeJobFile row inside a savepoint so a
-                # constraint violation or DB hiccup on one row doesn't lose
-                # files already extracted.
-                media_type = storage._media_kind_for_mime(mime_type)
-                try:
-                    async with session.begin_nested():
-                        row = ComputeJobFile(
-                            compute_job_id=job_id,
-                            safe_relpath=safe_relpath,
-                            media_type=media_type,
-                            storage_uri=storage_uri,
-                            content_type=mime_type,
-                            file_size_bytes=len(data),
-                        )
-                        session.add(row)
-                        await session.flush()
-                    extracted_count += 1
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "[COMPUTE_JOB] DB insert failed for viewable file '%s' in job=%s",
-                        safe_relpath,
-                        job_id,
-                        exc_info=True,
-                    )
-                    # Don't try to delete the GCS object on DB failure — it's
-                    # benignly unreferenced and small.
-    except (tarfile.TarError, OSError, EOFError, ValueError, Exception) as exc:  # noqa: BLE001
-        logger.warning(
-            "[COMPUTE_JOB] viewable-file extraction hit an error for job=%s: %s",
-            job_id,
-            exc if isinstance(exc, str) else type(exc).__name__,
-        )
-    return extracted_count
+    written = 0
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            continue
+        storage_uri = entry.get("storage_uri")
+        filename = entry.get("filename")
+        content_type = entry.get("content_type")
+        size_bytes = entry.get("size_bytes")
+        if not isinstance(storage_uri, str) or not storage_uri:
+            continue
+        if not isinstance(filename, str) or not filename:
+            continue
+        # ``kind`` comes straight from the shared extension classifier
+        # ("image"/"video"); fall back to the MIME mapping only if it is absent.
+        media_type = entry.get("kind")
+        if not isinstance(media_type, str) or not media_type:
+            media_type = (
+                storage._media_kind_for_mime(content_type)
+                if isinstance(content_type, str)
+                else "unknown"
+            )
+        try:
+            async with session.begin_nested():
+                row = ComputeJobFile(
+                    compute_job_id=job.id,
+                    safe_relpath=filename,
+                    media_type=media_type,
+                    storage_uri=storage_uri,
+                    content_type=(
+                        content_type if isinstance(content_type, str) else None
+                    ),
+                    file_size_bytes=(
+                        size_bytes if isinstance(size_bytes, int) else None
+                    ),
+                )
+                session.add(row)
+                await session.flush()
+            written += 1
+        except Exception:  # noqa: BLE001
+            # A UNIQUE(storage_uri) hit on re-entry is the common, benign case.
+            logger.warning(
+                "[COMPUTE_JOB] ComputeJobFile insert failed for viewable file %r "
+                "in job=%s",
+                filename,
+                job.id,
+                exc_info=True,
+            )
+    return written
 
 
-async def _extract_viewable_files_for_job(session, job: ComputeJob) -> None:
-    """Download the durable bundle and extract viewable files if the backend
-    produces bundles.
+async def persist_viewable_files_for_job(
+    session, job: ComputeJob
+) -> tuple[list[dict[str, Any]], int]:
+    """Persist a terminal job's viewable files — the SINGLE viewable pipeline.
 
-    Only fires for backends that write a durable ``bundle.tar.gz`` to GCS (GCP
-    and runner-subprocess). Local/local-gpu backends use on-disk artifact dirs
-    and are skipped for this pass — their artifacts are accessed directly.
+    Delegates selection and upload to :func:`persist_viewable_artifacts`, the
+    canonical backend-aware pass (ONE bundle download for gcp/runner-subprocess, an
+    on-disk walk for local backends; ``storage.sanitize_viewable_relpath``; 8 MiB
+    per-file and 25-file caps over a deterministically sorted candidate list), then
+    records that ONE result on both durable surfaces:
+
+    * ``polling_metadata['viewable_files']`` (plus ``viewable_files_dropped`` and
+      ``viewable_file_count``) — read by the admin UI (``viewable_artifacts``) and
+      the strategic context package, and used as the signing allowlist by the
+      artifact download-URL endpoint;
+    * ``ComputeJobFile`` rows — the DB-side signing allowlist for that same
+      endpoint, carrying the SAME canonical URIs.
+
+    IDEMPOTENT. ``viewable_file_count`` is stamped on every completed pass (even a
+    zero-file one), so a re-entry — the same terminal transition reaching both this
+    call site and :func:`_link_terminal_artifact` — returns the stamped manifest
+    WITHOUT re-downloading the bundle or re-uploading a byte. That guard is what
+    holds the bundle download to exactly one per job.
+
+    Fail-soft by contract: any extraction/upload/DB error degrades to no manifest
+    and NEVER raises — viewable persistence must never block terminal completion.
+    Returns ``(manifest, dropped)``.
     """
-    from app.compute_backends import GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME
+    meta = job.polling_metadata or {}
+    if "viewable_file_count" in meta:
+        # This job's viewable pass already ran — never re-download / re-upload.
+        stamped = meta.get("viewable_files")
+        dropped = meta.get("viewable_files_dropped")
+        return (
+            stamped if isinstance(stamped, list) else [],
+            dropped if isinstance(dropped, int) else 0,
+        )
 
-    if job.backend not in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
-        return
     try:
-        bundle_bytes = await storage.download_compute_job_artifact_bundle(job.id)
+        manifest, dropped = await persist_viewable_artifacts(job)
     except Exception:  # noqa: BLE001
         logger.warning(
-            "[COMPUTE_JOB] failed to download bundle for viewable extraction job=%s",
+            "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
+            "completing with no viewable manifest",
             job.id,
             exc_info=True,
         )
-        return
-    if not bundle_bytes:
-        return
-    count = await extract_viewable_files_from_bundle(
-        session, job.id, bundle_bytes
-    )
-    # Stamp polling_metadata for observability — the operator can see whether
-    # extraction ran and how many files it produced without querying the new table.
-    meta = dict(job.polling_metadata or {})
-    meta["viewable_file_count"] = count
-    job.polling_metadata = meta
+        manifest, dropped = [], 0
+
+    await _record_viewable_job_files(session, job, manifest)
+
+    # Stamped unconditionally (even at 0) — it doubles as the "pass completed"
+    # marker the idempotency guard above reads.
+    _set_meta(job, viewable_file_count=len(manifest))
+    if manifest:
+        _set_meta(job, viewable_files=manifest)
+    if dropped:
+        _set_meta(job, viewable_files_dropped=dropped)
     session.add(job)
+    return manifest, dropped

@@ -17598,8 +17598,22 @@ def test_extract_viewable_candidates_from_bundle_deterministic_order():
 
 
 # ---------------------------------------------------------------------------
-# Tests for viewable-file extraction from compute job artifact bundles
+# Tests for the SINGLE viewable-file pipeline (persist_viewable_files_for_job)
 # ---------------------------------------------------------------------------
+#
+# There used to be TWO overlapping viewable pipelines running at every terminal
+# transition: the canonical one (`persist_viewable_artifacts` → the
+# `artifacts/viewable/` prefix + the `viewable_files` manifest the admin UI reads)
+# and a second extractor that downloaded the SAME bundle AGAIN and re-uploaded
+# every file to `artifacts/files/` under a DIFFERENT sanitizer and DIFFERENT caps
+# (25 MB/50 files vs 8 MiB/25 files). The two copies could therefore disagree
+# about which files exist and under what names.
+#
+# They are now ONE pass. These tests cover that single pipeline: it downloads the
+# bundle exactly once, sanitizes once, uploads once, applies ONE cap policy, and
+# records the result on BOTH persisted surfaces (the `viewable_files` manifest and
+# the `ComputeJobFile` signing-allowlist rows) from that single pass — so the two
+# surfaces cannot drift apart.
 
 
 def _make_viewable_tar_bundle(files: dict[str, bytes]) -> bytes:
@@ -17607,32 +17621,75 @@ def _make_viewable_tar_bundle(files: dict[str, bytes]) -> bytes:
     return _make_tar_gz_bundle(files)
 
 
-async def _create_compute_job_for_test(db_session) -> uuid.UUID:
-    """Create a minimal Project + ComputeJob and return the job UUID.
+async def _create_bundle_compute_job(db_session, backend: str = "gcp") -> ComputeJob:
+    """Create a minimal Project + ComputeJob on a bundle-producing backend.
 
-    Required because ComputeJobFile has a FK to computejob.id.
+    A real ``ComputeJob`` (not just its id) is required because the single pipeline
+    is backend-aware: it reads the durable bundle for gcp/runner-subprocess jobs and
+    walks the on-disk artifact dir for local ones.
     """
     project = Project(name=f"vf-test-{uuid.uuid4().hex[:8]}", user_id="test")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    job = ComputeJob(
-        project_id=project.id,
-        backend="local-subprocess",
-    )
+    job = ComputeJob(project_id=project.id, backend=backend)
     db_session.add(job)
     await db_session.commit()
     await db_session.refresh(job)
-    return job.id
+    return job
+
+
+def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = None):
+    """Point the single viewable pipeline at an in-memory bundle; record its calls.
+
+    Returns a dict tallying ``downloads`` and ``uploads`` so a test can assert the
+    pipeline fetched the bundle EXACTLY ONCE — the core of the duplicate-pipeline
+    fix — rather than the 2x it used to.
+    """
+    calls: dict = {"downloads": 0, "uploads": []}
+
+    async def _fake_download(job_id):
+        calls["downloads"] += 1
+        return bundle
+
+    async def _fake_upload(job_id, basename, data, content_type):
+        if fail_on is not None and fail_on in basename:
+            raise RuntimeError("simulated GCS upload error")
+        calls["uploads"].append(
+            {
+                "basename": basename,
+                "size": len(data),
+                "content_type": content_type,
+            }
+        )
+        return (
+            f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+        )
+
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", _fake_download
+    )
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_upload)
+    return calls
+
+
+async def _job_files(db_session, job_id) -> list[ComputeJobFile]:
+    return (
+        (
+            await db_session.execute(
+                select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_from_bundle_roundtrips(
-    db_session, monkeypatch
-):
-    """A bundle with a mix of viewable and non-viewable files — only images and
-    videos produce ComputeJobFile rows with correct media_type and content_type."""
-    job_id = await _create_compute_job_for_test(db_session)
+async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkeypatch):
+    """A bundle mixing viewable and non-viewable files — only images and videos are
+    persisted, on BOTH surfaces, with correct media_type and content_type."""
+    job = await _create_bundle_compute_job(db_session)
     png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
     jpg_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
     mp4_data = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 100
@@ -17648,77 +17705,61 @@ async def test_extract_viewable_files_from_bundle_roundtrips(
             "./diagram.svg": b"<svg></svg>",
             "./output.mp4": mp4_data,
             "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
-            # Non-viewable — should be skipped.
+            # Non-viewable — must be skipped.
             "./terminal.json": b'{"status": "SUCCEEDED"}',
             "./command.log": b"all good\n",
             "./script.py": b"print('hello')",
             "./results.txt": b"accuracy: 0.95",
         }
     )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    # Mock the GCS upload to return a predictable URI and never fail.
-    uploaded: list[dict] = []
-
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append(
-            {
-                "job_id": job_id_arg,
-                "relpath": safe_relpath,
-                "size": len(data_bytes),
-                "content_type": content_type,
-            }
-        )
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
-
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    # 7 viewable files extracted (SVG is excluded fail-closed).
-    assert count == 7
-    assert len(uploaded) == 7
+    # 7 viewable files (SVG excluded fail-closed), uploaded ONCE each.
+    assert len(manifest) == 7
+    assert dropped == 0
+    assert len(calls["uploads"]) == 7
+    assert calls["downloads"] == 1, "the bundle must be downloaded exactly once"
 
-    # Verify DB rows.
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
+    rows = await _job_files(db_session, job.id)
     assert len(rows) == 7
 
-    # Verify specific files by safe_relpath.
     by_name = {r.safe_relpath: r for r in rows}
-    assert "plot.png" in by_name
     assert by_name["plot.png"].media_type == "image"
     assert by_name["plot.png"].content_type == "image/png"
     assert by_name["output.mp4"].media_type == "video"
     assert by_name["output.mp4"].content_type == "video/mp4"
-    # SVG must NOT be persisted as a signable/viewable ComputeJobFile — it is
-    # excluded fail-closed on BOTH surfaces (script-execution risk).
+
+    # SVG must NOT be persisted as a signable/viewable file — excluded fail-closed
+    # on BOTH surfaces (script-execution risk when served from a signed URL).
     assert "diagram.svg" not in by_name
+    assert not any(e["filename"] == "diagram.svg" for e in manifest)
 
     # Non-viewable files must NOT appear.
-    assert "terminal.json" not in by_name
-    assert "command.log" not in by_name
-    assert "script.py" not in by_name
-    assert "results.txt" not in by_name
+    for skipped in ("terminal.json", "command.log", "script.py", "results.txt"):
+        assert skipped not in by_name
+
+    # THE ANTI-DIVERGENCE INVARIANT: both persisted surfaces are written from the
+    # SAME single sanitize+upload pass, so they must agree exactly — same files,
+    # same canonical URIs. The old two-pipeline design could not guarantee this.
+    assert {r.storage_uri for r in rows} == {e["storage_uri"] for e in manifest}
+    assert {r.safe_relpath for r in rows} == {e["filename"] for e in manifest}
+    assert all("/artifacts/viewable/" in r.storage_uri for r in rows)
+
+    # The manifest is stamped on the job for the admin UI / strategic context.
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_file_count") == 7
+    assert len(meta.get("viewable_files") or []) == 7
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_non_viewable_skipped(db_session, monkeypatch):
-    """Files with extensions not in the viewable set are never extracted."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
-
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append({"relpath": safe_relpath})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
-
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
+async def test_viewable_pipeline_skips_non_viewable_files(db_session, monkeypatch):
+    """Files with extensions outside the viewable set are never persisted."""
+    job = await _create_bundle_compute_job(db_session)
     bundle = _make_viewable_tar_bundle(
         {
             "./data.json": b'{"x": 1}',
@@ -17729,163 +17770,146 @@ async def test_extract_viewable_files_non_viewable_skipped(db_session, monkeypat
             "./index.html": b"<html></html>",  # .html is not in the viewable set
         }
     )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    assert count == 0
-    assert len(uploaded) == 0
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
-    assert len(rows) == 0
+    assert manifest == []
+    assert dropped == 0
+    assert calls["uploads"] == []
+    assert await _job_files(db_session, job.id) == []
+    # The pass still records that it RAN (count 0) — that stamp is the idempotency
+    # marker, so a zero-file job must not re-download on re-entry either.
+    assert (job.polling_metadata or {}).get("viewable_file_count") == 0
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_size_cap(db_session, monkeypatch):
-    """Files larger than 25 MB are skipped; smaller files in the same bundle
-    are still extracted."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
+async def test_viewable_pipeline_enforces_single_per_file_size_cap(
+    db_session, monkeypatch
+):
+    """Files over the canonical per-file cap are skipped; smaller ones still persist.
 
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append({"relpath": safe_relpath, "size": len(data_bytes)})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+    ONE cap policy now governs both surfaces. Previously the two pipelines
+    disagreed (8 MiB vs 25 MB), so a 20 MB plot was present under one prefix and
+    absent from the other.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
 
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
-    # 26 MB oversized JPEG (skip), 1 KB normal PNG (extract).
-    big_file = b"\xff\xd8\xff\xe0" + b"X" * (26 * 1024 * 1024)
-    small_file = b"\x89PNG\r\n\x1a\n" + b"Y" * 1024
-
+    oversized = b"\xff\xd8\xff\xe0" + b"X" * (cap + 1024)
+    small = b"\x89PNG\r\n\x1a\n" + b"Y" * 1024
     bundle = _make_viewable_tar_bundle(
         {
-            "./huge_photo.jpg": big_file,
-            "./tiny_plot.png": small_file,
+            "./huge_photo.jpg": oversized,
+            "./tiny_plot.png": small,
         }
     )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, _dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    assert count == 1
-    assert len(uploaded) == 1
-    assert uploaded[0]["relpath"] == "tiny_plot.png"
+    assert len(manifest) == 1
+    assert manifest[0]["filename"] == "tiny_plot.png"
+    assert len(calls["uploads"]) == 1
 
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
+    rows = await _job_files(db_session, job.id)
     assert len(rows) == 1
     assert rows[0].safe_relpath == "tiny_plot.png"
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_50_file_cap(db_session, monkeypatch):
-    """At most 50 viewable files are extracted per bundle; excess are dropped."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
+async def test_viewable_pipeline_enforces_single_file_count_cap(
+    db_session, monkeypatch
+):
+    """At most the canonical N viewable files are persisted; the excess is REPORTED.
 
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append({"relpath": safe_relpath})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
+    The old duplicate pipeline capped at a different count (50 vs 25) and took the
+    first N in arbitrary tar order; the canonical pass sorts deterministically
+    before capping and reports how many it dropped.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    cap = compute_backends_module._MAX_VIEWABLE_FILE_COUNT
+    overflow = 5
 
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
-    # Create 60 PNG files — only the first 50 should be extracted.
     members = {}
-    for i in range(60):
+    for i in range(cap + overflow):
         members[f"./plot_{i:03d}.png"] = b"\x89PNG\r\n\x1a\n" + str(i).encode() * 10
     bundle = _make_viewable_tar_bundle(members)
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    assert count == 50
-    assert len(uploaded) == 50
+    assert len(manifest) == cap
+    assert dropped == overflow, "the pass must report the files it dropped"
+    assert len(calls["uploads"]) == cap
+    assert len(await _job_files(db_session, job.id)) == cap
 
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
-    assert len(rows) == 50
+    # Deterministic selection: the sorted-first `cap` filenames, not tar order.
+    expected = sorted(f"plot_{i:03d}.png" for i in range(cap + overflow))[:cap]
+    assert [e["filename"] for e in manifest] == expected
+    assert (job.polling_metadata or {}).get("viewable_files_dropped") == overflow
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_path_sanitization(db_session, monkeypatch):
-    """Tar members with ``..`` segments or absolute paths are rejected."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
+async def test_viewable_pipeline_sanitizes_paths_and_keeps_subdir_context(
+    db_session, monkeypatch
+):
+    """Traversal/absolute members are rejected; subdir context is folded, not lost.
 
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append({"relpath": safe_relpath})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
-
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
+    ONE sanitizer now. ``arm1/reward.png`` and ``arm2/reward.png`` are distinct
+    objects (``arm1__reward.png`` / ``arm2__reward.png``) instead of colliding, and
+    ``..`` / absolute members are refused outright.
+    """
+    job = await _create_bundle_compute_job(db_session)
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00"
-
     bundle = _make_viewable_tar_bundle(
         {
             "./safe_plot.png": png,
             "../escape.png": png,
             "./subdir/../../escape2.png": png,
             "/etc/passwd.png": png,  # absolute path rejected
-            "./deep/nested/ok.png": png,
+            "./arm1/reward.png": png,
+            "./arm2/reward.png": png,
         }
     )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, _dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    # Only safe_plot.png and deep/nested/ok.png are extracted.
-    assert count == 2
-    extracted_names = {u["relpath"] for u in uploaded}
-    assert extracted_names == {"safe_plot.png", "deep/nested/ok.png"}
+    persisted = {e["filename"] for e in manifest}
+    assert persisted == {"safe_plot.png", "arm1__reward.png", "arm2__reward.png"}
+    assert {u["basename"] for u in calls["uploads"]} == persisted
 
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
-    assert len(rows) == 2
-    assert {r.safe_relpath for r in rows} == {"safe_plot.png", "deep/nested/ok.png"}
+    # No traversal/absolute member may reach storage under any name.
+    for uploaded in calls["uploads"]:
+        assert ".." not in uploaded["basename"]
+        assert not uploaded["basename"].startswith("/")
+
+    rows = await _job_files(db_session, job.id)
+    assert {r.safe_relpath for r in rows} == persisted
+    # Same-named plots from different arms stay DISTINCT rows (no collision).
+    assert len(rows) == 3
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_upload_failure_non_blocking(
+async def test_viewable_pipeline_upload_failure_is_non_blocking(
     db_session, monkeypatch
 ):
-    """A GCS upload failure on one file does not prevent extraction of
-    the remaining viewable files in the bundle."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
-    call_count = 0
-
-    async def _flakey_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        nonlocal call_count
-        call_count += 1
-        if "fail_me" in safe_relpath:
-            raise RuntimeError("simulated GCS upload error")
-        uploaded.append({"relpath": safe_relpath})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
-
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _flakey_upload)
-
+    """One file's upload failure must not prevent the others being persisted."""
+    job = await _create_bundle_compute_job(db_session)
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00"
-
     bundle = _make_viewable_tar_bundle(
         {
             "./good_a.png": png,
@@ -17895,83 +17919,109 @@ async def test_extract_viewable_files_upload_failure_non_blocking(
             "./good_c.png": png,
         }
     )
+    _calls = _mock_viewable_storage(monkeypatch, bundle, fail_on="fail_me")
 
-    count = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest, _dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    # 3 of 5 succeeded.
-    assert count == 3
-    assert len(uploaded) == 3
-    extracted_names = {u["relpath"] for u in uploaded}
-    assert extracted_names == {"good_a.png", "good_b.png", "good_c.png"}
-
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
-    )
-    assert len(rows) == 3
+    # 3 of 5 survived; only durably-stored files appear on either surface.
+    assert {e["filename"] for e in manifest} == {
+        "good_a.png",
+        "good_b.png",
+        "good_c.png",
+    }
+    rows = await _job_files(db_session, job.id)
+    assert {r.safe_relpath for r in rows} == {
+        "good_a.png",
+        "good_b.png",
+        "good_c.png",
+    }
+    # A file that never landed in storage must NOT be advertised as signable.
+    assert not any("fail_me" in r.storage_uri for r in rows)
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_idempotent(db_session, monkeypatch):
-    """Calling extraction twice on the same job creates no duplicate rows
-    because of the UniqueConstraint on (compute_job_id, object_name)."""
-    job_id = await _create_compute_job_for_test(db_session)
-    uploaded: list[dict] = []
+async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
+    db_session, monkeypatch
+):
+    """Re-entry must not re-download, re-upload, or duplicate rows.
 
-    async def _fake_upload(job_id_arg, safe_relpath, data_bytes, content_type):
-        uploaded.append({"relpath": safe_relpath})
-        return f"gs://test-bucket/compute-jobs/{job_id_arg}/artifacts/files/{safe_relpath}"
-
-    monkeypatch.setattr(storage, "upload_compute_job_media_file", _fake_upload)
-
+    This is the regression cover for the duplicate-pipeline waste: the SAME terminal
+    transition reaches both the call site and ``_link_terminal_artifact``, and the
+    bundle must still be fetched exactly ONCE across both.
+    """
+    job = await _create_bundle_compute_job(db_session)
     png = b"\x89PNG\r\n\x1a\n" + b"Z" * 42
     mp4 = b"\x00\x00\x00\x18ftypmp42" + b"W" * 42
-    bundle = _make_viewable_tar_bundle(
-        {
-            "./chart.png": png,
-            "./anim.mp4": mp4,
-        }
-    )
+    bundle = _make_viewable_tar_bundle({"./chart.png": png, "./anim.mp4": mp4})
+    calls = _mock_viewable_storage(monkeypatch, bundle)
 
-    # First extraction.
-    count1 = await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    manifest1, _d1 = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
-    assert count1 == 2
-    assert len(uploaded) == 2
+    assert len(manifest1) == 2
+    assert calls["downloads"] == 1
+    assert len(calls["uploads"]) == 2
 
-    # Second extraction with the same bundle — should NOT create new rows.
-    # The function tries to insert but the savepoint catches the unique-constraint
-    # violation; total rows must still be 2.
-    await compute_jobs.extract_viewable_files_from_bundle(
-        db_session, job_id, bundle
+    # Second pass over the same job — the idempotency guard must short-circuit it.
+    manifest2, _d2 = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
     )
     await db_session.commit()
 
-    rows = (
-        (await db_session.execute(select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job_id)))
-        .scalars()
-        .all()
+    assert calls["downloads"] == 1, (
+        "re-entry must NOT re-download the bundle — this is exactly the waste the "
+        "single-pipeline collapse removes"
     )
-    assert len(rows) == 2, f"Expected 2 rows after idempotent re-extraction, got {len(rows)}"
-    # Uploads should NOT have been called a second time in the idempotent pass
-    # (we don't enforce this — the function may still upload then fail at
-    # insert — but row count is the invariant).
+    assert len(calls["uploads"]) == 2, "re-entry must NOT re-upload any file"
+    assert {e["filename"] for e in manifest2} == {e["filename"] for e in manifest1}
+
+    rows = await _job_files(db_session, job.id)
+    assert len(rows) == 2, f"expected no duplicate rows on re-entry, got {len(rows)}"
 
 
 @pytest.mark.asyncio
-async def test_extract_viewable_files_empty_or_bad_bundle(db_session):
-    """Empty input and unparseable bundles return 0 without raising."""
-    job_id = uuid.uuid4()
+async def test_viewable_pipeline_failsoft_on_empty_or_bad_bundle(
+    db_session, monkeypatch
+):
+    """An empty / unparseable bundle yields no files and NEVER raises.
 
-    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"") == 0
-    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"not-a-tar") == 0
-    assert await compute_jobs.extract_viewable_files_from_bundle(db_session, job_id, b"\x00" * 100) == 0
+    Viewable persistence must never block a job's terminal completion.
+    """
+    for blob in (b"", b"not-a-tar", b"\x00" * 100):
+        job = await _create_bundle_compute_job(db_session)
+        calls = _mock_viewable_storage(monkeypatch, blob)
+
+        manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+            db_session, job
+        )
+        await db_session.commit()
+
+        assert manifest == []
+        assert dropped == 0
+        assert calls["uploads"] == []
+        assert await _job_files(db_session, job.id) == []
+
+
+@pytest.mark.asyncio
+async def test_viewable_pipeline_skips_backends_without_a_bundle(
+    db_session, monkeypatch
+):
+    """A local-subprocess job has no durable bundle — the pass must not fetch one."""
+    job = await _create_bundle_compute_job(db_session, backend="local-subprocess")
+    calls = _mock_viewable_storage(monkeypatch, b"")
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert manifest == []
+    assert dropped == 0
+    assert calls["downloads"] == 0, "a local job must never download a bundle"
 
 
 # ── No-progress watchdog ──────────────────────────────────────────────────────

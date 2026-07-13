@@ -35,6 +35,10 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.orchestrator_runner_dispatch import (
+    AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+    FORCED_RUNNER_TARGET_CONTEXT_KEY,
+)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -202,6 +206,72 @@ class TestFailStaleLocalRunnerHolds:
         assert "offline" in message
         assert "require_local_runner" not in message
         assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_forced_runner_hold_timeout_names_pinned_runner(self, db_session):
+        """A timed-out FORCED-runner pin fails with a truthful reason naming the
+        pinned runner — the bounded-wait contract its sibling pins already had.
+
+        Regression cover for the unbounded-hold gap: ``forced_runner_target_id``
+        stamped ``awaiting_forced_runner_since``, but NO sweep read that stamp, so
+        the task sat QUEUED forever with nobody watching. It must now terminal-FAIL
+        at the 6h timeout like the strict payload pin does — and the reason must
+        name the forced runner, never the generic require_local_runner wording
+        (which would lie: other runners may well have been online and idle; the pin
+        is what excluded them).
+        """
+        project = await _make_project(db_session)
+        forced_runner_id = str(uuid.uuid4())
+        task = await _make_held_task(
+            db_session,
+            project.id,
+            held_ago_seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600,
+            stamp=False,
+        )
+        ctx = dict(task.context or {})
+        ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = (
+            _utcnow() - timedelta(seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600)
+        ).isoformat()
+        ctx[FORCED_RUNNER_TARGET_CONTEXT_KEY] = forced_runner_id
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 1, "a forced-runner hold past 6h must be terminal-failed"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        message = task.latest_status_message or ""
+        assert "forced_runner_target_id" in message
+        assert forced_runner_id in message, "the reason must name the pinned runner"
+        assert "require_local_runner" not in message, (
+            "must not reuse the generic require-local wording — it would lie about "
+            "why the task was held"
+        )
+        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_keeps_recent_forced_runner_hold(self, db_session):
+        """A forced-runner hold still inside the 6h window keeps waiting."""
+        project = await _make_project(db_session)
+        task = await _make_held_task(
+            db_session, project.id, held_ago_seconds=60, stamp=False
+        )
+        ctx = dict(task.context or {})
+        ctx[AWAITING_FORCED_RUNNER_CONTEXT_KEY] = (
+            _utcnow() - timedelta(seconds=60)
+        ).isoformat()
+        ctx[FORCED_RUNNER_TARGET_CONTEXT_KEY] = str(uuid.uuid4())
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
     async def test_keeps_recent_hold(self, db_session):
