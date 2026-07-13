@@ -2862,5 +2862,33 @@ async def test_gpu_contamination_audit_returns_completed_at(
     # and read back as naive UTC (tz stripped), matching the codebase-wide naive-UTC
     # convention and the canonical serializer. So the serialized value carries no
     # offset — compare against the naive-UTC round-trip, not the aware original.
+    #
+    # Anchored to the INPUT LITERAL (`suspect_completed`), deliberately NOT to
+    # `job.completed_at.isoformat()`: the latter is a self-consistency round-trip
+    # that would still pass if the storage layer mangled the timestamp, since both
+    # sides of the comparison would shift together.
     assert item["completed_at"] == suspect_completed.replace(tzinfo=None).isoformat()
     assert "ended_at" not in item
+    # status must serialize to the plain enum value. job.status arrives as a str on
+    # this load path, so a bare `.value` raises AttributeError and 500s the endpoint.
+    assert item["status"] == ComputeJobStatus.SUCCEEDED.value
+
+
+@pytest.mark.asyncio
+async def test_gpu_contamination_audit_non_member_404(client: AsyncClient, db_session):
+    """The audit is project-scoped: a non-member gets 404, not a 500.
+
+    Regression guard for a malformed access-control call — the endpoint used to
+    invoke ``_get_user_project_with_role(project_id, user, session,
+    required_role=...)``, passing the user DICT instead of ``user["user_id"]``
+    and a kwarg the helper does not accept. That raised TypeError on EVERY
+    request (500), so the endpoint was unreachable and its scoping never ran.
+    A well-formed call denies the non-member with the helper's 404.
+    """
+    project = await _make_project(db_session, name="Foreign GPU Project")
+    # Deliberately NO ProjectMember row for the test user.
+
+    resp = await client.get(
+        f"/api/admin/compute-jobs/gpu-contamination-audit?project_id={project.id}"
+    )
+    assert resp.status_code == 404, resp.text

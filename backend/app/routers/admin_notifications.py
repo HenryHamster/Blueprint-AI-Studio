@@ -31,7 +31,13 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.shared_state import limiter
-from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+from app.admin import (
+    _ROLE_LEVEL,
+    _get_user_project,
+    _get_user_project_with_role,
+    _member_project_ids,
+    _user_project_ids,
+)
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
 from app.project_message_creation import (
@@ -437,7 +443,8 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    # Verify alert belongs to user's project (via membership)
+    # Verify alert belongs to user's project (via membership) with member+
+    # role (viewers are read-only and may not mutate alert state)
     member = (
         await session.execute(
             select(ProjectMember).where(
@@ -448,6 +455,10 @@ async def dismiss_alert(
     ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Alert not found")
+    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL["member"]:
+        raise HTTPException(
+            status_code=403, detail="Requires member role on this project"
+        )
     alert.dismissed_at = _utcnow()
     session.add(alert)
     await session.commit()
@@ -496,6 +507,10 @@ async def acknowledge_alert(
     ).scalar_one_or_none()
     if not member:
         raise HTTPException(status_code=404, detail="Alert not found")
+    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL["member"]:
+        raise HTTPException(
+            status_code=403, detail="Requires member role on this project"
+        )
     if alert.acknowledged_at is None:
         alert.acknowledged_at = _utcnow()
         session.add(alert)
@@ -512,22 +527,63 @@ async def dismiss_all_alerts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    stmt = update(Alert).where(
-        Alert.dismissed_at.is_(None),
-        Alert.project_id.in_(_user_project_ids(current_user["user_id"])),
-    )
+    """Dismiss alerts in bulk. Only projects where the caller is member+ are
+    mutated — viewers are read-only and may not silence operator escalation.
+
+    Two shapes, deliberately different:
+
+    * **Explicitly targeted** (``project_id`` supplied) — a 403 if the caller
+      lacks member+ on it. An explicitly-targeted mutation that silently no-ops
+      (200 / ``dismissed_count: 0``) tells the caller nothing about WHY nothing
+      happened; gates must emit their reason.
+    * **Unfiltered bulk** ("dismiss everything I can") — silent scoping is
+      CORRECT: a caller who is member on 3 projects and viewer on a 4th should
+      dismiss the 3, not have the whole call rejected. ``skipped_count`` reports
+      what was left behind rather than hiding it.
+    """
+    user_id = current_user["user_id"]
+    pid: uuid.UUID | None = None
     if project_id:
-        stmt = stmt.where(Alert.project_id == uuid.UUID(project_id))
+        try:
+            pid = uuid.UUID(project_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid project_id format")
+        # Explicit target → say why, don't silently dismiss nothing.
+        await _get_user_project_with_role(pid, user_id, session, "member")
+
+    filters = [Alert.dismissed_at.is_(None)]
+    if pid is not None:
+        filters.append(Alert.project_id == pid)
     if domain:
-        stmt = stmt.where(Alert.domain == domain)
+        filters.append(Alert.domain == domain)
     if event_type:
-        stmt = stmt.where(Alert.event_type == event_type)
+        filters.append(Alert.event_type == event_type)
     if source:
-        stmt = stmt.where(Alert.source == source)
-    stmt = stmt.values(dismissed_at=_utcnow())
+        filters.append(Alert.source == source)
+
+    # Alerts the caller can SEE but may not dismiss (viewer-only projects).
+    # Always 0 on the explicit-target path, which 403s above.
+    skipped_count = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Alert)
+            .where(
+                *filters,
+                Alert.project_id.in_(_user_project_ids(user_id)),
+                Alert.project_id.notin_(_member_project_ids(user_id)),
+            )
+        )
+        or 0
+    )
+
+    stmt = (
+        update(Alert)
+        .where(*filters, Alert.project_id.in_(_member_project_ids(user_id)))
+        .values(dismissed_at=_utcnow())
+    )
     result = await session.execute(stmt)
     await session.commit()
-    return {"dismissed_count": result.rowcount}
+    return {"dismissed_count": result.rowcount, "skipped_count": skipped_count}
 
 
 # ── Notification Dispatch Stats Endpoint ─────────────────────────────────────
@@ -778,11 +834,14 @@ async def create_message(
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
-    # Verify user has access. The returned instance is used for the access
-    # check and for resolving the citation-grounding branch context below; the
-    # routine-digest branch further down re-reads the project under a row lock
-    # so its read-append-write on running_update is concurrency-safe.
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    # Verify user has write access (member+; viewers are read-only). The
+    # returned instance is used for the access check and for resolving the
+    # citation-grounding branch context below; the routine-digest branch
+    # further down re-reads the project under a row lock so its
+    # read-append-write on running_update is concurrency-safe.
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
 
     result = await create_operator_project_message(
         session,
@@ -824,8 +883,10 @@ async def resolve_message(
     msg = await session.get(ProjectMessage, message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
-    # Verify user has access to the project
-    await _get_user_project(msg.project_id, current_user["user_id"], session)
+    # Verify user has write access to the project (member+; viewers are read-only)
+    await _get_user_project_with_role(
+        msg.project_id, current_user["user_id"], session, "member"
+    )
 
     message_project_uuid = msg.project_id
     message_type = msg.message_type
@@ -1007,8 +1068,10 @@ async def delete_message(
     msg = await session.get(ProjectMessage, message_id)
     message_response: dict[str, Any] | None = None
     if msg:
-        # Verify user has access to the project
-        await _get_user_project(msg.project_id, current_user["user_id"], session)
+        # Verify user has write access to the project (member+; viewers are read-only)
+        await _get_user_project_with_role(
+            msg.project_id, current_user["user_id"], session, "member"
+        )
         message_response = {**admin_message_dict(msg), "status": "deleted"}
         await session.delete(msg)
         await session.commit()
@@ -1192,7 +1255,16 @@ async def put_messages_workbench_state(
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
-    await _get_user_project(pid, current_user["user_id"], session)
+    # NOT per-user personal UI state, despite living under /messages/* alongside
+    # last-seen / noise-prefs / saved-views / temp-mutes / mute-window (which ARE
+    # personal — each is keyed by a UniqueConstraint("user_id","project_id") and
+    # stays viewer-writable). persist_strategic_workbench_update takes
+    # with_vision_locked() to read-modify-write the PROJECT-GLOBAL Project.vision
+    # column, and on a client-supplied interaction_mode transition arms a sticky,
+    # breaker-bypassing, cooldown-bypassing strategic refresh with
+    # origin=ORIGIN_OPERATOR, persisting an operator-supplied steering excerpt.
+    # Without the member+ floor a viewer can steer the autonomous strategist.
+    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
 
     if workbench_state_size_bytes(payload.workbench) > WORKBENCH_STATE_MAX_BYTES:
         raise HTTPException(

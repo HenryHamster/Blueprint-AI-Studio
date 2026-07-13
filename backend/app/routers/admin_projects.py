@@ -31,7 +31,12 @@ from app.models import (
     notify_tasks_terminated,
 )
 from app.auth import get_current_user
-from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+from app.admin import (
+    _get_user_project,
+    _get_user_project_with_role,
+    _member_project_ids,
+    _user_project_ids,
+)
 from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
 from app.ci_resolution import (
@@ -1337,14 +1342,41 @@ async def pause_all_autonomous(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Disable autonomous mode on all projects at once."""
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    """Disable autonomous mode on all projects at once.
+
+    Only pauses projects where the caller holds member+ role — viewers are
+    documented read-only and may not mutate project state. This route takes no
+    ``project_id``, so it is inherently the "pause everything I can" bulk shape:
+    scoping viewer-only projects out silently is correct (a caller who is member
+    on 3 projects and viewer on a 4th should pause the 3, not be rejected
+    outright). ``skipped_count`` reports what was left running rather than
+    hiding it.
+    """
+    user_project_ids = _member_project_ids(current_user["user_id"])
     user_project_count = int(
         (
             await session.scalar(
                 select(func.count())
                 .select_from(ProjectMember)
-                .where(ProjectMember.user_id == current_user["user_id"])
+                .where(
+                    ProjectMember.user_id == current_user["user_id"],
+                    ProjectMember.role.in_(["member", "owner"]),
+                )
+            )
+        )
+        or 0
+    )
+    # Projects the caller can see but not pause (viewer-only), still autonomous.
+    skipped_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(Project)
+                .where(
+                    Project.id.in_(_user_project_ids(current_user["user_id"])),
+                    Project.id.notin_(_member_project_ids(current_user["user_id"])),
+                    Project.autonomous_enabled.is_(True),
+                )
             )
         )
         or 0
@@ -1373,7 +1405,7 @@ async def pause_all_autonomous(
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()
-    return {"paused": len(projects)}
+    return {"paused": len(projects), "skipped_count": skipped_count}
 
 
 @router.get("/projects/{project_id}/directions/task-counts")

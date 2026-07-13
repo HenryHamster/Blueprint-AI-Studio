@@ -116,13 +116,17 @@ def _assert_message_event_payload(
     assert len(json.dumps(payload, default=str).encode("utf-8")) < 800
 
 
-async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
-    """Create a project with the given user as owner, plus the owner membership."""
+async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", role="owner"):
+    """Create a project with the given user as a member, plus the membership row.
+
+    ``role`` defaults to ``owner``; pass ``viewer``/``member`` to exercise the
+    role floor on mutating endpoints (viewer is documented read-only).
+    """
     project = Project(name=name, user_id=owner_id)
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    member = ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
+    member = ProjectMember(project_id=project.id, user_id=owner_id, role=role)
     session.add(member)
     await session.commit()
     return project
@@ -3054,6 +3058,133 @@ class TestPurgeArchive:
         assert surviving.parent_task_id is None
 
 
+class TestArchiveRoleFloor:
+    """bulk-archive / purge-archive are mutations → member+ only.
+
+    Both were scoped by membership alone (any role), while the sibling
+    ``POST /tasks/bulk-action`` already filtered ``role.in_(["member","owner"])``
+    — so this was an inconsistency, not a design choice. purge-archive is the
+    sharpest case: it PERMANENTLY deletes up to 5000 task rows per call, and a
+    viewer is documented read-only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_purge_archive_skips_viewer_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer must not be able to permanently delete another member's tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Viewer Purge", role="viewer"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["deleted_count"] == 0
+
+        # The archived task on the viewer-only project must still exist.
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None
+
+    @pytest.mark.asyncio
+    async def test_purge_archive_deletes_member_project_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still purge."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Member Purge", role="member"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=True
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["deleted_count"] >= 1
+
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_archive_skips_viewer_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer must not be able to bulk-archive another member's tasks."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Viewer Archive", role="viewer"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-archive", json={"task_ids": [str(task_id)]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived_count"] == 0
+
+        await db_session.refresh(task)
+        assert task.archived is False
+
+    @pytest.mark.asyncio
+    async def test_bulk_archive_archives_member_project_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still archive."""
+        from testing.factories import make_task
+
+        project = await _make_project(
+            db_session, name="Member Archive", role="member"
+        )
+        task = make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, archived=False
+        )
+        db_session.add(task)
+        await db_session.commit()
+        task_id = task.id
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-archive", json={"task_ids": [str(task_id)]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived_count"] == 1
+
+        db_session.expunge_all()
+        row = (
+            (await db_session.execute(select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+        assert row is not None and row.archived is True
+
+
 class TestResetProjectStateHelper:
     def test_reset_project_state_clears_only_target(self):
         """reset_project_state pops one project's keys, leaves others intact."""
@@ -3092,6 +3223,51 @@ class TestAutonomousMode:
         resp = await client.post("/api/admin/autonomous/pause-all")
         assert resp.status_code == 200
         assert resp.json()["paused"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pause_all_skips_viewer_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """pause-all must not touch projects where the caller is only a viewer.
+
+        Viewers are read-only: disabling autonomous mode is a mutation they may
+        not perform, so the project is left running and excluded from the count.
+
+        This route takes no ``project_id``, so it is inherently the "pause
+        everything I can" bulk shape — scoping viewer-only projects out silently
+        is correct, but it must report what it left RUNNING via ``skipped_count``
+        rather than hiding it.
+        """
+        viewed = await _make_project(db_session, name="Viewed", role="viewer")
+        viewed.autonomous_enabled = True
+        db_session.add(viewed)
+        await db_session.commit()
+
+        resp = await client.post("/api/admin/autonomous/pause-all")
+        assert resp.status_code == 200
+        assert resp.json()["paused"] == 0
+        # The still-running viewer project is surfaced, not silently dropped.
+        assert resp.json()["skipped_count"] == 1
+
+        await db_session.refresh(viewed)
+        assert viewed.autonomous_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_pause_all_pauses_member_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can pause."""
+        owned = await _make_project(db_session, name="Member Project", role="member")
+        owned.autonomous_enabled = True
+        db_session.add(owned)
+        await db_session.commit()
+
+        resp = await client.post("/api/admin/autonomous/pause-all")
+        assert resp.status_code == 200
+        assert resp.json()["paused"] == 1
+
+        await db_session.refresh(owned)
+        assert owned.autonomous_enabled is False
 
     @pytest.mark.asyncio
     async def test_toggle_autonomous_enable(self, client: AsyncClient, db_session):
@@ -4037,6 +4213,165 @@ class TestAlerts:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_dismiss_alert_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not suppress operator escalation by dismissing an alert."""
+        project = await _make_project(db_session, name="Viewer Alerts", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Do not silence me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/dismiss")
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_alert_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not acknowledge an alert (read-only role)."""
+        project = await _make_project(db_session, name="Viewer Ack", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Unacknowledged",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.acknowledged_at is None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_alert_member_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can ack."""
+        project = await _make_project(db_session, name="Member Ack", role="member")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Acknowledge me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(alert)
+        assert alert.acknowledged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_skips_viewer_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """dismiss-all must leave alerts on viewer-only projects untouched.
+
+        The UNFILTERED bulk shape ("dismiss everything I can") scopes silently
+        rather than 403-ing the whole call — a caller who is member on 3 projects
+        and viewer on a 4th should dismiss the 3. But it must report what it left
+        behind via ``skipped_count`` instead of hiding it.
+        """
+        project = await _make_project(db_session, name="Viewer Bulk", role="viewer")
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Still open",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post("/api/admin/alerts/dismiss-all")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["dismissed_count"] == 0
+        # The no-op is surfaced, not silent.
+        assert body["skipped_count"] == 1
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_explicit_viewer_project_id_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """An EXPLICITLY-targeted dismiss-all on a viewer project → 403, not a silent no-op.
+
+        Silent scoping is right for the unfiltered bulk case, but when the caller
+        names a specific project they cannot write to, returning 200 /
+        ``dismissed_count: 0`` tells them nothing about why nothing happened.
+        Gates must emit WHY.
+        """
+        project = await _make_project(
+            db_session, name="Viewer Targeted", role="viewer"
+        )
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Still open",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(
+            f"/api/admin/alerts/dismiss-all?project_id={project.id}"
+        )
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_all_explicit_member_project_id_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The explicit-target 403 must not over-reject a member."""
+        project = await _make_project(
+            db_session, name="Member Targeted", role="member"
+        )
+        alert = Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title="Dismiss me",
+            message="boom",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        resp = await client.post(
+            f"/api/admin/alerts/dismiss-all?project_id={project.id}"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["dismissed_count"] == 1
+        assert resp.json()["skipped_count"] == 0
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+
+    @pytest.mark.asyncio
     async def test_dismiss_all_alerts(self, client: AsyncClient, db_session):
         """All undismissed alerts across user's projects are dismissed."""
         project = await _make_project(db_session)
@@ -4152,6 +4487,102 @@ class TestMessages:
         data = resp.json()
         assert data["status"] == "created"
         assert "id" in data
+
+    @pytest.mark.asyncio
+    async def test_create_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not post to the project message board (read-only role)."""
+        project = await _make_project(db_session, name="Viewer Board", role="viewer")
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Viewers must not be able to write this.",
+            },
+        )
+        assert resp.status_code == 403, resp.text
+
+        # Nothing persisted.
+        from sqlalchemy import func as sa_func
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count(ProjectMessage.id)).where(
+                    ProjectMessage.project_id == project.id
+                )
+            )
+        ).scalar_one()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_create_message_member_allowed(
+        self, client: AsyncClient, db_session
+    ):
+        """The member floor must not over-reject: a member (not owner) can post."""
+        project = await _make_project(db_session, name="Member Board", role="member")
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Members can post.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not resolve someone else's message."""
+        project = await _make_project(db_session, name="Viewer Resolve", role="viewer")
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Bug stays open",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{msg.id}", json={"resolution": "wontfix"}
+        )
+        assert resp.status_code == 403, resp.text
+
+        await db_session.refresh(msg)
+        assert msg.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_delete_message_viewer_forbidden(
+        self, client: AsyncClient, db_session
+    ):
+        """A viewer may not delete a message off the board."""
+        project = await _make_project(db_session, name="Viewer Delete", role="viewer")
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BUG_REPORT,
+            from_type="user",
+            content="Must survive",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.delete(f"/api/admin/messages/{msg.id}")
+        assert resp.status_code == 403, resp.text
+
+        # The message must still exist.
+        still_there = await db_session.get(ProjectMessage, msg.id)
+        assert still_there is not None
 
     @pytest.mark.asyncio
     async def test_create_message_broadcasts_created_once_for_idempotent_send(
@@ -7191,6 +7622,91 @@ class TestMessagesWorkbenchState:
         assert marker["operator_count"] == 1
         assert "workday mode" in marker["excerpt"]
         assert "Operator workbench" in marker["excerpt"]
+
+    # ── Role floor ────────────────────────────────────────────────────────────
+    #
+    # PUT /messages/workbench-state looks like the five sibling PUT /messages/*
+    # routes (last-seen, noise-prefs, saved-views, temp-mutes, mute-window) that
+    # ARE per-user personal UI state — each keyed by a
+    # UniqueConstraint("user_id","project_id") — and stay viewer-writable.
+    #
+    # It is not one of them. persist_strategic_workbench_update takes
+    # with_vision_locked() to read-modify-write the PROJECT-GLOBAL Project.vision
+    # column, and on a client-supplied interaction_mode transition arms a sticky,
+    # breaker-bypassing, cooldown-bypassing strategic refresh with
+    # origin=ORIGIN_OPERATOR (see test_entering_active_mode_arms_strategic_refresh
+    # directly above). Without the member+ floor, a VIEWER can steer the
+    # autonomous strategist.
+
+    @pytest.mark.asyncio
+    async def test_viewer_cannot_persist_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """Viewer → 403, and no operator-origin refresh armed in Project.vision."""
+        project = await _make_project(
+            db_session, name="Viewer Workbench", role="viewer"
+        )
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                    "selected_refs": [],
+                },
+            },
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        # The project-global vision column must be untouched: no viewer-supplied
+        # steering excerpt, no operator-origin refresh armed.
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
+
+    @pytest.mark.asyncio
+    async def test_member_can_persist_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still steer."""
+        project = await _make_project(
+            db_session, name="Member Workbench", role="member"
+        )
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                    "selected_refs": [],
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None
+        assert marker["origin"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_viewer_can_still_read_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        """The GET is a read — the floor must not break viewer read access."""
+        project = await _make_project(
+            db_session, name="Viewer Workbench Read", role="viewer"
+        )
+
+        resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert resp.status_code == 200, resp.text
 
     @pytest.mark.asyncio
     async def test_repeating_same_active_mode_does_not_rearm(
@@ -22391,11 +22907,94 @@ class TestComputeExperimentTaskLaunch:
         assert resp.status_code == 422, resp.text
         assert "command" in resp.text
 
+    # ── Role floor ────────────────────────────────────────────────────────────
+    #
+    # This endpoint mints a compute_experiment with a FULL LAUNCH CONTRACT: it
+    # spends real GPU budget against the project's spend_cap_usd. Membership
+    # alone is not authorization to spend. Without the member+ floor, a viewer
+    # denied POST /tasks/{id}/rerun could simply launch a fresh GPU job here
+    # instead — and, by falling through to the auto-create branch, mint a shadow
+    # project they own.
+
+    async def _project_with_role(self, session, role, repo="compute"):
+        project = Project(
+            name=f"acme/{repo}",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(
+            ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role=role)
+        )
+        await session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_viewer_cannot_launch_compute_experiment(
+        self, client: AsyncClient, db_session
+    ):
+        """Viewer → 403, no task enqueued, and NO shadow project auto-created."""
+        from sqlalchemy import func as sa_func
+
+        project = await self._project_with_role(db_session, "viewer")
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=self._valid_payload()
+        )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+
+        # No compute_experiment task enqueued on the project...
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 0
+
+        # ...and the 403 must NOT have fallen through into the auto-create
+        # branch, which would hand the viewer a project they own outright.
+        projects = (
+            await db_session.execute(
+                select(sa_func.count(Project.id)).where(
+                    Project.github_owner == "acme", Project.github_repo == "compute"
+                )
+            )
+        ).scalar_one()
+        assert projects == 1
+
+    @pytest.mark.asyncio
+    async def test_member_can_launch_compute_experiment(
+        self, client: AsyncClient, db_session
+    ):
+        """The floor must not over-reject: a member (not owner) can still launch."""
+        from sqlalchemy import func as sa_func
+
+        project = await self._project_with_role(db_session, "member")
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment", json=self._valid_payload()
+        )
+
+        assert resp.status_code == 200, resp.text
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 1
+
 
 class TestRerunComputeExperiment:
     """POST /api/admin/tasks/{task_id}/rerun — re-run a compute_experiment."""
 
-    async def _project_with_task(self, session, **payload_overrides):
+    async def _project_with_task(self, session, role="owner", **payload_overrides):
         project = Project(
             name="acme/rerun",
             user_id=TEST_USER_ID,
@@ -22407,7 +23006,7 @@ class TestRerunComputeExperiment:
         session.add(project)
         await session.commit()
         await session.refresh(project)
-        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role=role))
         base_payload = {
             "type": "compute_experiment",
             "title": "GPU bench",
@@ -22515,6 +23114,39 @@ class TestRerunComputeExperiment:
         resp = await client.post(f"/api/admin/tasks/{task.id}/rerun", json={})
         assert resp.status_code == 422, resp.text
         assert "compute_experiment" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_rerun_viewer_forbidden(self, client: AsyncClient, db_session):
+        """A viewer may not relaunch a compute_experiment — it burns GPU spend.
+
+        Membership alone is not authorization to spend: the re-run enqueues a
+        new QUEUED task against the project's spend_cap_usd, so it requires the
+        member+ floor (403), and no child task may be created.
+        """
+        _, source = await self._project_with_task(db_session, role="viewer")
+
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 403, resp.text
+
+        children = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.parent_task_id == source.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert children == []
+
+    @pytest.mark.asyncio
+    async def test_rerun_member_allowed(self, client: AsyncClient, db_session):
+        """The member floor must not over-reject: a member (not owner) can re-run."""
+        _, source = await self._project_with_task(db_session, role="member")
+
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["parent_task_id"] == str(source.id)
 
 
 class TestBugReportCitationGate:
@@ -24224,6 +24856,70 @@ class TestCanaryAdversarialChallenge:
 
         assert resp.status_code == 409
         assert "already in flight" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_post_viewer_forbidden(self, client: AsyncClient, db_session):
+        """Viewer → 403: this commits a synthetic Task and spawns a REAL agent
+        task that executes on a VM (LLM spend + compute). Membership alone does
+        not authorize that — the sibling reset_circuit_breaker already takes the
+        member floor. No canary task may be persisted.
+        """
+        from unittest.mock import AsyncMock, patch
+        from sqlalchemy import func as sa_func
+
+        project = await _make_project(
+            db_session, name="Viewer Canary", role="viewer"
+        )
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+        ) as spawn:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 403, resp.text
+        assert "member" in resp.json()["error"]["message"].lower()
+        # The gate must reject BEFORE any agent work is spawned.
+        spawn.assert_not_awaited()
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count(Task.id)).where(Task.project_id == project.id)
+            )
+        ).scalar_one()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_post_member_allowed(self, client: AsyncClient, db_session):
+        """The floor must not over-reject: a member (not owner) can run the canary."""
+        from unittest.mock import AsyncMock, patch
+
+        project = await _make_project(
+            db_session, name="Member Canary", role="member"
+        )
+        grader_id = uuid.uuid4()
+        mock_grader = Task(
+            project_id=project.id,
+            title="[GRADE] canary grader",
+            payloads=[{"type": "investigate", "scope": "small"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        mock_grader.id = grader_id
+
+        with patch(
+            "app.routers.admin_debug.spawn_forward_quality_grader",
+            new_callable=AsyncMock,
+            return_value=mock_grader,
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/canary/adversarial-challenge"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["grader_task_id"] == str(grader_id)
 
     @pytest.mark.asyncio
     async def test_get_returns_404_when_task_not_found(

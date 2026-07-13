@@ -1962,7 +1962,16 @@ async def create_message(
     user: dict = Depends(get_current_user),
 ):
     """Create a message from the user to the autonomous system."""
-    project = await _get_user_project(project_id, user["user_id"], session)
+    # Member+ floor: this is a near-duplicate of admin_notifications' POST
+    # /messages and must carry the same gate, or that one is trivially
+    # bypassable through this route. It calls create_operator_project_message ->
+    # maybe_arm_operator_refresh, which arms an OPERATOR-origin strategic
+    # refresh (breaker-bypassing, cooldown-bypassing) and persists the caller's
+    # steering text into the project-global Project.vision column. A viewer is
+    # read-only and must not be able to steer the autonomous strategist.
+    project = await _get_user_project_with_role(
+        project_id, user["user_id"], session, "member"
+    )
     result = await create_operator_project_message(
         session,
         project=project,

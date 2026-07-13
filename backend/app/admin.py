@@ -91,6 +91,8 @@ from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
     _user_project_ids,
+    _member_project_ids,
+    _resolve_repo_project_for_write,
     _get_user_project,
     _get_user_project_with_role,
     _get_user_task,
@@ -674,7 +676,10 @@ async def bulk_archive_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    # Archiving is a mutation: scope to projects where the caller is member+,
+    # matching the sibling bulk-action handler. A viewer is read-only and must
+    # not be able to bulk-archive another member's tasks.
+    user_project_ids = _member_project_ids(current_user["user_id"])
     if request.task_ids is not None:
 
         def _safe_uuid(raw: str) -> uuid.UUID | None:
@@ -760,8 +765,14 @@ async def purge_archive_tasks(
     recently archived items. Up to 5000 tasks are deleted per call; callers
     should repeat until ``deleted_count`` is zero if they need to drain a large
     archive.
+
+    Scoped to projects where the caller is member+: this PERMANENTLY deletes
+    rows (the most destructive task mutation there is), so it takes the same
+    floor as the sibling bulk-action/bulk-archive handlers. A viewer is
+    read-only and must never be able to irreversibly destroy another member's
+    task history.
     """
-    user_project_ids = _user_project_ids(current_user["user_id"])
+    user_project_ids = _member_project_ids(current_user["user_id"])
 
     where_clauses = [
         Task.archived.is_(True),
@@ -2337,15 +2348,17 @@ async def create_task_manually(
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    # Find project for this repo where user is a member (or create new)
-    stmt = select(Project).where(
-        Project.github_owner == github_owner,
-        Project.github_repo == github_repo,
-        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    # Find the project for this repo the caller may WRITE to (member+), else
+    # create one. Viewers are documented read-only, so creating work on a
+    # viewer-only project is a 403 — and must NOT fall through into the
+    # auto-create branch below, which would hand the viewer a shadow project
+    # they own. See _resolve_repo_project_for_write for why the member+ lookup
+    # has to come first (duplicate projects per repo are legitimate).
+    project = await _resolve_repo_project_for_write(
+        session, current_user["user_id"], github_owner, github_repo
     )
-    project = (await session.execute(stmt)).scalars().first()
 
-    if not project:
+    if project is None:
         project = Project(
             name=payload.github_repo,
             user_id=current_user.get("user_id", "admin"),
@@ -3099,12 +3112,15 @@ async def create_compute_experiment_task(
     """Create an operator-launched compute_experiment with a full launch contract."""
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    stmt = select(Project).where(
-        Project.github_owner == github_owner,
-        Project.github_repo == github_repo,
-        Project.id.in_(_user_project_ids(current_user["user_id"])),
+    # Same write gate as POST /tasks, and for a strictly stronger reason: this
+    # endpoint mints a compute_experiment with a full launch contract, i.e. it
+    # spends real GPU budget against the project's spend_cap_usd. Membership
+    # alone is not authorization to spend — without the member+ floor a viewer
+    # denied POST /tasks/{id}/rerun could simply launch a fresh GPU job here
+    # instead (and, via the auto-create branch, mint a project they own).
+    project = await _resolve_repo_project_for_write(
+        session, current_user["user_id"], github_owner, github_repo
     )
-    project = (await session.execute(stmt)).scalars().first()
 
     if not project:
         # Mark the auto-created project as bootstrap-complete and non-autonomous:
@@ -3489,7 +3505,11 @@ async def rerun_compute_experiment(
     validates the result, and creates a new QUEUED task with ``parent_task_id``
     pointing at the source so the two runs are linked.
     """
-    source = await _get_user_task(task_id, current_user["user_id"], session)
+    # Re-running a compute_experiment launches new GPU spend — member+ only
+    # (viewers are read-only).
+    source = await _get_user_task_with_role(
+        task_id, current_user["user_id"], session, "member"
+    )
 
     source_payload = _task_payload_dict(source)
     if not source_payload or source_payload.get("type") != "compute_experiment":
