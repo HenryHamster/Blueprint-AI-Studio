@@ -292,6 +292,91 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       expect(queryByText('Machine verified')).toBeNull();
     });
   });
+
+  test('run surface earned-vs-claimed evidence tier never hardcodes machine-verified for cloud jobs', async () => {
+    const setupMocks = () => {
+      fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+      fetchHeldComputeExperiments.mockResolvedValue([]);
+      fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+      fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    };
+
+    // Cloud (gcp) job: must show 'Attested', must NOT show 'Machine verified'
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-gcp',
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { getByText: getGcp, queryByText: queryGcp, unmount: unmountGcp } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getGcp('Attested')).toBeTruthy();
+    });
+    expect(queryGcp('Machine verified')).toBeNull();
+    unmountGcp();
+
+    // Operator-hardware (runner-subprocess) job: must show 'Machine verified'
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-runner',
+      task_title: 'compute_experiment: runner',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { getByText: getRunner, unmount: unmountRunner } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getRunner('Machine verified')).toBeTruthy();
+    });
+    unmountRunner();
+
+    // No-backend job: must show 'Self-reported', must NOT show 'Machine verified'
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-no-backend',
+      task_title: 'compute_experiment: no-backend',
+      backend: null as unknown as string,
+      status: 'FAILED',
+      outcome: 'FAILURE',
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { getByText: getNoBackend, queryByText: queryNoBackend, unmount: unmountNoBackend } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(getNoBackend('Self-reported')).toBeTruthy();
+    });
+    expect(queryNoBackend('Machine verified')).toBeNull();
+    unmountNoBackend();
+
+    // Active cloud job: no evidence-tier badge at all
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      id: 'job-active-gcp',
+      task_title: 'compute_experiment: active',
+      backend: 'gcp',
+      status: 'RUNNING',
+      outcome: null,
+    })]));
+    const { queryByText: queryActive } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    await waitFor(() => {
+      expect(queryActive('Machine verified')).toBeNull();
+      expect(queryActive('Attested')).toBeNull();
+      expect(queryActive('Self-reported')).toBeNull();
+    });
+  });
 });
 
 describe('ComputeJobsPanel render + kill', () => {
