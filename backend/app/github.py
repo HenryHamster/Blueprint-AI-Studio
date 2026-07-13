@@ -1296,7 +1296,6 @@ from app.github_pulls import (  # noqa: F401
     pr_is_not_behind_for,
     create_pull_request,
     get_pull_request,
-    get_pull_request_reviews,
     get_pull_request_reviews_checked,
     REVIEWS_COMPLETE,
     REVIEWS_TRUNCATED,

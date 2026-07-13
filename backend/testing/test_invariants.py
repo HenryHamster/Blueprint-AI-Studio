@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -10828,13 +10829,17 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
 # String patch-target resolution invariant
 # ---------------------------------------------------------------------------
 
-def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
-    """Return {filename: {target, ...}} for app.* string patch targets in test files.
+def _iter_app_patch_target_sites(testing_dir: Path) -> list[tuple[str, int, str]]:
+    """Return [(filename, lineno, target), ...] for app.* string patch targets.
+
+    Single source of truth for "where is an ``app.*`` symbol patched" — both the
+    resolution invariant (``test_string_patch_targets_resolve``) and the vacuous-mock
+    invariant (``test_patched_app_symbols_have_production_call_sites``) derive from it.
 
     Excludes patch() calls that carry ``create=True`` — those intentionally
     name attributes that don't exist at module level.
     """
-    result: dict[str, set[str]] = {}
+    sites: list[tuple[str, int, str]] = []
     for py_file in sorted(testing_dir.glob("*.py")):
         try:
             source = py_file.read_text(encoding="utf-8")
@@ -10842,7 +10847,6 @@ def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
         except (SyntaxError, UnicodeDecodeError):
             continue
 
-        targets: set[str] = set()
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -10873,11 +10877,49 @@ def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
             target = first_arg.value
             # Require at least app.<module>.<attr> (two dots minimum)
             if target.startswith("app.") and "." in target[4:]:
-                targets.add(target)
+                sites.append((py_file.name, node.lineno, target))
+    return sites
 
-        if targets:
-            result[py_file.name] = targets
+
+def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
+    """Return {filename: {target, ...}} for app.* string patch targets in test files."""
+    result: dict[str, set[str]] = {}
+    for filename, _lineno, target in _iter_app_patch_target_sites(testing_dir):
+        result.setdefault(filename, set()).add(target)
     return result
+
+
+@cache
+def _parse_python_file(path: Path) -> "ast.Module | None":
+    """Parse a source file to an AST, memoised. None if unreadable/unparseable.
+
+    The patch-target scans below resolve ~760 targets against a few dozen modules, so an
+    uncached read+parse per target re-parses the same handful of files hundreds of times
+    (measured: 30s of pure re-parsing). Memoising makes the scan ~6.5x faster. Test files
+    do not change mid-session, so the cache is safe for the whole run.
+    """
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return None
+
+
+@cache
+def _app_module_file(app_dir: Path, module_dotted: str) -> Path | None:
+    """Map a dotted ``app.*`` module path to its file on disk, or None.
+
+    None indicates a "nested import" pattern (e.g. app.storage.storage mapping to
+    google.cloud.storage accessed via app.storage) — not statically checkable.
+    """
+    parts = module_dotted.split(".")
+    base = app_dir.parent  # backend/
+
+    candidate = base.joinpath(*parts).with_suffix(".py")
+    if not candidate.exists():
+        candidate = base.joinpath(*parts, "__init__.py")
+        if not candidate.exists():
+            return None
+    return candidate
 
 
 def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] | None:
@@ -10889,19 +10931,12 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
     google.cloud.storage accessed via app.storage) — those are skipped rather
     than flagged.
     """
-    parts = module_dotted.split(".")
-    base = app_dir.parent  # backend/
+    candidate = _app_module_file(app_dir, module_dotted)
+    if candidate is None:
+        return None
 
-    candidate = base.joinpath(*parts).with_suffix(".py")
-    if not candidate.exists():
-        candidate = base.joinpath(*parts, "__init__.py")
-        if not candidate.exists():
-            return None
-
-    try:
-        source = candidate.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(candidate))
-    except (SyntaxError, UnicodeDecodeError):
+    tree = _parse_python_file(candidate)
+    if tree is None:
         return None
 
     names: set[str] = set()
@@ -11003,6 +11038,419 @@ def test_string_patch_target_scanner_self_tests():
         tmpdir_path = Path(tmpdir)
         (tmpdir_path / "test_create.py").write_text(src_create)
         assert _collect_app_patch_targets(tmpdir_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# Vacuous-mock invariant: a patched app.* function production no longer calls
+# ---------------------------------------------------------------------------
+#
+# ``test_string_patch_targets_resolve`` (above) only asserts the patched attribute
+# EXISTS. It is blind to the more damaging half of the same drift: production stops
+# CALLING the symbol (renamed, or moved to a ``_checked``/``_cached`` variant) while a
+# wrapper is left behind for compatibility. The patch still resolves, so nothing errors —
+# the mock just silently does nothing and the test passes vacuously while the REAL code
+# runs, sometimes making live network calls from the test container.
+#
+# This shipped a real bug: rollup_management.py moved to
+# ``get_pull_request_reviews_checked`` while three test helpers kept patching
+# ``get_pull_request_reviews``. The stale mocks went inert, a genuinely rejected PR was
+# downgraded FAILED->CANCELLED, and the suite stayed green.
+
+
+def _app_symbol_kind(
+    app_dir: Path, module_dotted: str, attr: str, _depth: int = 0
+) -> str:
+    """Classify ``module_dotted.attr`` as seen from ``backend/app/``.
+
+    Returns one of: ``function`` | ``class`` | ``data`` | ``module`` | ``thirdparty``
+    | ``absent`` | ``unknown``.
+
+    Follows ``from .x import y`` RE-EXPORTS within ``app`` so that a symbol patched at
+    its re-export path (``app.github.get_pull_request_reviews``) is classified by its
+    real definition (``app.github_pulls``). That hop matters: the re-export is precisely
+    what keeps a stale patch target resolving.
+
+    Only ``function`` is checked for call sites. Classes are excluded (a patched class is
+    normally instantiated, and its name legitimately appears only in annotations or
+    ``isinstance`` checks); constants/data are excluded (they are read, never called).
+    """
+    if _depth > 4:  # pathological import cycle — do not flag on a guess
+        return "unknown"
+    candidate = _app_module_file(app_dir, module_dotted)
+    if candidate is None:
+        return "unknown"
+    tree = _parse_python_file(candidate)
+    if tree is None:
+        return "unknown"
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == attr:
+            return "function"
+        if isinstance(node, ast.ClassDef) and node.name == attr:
+            return "class"
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name) and n.id == attr:
+                        return "data"
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == attr
+        ):
+            return "data"
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if (alias.asname or alias.name.split(".")[0]) == attr:
+                    return "module"
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name) != attr:
+                    continue
+                if node.level:  # relative: resolve against the importing package
+                    pkg = module_dotted.split(".")
+                    if candidate.name != "__init__.py":
+                        pkg = pkg[:-1]
+                    up = node.level - 1
+                    if up:
+                        pkg = pkg[: len(pkg) - up] if up < len(pkg) else []
+                    source_mod = ".".join(pkg + ([node.module] if node.module else []))
+                else:
+                    source_mod = node.module or ""
+                if not source_mod.startswith("app"):
+                    return "thirdparty"  # e.g. `from httpx import AsyncClient`
+                return _app_symbol_kind(app_dir, source_mod, alias.name, _depth + 1)
+    return "absent"  # caught by test_string_patch_targets_resolve, not here
+
+
+def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
+    """The set of every symbol name REFERENCED anywhere under ``roots``.
+
+    A reference means the in-process code under test still routes through the symbol, so
+    a mock on it is live. All of these count — anything narrower makes the guard fire on
+    healthy code:
+
+      * bare call ................. ``symbol(...)``
+      * module-attribute call ..... ``_gh.symbol(...)``, ``self.symbol(...)``
+      * dynamic lookup ............ ``getattr(mod, "symbol")``
+      * function-as-value ......... ``asyncio.to_thread(symbol, ...)``,
+                                    ``background_tasks.add_task(symbol, ...)``,
+                                    ``partial(symbol, ...)``, default args, dispatch
+                                    tables, decorators, ``Depends(symbol)``
+      * attribute load ............ ``mod.symbol`` stored in a table
+
+    Deliberately NOT counted — each is exactly what leaves a stale patch target
+    resolving while nothing actually calls it:
+
+      * the ``def`` / ``class`` statement that DEFINES the symbol
+      * ``import`` / ``from ... import`` aliases — a re-export is not a call
+      * string constants (``__all__`` entries)
+
+    A SET of names, not a map to locations: a flagged symbol has zero references by
+    definition, so per-site locations could never appear in a failure message. Building
+    350k location strings nobody reads is the compute-a-reason-and-discard-it pattern
+    this repo keeps getting burned by — so we do not build them.
+
+    Keyed by bare name, not by qualified path. A same-named symbol anywhere under
+    ``roots`` suppresses the finding: this guard fails toward silence, never toward a
+    false accusation. The cost is that patching the WRONG module path
+    (``patch("app.foo.bar")`` while production calls ``app.baz.bar``) is NOT caught —
+    the name is referenced, just not there.
+    """
+    names: set[str] = set()
+    for root in roots:
+        for py_file in sorted(root.rglob("*.py")):
+            tree = _parse_python_file(py_file)
+            if tree is None:
+                continue
+            for node in ast.walk(tree):
+                # ast.walk visits a Call's `func` child, so `symbol(...)` and
+                # `mod.symbol(...)` are both captured by the Load branches below.
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    names.add(node.id)
+                elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                    names.add(node.attr)
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                ):
+                    names.add(node.args[1].value)
+    return names
+
+
+def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
+    """Trees whose code a pytest mock can actually intercept — i.e. code the suite drives
+    IN-PROCESS.
+
+    ``app/`` is the obvious one. ``alembic/versions/`` and ``scripts/`` are here because
+    ``backend/testing/test_migration_*.py`` IMPORT and drive them in-process (e.g.
+    ``0472_encrypt_oauth_token.upgrade()`` calls ``app.field_encryption.encrypt_field``),
+    so a patch on a symbol they call IS live and must not be reported as vacuous.
+
+    NOT here, deliberately: ``agent/`` and the repo-root runner scripts. Those execute in
+    a SEPARATE process, so an in-process pytest patch on a symbol only they call is still
+    inert — exactly the finding this guard should surface.
+    """
+    return tuple(
+        d
+        for d in (
+            backend_dir / "app",
+            backend_dir / "alembic",
+            backend_dir / "scripts",
+        )
+        if d.is_dir()
+    )
+
+
+# app.* FUNCTIONS that are patched in backend/testing/ but have NO call site in any
+# in-process production tree — and are nonetheless legitimate. Each entry needs a REASON:
+# an escape hatch without one decays into a blanket suppression (enforced below).
+#
+# Legitimate reasons look like: the symbol is invoked only through dynamic dispatch this
+# AST scan cannot see (importlib, entry points, `getattr(mod, name_variable)`).
+#
+# NOT a legitimate reason: "the test would fail if I repointed it." That is the bug this
+# invariant exists to surface — the mock is inert and the assertions never ran against
+# the code path they name. Repoint the patch to the symbol production actually calls.
+#
+# Also not needed here: symbols called from alembic/versions/ or backend/scripts/. The
+# suite drives those IN-PROCESS, so patches on them are live and never flagged — see
+# _production_reference_roots. (A symbol called only from `agent/` or a repo-root runner
+# script IS still a finding: that code runs in another process, so the mock cannot reach
+# it. Delete the dead patch line; the symbol itself may well stay.)
+_VACUOUS_MOCK_ALLOWLIST: "dict[str, str]" = {
+    # (empty — the tree is clean as of this invariant landing; see the docstring above
+    # for what qualifies before you add anything here)
+}
+
+
+def _find_vacuous_mocks(
+    testing_dir: Path,
+    app_dir: Path,
+    reference_roots: "tuple[Path, ...]",
+    allowlist: "dict[str, str]",
+) -> list[str]:
+    """Return one formatted finding per patched app.* function nothing in-process calls.
+
+    The WHOLE body of the invariant lives here so the self-test can drive the real
+    decision path — the kind-skip, the allowlist-skip and the message — over a synthetic
+    tree. A guard whose skips are only exercised by the tree it is scanning can be
+    silently neutered (flip one comparison and it never fires again) while its self-test
+    stays green: that is precisely the bug class this invariant exists to catch, and it
+    must not be reproduced inside it.
+    """
+    sites_by_target: dict[str, list[str]] = {}
+    for filename, lineno, target in _iter_app_patch_target_sites(testing_dir):
+        sites_by_target.setdefault(target, []).append(f"{filename}:{lineno}")
+
+    referenced = _referenced_symbol_names(reference_roots)
+
+    findings: list[str] = []
+    for target, sites in sorted(sites_by_target.items()):
+        module_dotted, _, attr = target.rpartition(".")
+        if _app_symbol_kind(app_dir, module_dotted, attr) != "function":
+            continue  # classes/constants are read, never called — out of scope
+        if attr in referenced:
+            continue  # production still routes through it — the mock is live
+        if target in allowlist:
+            continue
+        findings.append(
+            f"  {target}\n"
+            f"      patched at: {', '.join(sorted(sites))}\n"
+            f"      production no longer calls this — the mock is INERT and the "
+            f"test is VACUOUS."
+        )
+    return findings
+
+
+def test_patched_app_symbols_have_production_call_sites():
+    """A patched ``app.*`` function that production never calls is an INERT mock.
+
+    The test that patches it passes vacuously: the mock is never consulted, and the real
+    code runs underneath (up to and including live network calls from the test
+    container). ``test_string_patch_targets_resolve`` cannot see this — a leftover
+    compatibility wrapper satisfies its "attribute exists" check forever.
+
+    Scope is deliberately narrow so the signal stays trustworthy: only symbols that
+    resolve to a top-level ``def``/``async def`` (following re-exports), and only when
+    the name appears NOWHERE in the in-process production trees outside its own
+    definition and import re-exports. Classes, constants, and dynamically-dispatched
+    symbols are excluded rather than guessed at.
+    """
+    testing_dir = Path(__file__).resolve().parent
+    backend_dir = Path(__file__).resolve().parents[1]
+    app_dir = backend_dir / "app"
+
+    assert all(reason.strip() for reason in _VACUOUS_MOCK_ALLOWLIST.values()), (
+        "Every _VACUOUS_MOCK_ALLOWLIST entry must carry a REASON. An escape hatch "
+        "without one decays into a blanket suppression: "
+        + ", ".join(
+            sorted(t for t, r in _VACUOUS_MOCK_ALLOWLIST.items() if not r.strip())
+        )
+    )
+
+    failures = _find_vacuous_mocks(
+        testing_dir,
+        app_dir,
+        _production_reference_roots(backend_dir),
+        _VACUOUS_MOCK_ALLOWLIST,
+    )
+
+    assert not failures, (
+        f"Vacuous mock(s): patched app.* function with ZERO call sites in production "
+        f"({len(failures)} offender(s)):\n"
+        + "\n".join(failures)
+        + "\n\nThe patch still RESOLVES (the symbol exists), so nothing errors — but "
+        "nothing production runs in-process calls it, so the mock never fires and the "
+        "real code runs underneath the assertions.\n"
+        "Fix (in order of preference):\n"
+        "  1. Repoint the patch at the symbol production actually calls — usually a "
+        "renamed or `_checked`/`_cached` variant of the same function. If the test then "
+        "FAILS, that failure is real and the inert mock was hiding it.\n"
+        "  2. If production reads that value from somewhere else entirely, delete the "
+        "dead patch line — it neutralises nothing.\n"
+        "  3. If the symbol is genuinely reached by dynamic dispatch this AST scan "
+        "cannot see, add it to _VACUOUS_MOCK_ALLOWLIST **with a reason**."
+    )
+
+
+def test_vacuous_mock_guard_scanner_self_tests():
+    """The vacuous-mock guard must flag a dead patch target and must NOT flag live ones.
+
+    Guards the guard, END-TO-END: this drives ``_find_vacuous_mocks`` — the real decision
+    path, including the kind-skip, the allowlist-skip and the message — over a synthetic
+    tree. Exercising only the helpers would leave the skips unpinned, so flipping one
+    comparison (``!= "function"`` -> ``!= "nonexistent"``) would silently neuter the guard
+    forever while this test stayed green. That is exactly the bug class this invariant
+    exists to catch; it must not be reproduced inside it.
+
+    Both directions are pinned: the true positive (zero call sites) AND every
+    false-positive shape that would otherwise get the guard disabled as noisy.
+    """
+    import tempfile
+    import textwrap
+
+    app_src = textwrap.dedent('''
+        from .other import reexported_only
+
+        CONFIG_FLAG = True
+        UNUSED_FLAG = True          # constant, referenced nowhere
+
+        class Widget:
+            pass
+
+        class Unused:               # class, referenced nowhere
+            pass
+
+        def dead_wrapper(x):
+            """Nothing in app/ calls this — the trap."""
+            return checked(x)
+
+        def checked(x):
+            return x
+
+        def via_attr(x):
+            return x
+
+        def via_getattr(x):
+            return x
+
+        def via_value(x):
+            return x
+
+        def caller():
+            _mod.via_attr(1)
+            getattr(_mod, "via_getattr")
+            asyncio.to_thread(via_value, 1)
+            reexported_only()
+            Widget()
+            return CONFIG_FLAG
+    ''')
+
+    # Patches every shape at once: the trap, the four live shapes, and an unreferenced
+    # class + constant (which must be skipped on KIND, not on reference).
+    test_src = textwrap.dedent('''
+        def test_synthetic(mocker):
+            mocker.patch("app.svc.dead_wrapper")
+            mocker.patch("app.svc.checked")
+            mocker.patch("app.svc.via_attr")
+            mocker.patch("app.svc.via_getattr")
+            mocker.patch("app.svc.via_value")
+            mocker.patch("app.svc.reexported_only")
+            mocker.patch("app.svc.Unused")
+            mocker.patch("app.svc.UNUSED_FLAG")
+    ''')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        app_dir = root / "app"
+        app_dir.mkdir()
+        testing_dir = root / "testing"
+        testing_dir.mkdir()
+        (app_dir / "svc.py").write_text(app_src)
+        (app_dir / "other.py").write_text("def reexported_only():\n    return 1\n")
+        (testing_dir / "test_synth.py").write_text(test_src)
+
+        roots = (app_dir,)
+        findings = _find_vacuous_mocks(testing_dir, app_dir, roots, {})
+
+        # ── TRUE POSITIVE ────────────────────────────────────────────────────────────
+        # Exactly one: `dead_wrapper` is defined, re-exported, and called by nothing.
+        # `reexported_only` is patched at its RE-EXPORT path (app.svc, not app.other) and
+        # IS called — the shape of every `patch("app.github.*")` in the suite. It must
+        # resolve through the hop and stay unflagged.
+        assert len(findings) == 1, (
+            "Guard is VACUOUS or NOISY end-to-end. Expected exactly one finding "
+            f"(app.svc.dead_wrapper); got {len(findings)}:\n" + "\n".join(findings)
+        )
+        assert "app.svc.dead_wrapper" in findings[0]
+        assert "test_synth.py:3" in findings[0], (  # line 1 blank, 2 = def, 3 = patch
+            "The finding must NAME the patch site — a gate that fails without saying "
+            f"WHERE is not actionable. Got: {findings[0]}"
+        )
+        assert "INERT" in findings[0] and "VACUOUS" in findings[0]
+
+        # ── ALLOWLIST SKIP ───────────────────────────────────────────────────────────
+        assert not _find_vacuous_mocks(
+            testing_dir, app_dir, roots, {"app.svc.dead_wrapper": "documented reason"}
+        ), "An allowlisted target must be suppressed."
+
+        # ── FALSE-POSITIVE SHAPES ────────────────────────────────────────────────────
+        # None of these may appear in ANY finding: each is a live call shape, and a guard
+        # that fires on them gets disabled by the next engineer. The `len == 1` assertion
+        # above already proves it; this names them so a regression says WHICH shape broke.
+        referenced = _referenced_symbol_names(roots)
+        for symbol, shape in (
+            ("checked", "bare call"),
+            ("via_attr", "module-attribute call `_mod.via_attr(...)`"),
+            ("via_getattr", 'dynamic `getattr(_mod, "via_getattr")`'),
+            ("via_value", "function-as-value `asyncio.to_thread(via_value, ...)`"),
+        ):
+            assert symbol in referenced, (
+                f"Guard is NOISY: '{symbol}' is called in app/ via {shape} but the "
+                "reference scan missed it. This would fire on healthy code and get "
+                "the invariant disabled."
+            )
+        # An import alias must NOT count as a reference — a re-export is not a call.
+        assert "dead_wrapper" not in referenced, (
+            "Guard is vacuous: 'dead_wrapper' has no call site in app/ but the "
+            "reference scan reported one."
+        )
+
+        # ── KIND SKIP ────────────────────────────────────────────────────────────────
+        # `Unused` / `UNUSED_FLAG` are patched and referenced NOWHERE — they survive only
+        # because they are not functions. This pins the kind-skip itself: delete it and
+        # they become findings (breaking `len == 1` above).
+        assert "Unused" not in referenced and "UNUSED_FLAG" not in referenced
+        assert _app_symbol_kind(app_dir, "app.svc", "Unused") == "class"
+        assert _app_symbol_kind(app_dir, "app.svc", "UNUSED_FLAG") == "data"
+        assert _app_symbol_kind(app_dir, "app.svc", "dead_wrapper") == "function"
+        # Re-export hop: classified by its real definition, not by the import alias.
+        assert _app_symbol_kind(app_dir, "app.svc", "reexported_only") == "function"
 
 
 # Redundant ``create=True`` patches currently in the suite (target already exists

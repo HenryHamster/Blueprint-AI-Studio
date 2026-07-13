@@ -550,26 +550,6 @@ async def get_pull_request_reviews_checked(
     return result, REVIEWS_TRUNCATED
 
 
-async def get_pull_request_reviews(
-    token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    project_id: str | None = None,
-) -> list[dict]:
-    """Reviews on a PR (APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED).
-
-    List-only wrapper over :func:`get_pull_request_reviews_checked` that DISCARDS
-    the outcome status. Use it only where a truncated list is harmless; a caller
-    deciding whether a PR was rejected must call the ``_checked`` variant and fail
-    closed on ``REVIEWS_TRUNCATED`` (see that function's docstring).
-    """
-    reviews, _status = await get_pull_request_reviews_checked(
-        token, owner, repo, pr_number, project_id=project_id
-    )
-    return reviews
-
-
 async def get_open_pull_requests(
     token: str, owner: str, repo: str, base: str | None = None
 ) -> list[dict]:

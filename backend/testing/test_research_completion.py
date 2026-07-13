@@ -15527,7 +15527,11 @@ async def test_adversarial_gate_uses_poolvm_provenance_after_cache_loss(
     db_session.add(grader)
     await db_session.commit()
 
-    mocker.patch("app.compute.get_vm_image", return_value=(None, None))
+    # Empty the in-memory heartbeat caches so provenance can only come from the
+    # PoolVm row — that DB fallback is what this test pins.
+    # NOTE: image identity is NOT patched here. task_lifecycle reads the image name
+    # and build_ts straight off `pool_vm` (the durable row); it never calls
+    # compute.get_vm_image, so a patch on that getter would be an INERT mock.
     mocker.patch("app.compute.get_vm_runtime_fingerprint", return_value=None)
     mocker.patch("app.compute.get_vm_source_sha", return_value=None)
 

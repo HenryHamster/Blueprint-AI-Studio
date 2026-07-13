@@ -8,7 +8,7 @@ an unconfirmed lookup refuses to create and raises a retryable HTTP 503 +
 ``Retry-After`` so the agent backs off instead.
 
 Also covers ``merge_pull_request`` (same rate-limit classification, body parsed
-only behind the status check) and ``get_pull_request_reviews`` pagination.
+only behind the status check) and ``get_pull_request_reviews_checked`` pagination.
 """
 
 import time
@@ -328,7 +328,7 @@ async def test_merge_pr_success_and_conflict_shapes_unchanged(mocker):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# get_pull_request_reviews — pagination
+# get_pull_request_reviews_checked — pagination
 #
 # GitHub returns reviews CHRONOLOGICALLY. A single per_page=100 request drops
 # everything past the 100th submission — i.e. the MOST RECENT reviews, exactly
@@ -355,9 +355,12 @@ async def test_reviews_follow_pagination_and_see_late_changes_requested(mocker):
         ),
     )
 
-    reviews = await github_pulls.get_pull_request_reviews("t", "o", "r", 42)
+    reviews, status = await github_pulls.get_pull_request_reviews_checked(
+        "t", "o", "r", 42
+    )
 
     assert len(reviews) == 102
+    assert status == github_pulls.REVIEWS_COMPLETE
     assert any(r["state"] == "CHANGES_REQUESTED" for r in reviews), (
         "the late CHANGES_REQUESTED on page 2 was truncated away — a rejected "
         "rollup would be read as a non-rejection close"
@@ -379,16 +382,20 @@ async def test_reviews_short_page_stops_pagination(mocker):
         new=mocker.AsyncMock(return_value=MockResponse(200, [_review(1)])),
     )
 
-    reviews = await github_pulls.get_pull_request_reviews("t", "o", "r", 42)
+    reviews, status = await github_pulls.get_pull_request_reviews_checked(
+        "t", "o", "r", 42
+    )
 
     assert len(reviews) == 1
+    assert status == github_pulls.REVIEWS_COMPLETE
     assert mock_request.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_reviews_keeps_partial_pages_on_mid_pagination_error(mocker):
     """Mirrors get_open_pull_requests: a transient error mid-pagination returns
-    the pages already fetched rather than discarding them."""
+    the pages already fetched rather than discarding them — and reports TRUNCATED
+    so a rejection-deciding caller knows the newest reviews are missing."""
     from app import github_pulls
 
     page1 = [_review(i, "CHANGES_REQUESTED") for i in range(100)]
@@ -399,10 +406,13 @@ async def test_reviews_keeps_partial_pages_on_mid_pagination_error(mocker):
         ),
     )
 
-    reviews = await github_pulls.get_pull_request_reviews("t", "o", "r", 42)
+    reviews, status = await github_pulls.get_pull_request_reviews_checked(
+        "t", "o", "r", 42
+    )
 
     # The 100 fetched reviews (incl. the rejections) survive the page-2 failure.
     assert len(reviews) == 100
+    assert status == github_pulls.REVIEWS_TRUNCATED
 
 
 @pytest.mark.asyncio
@@ -416,7 +426,7 @@ async def test_reviews_401_still_raises(mocker):
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await github_pulls.get_pull_request_reviews("t", "o", "r", 42)
+        await github_pulls.get_pull_request_reviews_checked("t", "o", "r", 42)
 
     assert exc_info.value.status_code == 401
 
@@ -529,9 +539,15 @@ async def test_reviews_checked_reports_FAILED_when_page_one_errors(mocker, code)
 
 
 @pytest.mark.asyncio
-async def test_reviews_list_wrapper_preserves_the_old_contract(mocker):
-    """The list-only wrapper still returns a plain list for callers that don't make
-    a rejection decision."""
+async def test_reviews_checked_returns_raw_review_dicts_unwrapped(mocker):
+    """The reviews element is a plain list of GitHub's raw review dicts.
+
+    Callers index straight into ``r["state"]``, so the payload must be passed through
+    untransformed. (This previously pinned the list-only ``get_pull_request_reviews``
+    wrapper; that wrapper was deleted as dead code — it had no callers in ``app/`` and
+    its only live effect was to make a stale ``patch("app.github.get_pull_request_reviews")``
+    resolve silently, going inert instead of erroring.)
+    """
     from app import github_pulls
 
     mocker.patch(
@@ -539,7 +555,10 @@ async def test_reviews_list_wrapper_preserves_the_old_contract(mocker):
         new=AsyncMock(return_value=MockResponse(200, [{"state": "APPROVED"}])),
     )
 
-    reviews = await github_pulls.get_pull_request_reviews("t", "o", "r", 7)
+    reviews, status = await github_pulls.get_pull_request_reviews_checked(
+        "t", "o", "r", 7
+    )
 
     assert isinstance(reviews, list)
     assert reviews == [{"state": "APPROVED"}]
+    assert status == github_pulls.REVIEWS_COMPLETE
