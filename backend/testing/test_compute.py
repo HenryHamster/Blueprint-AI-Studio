@@ -16019,12 +16019,23 @@ def test_image_scanner_covers_runner_credential_allowlist():
         pytest.skip("runner_isolation.py uses Python 3.11 dataclass syntax; covered in CI")
 
     # Load runner_isolation by path (it is stdlib-only, not in the backend package).
+    # Resolve across local + Docker test envs: scripts/test-backend.sh and CI both
+    # mount backend/ at /app and the repo root at /repo, so a path relative to
+    # __file__ alone cannot reach the repo root. Reuse the canonical resolver.
+    from testing.test_runner_isolation_gpu_markers import _require_runner_isolation_path
+
     spec = importlib.util.spec_from_file_location(
         "runner_isolation",
-        pathlib.Path(__file__).parent.parent.parent / "scripts" / "runner_isolation.py",
+        pathlib.Path(_require_runner_isolation_path()),
     )
     ri = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ri)
+    # runner_isolation defines dataclasses; @dataclass resolves annotations via
+    # sys.modules[cls.__module__], so the module must be registered BEFORE exec.
+    sys.modules[spec.name] = ri
+    try:
+        spec.loader.exec_module(ri)
+    finally:
+        sys.modules.pop(spec.name, None)
 
     # Credential-bearing subset of AGENT_ENV_ALLOWLIST: keys whose names suggest they
     # carry a secret (API key, token, credentials, secret).  Config/routing/locale keys
@@ -17060,7 +17071,9 @@ async def test_project_compute_image_build_no_build_config_returns_422(
 
     resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
     assert resp.status_code == 422
-    assert "build" in resp.json()["detail"].lower()
+    # The app installs a global HTTPException handler (app/main.py) that reshapes
+    # every error body to {"error": {"code", "message"}} — there is no "detail" key.
+    assert "build" in resp.json()["error"]["message"].lower()
 
     # No row should have been persisted.
     rows = (
@@ -18160,7 +18173,7 @@ async def test_process_compute_jobs_once_cuts_stalled_no_progress_job(
         task,
         command="python train.py",
         machine_type="e2-standard-2",
-        spend_cap_usd=100.0,
+        spend_cap_usd=1.0,
         deadline_seconds=86400,
         declared_metric="val/loss",
     )
@@ -18241,7 +18254,7 @@ async def test_process_compute_jobs_once_keeps_progressing_job_running(
         task,
         command="python train.py",
         machine_type="e2-standard-2",
-        spend_cap_usd=100.0,
+        spend_cap_usd=1.0,
         deadline_seconds=86400,
         declared_metric="val/loss",
     )
