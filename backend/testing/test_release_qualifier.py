@@ -4565,6 +4565,101 @@ async def test_finalize_tags_candidate_side_blocker_execution_site(db_session, m
     assert lq["execution_site"] == "candidate"
 
 
+@pytest.mark.asyncio
+async def test_ledger_stores_post_reconciliation_audit_score(db_session, mocker):
+    """Finding 7c6c3428ff6afee2: the per-dimension audit ledger row must reflect
+    the POST-challenge-reconciliation audit score, not the pre-reconciliation one.
+
+    Scenario: the primary audit surfaces one verified HIGH finding (a 0.15
+    deduction → pre-reconciliation audit_score == 0.85), and the challenge
+    REFUTES it with a substantive reason.  Reconciliation removes the refuted
+    finding, so the score the composite actually uses rises to 1.0.
+
+    Before the fix, an eager upsert wrote the 0.85/"failed" row BEFORE the
+    challenge gate ran; the skip-if-RESOLVED guard then froze it, so the durable
+    ledger permanently stored 0.85 while last_qualification carried 1.0 — and the
+    read-side sub_scores overlay clobbered the reconciled 1.0 back down to 0.85.
+    The refresh must leave the ledger at the reconciled 1.0/"passed".
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    _high_summary = "SQL injection in report export query builder"
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": _high_summary,
+                    "file": "app/reports.py",
+                    "verification_note": "confirmed via full repo scan with supporting evidence",
+                }
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        # The challenger refutes the single HIGH finding, so reconciliation drops
+        # it and the reconciled audit score rises from 0.85 back to 1.0.
+        challenge_verdicts=[
+            {
+                "primary_finding_index": 1,
+                "verdict": "refuted_false_positive",
+                "severity": "high",
+                "summary": _high_summary,
+                "reason": "the export path uses parameterized queries throughout; no raw interpolation",
+            }
+        ],
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The composite must have scored the reconciled (refuted-removed) report: 1.0.
+    assert result["sub_scores"]["audit"] == pytest.approx(1.0), (
+        f"expected reconciled audit sub_score 1.0 but got {result['sub_scores']['audit']!r}"
+    )
+
+    # The durable per-dimension ledger row must carry the POST-reconciliation
+    # value, not the pre-reconciliation 0.85 the eager upsert wrote.
+    audit_row = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.dimension == "audit",
+            )
+        )
+    ).scalar_one()
+    assert audit_row.sub_score == pytest.approx(1.0), (
+        f"ledger audit sub_score is {audit_row.sub_score!r} (pre-reconciliation "
+        "value leaked) — must be the post-reconciliation 1.0"
+    )
+    assert audit_row.status == "passed", (
+        f"ledger audit status is {audit_row.status!r} — a refuted-away deduction "
+        "must leave the dimension 'passed', not the pre-reconciliation 'failed'"
+    )
+
+    # And the read-side sub_scores overlay must now agree (it reads the ledger),
+    # so the top-level state and the per-dimension breakdown tell one story.
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
+
+
 class TestReconcileRefutedJustificationGate:
     """Backend reason-substantiveness gate for refuted_false_positive verdicts.
 

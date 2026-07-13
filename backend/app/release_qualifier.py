@@ -4964,6 +4964,30 @@ async def _finalize_qualification(
             legacy_advisory_only=bool(audit_challenge_task_id)
             and not bool(challenge_task_id),
         )
+        # Refresh the per-dimension audit ledger row with the POST-challenge-
+        # reconciliation score (finding 7c6c3428ff6afee2).  The eager upsert
+        # earlier in finalize ran BEFORE the challenge gate and therefore stored
+        # the PRE-reconciliation audit_score; reconciliation has now dropped
+        # challenger-refuted findings and re-scored the report, so overwrite that
+        # stale fact.  Without this the ledger permanently freezes the
+        # pre-reconciliation value (the later _dual_write_dimension_results skips
+        # audit because its row is already RESOLVED), and the read-side
+        # sub_scores overlay — patch_qualification_state_from_dimension_states —
+        # then clobbers the reconciled sub_scores.audit with that stale value.
+        # Both statuses are RESOLVED, so the primitive's downgrade guard permits
+        # this update.
+        if audit_score is None:
+            _reconciled_audit_status = "blocked"
+        elif audit_score < 1.0:
+            _reconciled_audit_status = "failed"
+        else:
+            _reconciled_audit_status = "passed"
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "audit",
+            status=_reconciled_audit_status,
+            sub_score=audit_score,
+            producing_task_id=audit_task_id,
+        )
     else:
         # audit+test_erosion resolved from ledger — reconciliation fields are
         # not meaningful (no challenge ran, no audit report exists).
