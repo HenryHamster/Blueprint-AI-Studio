@@ -35,6 +35,7 @@ from app.runner_config import (
     config_generation,
     live_safe_config,
 )
+from app.schemas import redact_command_log_text
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
 from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
@@ -71,6 +72,34 @@ _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
 _STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
+# Max chars of command-log tail surfaced inline on a failed recent-outcome row.
+# Kept small so the per-runner stats payload stays lean — operators wanting the
+# full log open ComputeJobsPanel. The text is redacted before truncation.
+_COMMAND_LOG_TAIL_MAX_CHARS = 2000
+
+
+def _command_log_tail(polling_metadata: Dict[str, Any] | None) -> str | None:
+    """Extract a bounded, credential-redacted tail of a job's command log.
+
+    Reads ``polling_metadata["command_log"]["text"]`` (the runner-captured
+    stdout/stderr marker), applies the shared credential redactor, and returns
+    the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters. Returns ``None`` when
+    the log is absent, malformed, or empty so success/legacy rows stay lean.
+    """
+    if not isinstance(polling_metadata, dict):
+        return None
+    command_log = polling_metadata.get("command_log")
+    if not isinstance(command_log, dict):
+        return None
+    text = command_log.get("text")
+    if not isinstance(text, str):
+        return None
+    redacted = redact_command_log_text(text).strip()
+    if not redacted:
+        return None
+    if len(redacted) <= _COMMAND_LOG_TAIL_MAX_CHARS:
+        return redacted
+    return redacted[-_COMMAND_LOG_TAIL_MAX_CHARS:]
 
 RunnerPreset = Literal["default", "strategic", "strategic_local"]
 
@@ -984,6 +1013,14 @@ async def runner_stats(
                 if isinstance(
                     (exit_code := (j.polling_metadata or {}).get("exit_code")), int
                 )
+                else None
+            ),
+            # Command-log tail only on failed/timed-out rows — success rows keep
+            # the payload lean (operators triage failures, not successes).
+            "command_log_tail": (
+                _command_log_tail(j.polling_metadata)
+                if (j.status.value if hasattr(j.status, "value") else str(j.status))
+                in ("FAILED", "TIMED_OUT")
                 else None
             ),
         }

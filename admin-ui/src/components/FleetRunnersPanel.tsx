@@ -1417,30 +1417,37 @@ function RunnerTelemetryDetail({ projectId, runnerId }: { projectId: string; run
         <div className="space-y-0.5">
           <span className="text-ui-md text-neutral-600">Recent jobs:</span>
           {stats.last_n_outcomes.map(o => (
-            <div key={o.job_id} className="flex items-center gap-2 text-ui-md">
-              <span
-                className={`tabular-nums ${
-                  o.status === 'SUCCEEDED'
-                    ? 'text-emerald-400/80'
-                    : o.status === 'FAILED' || o.status === 'TIMED_OUT'
-                      ? 'text-red-400/80'
-                      : 'text-neutral-400'
-                }`}
-              >
-                {o.status}
-              </span>
-              {(o.status === 'FAILED' || o.status === 'TIMED_OUT') &&
-                (o.terminal_reason || o.exit_code != null) && (
-                  <span
-                    className="truncate text-red-400/70"
-                    title={o.terminal_reason ?? undefined}
-                  >
-                    {o.terminal_reason ?? ''}
-                    {o.exit_code != null ? ` (exit ${o.exit_code})` : ''}
-                  </span>
+            <div key={o.job_id} className="space-y-0.5">
+              <div className="flex items-center gap-2 text-ui-md">
+                <span
+                  className={`tabular-nums ${
+                    o.status === 'SUCCEEDED'
+                      ? 'text-emerald-400/80'
+                      : o.status === 'FAILED' || o.status === 'TIMED_OUT'
+                        ? 'text-red-400/80'
+                        : 'text-neutral-400'
+                  }`}
+                >
+                  {o.status}
+                </span>
+                {(o.status === 'FAILED' || o.status === 'TIMED_OUT') &&
+                  (o.terminal_reason || o.exit_code != null) && (
+                    <span
+                      className="truncate text-red-400/70"
+                      title={o.terminal_reason ?? undefined}
+                    >
+                      {o.terminal_reason ?? ''}
+                      {o.exit_code != null ? ` (exit ${o.exit_code})` : ''}
+                    </span>
+                  )}
+                {o.task_id && (
+                  <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
                 )}
-              {o.task_id && (
-                <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
+              </div>
+              {(o.status === 'FAILED' || o.status === 'TIMED_OUT') && o.command_log_tail && (
+                <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900/60 px-2 py-1 font-mono text-ui-sm text-neutral-400">
+                  {o.command_log_tail}
+                </pre>
               )}
             </div>
           ))}

@@ -1934,6 +1934,12 @@ export interface RunnerOutcome {
   terminal_reason?: string | null;
   /** Process exit code for a failed job; null when not an int / absent. */
   exit_code?: number | null;
+  /**
+   * Server-side redacted + truncated tail of the job's command log, surfaced
+   * inline on failed/timed-out rows. null on success/legacy rows or when no
+   * log was captured.
+   */
+  command_log_tail?: string | null;
 }
 
 export interface RunnerStatsResponse {

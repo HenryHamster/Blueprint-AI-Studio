@@ -277,3 +277,74 @@ class TestRunnerStatsCloudCostAvoided:
         succeeded_row = outcomes[str(succeeded.id)]
         assert succeeded_row["terminal_reason"] is None
         assert succeeded_row["exit_code"] is None
+
+    @pytest.mark.asyncio
+    async def test_runner_stats_failed_outcome_includes_redacted_command_log_tail(
+        self, client: AsyncClient, db_session
+    ):
+        # A FAILED runner job with a captured command log surfaces a redacted,
+        # length-bounded tail inline on its recent-outcome row so an operator can
+        # triage *why* it failed without leaving the fleet view. A SUCCEEDED job
+        # never carries a tail even when it captured a log.
+        from app.routers.admin_runners import _COMMAND_LOG_TAIL_MAX_CHARS
+
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="e" * 64, hostname="host5", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        # Log longer than the tail cap, with a credential that must be redacted.
+        prefix = "x" * (_COMMAND_LOG_TAIL_MAX_CHARS + 500)
+        raw_text = f"{prefix}\nAuthorization: Bearer sk-supersecret-token-value\nboom"
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        failed = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.FAILED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=5),
+            terminal_reason="process exited non-zero",
+            polling_metadata={
+                **_pin(runner.id),
+                "command_log": {
+                    "text": raw_text,
+                    "truncated": True,
+                    "byte_count": len(raw_text.encode()),
+                },
+            },
+        )
+        succeeded = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.SUCCEEDED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=1),
+            polling_metadata={
+                **_pin(runner.id),
+                "command_log": {"text": "all good", "truncated": False, "byte_count": 8},
+            },
+        )
+        db_session.add_all([failed, succeeded])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        outcomes = {o["job_id"]: o for o in resp.json()["last_n_outcomes"]}
+
+        tail = outcomes[str(failed.id)]["command_log_tail"]
+        assert tail is not None
+        # Bounded to the tail cap (keeps the fleet payload lean).
+        assert len(tail) <= _COMMAND_LOG_TAIL_MAX_CHARS
+        # It is a TAIL — the trailing failure line survives, the head is elided.
+        assert tail.endswith("boom")
+        assert tail.startswith("x")
+        # Credentials are scrubbed before the tail reaches the operator surface.
+        assert "supersecret" not in tail
+
+        # A SUCCEEDED row never carries a tail even with a captured log.
+        assert outcomes[str(succeeded.id)]["command_log_tail"] is None

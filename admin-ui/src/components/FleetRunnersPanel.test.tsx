@@ -1456,4 +1456,62 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(text).toContain('process exited non-zero');
     expect(text).toContain('(exit 137)');
   });
+
+  test('telemetry recent-jobs rows show command_log_tail for a failed job only', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 2,
+      jobs_terminal_count: 2,
+      jobs_succeeded_count: 1,
+      jobs_success_rate: 0.5,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+          command_log_tail: 'Traceback (most recent call last):\n  RuntimeError: boom',
+        },
+        {
+          job_id: 'job-ok',
+          task_id: null,
+          status: 'SUCCEEDED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: null,
+          exit_code: null,
+          command_log_tail: 'this should never render',
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail).not.toBeNull();
+    const text = detail?.textContent ?? '';
+    // The failed row surfaces its command-log tail inline.
+    expect(text).toContain('RuntimeError: boom');
+    // A success row's tail (defensive) is never rendered.
+    expect(text).not.toContain('this should never render');
+  });
 });
