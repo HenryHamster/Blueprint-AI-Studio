@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { apiFetch } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
@@ -89,20 +89,50 @@ export function UILoadTimingPanel() {
   const [pollError, setPollError] = useState(false);
   const [preset, setPreset] = useState<string>(CUTOFF_PRESETS[0].value);
   const [customCutoff, setCustomCutoff] = useState('2026-07-09T22:09');
+  const [pinLabel, setPinLabel] = useState('');
+  const [pinning, setPinning] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
 
   const cutoffIso = preset === 'custom' ? `${customCutoff}:00Z` : preset;
 
-  usePoller(async (signal) => {
+  const fetchData = useCallback(async (signal?: AbortSignal) => {
     try {
       const res = await apiFetch('/api/admin/ui-load-timing');
-      if (signal.aborted) return;
+      if (signal?.aborted) return;
       if (!res.ok) { setPollError(true); return; }
       setData(await res.json());
       setPollError(false);
     } catch {
-      if (!signal.aborted) setPollError(true);
+      if (!signal?.aborted) setPollError(true);
     }
+  }, []);
+
+  usePoller(async (signal) => {
+    await fetchData(signal);
   }, { intervalMs: DEFAULT_POLL_MS });
+
+  const handlePin = useCallback(async () => {
+    setPinning(true);
+    setPinError(null);
+    try {
+      const res = await apiFetch('/api/admin/ui-load-timing/pin-baseline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: pinLabel.slice(0, 128) }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'unknown error');
+        setPinError(`Failed to pin: ${text}`);
+        return;
+      }
+      setPinLabel('');
+      await fetchData();
+    } catch (e) {
+      setPinError(e instanceof Error ? e.message : 'Pin failed');
+    } finally {
+      setPinning(false);
+    }
+  }, [pinLabel, fetchData]);
 
   const surfaces = data?.surfaces;
   if (!surfaces || Object.keys(surfaces).length === 0) {
@@ -156,9 +186,9 @@ export function UILoadTimingPanel() {
 
   return (
     <section>
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">UI Load Timing</h2>
-        <div className="flex items-center gap-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="text-neutral-500">Cutoff:</span>
           <select
             value={preset}
@@ -177,6 +207,30 @@ export function UILoadTimingPanel() {
               className="bg-neutral-800 text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs"
             />
           )}
+          <span className="text-neutral-600 hidden sm:inline">|</span>
+          <input
+            type="text"
+            value={pinLabel}
+            onChange={e => {
+              setPinLabel(e.target.value.slice(0, 128));
+              // Clear a stale "Failed to pin" message as soon as the user edits
+              // the label, rather than waiting for the next pin attempt.
+              if (pinError) setPinError(null);
+            }}
+            placeholder="Baseline label…"
+            maxLength={128}
+            aria-label="Baseline label"
+            className="bg-neutral-800 text-neutral-200 border border-neutral-700 rounded px-2 py-0.5 text-xs w-44 placeholder-neutral-600"
+          />
+          {/* eslint-disable-next-line viewport/min-touch-target */}
+          <button
+            onClick={handlePin}
+            disabled={pinning || pinLabel.trim() === ''}
+            className="bg-neutral-700 hover:bg-neutral-600 disabled:opacity-40 text-neutral-200 border border-neutral-600 rounded px-2 py-0.5 text-xs whitespace-nowrap"
+          >
+            {pinning ? 'Pinning…' : 'Pin baseline'}
+          </button>
+          {pinError && <span className="text-red-400 text-xs">{pinError}</span>}
         </div>
       </div>
       <div className="overflow-hidden rounded-lg border border-neutral-800/50 bg-neutral-900/50 md:overflow-x-auto">
@@ -219,7 +273,7 @@ export function UILoadTimingPanel() {
                     ? [
                         <td key={`${t}-bef-empty`} colSpan={3} className="flex justify-between gap-3 py-1 text-right text-ui-sm text-neutral-600 italic md:table-cell md:px-2 md:py-2 md:text-center">
                           <span className="min-w-0 break-all text-left not-italic text-neutral-500 md:hidden">{t} · Before</span>
-                          no baseline — overwritten by 200-sample cap
+                          no pinned baseline — use Pin baseline to capture one
                         </td>,
                       ]
                     : [

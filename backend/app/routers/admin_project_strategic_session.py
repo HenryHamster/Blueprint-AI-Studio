@@ -28,14 +28,21 @@ from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
+    Alert,
+    ComputeJob,
+    ComputeJobStatus,
     Direction,
+    LocalRunner,
+    MessagesNoisePrefs,
     ProjectMessage,
     MessageType,
     ReleaseVersion,
     StrategicCycle,
     Task,
     TaskStatus,
+    TaskWakeRegistration,
     Project,
+    WakeDeliveryState,
     _utcnow,
 )
 from app.auth import get_current_user
@@ -59,6 +66,10 @@ from app.strategic_context_package import (
     selected_ref_descriptor,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
+# Canonical runner-liveness window (300s). is_live in _runner_health is purely
+# time-derived (status=='active' AND now-last_seen < this), so the broad-revision
+# fingerprint must probe it against the wall clock, not just max(last_seen_at).
+from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS
 from app.work_session_actions import build_work_session_actions
 from app.work_session_command_execution import (
     OPERATOR_COMMAND_EVENT_TYPE,
@@ -148,6 +159,23 @@ _BG_TASKS: set[asyncio.Task] = set()
 _COST_CACHE: dict[str, tuple[float, float]] = {}
 _COST_CACHE_TTL_S = 90.0
 
+# Phase-1 fingerprint constants for the broad-revision assembly-skip guard.
+# These mirror the "active" filters the Phase-2 assembly applies so a single
+# indexed count/max scalar can stand in for the expensive multi-row build when
+# nothing in a segment changed. Kept local (rather than importing the private
+# tuples from strategic_runtime_work) so the fingerprint contract is explicit
+# and testable at this seam.
+_FINGERPRINT_ACTIVE_COMPUTE_JOB_STATUSES = (
+    ComputeJobStatus.QUEUED,
+    ComputeJobStatus.STARTING,
+    ComputeJobStatus.RUNNING,
+    ComputeJobStatus.POLLING,
+)
+_FINGERPRINT_ACTIVE_WAKE_STATES = (
+    WakeDeliveryState.PENDING,
+    WakeDeliveryState.FIRED,
+)
+
 async def _currency_resolve_and_cache(
     project_id: uuid.UUID,
     last_qual: dict,
@@ -187,6 +215,53 @@ async def _currency_resolve_and_cache(
             "[STRATEGIC_STATE] background currency resolve failed for project %s",
             project_id,
         )
+
+
+def _currency_cache_fingerprint(
+    project: Project, open_version: ReleaseVersion | None
+) -> str:
+    """Fingerprint the in-memory currency-cache state that feeds sha_freshness.
+
+    sha_freshness is resolved out-of-band into ``_CURRENCY_CACHE`` (never the DB)
+    by ``_currency_resolve_and_cache``, so the DB-derived fingerprints cannot see
+    the cold→warm verdict transition: a cold-cache 200 (verdict='unknown') warms
+    the cache, and with identical DB state the next poll would otherwise match the
+    broad revision and 304 BEFORE assembly — pinning the operator's banner on
+    'unknown'. Folding this cache-state string into the broad revision makes that
+    matching-token 304 impossible across the transition, so the two-poll cold→warm
+    currency design still delivers the resolved verdict (exactly as the pre-skip
+    full-body ETag did).
+
+    Read-only: mirrors the request-path cache read below (same key + monotonic TTL
+    check) but never spawns the background resolve. Any failure degrades to a
+    constant so this segment simply falls back to pre-fingerprint behavior rather
+    than sinking the endpoint.
+    """
+    if open_version is None:
+        return "no-open-version"
+    try:
+        from app.strategic_spawning import get_project_integration_branch
+
+        _last_qual = open_version.last_qualification or {}
+        _integration_branch = get_project_integration_branch(project)
+        _candidate_sha = _last_qual.get("candidate_sha") or ""
+        _cache_key = (str(project.id), _integration_branch, _candidate_sha)
+        _cached = _CURRENCY_CACHE.get(_cache_key)
+        if _cached is None or _cached[1] <= time.monotonic():
+            # Cold / expired: assembly will serve an 'unknown' block and spawn a
+            # background resolve. When that resolve warms the cache, this string
+            # flips warm → a new revision → assembly delivers the real verdict.
+            return f"cold:{_candidate_sha}"
+        _verdict = (
+            _cached[0].get("verdict") if isinstance(_cached[0], dict) else None
+        )
+        return f"warm:{_candidate_sha}:{_verdict}"
+    except Exception:
+        logger.exception(
+            "[STRATEGIC_STATE] currency-cache fingerprint failed for project %s",
+            project.id,
+        )
+        return "error"
 
 
 def _build_work_session_summary(
@@ -998,13 +1073,22 @@ def _compute_strategic_state_revision(
     message_counts: Dict[str, int],
     task_counts: Dict[str, int],
     attention: Dict[str, Any] | None,
+    fingerprints: Dict[str, Any] | None = None,
 ) -> str:
-    """Compute a lightweight revision token for the context package inputs.
+    """Compute a lightweight revision token for the strategic-state payload.
 
-    Only includes fields that the context package build reads directly.
-    Called AFTER cheap inputs are resolved and BEFORE the expensive
-    load_strategic_context_evidence + build_strategic_context_package_summary
-    steps, so a matching client token allows those steps to be skipped.
+    Covers both the context-package inputs and — via the optional
+    ``fingerprints`` map of cheap Phase-1 scalar/count/max-timestamp probes —
+    the segments the narrow token historically did NOT reach (runtime runners /
+    compute jobs / wakes, workbench, event feed, command jobs, integrity / open
+    version). Called AFTER the cheap inputs are resolved and BEFORE the
+    expensive Phase-2 assembly, so a matching client token lets the whole
+    assembly be skipped with an HTTP 304.
+
+    ``fingerprints`` defaults to ``None`` so the historical (context-package
+    only) signature and its callers keep working; when provided it is folded
+    into the hashed seed under a stable key, making the token change iff a
+    fingerprinted segment changed.
     """
     seed = json.dumps(
         {
@@ -1035,11 +1119,146 @@ def _compute_strategic_state_revision(
             "task_counts": task_counts,
             "attention_level": (attention or {}).get("level"),
             "attention_counts": (attention or {}).get("counts", {}),
+            "fingerprints": fingerprints or {},
         },
         sort_keys=True,
         default=str,
     )
     return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+async def _compute_strategic_state_fingerprints(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Cheap Phase-1 fingerprint probes for the strategic-state segments the
+    narrow context-package revision never covered.
+
+    Each probe is a single indexed scalar / count / max-timestamp — collectively
+    O(1)-ish — chosen so its value changes iff the corresponding Phase-2 segment
+    would render differently:
+
+    * ``workbench_updated_at`` — per-user workbench prefs row (MessagesNoisePrefs)
+    * ``runner_count`` / ``runner_max_seen`` / ``live_runner_count`` — enrolled
+      runners, latest heartbeat, and the count currently INSIDE the liveness
+      window (runtime local_runner + resident-session picker + availability).
+      ``live_runner_count`` is time-derived (mirrors ``_runner_health``'s
+      ``is_live``) so a runner heartbeat going stale — which does NOT move
+      ``runner_max_seen`` or ``runner_count`` — still flips the revision the
+      instant it crosses ``_RUNNER_LIVENESS_SECONDS``.
+    * ``active_compute_count`` / ``compute_max_updated`` — in-flight compute jobs
+    * ``active_wake_count`` — parked task wakes still pending/fired
+    * ``message_max_created_at`` / ``message_max_resolved_at`` — message previews,
+      event feed, and command-job feed (all ProjectMessage-derived)
+    * ``task_max_updated_at`` — event feed task rows + task focus
+    * ``alert_max_at`` — event feed alert rows
+    * ``open_version_updated_at`` — sha-freshness open version
+    * ``direction_count`` / ``direction_max_updated_at`` — Direction rows whose
+      ``criterion_keys`` / ``status`` feed model-integrity + criterion-links (these
+      live on the Direction table, NOT the project.directions blob the narrow
+      token folds in, so an integrity edit is invisible without this probe).
+
+    A DB error here would silently over-suppress (a stale probe → false 304), so
+    the caller runs this on the always-executed Phase-1 path where any failure
+    surfaces as a normal 500 rather than a wrong-but-200; we deliberately do NOT
+    swallow exceptions.
+    """
+    workbench_updated_at = await session.scalar(
+        select(func.max(MessagesNoisePrefs.updated_at)).where(
+            MessagesNoisePrefs.project_id == project_id,
+            MessagesNoisePrefs.user_id == user_id,
+        )
+    )
+    runner_row = (
+        await session.execute(
+            select(func.count(), func.max(LocalRunner.last_seen_at)).where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+        )
+    ).one()
+    # Time-derived liveness: count runners _runner_health would mark is_live=True
+    # right now (status=='active' AND heartbeat within the liveness window). When
+    # a live runner stops heartbeating, last_seen_at is frozen so runner_max_seen
+    # cannot catch the transition — this count drops from N to N-1 the moment the
+    # frozen heartbeat ages past the cutoff, flipping the revision.
+    _liveness_cutoff = _utcnow() - _dt.timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    live_runner_count = await session.scalar(
+        select(func.count()).where(
+            LocalRunner.project_id == project_id,
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+            LocalRunner.last_seen_at >= _liveness_cutoff,
+        )
+    )
+    direction_row = (
+        await session.execute(
+            select(func.count(), func.max(Direction.updated_at)).where(
+                Direction.project_id == project_id,
+            )
+        )
+    ).one()
+    compute_row = (
+        await session.execute(
+            select(func.count(), func.max(ComputeJob.updated_at)).where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.status.in_(_FINGERPRINT_ACTIVE_COMPUTE_JOB_STATUSES),
+            )
+        )
+    ).one()
+    active_wake_count = await session.scalar(
+        select(func.count()).where(
+            TaskWakeRegistration.project_id == project_id,
+            TaskWakeRegistration.delivery_state.in_(
+                _FINGERPRINT_ACTIVE_WAKE_STATES
+            ),
+        )
+    )
+    message_row = (
+        await session.execute(
+            select(
+                func.max(ProjectMessage.created_at),
+                func.max(ProjectMessage.resolved_at),
+            ).where(ProjectMessage.project_id == project_id)
+        )
+    ).one()
+    task_max_updated_at = await session.scalar(
+        select(func.max(Task.updated_at)).where(Task.project_id == project_id)
+    )
+    alert_max_at = await session.scalar(
+        select(
+            func.max(func.coalesce(Alert.dismissed_at, Alert.created_at))
+        ).where(Alert.project_id == project_id)
+    )
+    open_version_updated_at = await session.scalar(
+        select(func.max(ReleaseVersion.updated_at)).where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.status == "open",
+        )
+    )
+    return {
+        "workbench_updated_at": str(workbench_updated_at)
+        if workbench_updated_at
+        else None,
+        "runner_count": int(runner_row[0] or 0),
+        "runner_max_seen": str(runner_row[1]) if runner_row[1] else None,
+        "live_runner_count": int(live_runner_count or 0),
+        "direction_count": int(direction_row[0] or 0),
+        "direction_max_updated_at": str(direction_row[1]) if direction_row[1] else None,
+        "active_compute_count": int(compute_row[0] or 0),
+        "compute_max_updated": str(compute_row[1]) if compute_row[1] else None,
+        "active_wake_count": int(active_wake_count or 0),
+        "message_max_created_at": str(message_row[0]) if message_row[0] else None,
+        "message_max_resolved_at": str(message_row[1]) if message_row[1] else None,
+        "task_max_updated_at": str(task_max_updated_at)
+        if task_max_updated_at
+        else None,
+        "alert_max_at": str(alert_max_at) if alert_max_at else None,
+        "open_version_updated_at": str(open_version_updated_at)
+        if open_version_updated_at
+        else None,
+    }
 
 
 # Pure wall-clock stamps / derived durations that advance on every poll without
@@ -1122,8 +1341,15 @@ def _if_none_match_hits(if_none_match: str | None, etag: str) -> bool:
     Tolerates the standard header shapes a proxy/browser may produce: a
     comma-separated list, weak validators (``W/"…"``), surrounding quotes, and
     the ``*`` wildcard.
+
+    Also tolerant of non-``str`` inputs: internal direct callers invoke
+    ``get_project_strategic_state`` as a plain function, so its
+    ``if_none_match: str | None = Header(None, ...)`` parameter arrives as the
+    unresolved FastAPI ``Header`` sentinel (a truthy object, not ``None``).
+    Treat anything that is not a real header string as absent so those callers
+    always receive the full dict instead of tripping on ``.split``.
     """
-    if not if_none_match:
+    if not isinstance(if_none_match, str) or not if_none_match:
         return False
     for raw in if_none_match.split(","):
         candidate = raw.strip()
@@ -1305,9 +1531,25 @@ async def get_project_strategic_state(
     running_update_summary = _running_update_summary(project)
     problem_model_summary = _problem_model_summary(project.problem_model or {})
     directions_summary = _direction_summary(project.directions or [])
-    # State-revision skip: if the client already has a matching revision token,
-    # the context package inputs haven't changed since their last poll.
-    # Skip the expensive evidence load + package build and log the bypass.
+
+    # Broad-revision fingerprints: a handful of single-row indexed scalar/count/
+    # max-timestamp probes standing in for each Phase-2 segment the narrow token
+    # never covered. Folded into the revision hash below so the token is stable
+    # iff the visible response is stable — letting a matching poll return 304
+    # BEFORE the expensive Phase-2 assembly runs. AsyncSession is single-threaded,
+    # so these run sequentially; each is O(1)/small GROUP BY over indexed columns.
+    async with async_timed(request, "fingerprints"):
+        fingerprints = await _compute_strategic_state_fingerprints(
+            session, project.id, current_user["user_id"]
+        )
+    # sha_freshness lives in an out-of-band memory cache the DB probes above can
+    # never see; fold its cache-state so the cold→warm verdict transition flips
+    # the revision instead of being masked by an early 304 (see helper docstring).
+    fingerprints["currency"] = _currency_cache_fingerprint(project, open_version)
+
+    # Broad state-revision skip: a matching client token proves EVERY visible
+    # segment (context package + runtime + workbench + events + jobs + integrity)
+    # is unchanged, so the whole Phase-2 assembly can be skipped with an HTTP 304.
     _revision = _compute_strategic_state_revision(
         project,
         active_cycle_summary=active_cycle_summary,
@@ -1319,30 +1561,40 @@ async def get_project_strategic_state(
         message_counts=message_counts,
         task_counts=task_counts,
         attention=attention,
+        fingerprints=fingerprints,
     )
     if state_revision is not None and state_revision == _revision:
-        context_evidence: dict = {}
-        context_package: dict | None = None
+        # Assembly-skip: return 304 Not Modified with an empty body BEFORE
+        # running any Phase-2 builder. Internal direct callers never pass
+        # state_revision (it defaults to None), so this path is reachable only
+        # for a real HTTP GET carrying ?state_revision= and always yields the
+        # full dict for internal callers.
         logger.info(
-            "[STRATEGIC_STATE] skipped context package build for project %s "
-            "(state_revision unchanged)",
+            "[STRATEGIC_STATE] 304 not modified for project %s "
+            "(broad state_revision unchanged; Phase-2 assembly skipped)",
             project.id,
         )
-    else:
-        context_evidence = await load_strategic_context_evidence(session, project.id)
-        context_package = build_strategic_context_package_summary(
-            project,
-            active_cycle=active_cycle_summary,
-            active_task=active_task,
-            latest_cycle=latest_cycle,
-            running_update=running_update_summary,
-            problem_model=problem_model_summary,
-            directions=directions_summary,
-            message_counts=message_counts,
-            task_counts=task_counts,
-            attention=attention,
-            evidence=context_evidence,
-        )
+        # Empty body, no full-body ETag (never assembled). The client keys this
+        # path on ?state_revision= and keeps its held ETag untouched on a 304.
+        return Response(status_code=304)
+
+    # Revision miss (or first-load with no token): build the full context
+    # package. With the broad guard above, reaching here means a visible segment
+    # changed, so the package's inputs are (re)assembled unconditionally.
+    context_evidence = await load_strategic_context_evidence(session, project.id)
+    context_package = build_strategic_context_package_summary(
+        project,
+        active_cycle=active_cycle_summary,
+        active_task=active_task,
+        latest_cycle=latest_cycle,
+        running_update=running_update_summary,
+        problem_model=problem_model_summary,
+        directions=directions_summary,
+        message_counts=message_counts,
+        task_counts=task_counts,
+        attention=attention,
+        evidence=context_evidence,
+    )
     runtime_summary = await build_strategic_runtime_summary(
         session,
         project.id,

@@ -7690,20 +7690,24 @@ async def test_strategic_state_includes_state_revision(
 
 
 @pytest.mark.asyncio
-async def test_strategic_state_matching_revision_skips_context_package(
+async def test_strategic_state_matching_revision_returns_304_skips_assembly(
     client: AsyncClient, db_session, mocker
 ):
-    """When the client sends a matching state_revision, the endpoint skips the
-    expensive context-evidence load + package build and returns context_package=None."""
+    """ACCEPTANCE: a matching broad state_revision returns HTTP 304 with an EMPTY
+    body BEFORE any Phase-2 assembly runs — no context-package build, no runtime
+    summary, no workbench state, no event feed. This is the server-side
+    assembly-skip (distinct from the post-assembly ETag 304 which only saves
+    transmission)."""
     project = await _make_project(db_session)
 
-    # First call to get the current revision token
+    # First call to get the current broad revision token.
     resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp1.status_code == 200
     revision = resp1.json().get("state_revision")
     assert revision is not None
 
-    # Mock the expensive steps to confirm they are NOT called on a matching revision
+    # Spy on representative Phase-1 (context) AND Phase-2 (assembly) builders to
+    # prove NONE of them run on a matching revision.
     evidence_spy = mocker.patch(
         "app.routers.admin_project_strategic_session.load_strategic_context_evidence",
         new_callable=AsyncMock,
@@ -7711,20 +7715,311 @@ async def test_strategic_state_matching_revision_skips_context_package(
     build_spy = mocker.patch(
         "app.routers.admin_project_strategic_session.build_strategic_context_package_summary",
     )
+    runtime_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_strategic_runtime_summary",
+        new_callable=AsyncMock,
+    )
+    workbench_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.get_strategic_workbench_state",
+        new_callable=AsyncMock,
+    )
+    events_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_workbench_event_feed",
+        new_callable=AsyncMock,
+    )
 
-    # Second call WITH matching revision token
+    # Second call WITH the matching revision token → 304, empty body.
     resp2 = await client.get(
         f"/api/admin/projects/{project.id}/strategic-state?state_revision={revision}"
     )
-    assert resp2.status_code == 200
-    data = resp2.json()
+    assert resp2.status_code == 304, (
+        f"matching revision must 304; got {resp2.status_code} "
+        f"body={resp2.text[:200]!r}"
+    )
+    assert len(resp2.content) == 0, "304 assembly-skip must have an empty body"
 
-    # The expensive functions must NOT have been called
+    # NONE of the expensive builders ran — the assembly was skipped, not just the
+    # transmission.
     evidence_spy.assert_not_called()
     build_spy.assert_not_called()
+    runtime_spy.assert_not_called()
+    workbench_spy.assert_not_called()
+    events_spy.assert_not_called()
 
-    # context_package is None when skipped
-    assert data.get("context_package") is None
+
+# The visible response segments and the mutation that must flip the broad
+# revision for each. Guards against a false 304 hiding a real change.
+@pytest.mark.asyncio
+async def test_strategic_state_revision_changes_when_each_segment_changes(
+    client: AsyncClient, db_session
+):
+    """The broad revision must CHANGE when any fingerprinted segment changes, so a
+    held token never suppresses a real update. Exercises workbench, runners,
+    compute jobs, wakes, messages, and the open release version end-to-end."""
+    project = await _make_project(db_session)
+
+    async def _current_revision() -> str:
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/strategic-state"
+        )
+        assert resp.status_code == 200
+        rev = resp.json().get("state_revision")
+        assert rev is not None
+        return rev
+
+    async def _assert_flips(label: str, mutate) -> None:
+        before = await _current_revision()
+        await mutate()
+        await db_session.commit()
+        after = await _current_revision()
+        assert after != before, (
+            f"{label}: broad revision must change so no 304 hides the update "
+            f"(before={before} after={after})"
+        )
+
+    now = _utcnow()
+
+    # 1. Workbench (MessagesNoisePrefs) updated.
+    async def _mutate_workbench():
+        db_session.add(
+            MessagesNoisePrefs(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                prefs={
+                    "_strategic_workbench": {
+                        "version": 1,
+                        "interaction_mode": "continuous",
+                        "active_surface": "runtime",
+                        "selected_refs": [],
+                    },
+                },
+            )
+        )
+
+    await _assert_flips("workbench", _mutate_workbench)
+
+    # 2. A new enrolled runner (count + max last_seen fingerprint).
+    async def _mutate_runner():
+        db_session.add(
+            LocalRunner(
+                project_id=project.id,
+                token_hash="c" * 64,
+                hostname="desk-new",
+                status="active",
+                last_seen_at=now,
+                capabilities={"task_types": "all", "agent_available": True},
+            )
+        )
+
+    await _assert_flips("runner", _mutate_runner)
+
+    # 3. A new ACTIVE compute job (count + max updated_at fingerprint).
+    async def _mutate_compute():
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                backend="local",
+                status=ComputeJobStatus.RUNNING,
+                started_at=now,
+                updated_at=now,
+            )
+        )
+
+    await _assert_flips("compute_job", _mutate_compute)
+
+    # 4. A new PARKED-task wake (active wake count fingerprint).
+    parked_task = Task(
+        project_id=project.id,
+        title="Parked on compute",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.PARKED,
+    )
+    db_session.add(parked_task)
+    await db_session.commit()
+    await db_session.refresh(parked_task)
+
+    async def _mutate_wake():
+        db_session.add(
+            TaskWakeRegistration(
+                task_id=parked_task.id,
+                project_id=project.id,
+                wake_source_kind="compute_job_terminal",
+                wake_source_ref="job-xyz",
+                wake_action=WakeAction.FINALIZE,
+                delivery_state=WakeDeliveryState.PENDING,
+                requested_at=now,
+                deadline_at=now + timedelta(hours=1),
+            )
+        )
+
+    await _assert_flips("wake", _mutate_wake)
+
+    # 5. A new project message (event feed / command-job / preview fingerprint).
+    async def _mutate_message():
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                content="operator note",
+                from_type="user",
+                status="open",
+            )
+        )
+
+    await _assert_flips("message", _mutate_message)
+
+    # 6. An open ReleaseVersion (model-integrity / sha-freshness fingerprint).
+    async def _mutate_open_version():
+        db_session.add(
+            ReleaseVersion(
+                project_id=project.id, version_number=1, status="open"
+            )
+        )
+
+    await _assert_flips("open_version", _mutate_open_version)
+
+    # 7. A Direction row's criterion_keys. model_integrity / criterion_links are
+    #    computed from Direction rows (NOT the project.directions blob the narrow
+    #    token folds in), so editing them must flip the broad revision.
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-fp-1",
+        status="active",
+        text="fingerprint direction",
+        criterion_keys=["crit-a"],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    async def _mutate_direction_keys():
+        direction.criterion_keys = ["crit-a", "crit-b"]
+        db_session.add(direction)
+
+    await _assert_flips("direction_criterion_keys", _mutate_direction_keys)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
+    client: AsyncClient, db_session, mocker
+):
+    """A live runner going stale is a purely time-derived transition: last_seen_at
+    (and thus runner_max_seen / runner_count) never moves, yet is_live flips to
+    False once the heartbeat ages past _RUNNER_LIVENESS_SECONDS. The broad-revision
+    fingerprint must catch it via live_runner_count so no false 304 pins the
+    resident-session picker / availability on a now-offline runner."""
+    from app.routers.admin_project_strategic_session import (
+        _RUNNER_LIVENESS_SECONDS,
+        _compute_strategic_state_fingerprints,
+    )
+
+    project = await _make_project(db_session)
+    seen_at = _utcnow() - timedelta(seconds=100)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="d" * 64,
+        hostname="desk-live",
+        status="active",
+        last_seen_at=seen_at,
+        capabilities={"task_types": "all", "agent_available": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    fp_live = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    assert fp_live["live_runner_count"] == 1
+    assert fp_live["runner_count"] == 1
+
+    # Advance the wall clock past the liveness window WITHOUT touching the DB.
+    mocker.patch(
+        "app.routers.admin_project_strategic_session._utcnow",
+        return_value=seen_at + timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 30),
+    )
+    fp_stale = await _compute_strategic_state_fingerprints(
+        db_session, project.id, TEST_USER_ID
+    )
+    # DB-derived probes are frozen; only the time-derived liveness count drops —
+    # which is exactly what must flip the broad revision.
+    assert fp_stale["runner_count"] == fp_live["runner_count"]
+    assert fp_stale["runner_max_seen"] == fp_live["runner_max_seen"]
+    assert fp_stale["live_runner_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_broad_revision_delivers_cold_to_warm_currency(
+    client: AsyncClient, db_session, mocker
+):
+    """The broad-revision 304 skip must NOT mask the sha_freshness cold→warm
+    transition. sha_freshness is resolved into the out-of-band _CURRENCY_CACHE
+    (never the DB), so after a cold poll warms the cache, the next poll carrying
+    the cold poll's revision must RE-ASSEMBLE (200 with the resolved verdict),
+    not return an early 304 that pins the banner on 'unknown'."""
+    import asyncio
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE
+
+    project = await _make_project(db_session)
+    sha = "feedface" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={"current": True, "candidate_sha": sha, "head_sha": sha}
+        ),
+    )
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
+    )
+
+    bg_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    def _capture(coro, **kw):
+        t = original_create_task(coro, **kw)
+        bg_tasks.append(t)
+        return t
+
+    mocker.patch("asyncio.create_task", side_effect=_capture)
+
+    # Poll 1 — cold cache: unknown verdict, capture the broad revision.
+    r1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert r1.status_code == 200
+    body1 = r1.json()
+    assert body1["sha_freshness"]["verdict"] == "unknown"
+    rev1 = body1["state_revision"]
+
+    # Warm the cache out-of-band, exactly as the background resolver does.
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+    cache_key = (str(project.id), "main", sha)
+    assert cache_key in _CURRENCY_CACHE
+
+    # Poll 2 — identical DB state, carrying poll-1's revision. Must NOT 304: the
+    # warmed verdict has to be delivered.
+    r2 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state?state_revision={rev1}"
+    )
+    assert r2.status_code == 200, (
+        "cold→warm currency transition was masked by a false broad-revision 304"
+    )
+    body2 = r2.json()
+    assert body2["sha_freshness"]["verdict"] != "unknown"
+    assert body2["state_revision"] != rev1
 
 
 @pytest.mark.asyncio
@@ -7912,34 +8207,31 @@ async def test_strategic_state_volatile_field_change_busts_etag(
 
 
 @pytest.mark.asyncio
-async def test_strategic_state_etag_stable_across_context_package_build_skip(
+async def test_strategic_state_context_package_only_built_on_full_200(
     client: AsyncClient, db_session
 ):
-    """The full-body ETag must be IDENTICAL whether the context-package was built
-    or skipped for the same underlying state, so a client's held ETag (issued on a
-    full build) still 304s on a later build-skipped poll."""
+    """The narrow context-package build-skip has been retired by the broad-revision
+    assembly-skip: a reached (non-304) response ALWAYS carries a built
+    context_package, and a matching revision 304s outright (no partial
+    context_package=None body). Confirms the full context package is present on a
+    first-load 200 and that a matching revision never returns a null-package 200."""
     project = await _make_project(db_session)
 
-    # First poll: full build (context_package present) → ETag E.
     resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp1.status_code == 200
-    etag = resp1.headers.get("ETag")
-    narrow_revision = resp1.json().get("state_revision")
-    assert etag is not None and narrow_revision is not None
-    assert resp1.json().get("context_package") is not None
+    revision = resp1.json().get("state_revision")
+    assert revision is not None
+    assert resp1.json().get("context_package") is not None, (
+        "a reached 200 must always carry a built context package"
+    )
 
-    # Poll with the narrow revision (build skipped) but a NON-matching ETag so we
-    # still get a 200 body — confirm context_package is skipped yet the returned
-    # ETag equals the original (context_package is excluded from the ETag).
+    # A matching revision 304s — there is no longer a build-skipped null-package
+    # 200 intermediate state.
     resp2 = await client.get(
-        f"/api/admin/projects/{project.id}/strategic-state?state_revision={narrow_revision}",
-        headers={"If-None-Match": '"0000000000000000000000000000000000000000000000000000000000000000"'},
+        f"/api/admin/projects/{project.id}/strategic-state?state_revision={revision}"
     )
-    assert resp2.status_code == 200
-    assert resp2.json().get("context_package") is None, "build must be skipped"
-    assert resp2.headers.get("ETag") == etag, (
-        "ETag must not depend on whether context_package was built"
-    )
+    assert resp2.status_code == 304
+    assert len(resp2.content) == 0
 
 
 @pytest.mark.asyncio
@@ -8000,6 +8292,29 @@ async def test_compute_strategic_state_revision_deterministic(
     rev5 = _compute_strategic_state_revision(project, **diff_kwargs)
     assert rev5 != rev4, (
         "changing active_cycle_summary must produce a different revision"
+    )
+
+    # fingerprints defaults to None → identical to omitting it (backward compat).
+    rev6 = _compute_strategic_state_revision(
+        project, **base_kwargs, fingerprints=None
+    )
+    assert rev6 == rev1, "fingerprints=None must not change the revision"
+
+    # A non-empty fingerprints map changes the token...
+    fp = {"runner_count": 1, "runner_max_seen": "2026-07-13T00:00:00"}
+    rev7 = _compute_strategic_state_revision(
+        project, **base_kwargs, fingerprints=fp
+    )
+    assert rev7 != rev1, "a non-empty fingerprints map must change the revision"
+
+    # ...and a mutated fingerprint value changes it again (guards false 304s at
+    # the hash layer).
+    fp2 = {**fp, "runner_count": 2}
+    rev8 = _compute_strategic_state_revision(
+        project, **base_kwargs, fingerprints=fp2
+    )
+    assert rev8 != rev7, (
+        "mutating a fingerprint value must change the revision"
     )
 
 

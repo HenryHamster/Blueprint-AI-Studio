@@ -339,7 +339,10 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     expect(queryGcp('Machine verified')).toBeNull();
     unmountGcp();
 
-    // Operator-hardware (runner-subprocess) job: must show 'Machine verified'
+    // Operator-hardware (runner-subprocess) job WITH a measurable result: must
+    // show 'Machine verified'. Post-#14597 `covered` requires BOTH operator
+    // hardware AND a produced result — a bare local run only proves WHERE it ran
+    // (see computeJobEvidenceTier), so the result is what earns the badge.
     setupMocks();
     fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
       id: 'job-runner',
@@ -349,6 +352,7 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       outcome: 'SUCCESS',
       final_cost_usd: 0,
       completed_at: new Date().toISOString(),
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
     })]));
     const { getByText: getRunner, unmount: unmountRunner } = render(
       <ComputeJobsPanel projectId="proj-1" />

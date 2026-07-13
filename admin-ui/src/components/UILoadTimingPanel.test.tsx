@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import { UILoadTimingPanel, percentile, fmtMs, computeStats, computePerTypeSplit } from './UILoadTimingPanel';
 
 const { apiFetchMock } = vi.hoisted(() => ({
@@ -168,7 +168,7 @@ describe('UILoadTimingPanel', () => {
     expect(screen.getAllByText('no post-cutoff data').length).toBeGreaterThan(0);
   });
 
-  it('shows "no baseline" message when all samples are after the cutoff', async () => {
+  it('shows "no pinned baseline" message when all samples are after the cutoff', async () => {
     apiFetchMock.mockResolvedValue(
       jsonResponse({
         surfaces: {
@@ -182,7 +182,7 @@ describe('UILoadTimingPanel', () => {
     render(<UILoadTimingPanel />);
     await act(async () => {});
 
-    expect(screen.getByText(/no baseline — overwritten by 200-sample cap/i)).toBeInTheDocument();
+    expect(screen.getByText(/no pinned baseline — use Pin baseline to capture one/i)).toBeInTheDocument();
     // after group shows the value (p50 and p90 both 200ms for a single sample)
     expect(screen.getAllByText('200ms').length).toBeGreaterThan(0);
   });
@@ -257,5 +257,82 @@ describe('UILoadTimingPanel', () => {
 
     expect(screen.getByText('before p50')).toBeInTheDocument();
     expect(screen.getByText('after p50')).toBeInTheDocument();
+  });
+
+  it('POSTs to pin-baseline endpoint with label and re-fetches data', async () => {
+    const surfaceData = jsonResponse({
+      surfaces: {
+        chat: [{ ts: '2026-07-09T07:31:00Z', page_ready_ms: 500, sample_type: 'first_commit' }],
+      },
+      baselines: [],
+    });
+    const pinResponse = { ok: true, json: async () => ({}), text: async () => '' } as Response;
+    // First call: GET data; second call: POST pin; third call: GET data after pin
+    apiFetchMock
+      .mockResolvedValueOnce(surfaceData)
+      .mockResolvedValueOnce(pinResponse)
+      .mockResolvedValueOnce(jsonResponse({
+        surfaces: {
+          chat: [{ ts: '2026-07-09T07:31:00Z', page_ready_ms: 500, sample_type: 'first_commit' }],
+        },
+        baselines: [{ id: 'b1', surface: 'chat', sample_type: 'first_commit', p50: 500, p90: 500, count: 1, label: 'Before test', pinned_at: '2026-07-13T00:00:00Z' }],
+      }));
+
+    render(<UILoadTimingPanel />);
+    await act(async () => {});
+
+    // Fill the label input and click Pin baseline
+    const labelInput = screen.getByPlaceholderText('Baseline label…');
+    fireEvent.change(labelInput, { target: { value: 'Before test' } });
+    const pinBtn = screen.getByRole('button', { name: /pin baseline/i });
+    await act(async () => { fireEvent.click(pinBtn); });
+
+    // POST was called with correct endpoint and label
+    const allCalls = apiFetchMock.mock.calls as unknown as Array<[string, RequestInit?]>;
+    const postCall = allCalls.find(
+      ([url, opts]) => url === '/api/admin/ui-load-timing/pin-baseline' && opts?.method === 'POST',
+    );
+    expect(postCall).toBeDefined();
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const postOpts = postCall![1] as RequestInit;
+    expect(JSON.parse(postOpts.body as string)).toEqual({ label: 'Before test' });
+
+    // GET was called again after pin (re-fetch)
+    const getCalls = allCalls.filter(
+      ([url, opts]) => url === '/api/admin/ui-load-timing' && !opts?.method,
+    );
+    expect(getCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('truncates label to 128 characters', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      surfaces: { chat: [{ ts: '2026-07-09T07:31:00Z', page_ready_ms: 500, sample_type: 'first_commit' }] },
+      baselines: [],
+    }));
+    render(<UILoadTimingPanel />);
+    await act(async () => {});
+    const labelInput = screen.getByPlaceholderText('Baseline label…') as HTMLInputElement;
+    const longLabel = 'a'.repeat(200);
+    fireEvent.change(labelInput, { target: { value: longLabel } });
+    expect(labelInput.value.length).toBe(128);
+  });
+
+  it('shows error when pin request fails', async () => {
+    apiFetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        surfaces: { chat: [{ ts: '2026-07-09T07:31:00Z', page_ready_ms: 500, sample_type: 'first_commit' }] },
+        baselines: [],
+      }))
+      .mockResolvedValueOnce({ ok: false, text: async () => 'Server error' } as Response);
+
+    render(<UILoadTimingPanel />);
+    await act(async () => {});
+
+    const labelInput = screen.getByPlaceholderText('Baseline label…');
+    fireEvent.change(labelInput, { target: { value: 'Test' } });
+    const pinBtn = screen.getByRole('button', { name: /pin baseline/i });
+    await act(async () => { fireEvent.click(pinBtn); });
+
+    expect(screen.getByText(/Failed to pin/i)).toBeInTheDocument();
   });
 });
