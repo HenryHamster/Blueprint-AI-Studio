@@ -647,6 +647,77 @@ esac
     // No PR URL marker was written.
     expect(realFs.existsSync('/tmp/pr_url_task-emptydiff-1')).toBe(false);
   });
+
+  // ── Failed-vs-empty diff on a depth-limited clone ────────────────────────────
+  // On a shallow clone the merge-base commit can be absent, so `git diff
+  // base...HEAD` FAILS (non-zero exit, empty stdout) rather than reporting a
+  // genuinely-empty diff. The guard must NOT conflate the two: a failed diff is
+  // inconclusive, not a proven zero-diff, and must NOT hard-block real work.
+  it('does not block on a FAILED base diff (depth-limited clone) — treats it as inconclusive and proceeds', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    realFs.rmSync('/tmp/pr_url_task-shallow-1', { force: true });
+
+    const script = writeScript({
+      taskId: 'task-shallow-1',
+      workBranch: 'blueprint/task-shallow-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      // The base-relative diff FAILS (exit 128) as it would when the merge-base
+      // is missing on a shallow clone — even after a deepen/unshallow fetch that
+      // cannot recover it here. push + PR-create MUST still run (guard skipped).
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf 'fatal: bad revision\\n' >&2; exit 128 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"fetch --deepen"*) exit 0 ;;
+  *"fetch --unshallow"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-shallow-1"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-shallow-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/8"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/8"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/8\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+    });
+
+    // Behavioral proof the guard did NOT hard-block: under the OLD
+    // `2>/dev/null || true` code a failing diff produced empty output and
+    // exited 1 with the ZERO-diff message. Here the script reaches status 0
+    // (push + PR-create ran) and writes the PR URL marker — the failed diff was
+    // treated as inconclusive, not a proven zero-diff. (runScript only surfaces
+    // stderr on non-zero exit, so the inconclusive wording is asserted in the
+    // static content test below, not here.)
+    expect(result.status).toBe(0);
+    expect(realFs.existsSync('/tmp/pr_url_task-shallow-1')).toBe(true);
+    realFs.rmSync('/tmp/pr_url_task-shallow-1', { force: true });
+  });
 });
 
 // Static content checks (no bash execution — these run on every platform,
@@ -786,5 +857,13 @@ describe('writePrHelper — generated script content', () => {
     expect(s).toContain('nets to ZERO effective diff vs base');
     expect(s).toContain('./pr close --superseded-by');
     expect(s).toContain('./done --already-done');
+    // Distinguishes a FAILED diff (depth-limited clone, merge-base absent) from a
+    // genuinely-empty one: captures the exit status separately, deepens+retries on
+    // failure, and treats a persistent failure as inconclusive (skip) — NOT a hard
+    // block. The zero-diff hard block only fires when the diff SUCCEEDED but empty.
+    expect(s).toContain('_EFFECTIVE_DIFF_STATUS=$?');
+    expect(s).toContain('git fetch --deepen=200 origin');
+    expect(s).toContain('effective-diff check inconclusive');
+    expect(s).toMatch(/if \[ "\$_EFFECTIVE_DIFF_STATUS" -ne 0 \][\s\S]*elif \[ -z "\$_EFFECTIVE_DIFF" \]/);
   });
 });
