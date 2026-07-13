@@ -689,6 +689,7 @@ def compute_composite(
     category_verdicts: list[dict[str, Any]] | None = None,
     residual_uncaptured_gap: str | None = None,
     merge_grade_misses: bool = False,
+    merge_grade_exempt: bool = False,
     debt_pressure_score: float | None = None,
     capability_proof_blocked: bool = False,
 ) -> dict[str, Any]:
@@ -743,6 +744,19 @@ def compute_composite(
         the gate entirely — preserving the pre-redesign no-criteria path.
         ``sub_scores["unmet_categories"]`` / ``["residual_uncaptured_gap"]``
         record WHY for observability.
+
+        ``merge_grade_exempt`` (finding 85fa667a4d7fcae6): a merge-grade
+        exemption (``superseded_exempt`` / ``already_on_main_exempt``) exempts
+        ONLY the HOLISTIC ``merge_grade_misses`` gate — the caller clears that
+        boolean.  It does NOT exempt this per-category coverage gate: an exempt
+        candidate whose ACTIVE acceptance criteria are graded and come back
+        ``not_met`` must still block on ``criterion_coverage_incomplete``, exactly
+        as ``main``'s retired unconditional coverage block did.  Previously the
+        caller skipped grading entirely on the exempt path (passing
+        ``category_verdicts=None``), silently loosening coverage; the caller now
+        grades and passes the verdicts, and this flag is recorded in
+        ``sub_scores["merge_grade_exempt"]`` for provenance without weakening the
+        gate.
       * ``capability_proof_blocked`` is True — the capability proof gate is in
         ``"enforce"`` mode and at least one ``working`` capability lacks
         ``proven`` evidence (``"capability_proof_gate_blocked"``).  Governs the
@@ -921,6 +935,12 @@ def compute_composite(
             sub_scores["judged_tier_met_fraction"] = round(_judged / len(_met), 4)
     if residual_uncaptured_gap:
         sub_scores["residual_uncaptured_gap"] = str(residual_uncaptured_gap)
+    # Provenance (finding 85fa667a4d7fcae6): record that this candidate reached
+    # scoring on a merge-grade-exempt path so an operator can see the per-category
+    # coverage gate STILL applied (only the holistic merge_grade_misses gate was
+    # exempted).  Purely informational — the gate outcome above is unchanged.
+    if merge_grade_exempt:
+        sub_scores["merge_grade_exempt"] = True
 
     if blocker is not None:
         return {

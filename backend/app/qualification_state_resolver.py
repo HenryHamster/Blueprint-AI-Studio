@@ -450,16 +450,41 @@ def resolve_dimension_states(
             else:
                 dim_status = "unavailable"
         elif key == "criterion_coverage":
-            total = int(criterion_coverage.get("total") or 0)
-            covered = int(criterion_coverage.get("covered") or 0)
-            if total == 0:
-                dim_status = "not_applicable"
-            elif covered >= total:
-                dim_status = "passed"
-                score = 1.0
+            # Redesigned goal-verification gate: the acceptance criteria ARE the
+            # merge-grade's per-category verdicts, and the gate blocks on
+            # ``criterion_coverage_incomplete`` iff ANY active category is not
+            # ``met`` (``partial`` gates like ``not_met``) OR a residual gap
+            # remains.  The legacy evidence-coverage COUNTS (``total``/``covered``)
+            # no longer drive that gate — attested/backfilled criteria are NOT
+            # counted as ``covered`` — so deriving this dimension from counts made
+            # an all-``met`` category set surface as ``failed``, directly
+            # contradicting a promotion the gate allowed.  Derive from the SAME
+            # ``category_verdicts`` the gate consumes when they are present; only
+            # fall back to the legacy counts when no per-category verdicts exist
+            # (no rubric / ledger absent — the pre-redesign path).
+            category_verdicts = q.get("category_verdicts")
+            if isinstance(category_verdicts, list) and category_verdicts:
+                residual = q.get("residual_uncaptured_gap")
+                any_unmet = any(
+                    (v or {}).get("status") != "met" for v in category_verdicts
+                )
+                if any_unmet or residual:
+                    dim_status = "failed"
+                    reason = "criterion_coverage_incomplete"
+                else:
+                    dim_status = "passed"
+                    score = 1.0
             else:
-                dim_status = "failed"
-                reason = "criterion_coverage_incomplete"
+                total = int(criterion_coverage.get("total") or 0)
+                covered = int(criterion_coverage.get("covered") or 0)
+                if total == 0:
+                    dim_status = "not_applicable"
+                elif covered >= total:
+                    dim_status = "passed"
+                    score = 1.0
+                else:
+                    dim_status = "failed"
+                    reason = "criterion_coverage_incomplete"
         elif key == "debt_pressure":
             raw = sub_scores.get("debt_pressure")
             if raw is not None:

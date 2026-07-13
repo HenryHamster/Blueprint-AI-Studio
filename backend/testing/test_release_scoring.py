@@ -636,7 +636,10 @@ class TestCategoryGateNonEngagingPaths:
          for a contentless placeholder goal — the caller (_finalize_qualification)
          MUST use _never_graded_category_verdicts to block for active criteria.
       2. merge-grade-exempt: superseded_exempt / already_on_main_exempt candidates
-         skip the entire category-ledger block → category_verdicts=None (by-design).
+         were previously skipped entirely (category_verdicts=None).  Finding
+         85fa667a4d7fcae6 corrected this: the exemption covers only the holistic
+         merge_grade_misses gate, so exempt candidates with active criteria are now
+         graded and STILL coverage-gated (see test_merge_grade_exempt_* below).
       3. legacy ci_unresolved-recovery: the recovery re-runs compute_composite with
          base_record.get("category_verdicts") — when the original finalize persisted
          None (no rubric or exempt), recovery also passes None (by-design same-SHA).
@@ -707,27 +710,71 @@ class TestCategoryGateNonEngagingPaths:
 
     # Path 2 -------------------------------------------------------------------
 
-    def test_merge_grade_exempt_category_verdicts_none_skips_gate_by_design(self):
-        """Path 2: merge-grade-exempt candidates receive category_verdicts=None
-        (by-design).  superseded_exempt and already_on_main_exempt skip the
-        entire category-ledger block in _finalize_qualification, so
-        _gate_category_verdicts stays None and the gate is not applied.
+    def test_merge_grade_exempt_not_met_verdicts_still_gate(self):
+        """Finding 85fa667a4d7fcae6 — Path 2 (CORRECTED policy): a merge-grade
+        exemption (superseded_exempt / already_on_main_exempt) exempts ONLY the
+        holistic merge_grade_misses gate, NOT the per-category coverage gate.
 
-        This is intentional: a candidate already landed on the promotion target
-        (already_on_main_exempt) or whose release was superseded (superseded_exempt)
-        does not need its acceptance contract re-evaluated.
+        _finalize_qualification now grades + passes the exempt candidate's active
+        category verdicts (instead of the prior category_verdicts=None skip), so a
+        not_met active criterion STILL blocks on criterion_coverage_incomplete —
+        exactly as main's retired unconditional coverage block did.  The
+        merge_grade_exempt flag is recorded for provenance without weakening the
+        gate.
         """
-        # When _finalize_qualification skips the ledger block for an exempt
-        # candidate, it passes category_verdicts=None to compute_composite.
-        # The gate must be a no-op (not raise criterion_coverage_incomplete).
+        verdicts = [
+            {"category_key": "c-1", "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+            {"category_key": "c-2", "status": "not_met", "tier": "judged",
+             "gap": "feature not shipped", "citations": []},
+        ]
         result = rs.compute_composite(
             **_perfect_kwargs(
-                category_verdicts=None,
-                merge_grade_misses=False,  # exempt candidates also clear this
+                category_verdicts=verdicts,
+                merge_grade_misses=False,  # holistic gate IS exempted
+                merge_grade_exempt=True,
+            )
+        )
+        assert result["blocker"] == "criterion_coverage_incomplete"
+        assert result["promote"] is False
+        assert result["confidence"] == 0.0
+        # Provenance recorded without altering the gate outcome.
+        assert result["sub_scores"]["merge_grade_exempt"] is True
+        assert result["sub_scores"]["unmet_categories"] == ["c-2"]
+
+    def test_merge_grade_exempt_all_met_verdicts_promote(self):
+        """The corrected exempt policy does not over-block: an exempt candidate
+        whose active criteria all grade ``met`` still promotes, and records the
+        merge_grade_exempt provenance flag."""
+        verdicts = [
+            {"category_key": "c-1", "status": "met", "tier": "judged",
+             "citations": [{"kind": "diff", "ref": "a.py:1"}]},
+        ]
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                category_verdicts=verdicts,
+                merge_grade_misses=False,
+                merge_grade_exempt=True,
             )
         )
         assert result["blocker"] is None
         assert result["promote"] is True
+        assert result["sub_scores"]["merge_grade_exempt"] is True
+
+    def test_merge_grade_exempt_no_rubric_none_verdicts_skips_gate(self):
+        """When an exempt candidate has NO active rubric, category_verdicts is
+        legitimately None and the gate stays inert (pre-redesign holistic-only
+        path preserved).  merge_grade_exempt is still recorded for provenance."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                category_verdicts=None,
+                merge_grade_misses=False,
+                merge_grade_exempt=True,
+            )
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+        assert result["sub_scores"]["merge_grade_exempt"] is True
 
     def test_merge_grade_exempt_path_only_holistic_blockers_apply(self):
         """On the merge-grade-exempt path, holistic quality blockers (CI, audit,

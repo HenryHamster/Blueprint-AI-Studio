@@ -281,6 +281,109 @@ def test_criterion_coverage_zero_total_not_applicable():
     assert d["criterion_coverage"]["status"] == "not_applicable"
 
 
+def test_criterion_coverage_all_met_verdicts_passed_despite_low_counts():
+    """Finding 9c04a643e3d336ec — align the resolver's coverage derivation with
+    the redesigned category-verdict gate.
+
+    The redesigned gate blocks on criterion_coverage_incomplete iff a category is
+    not ``met`` (or a residual gap remains).  The legacy evidence-coverage COUNTS
+    no longer feed that gate — attested/backfilled criteria are NOT counted as
+    ``covered`` — so a version whose categories all grade ``met`` can still show
+    covered < total.  Deriving the dimension from counts marked it ``failed``,
+    contradicting the promotion the gate allowed.  With category_verdicts present
+    and all ``met``, the dimension must resolve to ``passed``.
+    """
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        # Counts disagree (attested tiers not counted as covered) ...
+        "criterion_coverage": {"total": 4, "covered": 2},
+        # ... but every active category graded 'met' — the gate did NOT fire.
+        "category_verdicts": [
+            {"category_key": "c-1", "status": "met"},
+            {"category_key": "c-2", "status": "met"},
+        ],
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["criterion_coverage"]["status"] == "passed"
+    assert d["criterion_coverage"]["score"] == 1.0
+    assert d["criterion_coverage"]["reason"] is None
+
+
+def test_criterion_coverage_not_met_verdict_failed_despite_full_counts():
+    """The verdict-derived path also correctly FAILS: a not_met category resolves
+    to ``failed`` even when the legacy counts show full coverage (covered==total).
+
+    This exercises the case where a DIFFERENT blocker (e.g. ci) fired first, so the
+    criterion_coverage dimension is derived from category_verdicts rather than the
+    blocker map — the dimension must still reflect the true not_met category state.
+    """
+    qual = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",  # a different blocker won the ordered chain
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "red"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "criterion_coverage": {"total": 3, "covered": 3},
+        "category_verdicts": [
+            {"category_key": "c-1", "status": "met"},
+            {"category_key": "c-2", "status": "not_met"},
+        ],
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["criterion_coverage"]["status"] == "failed"
+    assert d["criterion_coverage"]["reason"] == "criterion_coverage_incomplete"
+
+
+def test_criterion_coverage_residual_gap_fails_despite_all_met():
+    """A residual uncaptured gap fails the coverage dimension even when every
+    category is ``met`` — mirroring the gate's residual_uncaptured_gap block."""
+    qual = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "red"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "criterion_coverage": {"total": 1, "covered": 1},
+        "category_verdicts": [{"category_key": "c-1", "status": "met"}],
+        "residual_uncaptured_gap": "goal aspect no category captures",
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["criterion_coverage"]["status"] == "failed"
+    assert d["criterion_coverage"]["reason"] == "criterion_coverage_incomplete"
+
+
+def test_criterion_coverage_no_verdicts_falls_back_to_counts():
+    """When no category_verdicts are present (no rubric / ledger absent), the
+    resolver falls back to the legacy evidence-coverage counts."""
+    qual = {
+        "status": "not_promoted",
+        "blocker": "audit_missing",
+        "sub_scores": {"audit": 0.0, "test_erosion": 0.0, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "criterion_coverage": {"total": 5, "covered": 3},
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["criterion_coverage"]["status"] == "failed"
+    assert d["criterion_coverage"]["reason"] == "criterion_coverage_incomplete"
+
+
 def test_debt_pressure_when_present():
     qual = {
         "status": "promoted",

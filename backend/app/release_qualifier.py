@@ -5247,18 +5247,27 @@ async def _finalize_qualification(
     # candidate's per-category verdicts + residual into the sha-keyed ledger (the
     # verdict cache), then read the gate inputs back FROM the ledger so the gate
     # is a pure read that survives a re-drive (on a re-drive the merge_grade child
-    # is not re-spawned; its verdicts are already in the ledger).  Exemptions
-    # (superseded / already-on-main) skip the category gate exactly as they skip
-    # the holistic merge_grade_misses gate.  When the sibling ledger module is not
-    # present in this checkout, or there is no active rubric, the gate is skipped
-    # (fallback to the pre-redesign holistic-only path).
+    # is not re-spawned; its verdicts are already in the ledger).
+    #
+    # Finding 85fa667a4d7fcae6 — merge-grade EXEMPTIONS (superseded_exempt /
+    # already_on_main_exempt) exempt ONLY the HOLISTIC merge_grade_misses gate
+    # (cleared above).  They do NOT exempt this per-category coverage gate: a
+    # candidate whose ACTIVE acceptance criteria grade ``not_met`` must still
+    # block on ``criterion_coverage_incomplete``, exactly as main's retired
+    # unconditional coverage block did.  Skipping grading on the exempt path
+    # (the prior ``not _merge_grade_exempt`` guard) silently loosened coverage —
+    # a not_met candidate promoted just because its release was superseded or it
+    # had already landed on the promotion target.  We now grade + persist + gate
+    # on the SAME exempt candidates.  When the sibling ledger module is absent,
+    # or there is no active rubric, the gate is still skipped (fallback to the
+    # pre-redesign holistic-only path).
     _merge_grade_exempt = merge_grade_cert.get("status") in (
         "superseded_exempt",
         "already_on_main_exempt",
     )
     _gate_category_verdicts: list[dict[str, Any]] | None = None
     _gate_residual: str | None = None
-    if _category_ledger is not None and active_categories and not _merge_grade_exempt:
+    if _category_ledger is not None and active_categories:
         # The CURRENTLY-ACTIVE criterion keys.  A retracted / superseded criterion
         # keeps its (possibly ``not_met``) CategoryVerdict row in the ledger — the
         # row is never cleared — but it is no longer part of the acceptance
@@ -5521,6 +5530,7 @@ async def _finalize_qualification(
         category_verdicts=_gate_category_verdicts,
         residual_uncaptured_gap=_gate_residual,
         merge_grade_misses=merge_grade_misses,
+        merge_grade_exempt=_merge_grade_exempt,
         debt_pressure_score=_debt_pressure_score,
         capability_proof_blocked=capability_proof_blocked,
     )
