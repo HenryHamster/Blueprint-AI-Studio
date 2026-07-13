@@ -16,8 +16,6 @@ import { humanizeUnverifiedReason, labelNoTestsReason } from '../utils/unverifie
 import { parseMergeTestVerdict, deriveMergeTestOutcome, type MergeTestVerdict, type MergeTestResult } from '../utils/mergeTestVerdict';
 import { getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 
-const WIDE_FINISHED_WINDOW_MINUTES = 10_080;
-
 /** Classify whether a terminal kill was intentional (budget cap / deadline /
  *  operator cancel) vs a genuine crash — drives amber vs red badge styling. */
 function isIntentionalKill(job: ComputeJob): boolean {
@@ -70,9 +68,9 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
-    fetchComputeJobs(projectId, undefined, WIDE_FINISHED_WINDOW_MINUTES)
+    fetchComputeJobs(projectId, undefined, undefined, 0, taskId)
       .then(result => {
-        if (!cancelled) setJobs(result.jobs.filter(j => j.task_id === taskId));
+        if (!cancelled) setJobs(result.jobs);
       })
       .catch(() => { /* compute jobs are optional context */ });
     return () => { cancelled = true; };

@@ -1,6 +1,6 @@
 {
   "_doc": "Per-component and project-wide caps on viewport escape-hatch debt. Read by viewport-coverage.test.ts (checkEscapeHatchBudget). Re-baselined 2026-05-22: each cap is set to the component's then-current actual opt-out count plus 1 (single-opt-out headroom). This removes dead slack that accumulated as debt was paid down -- it is NOT lowering caps below current usage to force refactoring. Policy: one justified opt-out in a component passes without a bump; a cluster of new opt-outs requires a visible, reviewable budget increase in the same PR. Bump 'total' alongside any per-component increase.",
-  "total": 260,
+  "total": 261,
   "perComponent": {
     "FleetRunnersPanel": 4,
     "DirectionCard": 27,
@@ -58,6 +58,7 @@
     "ProjectToolHost": 3,
     "ViewportDebtPanel": 1,
     "WarmVmPanel": 1,
-    "NotesTool": 3
+    "NotesTool": 3,
+    "UILoadTimingPanel": 1
   }
 }

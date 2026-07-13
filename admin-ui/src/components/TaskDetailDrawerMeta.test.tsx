@@ -793,7 +793,7 @@ describe('DetailsTab — Merge Test Gate', () => {
     ]));
     const task = makeTask({ project_id: 'proj-1' as unknown as Task['project_id'] });
     render(<DetailsTab task={task} />);
-    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, 10_080);
+    expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', undefined, undefined, 0, 'task-verify-1');
     expect(await screen.findByRole('link', { name: /https:\/\/storage\.example\.com\/jobs\/job-1\/result\.json/i })).toHaveAttribute(
       'href',
       'https://storage.example.com/jobs/job-1/result.json',

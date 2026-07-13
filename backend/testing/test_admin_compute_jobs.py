@@ -2892,3 +2892,56 @@ async def test_gpu_contamination_audit_non_member_404(client: AsyncClient, db_se
         f"/api/admin/compute-jobs/gpu-contamination-audit?project_id={project.id}"
     )
     assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_task_id_filter(client: AsyncClient, db_session):
+    """task_id query param returns only jobs for that task, not the whole project."""
+    project = await _make_project(db_session, name="TaskFilter")
+    await _add_member(db_session, project.id, "viewer")
+    task_a, job_a, _ = await _make_job(db_session, project, title="task A")
+    _task_b, job_b, _ = await _make_job(db_session, project, title="task B")
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?task_id={task_a.id}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [j["id"] for j in body["compute_jobs"]]
+    assert ids == [str(job_a.id)], f"expected only job_a, got {ids}"
+    assert str(job_b.id) not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_task_id_bypasses_time_window(
+    client: AsyncClient, db_session
+):
+    """A task_id filter returns the task's OLD terminal jobs that the default
+    time-window query would exclude — this is what lets the task drawer drop
+    its wide (7-day) window and fetch a single task-scoped request."""
+    project = await _make_project(db_session, name="TaskFilterWindow")
+    await _add_member(db_session, project.id, "viewer")
+    task, old_job, _ = await _make_job(
+        db_session, project, status=ComputeJobStatus.SUCCEEDED, title="stale task"
+    )
+    # Completed far outside the default 6h include_finished window.
+    old_job.completed_at = _utcnow() - timedelta(days=30)
+    db_session.add(old_job)
+    await db_session.commit()
+
+    # Unfiltered listing excludes the stale terminal job (window applies)...
+    unfiltered = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert unfiltered.status_code == 200
+    unfiltered_ids = [j["id"] for j in unfiltered.json()["compute_jobs"]]
+    assert str(old_job.id) not in unfiltered_ids
+
+    # ...but the task-scoped request still returns it (window bypassed).
+    scoped = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs?task_id={task.id}"
+    )
+    assert scoped.status_code == 200
+    scoped_body = scoped.json()
+    scoped_ids = [j["id"] for j in scoped_body["compute_jobs"]]
+    assert scoped_ids == [str(old_job.id)], f"expected stale job, got {scoped_ids}"
+    # Per-task summary counts the returned jobs (aggregate is not meaningful here).
+    assert scoped_body["summary"]["total_jobs"] == 1

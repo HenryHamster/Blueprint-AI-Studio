@@ -980,12 +980,14 @@ export async function fetchComputeJobs(
   signal?: AbortSignal,
   includeFinishedMinutes?: number,
   offset = 0,
+  taskId?: string,
 ): Promise<ComputeJobsListResponse> {
   const query = new URLSearchParams();
   if (typeof includeFinishedMinutes === 'number') {
     query.set('include_finished_minutes', String(includeFinishedMinutes));
   }
   if (offset > 0) query.set('offset', String(offset));
+  if (taskId) query.set('task_id', taskId);
   const suffix = query.toString() ? `?${query.toString()}` : '';
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs${suffix}`,

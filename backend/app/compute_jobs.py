@@ -1526,6 +1526,7 @@ async def list_compute_jobs(
     limit: int = 50,
     offset: int = 0,
     all_terminal: bool = False,
+    task_id: uuid.UUID | None = None,
 ) -> tuple[list[ComputeJob], bool]:
     """Return a project's active compute jobs plus recently-finished ones.
 
@@ -1533,7 +1534,24 @@ async def list_compute_jobs(
     jobs are included regardless of age (``include_finished_within`` is ignored
     for the terminal filter). Otherwise only terminal jobs completed within
     ``include_finished_within`` are returned. Ordered newest-first.
+
+    When ``task_id`` is provided, only jobs linked to that task are returned
+    (skips the active/terminal window filter — returns all jobs for that task).
     """
+    if task_id is not None:
+        result = await session.execute(
+            select(ComputeJob)
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.task_id == task_id,
+            )
+            .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+        jobs = list(result.scalars().all())
+        has_more = len(jobs) > limit
+        return jobs[:limit], has_more
     if all_terminal:
         terminal_filter = ComputeJob.completed_at.is_not(None)
     else:
@@ -1541,15 +1559,16 @@ async def list_compute_jobs(
         terminal_filter = ComputeJob.completed_at.is_not(None) & (
             ComputeJob.completed_at >= cutoff
         )
+    where_clauses = [
+        ComputeJob.project_id == project_id,
+        (
+            ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
+            | terminal_filter
+        ),
+    ]
     result = await session.execute(
         select(ComputeJob)
-        .where(
-            ComputeJob.project_id == project_id,
-            (
-                ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)
-                | terminal_filter
-            ),
-        )
+        .where(*where_clauses)
         .order_by(ComputeJob.created_at.desc(), ComputeJob.id.desc())
         .offset(offset)
         .limit(limit + 1)
@@ -1717,12 +1736,24 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
             result = await session.execute(stmt)
             jobs = result.scalars().all()
 
+            # Batch-load tasks for the fetched jobs to avoid N+1 per-job lookups.
+            task_ids = [j.task_id for j in jobs if j.task_id]
+            task_map: dict[uuid.UUID, Task] = {}
+            if task_ids:
+                task_rows = await session.execute(
+                    select(Task).where(Task.id.in_(task_ids))
+                )
+                task_map = {t.id: t for t in task_rows.scalars().all()}
+
         if not jobs:
             break
 
         for job in jobs:
             try:
-                await _process_single_compute_job(job, session_factory=session_factory)
+                prefetched_task = task_map.get(job.task_id) if job.task_id else None
+                await _process_single_compute_job(
+                    job, session_factory=session_factory, task=prefetched_task
+                )
             except Exception as exc:  # noqa: PERF203
                 logger.exception(
                     "[COMPUTE_JOB] monitor failed for job=%s: %s",
@@ -1940,16 +1971,20 @@ async def _maybe_retry_provisioning_timeout(
     return True
 
 
+_MISSING = object()
+
+
 async def _process_single_compute_job(
-    job: ComputeJob, *, session_factory=AsyncSessionLocal
+    job: ComputeJob, *, session_factory=AsyncSessionLocal, task=_MISSING
 ) -> None:
     now = _utcnow()
     backend = get_compute_backend(job.backend)
 
-    task = None
-    if job.task_id:
-        async with session_factory() as session:
-            task = await session.get(Task, job.task_id)
+    if task is _MISSING:
+        task = None
+        if job.task_id:
+            async with session_factory() as session:
+                task = await session.get(Task, job.task_id)
 
     if job.task_id is not None and (
         task is None or task.status in _TASK_TERMINAL_STATUSES
@@ -2068,7 +2103,7 @@ async def _process_single_compute_job(
         started_at = _utcnow()
         try:
             spec = await _attach_repo_clone(
-                session_factory, reserved, _build_launch_spec(reserved)
+                session_factory, reserved, _build_launch_spec(reserved), task=task
             )
             launch_coro = backend.launch(spec)
             if provisioning_timeout_seconds is not None:
@@ -2776,6 +2811,10 @@ async def _apply_task_terminal_cancellation(
         live = await _lock_compute_job(session, job_id)
         if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
             return False
+        # Deliberately a FRESH read under the job lock — the caller's task
+        # snapshot can be minutes stale by the end of a batch, and a task
+        # revived in that window (e.g. FAILED→QUEUED restore) must not get
+        # its running job cancelled on stale terminal status.
         live_task = await session.get(Task, live.task_id) if live.task_id else None
         if live.task_id is not None and (
             live_task is None or live_task.status not in _TASK_TERMINAL_STATUSES
@@ -2872,7 +2911,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
 
 
 async def _attach_repo_clone(
-    session_factory, job: ComputeJob, spec: ComputeLaunchSpec
+    session_factory, job: ComputeJob, spec: ComputeLaunchSpec, *, task: Task | None = None
 ) -> ComputeLaunchSpec:
     """Best-effort: give the compute VM a checked-out clone of the project repo.
 
@@ -2901,14 +2940,16 @@ async def _attach_repo_clone(
                 return spec
             ref: str | None = None
             if job.task_id:
-                task = await session.get(Task, job.task_id)
-                if task is not None:
+                _task = task
+                if _task is None:
+                    _task = await session.get(Task, job.task_id)
+                if _task is not None:
                     payload = (
-                        task.first_payload
-                        if isinstance(task.first_payload, dict)
+                        _task.first_payload
+                        if isinstance(_task.first_payload, dict)
                         else {}
                     )
-                    ctx = task.context if isinstance(task.context, dict) else {}
+                    ctx = _task.context if isinstance(_task.context, dict) else {}
                     ref = payload.get("base_branch") or ctx.get("original_base")
             ref = ref or getattr(project, "promotion_target", None) or "main"
             # Reuses the shared, cached install-token path (50-min TTL) so launches

@@ -415,6 +415,7 @@ async def get_project_compute_jobs(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     all_terminal: bool = Query(False),
+    task_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -423,6 +424,9 @@ async def get_project_compute_jobs(
     When ``all_terminal=true``, all terminal jobs are returned regardless of
     age — ``include_finished_minutes`` is accepted but ignored for the terminal
     filter, allowing deep-history browsing of past experiments.
+
+    When ``task_id`` is provided, only jobs linked to that task are returned
+    and the time-window filter is bypassed.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
@@ -435,25 +439,38 @@ async def get_project_compute_jobs(
         limit=limit,
         offset=offset,
         all_terminal=all_terminal,
+        task_id=task_id,
     )
     built_payload = await _build_compute_job_payload(session, jobs)
-    agg_summary = await aggregate_compute_jobs_summary(
-        session,
-        project_id=project_id,
-        include_finished_within=window,
-        all_terminal=all_terminal,
-    )
-    criterion_stats = await aggregate_criterion_summary(
-        session,
-        project_id=project_id,
-        include_finished_within=window,
-        all_terminal=all_terminal,
-    )
-    summary = {
-        **agg_summary,
-        "criterion_met": criterion_stats["criterion_met"],
-        "criterion_measured": criterion_stats["criterion_measured"],
-    }
+    if task_id is not None:
+        # Aggregate summary is not meaningful for a single-task filter.
+        summary: dict = {
+            "total_jobs": len(jobs),
+            "active_jobs": 0,
+            "terminal_jobs": 0,
+            "total_spend_usd": 0,
+            "outcome_breakdown": {},
+            "criterion_met": 0,
+            "criterion_measured": 0,
+        }
+    else:
+        agg_summary = await aggregate_compute_jobs_summary(
+            session,
+            project_id=project_id,
+            include_finished_within=window,
+            all_terminal=all_terminal,
+        )
+        criterion_stats = await aggregate_criterion_summary(
+            session,
+            project_id=project_id,
+            include_finished_within=window,
+            all_terminal=all_terminal,
+        )
+        summary = {
+            **agg_summary,
+            "criterion_met": criterion_stats["criterion_met"],
+            "criterion_measured": criterion_stats["criterion_measured"],
+        }
     return {
         "compute_jobs": built_payload,
         "has_more": has_more,

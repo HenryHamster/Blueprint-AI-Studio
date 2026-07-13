@@ -1188,7 +1188,7 @@ class Task(SQLModel, table=True):
             onupdate=_utcnow,
         ),
     )
-    archived: bool = Field(default=False)
+    archived: bool = Field(default=False, index=True)
 
     # VM lifecycle timing for cost tracking
     # Write-once timestamp recorded at initial dispatch (before GCE create call).
@@ -1657,6 +1657,29 @@ class Task(SQLModel, table=True):
             "completed_at",
             postgresql_where=text("status = 'COMPLETED'"),
             sqlite_where=text("status = 'COMPLETED'"),
+        ),
+        # Trigram GIN indexes for the admin task-search ILIKE filter (title,
+        # description, latest_status_message).  Without these every task search
+        # triggers a full sequential table scan.  The ``postgresql_*`` kwargs are
+        # dialect-scoped — SQLite create_all emits plain indexes — so the test
+        # suite is unaffected.  See KnowledgeDocument trigram precedent above.
+        Index(
+            "ix_task_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_task_description_trgm",
+            "description",
+            postgresql_using="gin",
+            postgresql_ops={"description": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_task_latest_status_message_trgm",
+            "latest_status_message",
+            postgresql_using="gin",
+            postgresql_ops={"latest_status_message": "gin_trgm_ops"},
         ),
         # Partial index on (updated_at) for the EVALUATING CI-monitor scan
         # (orchestrator_ci_monitor.py:289-303) which repeatedly selects

@@ -14430,7 +14430,7 @@ async def test_next_compute_job_delivers_repo_clone_from_launch(
     # Patch _attach_repo_clone so it injects a repo_clone without needing GitHub.
     _FAKE_REPO_CLONE = {"owner": "acme", "repo": "ml", "ref": "main"}
 
-    async def _fake_attach_repo_clone(session_factory, job, spec):
+    async def _fake_attach_repo_clone(session_factory, job, spec, *, task=None):
         import dataclasses
         return dataclasses.replace(spec, repo_clone=_FAKE_REPO_CLONE)
 
@@ -17595,6 +17595,113 @@ def test_extract_viewable_candidates_from_bundle_deterministic_order():
     names = [c.filename for c in cands]
     # Order matches archive insertion — NOT sorted (sorting is upstream's job)
     assert names == ["zzz.png", "mmm.png", "aaa.png"]
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_batch_task_prefetch_cancels_terminal_task_jobs(
+    db_session, monkeypatch
+):
+    """process_compute_jobs_once batch-loads tasks and correctly cancels jobs
+    whose owning task is terminal — verifying the N+1 fix doesn't regress behavior.
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.database import resolve_async_engine
+
+    project = Project(name="Batch Prefetch Project", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks: one terminal (DONE), one still in progress.
+    task_done = Task(
+        project_id=project.id,
+        title="terminal task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    task_live = Task(
+        project_id=project.id,
+        title="live task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task_done)
+    db_session.add(task_live)
+    await db_session.commit()
+    await db_session.refresh(task_done)
+    await db_session.refresh(task_live)
+
+    # A running job owned by the terminal task — should be cancelled.
+    job_should_cancel = ComputeJob(
+        task_id=task_done.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        external_compute_id="fake-done-job",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    # A queued job owned by the live task — should NOT be cancelled.
+    job_stays = ComputeJob(
+        task_id=task_live.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.QUEUED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"preflight_smoke_done": True},
+    )
+    db_session.add(job_should_cancel)
+    db_session.add(job_stays)
+    await db_session.commit()
+    await db_session.refresh(job_should_cancel)
+    await db_session.refresh(job_stays)
+
+    class FakeBackend:
+        def external_id_for(self, j):
+            return "fake-id"
+
+        async def terminate(self, j, *, reason):
+            return True
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="fake-live-job",
+                started_at=_utcnow(),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, j, *, as_of):
+            from app.compute_backends import ComputeCostResult
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, j):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job_should_cancel)
+    await db_session.refresh(job_stays)
+
+    # The job owned by the terminal task must be cancelled.
+    assert job_should_cancel.status == ComputeJobStatus.CANCELLED, (
+        f"expected CANCELLED, got {job_should_cancel.status}"
+    )
+    assert job_should_cancel.outcome == ComputeJobOutcome.CANCELLED
+
+    # The job owned by the live task must still be active (not cancelled).
+    assert job_stays.status != ComputeJobStatus.CANCELLED, (
+        f"live-task job should not be cancelled but got {job_stays.status}"
+    )
 
 
 # ---------------------------------------------------------------------------

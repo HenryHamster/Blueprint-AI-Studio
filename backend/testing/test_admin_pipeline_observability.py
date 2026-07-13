@@ -764,8 +764,8 @@ async def test_ui_load_timing_pinned_baseline_survives_sample_cap(
         if b["surface"] == surface:
             baseline_id = b["id"]
             assert b["count"] == 10
-            assert b["p50"] == 600  # sorted[5]
-            assert b["p90"] == 1000  # sorted[9]
+            assert b["p50"] == 550  # percentile_cont continuous interpolation
+            assert b["p90"] == 910  # percentile_cont continuous interpolation
             assert b["label"] == "Before cap test"
             break
     assert baseline_id is not None, "Baseline not found for test surface"
@@ -793,7 +793,7 @@ async def test_ui_load_timing_pinned_baseline_survives_sample_cap(
     assert len(surviving) >= 1
     bl = surviving[0]
     assert bl["count"] == 10
-    assert bl["p50"] == 600
-    assert bl["p90"] == 1000
+    assert bl["p50"] == 550
+    assert bl["p90"] == 910
     assert bl["label"] == "Before cap test"
     assert bl["id"] == baseline_id
