@@ -13355,8 +13355,11 @@ def test_gcp_startup_script_passes_live_tail_path_to_command_runner():
     )
 
 
-def test_gcp_startup_script_heartbeat_reads_live_tail():
-    """The _compute_heartbeat function in the startup script must read live_tail.b64."""
+def test_gcp_startup_script_heartbeat_emits_live_tail_and_progress():
+    """The _compute_heartbeat function delegates body construction to the baked
+    heartbeat_body.py helper, feeding it BOTH the live-tail file and the progress
+    file so each heartbeat can carry {progress:{metric,value}} — the sample that
+    feeds the server-side no-progress watchdog (finding 76c9633f15448f99)."""
     spec = ComputeLaunchSpec(
         job_id=uuid.uuid4(),
         command="python3 train.py",
@@ -13364,18 +13367,177 @@ def test_gcp_startup_script_heartbeat_reads_live_tail():
         spend_cap_usd=1.0,
         deadline_at=None,
         runtime_deadline_seconds=300,
+        no_progress_timeout_seconds=600,
     )
     script = compute_backends_module._build_gcp_startup_script(
         spec, artifact_upload_url="https://storage.example.com/upload"
     )
+    # The helper is base64-decoded onto the VM alongside the other helpers.
+    assert "base64 -d > /tmp/blueprint_heartbeat_body.py" in script, (
+        "heartbeat_body.py must be base64-decoded onto the VM"
+    )
     hb_func_start = script.index("_compute_heartbeat() {")
-    hb_func_body = script[hb_func_start : hb_func_start + 600]
+    hb_func_body = script[hb_func_start : hb_func_start + 900]
+    # The heartbeat invokes the helper with the live-tail AND the progress file.
+    assert "blueprint_heartbeat_body.py" in hb_func_body, (
+        "_compute_heartbeat must invoke the heartbeat_body.py helper"
+    )
     assert "live_tail.b64" in hb_func_body, (
-        "_compute_heartbeat must reference live_tail.b64"
+        "_compute_heartbeat must pass live_tail.b64 to the helper"
     )
-    assert "live_output_tail" in hb_func_body, (
-        "_compute_heartbeat must include live_output_tail in the POST body"
+    assert "blueprint_compute_progress.json" in hb_func_body, (
+        "_compute_heartbeat must pass the progress file to the helper so a "
+        "{progress:{metric,value}} sample can be emitted"
     )
+    # The body is POSTed as JSON.
+    assert '-d "$_HB_BODY"' in hb_func_body, (
+        "_compute_heartbeat must POST the helper-built JSON body"
+    )
+
+
+def test_heartbeat_body_helper_emits_live_tail_and_progress(tmp_path):
+    """The baked heartbeat_body.py helper merges the live-tail file and the last
+    valid progress record into a single JSON body, degrading to {} on missing or
+    malformed inputs so an old runner / progress-less job still heartbeats."""
+    helper = (
+        compute_backends_module._COMPUTE_SCRIPTS_DIR / "heartbeat_body.py"
+    )
+
+    def run(*args):
+        import subprocess
+
+        out = subprocess.run(
+            ["python3", str(helper), *args], capture_output=True, text=True
+        )
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    # No inputs / missing files → bare liveness ping.
+    assert run() == {}
+    assert run("/nope/live", "/nope/prog") == {}
+
+    live = tmp_path / "live_tail.b64"
+    live.write_text("SGVsbG8=")  # opaque, copied verbatim
+    prog = tmp_path / "progress.json"
+    # Garbage, a partial line, and a NaN value are all skipped; the LAST valid
+    # record (loss=0.9) is the one emitted.
+    prog.write_text(
+        "garbage\n"
+        '{"metric": "loss", "value": 1.5}\n'
+        "notjson{\n"
+        '{"metric": "loss", "value": 0.9, "step": 10}\n'
+        '{"metric": "loss", "value": "nan"}\n'
+    )
+    assert run(str(live), str(prog)) == {
+        "live_output_tail": "SGVsbG8=",
+        "progress": {"metric": "loss", "value": 0.9},
+    }
+    # Progress only.
+    assert run("", str(prog)) == {"progress": {"metric": "loss", "value": 0.9}}
+    # Live tail only.
+    assert run(str(live), "/nope/prog") == {"live_output_tail": "SGVsbG8="}
+    # Non-finite / boolean values are rejected (never keep the watchdog quiet).
+    prog.write_text('{"metric": "m", "value": true}\n{"metric": "m", "value": 1e999}\n')
+    assert run("", str(prog)) == {}
+
+
+def test_gcp_startup_script_no_progress_watchdog_armed_after_setup():
+    """The GCP no-progress watchdog must be ARMED only after setup (repo clone,
+    setup step, container image pull, resume hydration) completes, so slow
+    provisioning is never counted as 'no progress' (finding de3ae13c14a610d2).
+
+    Concretely: the sliding-window arm (`_NP_WATCHDOG_PID=$!` following the
+    `stat`-based watchdog loop) must come AFTER every setup failure branch, and
+    the PID var must be pre-declared (empty) BEFORE those branches so the
+    `set -u` script can reference it in their cleanup kills."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        no_progress_timeout_seconds=600,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+        setup_step="pip install -r requirements.txt",
+        container_image="ghcr.io/x/y:1",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url="https://storage.example.com/resume",
+    )
+    # Pre-declared empty init (for the set -u cleanup kills in setup branches).
+    empty_init_idx = script.index("\n_NP_WATCHDOG_PID=\n")
+    # The watchdog clock is anchored (touch + stat _NP_START) then armed ($!).
+    arm_idx = script.index("_NP_WATCHDOG_PID=$!")
+    np_start_idx = script.index("_NP_START=$(stat")
+    # Every setup phase precedes the arm; the command follows it.
+    clone_idx = script.index("repo_clone_failed")
+    setup_idx = script.index("setup_step_failed")
+    pull_idx = script.index("container_image_pull_failed")
+    resume_idx = script.index("[resume]")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert empty_init_idx < clone_idx < arm_idx, "empty init must precede setup"
+    assert empty_init_idx < setup_idx < arm_idx
+    assert empty_init_idx < pull_idx < arm_idx
+    assert empty_init_idx < resume_idx < arm_idx
+    assert np_start_idx < arm_idx, "clock must be anchored before the arm"
+    assert clone_idx < np_start_idx, "watchdog must arm AFTER the clone runs"
+    assert setup_idx < np_start_idx, "watchdog must arm AFTER the setup step"
+    assert pull_idx < np_start_idx, "watchdog must arm AFTER the image pull"
+    assert arm_idx < command_idx, "watchdog must be armed before the command runs"
+
+
+def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
+    """The server-side no-progress watchdog (`_no_progress_stalled`) fires on a
+    plateaued declared metric built from heartbeat-appended samples, and spares a
+    job whose metric is still advancing — i.e. progress heartbeats keep a live
+    job alive while a stalled one past the window is cut (findings de3ae13c /
+    76c9633f, server side)."""
+    from app.compute_jobs import append_progress_sample, _no_progress_stalled
+
+    window = compute_jobs.COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+    grace = compute_jobs.COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
+    min_samples = compute_jobs.COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES
+    now = datetime(2026, 1, 2, 0, 0, 0)
+    started = now - timedelta(seconds=grace + window + 60)
+
+    def build_job(values):
+        meta = {"declared_metric": "loss"}
+        n = len(values)
+        for i, v in enumerate(values):
+            # Spread the samples evenly across the trailing window.
+            t = now - timedelta(seconds=window * (n - 1 - i) / (n - 1))
+            meta = append_progress_sample(
+                meta, metric="loss", value=v, t=t.isoformat()
+            )
+        return ComputeJob(
+            command="true",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            status=ComputeJobStatus.RUNNING,
+            started_at=started,
+            polling_metadata=meta,
+        )
+
+    # Flat metric across a full window with enough samples → stalled → cut.
+    flat = build_job([0.5] * (min_samples + 1))
+    assert _no_progress_stalled(flat, now=now) is True
+
+    # A steadily advancing metric (heartbeats moving the value) → NOT stalled.
+    advancing = build_job([0.9 - 0.1 * i for i in range(min_samples + 1)])
+    assert _no_progress_stalled(advancing, now=now) is False
+
+    # A job that declares no metric is fail-open (never cut).
+    no_metric = build_job([0.5] * (min_samples + 1))
+    no_metric.polling_metadata = {
+        k: v
+        for k, v in (no_metric.polling_metadata or {}).items()
+        if k != "declared_metric"
+    }
+    assert _no_progress_stalled(no_metric, now=now) is False
 
 
 def test_local_backend_live_tail_read_on_poll(tmp_path):

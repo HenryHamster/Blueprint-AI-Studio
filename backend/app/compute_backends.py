@@ -58,6 +58,9 @@ _TERMINAL_RECORD_B64 = base64.b64encode(
 _ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "artifact_download.py").read_bytes()
 ).decode("ascii")
+_HEARTBEAT_BODY_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "heartbeat_body.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -2588,6 +2591,7 @@ def _build_gcp_startup_script(
     command_runner_b64 = _COMMAND_RUNNER_B64
     artifact_upload_b64 = _ARTIFACT_UPLOAD_B64
     terminal_record_b64 = _TERMINAL_RECORD_B64
+    heartbeat_body_b64 = _HEARTBEAT_BODY_B64
     orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
     job_id_q = shlex.quote(str(spec.job_id))
     np_timeout = (
@@ -2646,44 +2650,26 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
   poweroff || shutdown -h now || true
 ) &
 TTL_PID=$!
-# No-progress watchdog: parallel to the TTL watchdog. When
-# no_progress_timeout_seconds is set, this watchdog polls the progress file's
-# mtime and kills the VM early if the job has stalled with no progress signal.
-# When unset/0 the watchdog skip-branch makes the block a no-op.
-touch {progress_file} 2>/dev/null || true
-(
-  if [ "$_NP_TIMEOUT_SECONDS" -gt 0 ]; then
-    _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
-    while true; do
-      sleep "$_NP_TIMEOUT_SECONDS"
-      _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
-      if [ "$_NP_NOW" = "$_NP_START" ]; then
-        python3 /tmp/blueprint_terminal_record.py \
-          {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
-          >/dev/null 2>&1 || true
-        echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
-        echo "{_SERIAL_STATUS_PREFIX}FAILED"
-        echo "{_SERIAL_EXIT_PREFIX}125"
-        upload_artifacts
-        poweroff || shutdown -h now || true
-        exit 0
-      fi
-      _NP_START=$_NP_NOW
-    done
-  fi
-) &
-_NP_WATCHDOG_PID=$!
+# The no-progress watchdog is ARMED LATER (right before the command runs), after
+# setup — repo clone, container image pull, resume hydration — completes, so slow
+# provisioning is never mistaken for a stalled job. Declared empty here so the
+# `set -u` script can reference "$_NP_WATCHDOG_PID" in the setup-failure kill
+# paths (clone/setup/pull) that run before the watchdog is armed.
+_NP_WATCHDOG_PID=
+echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
 _compute_heartbeat() {{
-  if [ -s {live_tail_path} ]; then
-    _LT_VAL=$(cat {live_tail_path} 2>/dev/null || true)
-    if [ -n "$_LT_VAL" ]; then
-      curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d '{{"live_output_tail": "'"$_LT_VAL"'"}}' "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
-      return
-    fi
+  # Build the heartbeat body off-VM in a real, tested Python file (base64-baked
+  # above): it merges the live-output tail with the latest {{"metric","value"}}
+  # record from the progress file into {{"live_output_tail":..,"progress":..}}.
+  # The progress sample is what feeds the server's no-progress watchdog, so a job
+  # that keeps writing its declared metric stays distinguishable from a dead one.
+  _HB_BODY=$(python3 /tmp/blueprint_heartbeat_body.py {live_tail_path} {progress_file} 2>/dev/null || true)
+  if [ -z "$_HB_BODY" ]; then
+    _HB_BODY='{{}}'
   fi
-  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
 }}
 _compute_heartbeat
 (
@@ -2708,7 +2694,36 @@ python3 /tmp/blueprint_terminal_record.py \
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
-{docker_setup_block}EXIT_CODE=0
+{docker_setup_block}# No-progress watchdog: ARMED HERE, after all setup (repo clone, container image
+# pull, resume hydration, setup step) has completed, so slow provisioning never
+# counts as "no progress" and cannot trip a false kill. Mirrors the local
+# subprocess wrapper, which launches its watchdog after setup_step + container
+# pull. Polls the progress file's mtime; each interval that advances it resets
+# the deadline (sliding window). When _NP_TIMEOUT_SECONDS is 0 the block is inert.
+touch {progress_file} 2>/dev/null || true
+(
+  if [ "$_NP_TIMEOUT_SECONDS" -gt 0 ]; then
+    _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    while true; do
+      sleep "$_NP_TIMEOUT_SECONDS"
+      _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+      if [ "$_NP_NOW" = "$_NP_START" ]; then
+        python3 /tmp/blueprint_terminal_record.py \
+          {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
+          >/dev/null 2>&1 || true
+        echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
+        echo "{_SERIAL_STATUS_PREFIX}FAILED"
+        echo "{_SERIAL_EXIT_PREFIX}125"
+        upload_artifacts
+        poweroff || shutdown -h now || true
+        exit 0
+      fi
+      _NP_START=$_NP_NOW
+    done
+  fi
+) &
+_NP_WATCHDOG_PID=$!
+EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
   {command} \
   {command_log_path} \
