@@ -419,6 +419,42 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
     expect(failedCalls).toHaveLength(0);
   });
 
+  it('does NOT finalize COMPLETED when a PR-URL marker is present but base..HEAD nets to zero effective diff', async () => {
+    // Defense-in-depth: a rebased/superseded branch can carry a valid PR-URL
+    // marker yet contribute NO effective diff vs base. The wrapper must NOT post
+    // COMPLETED on Claude's behalf — it falls through to the fail-closed path so
+    // the no-op is recorded as an explicit incomplete disposition, not success.
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      String(p) === prUrlMarker,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) =>
+      String(p) === prUrlMarker ? validPrUrl : '',
+    );
+    // Empty base..HEAD diff (successful git call → confirmed empty), clean tree,
+    // HEAD unchanged from baseCommit — so there is genuinely nothing shipped.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return 'abc123';
+      if (args[0] === 'diff') return '';
+      return '';
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'rebased away to nothing', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // No COMPLETED — and specifically no COMPLETED carrying the PR URL.
+    const completedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'COMPLETED',
+    );
+    expect(completedCalls).toHaveLength(0);
+    // The task fails closed as incomplete.
+    const failedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'FAILED',
+    );
+    expect(failedCalls).toHaveLength(1);
+    expect(failedCalls[0][1].failure_category).toBe('incomplete');
+  });
+
   it('completes via the PR-URL finalizer when the continuation opens a PR but skips ./done', async () => {
     // Continuation opens a PR (valid /tmp/pr_url_<id>) but ends without ./done.
     // The wrapper must finalise COMPLETED on Claude's behalf.

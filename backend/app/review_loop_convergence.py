@@ -1016,6 +1016,165 @@ async def _handle_cap_exhaustion(
         )
 
 
+async def _handle_empty_effective_diff_at_merge(
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    session: AsyncSession,
+) -> None:
+    """Terminal handler when a task PR reaches the merge gate with an EMPTY
+    effective diff (``get_pr_files`` returned ``[]`` vs base).
+
+    A code-fix/create PR whose effective diff went empty by merge time (its
+    commits already landed on base via a sibling merge / rebase-flat) MUST NOT
+    auto-merge and MUST NOT report success — merging it would mark the task
+    COMPLETED ('CI passed + review approved, PR merged') while zero user-visible
+    change landed (incident 2026-07-12, PR #14500 / commit 683abce38: an empty
+    ``git show --stat`` merged 'green' with a title claiming a real fix).
+
+    Instead: close the empty PR and land the chain original terminal with the
+    benign, budget-exempt ``SCOPE_EMPTY`` failure class and
+    ``failure_detail="empty_effective_diff_at_merge"``. ``pr_closed_empty=True``
+    marks the close as an intentional empty no-op (not a review rejection or a
+    merge failure) so downstream verification (rollup_pr_verification) does not
+    mis-downgrade the outcome.
+
+    Idempotent — re-entering on an already-terminal orig skips side effects.
+    """
+    from app.failure_classification import SCOPE_EMPTY, persist_failure_category
+    from app.github import close_pull_request, create_pr_comment
+    from app.routers.agent import get_github_token_for_task
+    from app.routers.agent_status import record_task_result
+    from app.shared_state import record_direction_result
+
+    source_task.latest_status_message = (
+        f"Empty effective diff at merge for PR #{pr_number} — nothing to land; "
+        f"not merging (no-op)"
+    )
+    session.add(source_task)
+
+    try:
+        orig = await session.get(Task, uuid.UUID(resolved_original_id))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Empty-diff-at-merge: failed to load orig "
+            f"{resolved_original_id[:8]}: {e}"
+        )
+        return
+    if orig is None:
+        logger.warning(
+            f"[PIPELINE] Empty-diff-at-merge: orig {resolved_original_id[:8]} not found"
+        )
+        return
+
+    already_handled = orig.status in (
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and (orig.context or {}).get("failure_detail") == "empty_effective_diff_at_merge"
+    if already_handled:
+        logger.info(
+            f"[PIPELINE] Empty-diff-at-merge re-triggered for PR #{pr_number} — "
+            f"orig {resolved_original_id[:8]} already terminal, skipping side effects"
+        )
+        await session.commit()
+        return
+
+    logger.info(
+        f"[PIPELINE] PR #{pr_number} reached the merge gate with an EMPTY effective "
+        f"diff — landing orig {resolved_original_id[:8]} CANCELLED "
+        f"(empty_effective_diff_at_merge / {SCOPE_EMPTY}), closing PR, NOT merging"
+    )
+    orig.status = TaskStatus.CANCELLED
+    orig.latest_status_message = (
+        f"PR #{pr_number} had an empty effective diff at merge — no change to land; "
+        f"closed as a no-op instead of reporting a false success"
+    )
+    persist_failure_category(orig, SCOPE_EMPTY)
+    ctx = dict(orig.context or {})
+    ctx["failure_detail"] = "empty_effective_diff_at_merge"
+    ctx["pr_closed_empty"] = True
+    # NB: deliberately NOT setting pr_rejected — this is a benign no-op, not a
+    # review rejection or a code failure.
+    orig.context = ctx
+    _set_review_loop_terminal_outcome(
+        orig,
+        kind="empty_effective_diff",
+        reason="empty_effective_diff_at_merge",
+        pr_number=pr_number,
+        iterations=int((ctx.get("review_loop") or {}).get("iteration") or 0),
+        detail="empty_effective_diff_at_merge",
+    )
+    session.add(orig)
+    try:
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Empty-diff-at-merge: failed to commit orig "
+            f"{resolved_original_id[:8]}: {e}",
+            exc_info=True,
+        )
+        return
+
+    record_task_result(
+        success=False,
+        failure_class=SCOPE_EMPTY,
+        task_id=str(orig.id),
+        task_type=(orig.first_payload or {}).get("type", ""),
+    )
+    _direction_id = str((orig.context or {}).get("direction_id") or "")
+    if _direction_id:
+        record_direction_result(
+            _direction_id,
+            success=False,
+            failure_class=SCOPE_EMPTY,
+            project_id=str(orig.project_id) if orig.project_id else "",
+        )
+
+    try:
+        from app.task_completion import _record_remediation_if_terminal
+
+        await _record_remediation_if_terminal(orig, TaskStatus.CANCELLED, session)
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Empty-diff-at-merge: failed to record remediation for "
+            f"PR #{pr_number}: {e}"
+        )
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        try:
+            await create_pr_comment(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                "Auto-closed: this PR had an empty effective diff at merge time "
+                "(its changes already landed on the base branch). Closing as a "
+                "no-op rather than reporting a false success.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Empty-diff-at-merge: comment failed on PR #{pr_number}: {e}"
+            )
+        closed = await close_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+        if closed:
+            logger.info(
+                f"[PIPELINE] Closed empty-effective-diff PR #{pr_number} (no-op)"
+            )
+        else:
+            logger.warning(
+                f"[PIPELINE] close_pull_request returned False for empty PR #{pr_number}"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Empty-diff-at-merge: failed to close PR #{pr_number}: {e}",
+            exc_info=True,
+        )
+
+
 async def _handle_persistent_conflict_escalation(
     source_task: Task,
     resolved_original_id: str,

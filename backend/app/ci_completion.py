@@ -437,6 +437,51 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
         # "ok" → fall through to merge
 
+    # Empty-effective-diff gate for direct (non-rollup) task PRs. A code-fix /
+    # create PR can reach this merge chokepoint with a zero-file effective diff
+    # when its commits already landed on the base (a sibling merge / rebase-flat
+    # collapsed the branch). Auto-merging such a PR marks the task COMPLETED
+    # ('CI passed + review approved, PR merged') while NOTHING user-visible
+    # lands (incident 2026-07-12, PR #14500 / commit 683abce38 merged 'green'
+    # with an empty ``git show --stat``). Probe the effective diff here — AFTER
+    # the migration and size-cap gates so their tests (which patch/raise
+    # get_pr_files) reach their existing outcome first — and on a CONFIRMED
+    # empty diff route to a distinct SCOPE_EMPTY no-op terminal (PR closed,
+    # task NOT marked COMPLETED-success) and return False. An INDETERMINATE
+    # probe (None) defers the merge without merging or no-op'ing. Rollup parents
+    # handle their own empty-diff case upstream, so skip when rollup_pr_number.
+    if ci_pr_number and not (task.context or {}).get("rollup_pr_number"):
+        from app.github import pr_effective_diff_is_empty
+
+        _diff_empty = await pr_effective_diff_is_empty(
+            gh_token,
+            owner,
+            repo,
+            ci_pr_number,
+            project_id=str(task.project_id) if task.project_id else None,
+        )
+        if _diff_empty is True:
+            from app.review_loop_convergence import (
+                _handle_empty_effective_diff_at_merge,
+            )
+
+            _empty_orig_id = ci_orig_id or str(task.id)
+            logger.warning(
+                f"[CI] Merge blocked for PR #{ci_pr_number} — empty effective diff "
+                f"at merge; closing as a no-op instead of a false success"
+            )
+            await _handle_empty_effective_diff_at_merge(
+                task, _empty_orig_id, ci_pr_number, session
+            )
+            return False
+        if _diff_empty is None:
+            logger.info(
+                "[CI] PR #%s effective-diff probe indeterminate — deferring merge",
+                ci_pr_number,
+            )
+            return False
+        # _diff_empty is False → non-empty diff → fall through to merge.
+
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
     # rollup_management.py: the in-memory ``task`` is stale after release;

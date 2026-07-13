@@ -342,6 +342,28 @@ if [ "$COMMITS_AHEAD" = "0" ]; then
   exit 1
 fi
 
+# Zero-effective-diff guard (primary defense for the empty-diff-at-merge
+# incident). COMMITS_AHEAD>0 only means this branch differs from base by SHA —
+# a rebased/superseded branch can be commits-ahead yet contribute ZERO effective
+# diff vs base (git diff base...HEAD is empty). Pushing + opening a PR here would
+# let a no-op branch flow to ./done and report success. Refuse and route to the
+# sanctioned no-op exits instead. Uses the three-dot (merge-base) diff so the
+# check matches what a merge actually contributes. Skip only when the base ref is
+# unresolvable (BASE_REF empty) — keep the commits-ahead-only behavior there.
+if [ -n "$BASE_REF" ]; then
+  _EFFECTIVE_DIFF=$(git -c core.quotepath=false diff --name-only "$BASE_REF...HEAD" 2>/dev/null || true)
+  if [ -z "$_EFFECTIVE_DIFF" ]; then
+    echo "[pr] Branch is $COMMITS_AHEAD commit(s) ahead of ${cfg.baseBranch} but nets to ZERO effective diff vs base." >&2
+    echo "[pr] A code-change task that produced no effective diff must NOT open a PR or report success." >&2
+    echo "[pr] If a sibling PR already merged the same changes (this branch was superseded)," >&2
+    echo "[pr]   run:  ./pr close --superseded-by <winning-PR-number>" >&2
+    echo "[pr] If the deliverable already exists on ${cfg.baseBranch} and no change is needed," >&2
+    echo "[pr]   run:  ./done --already-done \\"<reason naming the artifact you verified>\\"" >&2
+    echo "[pr] Otherwise make your changes and re-run ./pr open." >&2
+    exit 1
+  fi
+fi
+
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 _load_agent_token
 TASK="${cfg.taskId}"

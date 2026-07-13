@@ -278,7 +278,7 @@ esac
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
   *"rev-parse --verify origin/main"*) exit 0 ;;
-  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\n' 'src/app.ts'; exit 0 ;;
   *"diff --name-only --cached"*) exit 0 ;;
   *"diff --name-only"*) exit 0 ;;
   *"ls-files --others --exclude-standard"*) exit 0 ;;
@@ -449,7 +449,7 @@ esac
       rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
   *"rev-parse --verify origin/main"*) exit 0 ;;
-  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
   *"diff --name-only --cached"*) exit 0 ;;
   *"diff --name-only"*) exit 0 ;;
   *"ls-files --others --exclude-standard"*) exit 0 ;;
@@ -523,7 +523,7 @@ esac
       realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
   *"rev-parse --verify origin/main"*) exit 0 ;;
-  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
   *"diff --name-only --cached"*) exit 0 ;;
   *"diff --name-only"*) exit 0 ;;
   *"ls-files --others --exclude-standard"*) exit 0 ;;
@@ -590,6 +590,62 @@ esac
     // Cleanup.
     realFs.rmSync('/tmp/pr_body_task-nojq-1', { force: true });
     realFs.rmSync('/tmp/pr_url_task-nojq-1', { force: true });
+  });
+
+  // ── Zero-effective-diff guard ────────────────────────────────────────────────
+  // A rebased/superseded branch can be commits-ahead by SHA yet net to ZERO
+  // effective diff vs base. The guard must refuse to push / open a PR and point
+  // the agent at the sanctioned no-op exits — NOT report success.
+  it('refuses to push or open a PR when commits-ahead but effective diff is empty', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    realFs.rmSync('/tmp/pr_url_task-emptydiff-1', { force: true });
+
+    const script = writeScript({
+      taskId: 'task-emptydiff-1',
+      workBranch: 'blueprint/task-emptydiff-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      // rev-list reports the branch as 1 commit ahead (rebased/superseded), but
+      // the base-relative diff is EMPTY. push + PR-create must NOT run.
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"push --force-with-lease"*) printf 'push should not run\\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+case "$*" in
+  *"/api/agent/github/pull-requests"*) printf 'PR create should not run\\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('ZERO effective diff vs base');
+    expect(result.stderr).toContain('./pr close --superseded-by');
+    expect(result.stderr).toContain('./done --already-done');
+    // Neither the push nor the PR-create seam ran.
+    expect(result.stderr).not.toContain('push should not run');
+    expect(result.stderr).not.toContain('PR create should not run');
+    // No PR URL marker was written.
+    expect(realFs.existsSync('/tmp/pr_url_task-emptydiff-1')).toBe(false);
   });
 });
 
@@ -711,5 +767,24 @@ describe('writePrHelper — generated script content', () => {
     expect(s).toContain('401|403|429|000|5[0-9][0-9]');
     // The old tight linear backoff (~3-9s) is gone.
     expect(s).not.toContain('BACKOFF=$((attempt * 3))');
+  });
+
+  it('emits the zero-effective-diff guard after the commits-ahead check', () => {
+    writePrHelper({
+      taskId: 'task-static-diff',
+      workBranch: 'blueprint/task-static-diff',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const s = capturedScripts['/tmp/workspace/pr'];
+    expect(s).toBeDefined();
+    // Guards on the three-dot (merge-base) diff so it matches merge semantics,
+    // skips when BASE_REF is unresolvable, and routes to the sanctioned no-op exits.
+    expect(s).toContain('_EFFECTIVE_DIFF=$(git -c core.quotepath=false diff --name-only "$BASE_REF...HEAD"');
+    expect(s).toContain('nets to ZERO effective diff vs base');
+    expect(s).toContain('./pr close --superseded-by');
+    expect(s).toContain('./done --already-done');
   });
 });

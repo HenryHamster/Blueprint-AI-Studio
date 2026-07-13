@@ -1166,3 +1166,43 @@ async def get_pr_files(
         if len(batch) < 100:
             break
     return result
+
+
+async def pr_effective_diff_is_empty(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return whether a PR's effective diff against its base is empty.
+
+    Built on :func:`get_pr_files`, which lists exactly the files GitHub reports
+    as changed for the PR (an empty list = no effective diff vs base). A PR can
+    reach the merge gate with a zero-file effective diff when its commits were
+    already landed on the base by a sibling merge / rebase-flat (incident
+    2026-07-12, PR #14500 / commit 683abce38 merged 'green' with an empty
+    ``git show --stat``).
+
+    Returns:
+      * ``True``  — confirmed empty (``get_pr_files`` returned ``[]``).
+      * ``False`` — confirmed non-empty (one or more changed files).
+      * ``None``  — indeterminate: the file lookup raised (transient GitHub
+                    error, auth, non-200). ``None`` is deliberately NOT coerced
+                    to a bool so a transient failure never reads as "empty"
+                    (which would wrongly no-op a real PR) — the merge-gate caller
+                    treats ``None`` as "defer, do not merge and do not no-op".
+    """
+    from app import github as _gh
+
+    try:
+        files = await _gh.get_pr_files(
+            token, owner, repo, pr_number, project_id=project_id
+        )
+    except Exception as exc:  # noqa: BLE001 — any lookup failure is INDETERMINATE, not "empty". Fail safe so we never no-op a real PR on a flaky probe.
+        logger.warning(
+            f"[PR] Effective-diff probe for PR #{pr_number} failed: {exc} — "
+            f"treating as indeterminate (merge deferred, not no-op'd)"
+        )
+        return None
+    return len(files) == 0

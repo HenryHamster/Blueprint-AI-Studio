@@ -1292,6 +1292,7 @@ from app.github_pulls import (  # noqa: F401
     close_pull_request,
     reopen_pull_request,
     get_pr_files,
+    pr_effective_diff_is_empty,
     _UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE,
     _is_no_new_commits_message,
     _tag_not_behind_if_no_new_commits,
