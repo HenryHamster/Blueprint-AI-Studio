@@ -355,6 +355,25 @@ class TestGetMetricsReader:
         assert result["vm_instance_id"] == "pool-vm-001"
 
     @pytest.mark.asyncio
+    async def test_tool_asset_scoped_jwt_rejected(self):
+        """A tool-asset-scoped JWT is rejected with 403 (out of scope).
+
+        Regression for finding bbd2610e22e1779b: tool-asset tokens carry a
+        ``scope`` claim that was NOT enforced, so a token minted for tool-asset
+        access could authenticate to the metrics reader.
+        """
+        from fastapi import HTTPException
+        from app.auth import get_metrics_reader
+        from app.routers.admin_project_tools import _create_tool_asset_token
+
+        token = _create_tool_asset_token("proj-222", "some-tool")
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_metrics_reader(credentials=creds)
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
     async def test_expired_jwt_rejected(self):
         """An expired agent JWT raises 401."""
         import jwt as pyjwt

@@ -8223,6 +8223,40 @@ async def test_agent_format_compliance_snapshot_endpoint(
     assert "by_schema" in data
 
 
+@pytest.mark.asyncio
+async def test_agent_format_compliance_snapshot_rejects_tool_asset_token(
+    client: AsyncClient, db_session
+):
+    """A tool-asset-scoped JWT must be rejected (403) by the snapshot reader.
+
+    Regression for finding bbd2610e22e1779b: tool-asset tokens carry a
+    ``scope`` claim that was NOT enforced, so a token minted for tool-asset
+    access could authenticate to this unrelated read surface.
+    """
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Give the reader something to return, so a 403 can only come from the
+    # scope gate (not from a missing snapshot).
+    db_session.add(
+        _make_format_compliance_typed_task(project.id, task_type="create", errors=0)
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    tool_asset_token = _create_tool_asset_token(str(project.id), "some-tool")
+    resp = await client.get(
+        "/api/agent/efficiency-snapshot/format-compliance",
+        headers={"x-agent-token": tool_asset_token},
+    )
+    assert resp.status_code == 403, resp.text
+
+
 # ---------------------------------------------------------------------------
 # compute_pr_rework_chain_breakdown tests
 # ---------------------------------------------------------------------------

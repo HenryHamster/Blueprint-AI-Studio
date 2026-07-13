@@ -47,7 +47,12 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.models import Project, ProjectTool, _utcnow
-from app.auth import get_current_user, AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+from app.auth import (
+    get_current_user,
+    AGENT_JWT_SECRET,
+    AGENT_JWT_ALGORITHM,
+    TOOL_ASSET_TOKEN_SCOPE,
+)
 from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
 from app import compute_backends as _cb
@@ -552,7 +557,7 @@ def _create_tool_asset_token(project_id: str, tool_slug: str) -> str:
     """
     expire = datetime.now(timezone.utc) + timedelta(minutes=ASSET_TOKEN_TTL_MINUTES)
     to_encode = {
-        "scope": "tool-asset",
+        "scope": TOOL_ASSET_TOKEN_SCOPE,
         "project_id": project_id,
         "tool_slug": tool_slug,
         "exp": expire,
@@ -1063,7 +1068,7 @@ def _verify_tool_asset_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Asset token expired") from None
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid asset token") from None
-    if payload.get("scope") != "tool-asset":
+    if payload.get("scope") != TOOL_ASSET_TOKEN_SCOPE:
         raise HTTPException(status_code=401, detail="Token scope is not tool-asset")
     return payload
 

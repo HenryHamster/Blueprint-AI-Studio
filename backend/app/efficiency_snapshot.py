@@ -5016,9 +5016,12 @@ async def agent_get_efficiency_snapshot_format_compliance(
     repair counts without navigating the nested blob. Returns 404 when no
     snapshot exists yet.
     """
-    from app.auth import verify_agent_jwt
+    from app.auth import reject_tool_asset_scope, verify_agent_jwt
 
     payload = verify_agent_jwt(x_agent_token)
+    # A tool-asset capability token carries scope="tool-asset" and must not be
+    # usable to read the efficiency snapshot — reject it with 403 (out of scope).
+    reject_tool_asset_scope(payload)
     task_id_str = payload.get("sub")
     project_id_str = payload.get("project_id")
 

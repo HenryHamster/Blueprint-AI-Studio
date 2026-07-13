@@ -181,6 +181,29 @@ def create_agent_token(
 # VM only reaches those AFTER /next-role rotates it to a task-scoped token.)
 VM_SCOPED_TOKEN_SCOPE = "vm"
 
+# Scope marker for tool-asset capability JWTs (minted by the tool-asset serve
+# path in ``app.routers.admin_project_tools``). These tokens carry
+# ``scope == "tool-asset"`` and are ONLY valid on the tool-asset download path —
+# they must never authenticate to unrelated agent read surfaces (metrics reader,
+# efficiency-snapshot read). ``reject_tool_asset_scope`` enforces that boundary.
+TOOL_ASSET_TOKEN_SCOPE = "tool-asset"
+
+
+def reject_tool_asset_scope(payload: dict) -> None:
+    """Reject a tool-asset-scoped JWT on general agent read surfaces.
+
+    Tool-asset capability tokens are signed with the same ``AGENT_JWT_SECRET`` as
+    agent tokens but are minted solely to serve static tool assets. They must not
+    be usable to authenticate to unrelated read surfaces, so any decoded payload
+    carrying ``scope == "tool-asset"`` is rejected with 403 (out of scope), not
+    401 (which callers may treat as "try the next auth method").
+    """
+    if payload.get("scope") == TOOL_ASSET_TOKEN_SCOPE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tool-asset token is out of scope for this surface",
+        )
+
 
 def create_vm_scoped_token(
     vm_instance_id: str,
@@ -699,6 +722,11 @@ async def get_metrics_reader(
     try:
         # verify_agent_jwt raises HTTPException(401) on expired or invalid tokens.
         payload = verify_agent_jwt(token)
+        # A tool-asset capability token must not authenticate to the metrics
+        # reader — reject it with 403 (out of scope) rather than treating it as a
+        # valid agent principal. The 403 propagates through the handler below
+        # (which only swallows 401 to fall through to the Firebase path).
+        reject_tool_asset_scope(payload)
         return {
             "role": "metrics_reader",
             "sub": payload.get("sub"),
