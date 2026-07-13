@@ -505,6 +505,16 @@ function ViewableMediaInline({
   }, [projectId, storageUri]);
 
   if (error) {
+    // Route the fallback href through the same scheme gate as the primary path:
+    // a citation ref is LLM-authored, so an unsafe scheme (e.g. javascript:) must
+    // never become a clickable link. Render plain text with the href stripped.
+    if (!isSafeUrl(storageUri)) {
+      return (
+        <span className="text-neutral-400 break-all text-ui-sm">
+          {label} — {error}
+        </span>
+      );
+    }
     return (
       <a
         href={storageUri}

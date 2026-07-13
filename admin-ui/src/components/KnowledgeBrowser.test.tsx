@@ -1547,3 +1547,67 @@ describe('KnowledgeBrowser — renders execution-location badge on compute_exper
     expect(card?.textContent).not.toContain('GCP cloud');
   });
 });
+
+describe('KnowledgeBrowser — viewable-media error fallback sanitizes citation hrefs', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  // A javascript: citation ref that ends in an image extension is classified as
+  // viewable media and rendered by ViewableMediaInline. When artifact resolution
+  // fails, the error fallback must NOT turn that LLM-authored javascript: URL into
+  // a clickable link — regression guard for gating finding a6ecad413d65e268.
+  test('does not render a javascript: citation ref as a clickable link in the error fallback', async () => {
+    const maliciousRef = 'javascript:alert(document.cookie)//pwn.png';
+    const { fetchKnowledgeDocument, resolveArtifactDownloadUrl } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValueOnce({
+      ...webResearchDoc,
+      body: '# Body',
+      source_citations: [maliciousRef],
+    } as never);
+    // Force the ViewableMediaInline resolve path to fail so the error fallback renders.
+    vi.mocked(resolveArtifactDownloadUrl).mockRejectedValue(new Error('resolve failed'));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    // Allow the rejected resolveArtifactDownloadUrl promise to settle into the error state.
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+
+    const anchors = Array.from((host as HTMLDivElement).querySelectorAll('a'));
+    // No anchor may carry a javascript: scheme href sourced from the citation ref.
+    for (const a of anchors) {
+      expect(a.getAttribute('href') ?? '').not.toContain('javascript:');
+    }
+    // The Artifacts section renders, and the failed preview appears as plain text
+    // (label + error) rather than an "open directly" link.
+    expect((host as HTMLDivElement).textContent).toContain('Failed to load preview.');
+    const openDirectlyLink = anchors.find(a => a.textContent?.includes('open directly'));
+    expect(openDirectlyLink).toBeUndefined();
+  });
+});
