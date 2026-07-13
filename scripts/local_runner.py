@@ -3321,8 +3321,16 @@ def _run_compute_job(
                 if now - _np_last_progress >= no_progress_timeout_seconds:
                     _teardown()
                     outcome = "failure"
-                    _report_compute_job(orchestrator_url, token, job_id,
-                                         exec_status="failed", exit_code=125)
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=125,
+                        command_log=_terminal_command_log(
+                            "killed by runner: no-progress watchdog "
+                            f"({no_progress_timeout_seconds}s without a progress "
+                            "update) exceeded"
+                        ),
+                        progress=progress_tail.poll(),
+                    )
                     return
 
             if _shutdown_event.is_set():

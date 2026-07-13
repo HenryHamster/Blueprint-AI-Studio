@@ -757,6 +757,11 @@ def _compute_prereq_plan_logs():
                     "type": "compute_experiment",
                     "command": "python bench.py",
                     "spend_cap_usd": 1.0,
+                    # Required by _validate_compute_launch_contract — without it the
+                    # contract is invalid, the subtask is skipped at the plan gate,
+                    # and NO child spawns (every other compute_experiment fixture in
+                    # this file declares it).
+                    "deadline_seconds": 600,
                     "success_criterion": {
                         "metric": "accuracy",
                         "operator": ">=",

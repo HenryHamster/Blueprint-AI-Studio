@@ -3761,8 +3761,12 @@ async def test_checkpoint_state_endpoint_returns_current_data(
     # open_messages must be present and reflect the CURRENT open-message state.
     assert "open_messages" in body2, "checkpoint-state must include open_messages key"
     assert isinstance(body2["open_messages"], list)
-    # No open messages yet — feed must be empty.
-    assert body2["open_messages"] == [], f"Expected empty feed, got: {body2['open_messages']}"
+    # NOTE: an "assert body2['open_messages'] == []" used to sit here, left over from
+    # an earlier revision of this test that filed no messages before this point. It
+    # directly contradicts the assertions just above — msg_new was filed open at this
+    # point, so the feed is non-empty BY DESIGN and is asserted exactly (resolved
+    # message out, new one in) at the block above. The precise membership checks are
+    # strictly stronger than an emptiness check, so nothing is lost by its removal.
 
     # Add an open message and confirm it appears.
     msg = ProjectMessage(
