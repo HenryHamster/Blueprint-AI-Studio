@@ -1255,6 +1255,44 @@ async def reaper_service():
                             if reap_reason_code in _HEARTBEAT_STALE_REAP_CODES
                             else None
                         )
+                        # Shared-VmContact zombie mask at the relock stage: every
+                        # task on a fleet runner shares vm_instance_id
+                        # 'runner:<id>' and therefore ONE vmcontact row, so a live
+                        # sibling's heartbeat keeps last_contact_at fresh and the
+                        # relock's contact check un-reaps a dead task on EVERY
+                        # cycle — silently undoing the Step-1/Step-2
+                        # classification that #14413 taught to see through the
+                        # mask. Give the relock the same runner self-report
+                        # override. Re-fetched HERE (not reused from Step 2)
+                        # because the unlocked external-I/O window above can span
+                        # 30-120s: the report's own freshness is gated against the
+                        # liveness cutoff, so a Step-2 snapshot could read as
+                        # "stale runner" purely from I/O latency and fail-safe
+                        # back into the mask. Cheap: _build_runner_report_lookup
+                        # issues NO query for a non-'runner:' vm id.
+                        _relock_runner_report_lookup: dict = {}
+                        if (
+                            _relock_liveness_cutoff is not None
+                            and fresh_task.vm_instance_id
+                        ):
+                            try:
+                                _relock_runner_report_lookup = (
+                                    await _build_runner_report_lookup(
+                                        session, {fresh_task.vm_instance_id}
+                                    )
+                                )
+                            except Exception as _rr_exc:  # noqa: BLE001
+                                # The pre-try `{}` binding still stands (the
+                                # assignment above only binds on success), so the
+                                # relock falls back to vm_contact suppression.
+                                logger.warning(
+                                    "[REAPER] runner self-report fetch failed for "
+                                    "task %s vm=%s (non-fatal, relock falls back "
+                                    "to vm_contact suppression): %s",
+                                    task.id,
+                                    fresh_task.vm_instance_id,
+                                    _rr_exc,
+                                )
                         relocked = await _relock_orphan_task(
                             session,
                             task.id,
@@ -1262,6 +1300,7 @@ async def reaper_service():
                             pre_io_status,
                             pre_io_last_hb,
                             vm_liveness_cutoff=_relock_liveness_cutoff,
+                            runner_report_lookup=_relock_runner_report_lookup,
                         )
                         if relocked is None:
                             # Peer is finalizing this task or agent revived; skip safely.

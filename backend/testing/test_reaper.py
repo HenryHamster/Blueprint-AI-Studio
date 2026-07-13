@@ -7581,6 +7581,161 @@ def test_classify_orphan_resident_session_vm_contact_override_suppresses_reap():
     )
 
 
+# ── Z3: the runner self-report defeats the shared-VmContact mask for the ─────
+# resident strategic session too. The session is pinned to the operator's box;
+# every task there shares vm_instance_id='runner:<id>' and therefore ONE
+# vmcontact row, so a single live sibling agent kept last_contact_at fresh and
+# suppressed the reap past the resident window FOREVER — and no other reclaim
+# path exists (start_resident_session returns the existing session while a live
+# task exists), so the zombie permanently blocked respawn of the Workday session.
+
+
+def _dead_resident_on_busy_runner(now, *, silent_seconds=None):
+    """The Z3 incident shape: a resident session whose agent process is gone
+    (heartbeat silent past the resident window) on a runner that is still busy
+    with live sibling agents (fresh shared contact)."""
+    silent = silent_seconds or _RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 300
+    return _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=silent),
+        started_at=now - timedelta(hours=2),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+        vm_instance_id="runner:cccc-dddd",
+    )
+
+
+def test_classify_resident_session_runner_report_defeats_shared_contact_mask():
+    """Dead resident session + live siblings on the same runner: the fresh shared
+    vmcontact row is a SIBLING's liveness, not the session's. A fresh runner
+    self-report that omits the session proves its process is gone → reap."""
+    now = _utcnow()
+    t = _dead_resident_on_busy_runner(now)
+    contact = {"runner:cccc-dddd": now - timedelta(seconds=30)}  # sibling alive
+    # The bug: the sibling's contact masks the dead session forever.
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=contact) is False
+    )
+    # The fix: the runner's own fresh report omits the session → reaped.
+    report = {
+        "runner:cccc-dddd": (now - timedelta(seconds=30), frozenset({"sibling-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is True
+    )
+
+
+def test_classify_resident_session_runner_report_listing_it_still_suppresses():
+    """A report that DOES list the session keeps the suppression — the session is
+    alive and its heartbeat write was merely lock-starved."""
+    now = _utcnow()
+    t = _dead_resident_on_busy_runner(now)
+    contact = {"runner:cccc-dddd": now - timedelta(seconds=30)}
+    report = {
+        "runner:cccc-dddd": (
+            now - timedelta(seconds=30),
+            frozenset({str(t.id), "sibling-task"}),
+        )
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is False
+    )
+    # A STALE report (runner itself gone quiet) is not evidence either → the
+    # vm_contact suppression applies exactly as before (fail-safe).
+    stale_report = {
+        "runner:cccc-dddd": (now - timedelta(minutes=30), frozenset({"sibling-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=stale_report,
+        )
+        is False
+    )
+
+
+def test_classify_resident_session_runner_report_does_not_shortcut_window():
+    """The report only defeats the CONTACT suppression — it does not shorten the
+    resident window and does not touch the progress-staleness exemption. A
+    warm-idle session (fresh heartbeat, zero tool calls for 40 min) is NOT reaped
+    even when a report omits it: the reclaim still waits for the 25-min silence.
+    (A live session is in active_task_ids anyway; this is the fail-safe guard.)"""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=45),  # FRESH — window not elapsed
+        last_tool_use_at=now - timedelta(minutes=40),  # warm-idle, no tool calls
+        started_at=now - timedelta(hours=2),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True, "llm_provider": "anthropic"},
+        vm_instance_id="runner:cccc-dddd",
+    )
+    report = {
+        "runner:cccc-dddd": (now - timedelta(seconds=30), frozenset({"sibling-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup={"runner:cccc-dddd": now - timedelta(seconds=10)},
+            runner_report_lookup=report,
+        )
+        is False
+    ), (
+        "progress-staleness exemption + the resident window must both survive the "
+        "runner-report override"
+    )
+
+
+def test_classify_resident_session_runner_report_null_heartbeat_branch():
+    """The started_at branch (no heartbeat ever recorded) gets the override too."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=now
+        - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 300),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+        vm_instance_id="runner:cccc-dddd",
+    )
+    contact = {"runner:cccc-dddd": now - timedelta(seconds=30)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=contact) is False
+    )
+    report = {
+        "runner:cccc-dddd": (now - timedelta(seconds=30), frozenset({"sibling-task"}))
+    }
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=contact,
+            runner_report_lookup=report,
+        )
+        is True
+    )
+
+
 def test_classify_orphan_non_resident_strategic_review_still_reaped():
     """The carve-out is opt-in: a normal (non-resident) strategic_review that
     blows the 1500s thinking-heavy budget is still reaped as before."""
@@ -8136,6 +8291,318 @@ async def test_relock_orphan_no_cutoff_does_not_consult_vm_contact(reaper_db):
         "must be preserved (Fix 3a)"
     )
     assert relocked.id == t.id
+
+
+# ── Z1: the relock stage un-reaped runner zombies every cycle ───────────────
+# _classify_orphan learned to see through the shared-VmContact mask (#14413),
+# but the RELOCK still re-queried vmcontact.last_contact_at on the shared
+# 'runner:<id>' row and aborted the reap when a sibling kept it fresh — so a
+# correctly-classified zombie was silently un-reaped, forever. The relock now
+# consults the same runner self-report.
+
+
+async def _runner_zombie_task(reaper_db, *, vm_id, now, started_minutes_ago=30):
+    """A heartbeat-stale task on a fleet runner whose SHARED vmcontact row is
+    kept fresh by a live sibling agent (the zombie shape)."""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=started_minutes_ago),
+        last_heartbeat=now - timedelta(minutes=10),  # past the 5min small cutoff
+    )
+    reaper_db.add(t)
+    # Sibling agent on the SAME runner keeps the one-row-per-VM contact fresh.
+    reaper_db.add(
+        VmContact(vm_instance_id=vm_id, last_contact_at=now - timedelta(seconds=20))
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    return t
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_runner_report_excluding_task_proceeds_with_reap(
+    reaper_db,
+):
+    """Z1: with a fresh runner self-report that OMITS the task, the relock must NOT
+    abort on the shared vmcontact row — that contact is a sibling's liveness. The
+    reap proceeds (relock returns the locked task)."""
+    now = _utcnow()
+    vm_id = "runner:11111111-1111-1111-1111-111111111111"
+    t = await _runner_zombie_task(reaper_db, vm_id=vm_id, now=now)
+    cutoff = now - timedelta(minutes=5)
+
+    # Baseline (no report): the shared contact un-reaps it — the bug.
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=cutoff,
+        )
+        is None
+    )
+
+    report = {vm_id: (now - timedelta(seconds=20), frozenset({"sibling-task"}))}
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=cutoff,
+        runner_report_lookup=report,
+    )
+    assert relocked is not None, (
+        "a fresh runner report that omits the task proves its agent is gone — the "
+        "shared-vmcontact abort must not un-reap it"
+    )
+    assert relocked.id == t.id
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_runner_report_including_task_still_aborts(reaper_db):
+    """The abort MUST still fire for a task the runner DOES list — that agent is
+    alive and its last_heartbeat write was merely lock-starved."""
+    now = _utcnow()
+    vm_id = "runner:22222222-2222-2222-2222-222222222222"
+    t = await _runner_zombie_task(reaper_db, vm_id=vm_id, now=now)
+    report = {
+        vm_id: (now - timedelta(seconds=20), frozenset({str(t.id), "sibling-task"}))
+    }
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=now - timedelta(minutes=5),
+            runner_report_lookup=report,
+        )
+        is None
+    ), "a task the runner still reports as active must keep the contact suppression"
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_stale_runner_report_still_aborts(reaper_db):
+    """Fail-safe: a STALE report (the runner itself went quiet) is not evidence of
+    a per-task death — the vm_contact abort applies exactly as before."""
+    now = _utcnow()
+    vm_id = "runner:33333333-3333-3333-3333-333333333333"
+    t = await _runner_zombie_task(reaper_db, vm_id=vm_id, now=now)
+    # reported_at is older than the liveness cutoff → not trusted.
+    stale_report = {vm_id: (now - timedelta(minutes=30), frozenset({"sibling-task"}))}
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=now - timedelta(minutes=5),
+            runner_report_lookup=stale_report,
+        )
+        is None
+    )
+    # Absent report (older runner build, no active_work_reported_at stamp) → same.
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=now - timedelta(minutes=5),
+            runner_report_lookup={},
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_runner_report_within_claim_grace_still_aborts(reaper_db):
+    """Fail-safe: a report that predates this task's claim + grace may simply not
+    know about the claim yet — it must not authorize the reap."""
+    now = _utcnow()
+    vm_id = "runner:44444444-4444-4444-4444-444444444444"
+    # started_at only 30s ago → any report is inside the 180s claim grace.
+    t = await _runner_zombie_task(
+        reaper_db, vm_id=vm_id, now=now, started_minutes_ago=0
+    )
+    t.started_at = now - timedelta(seconds=30)
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    assert _RUNNER_REPORT_CLAIM_GRACE_SECONDS > 30
+    report = {vm_id: (now - timedelta(seconds=10), frozenset({"sibling-task"}))}
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=now - timedelta(minutes=5),
+            runner_report_lookup=report,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_runner_report_ignored_for_non_runner_vm(reaper_db):
+    """A cloud/GCE vm id owns its vmcontact row alone — there is no mask to defeat,
+    so the report is irrelevant and the abort still fires."""
+    now = _utcnow()
+    vm_id = "vm-cloud-abc"  # NOT a 'runner:' id
+    t = await _runner_zombie_task(reaper_db, vm_id=vm_id, now=now)
+    report = {vm_id: (now - timedelta(seconds=20), frozenset({"sibling-task"}))}
+    assert (
+        await _relock_orphan_task(
+            reaper_db,
+            t.id,
+            t,
+            TaskStatus.IN_PROGRESS,
+            t.last_heartbeat,
+            vm_liveness_cutoff=now - timedelta(minutes=5),
+            runner_report_lookup=report,
+        )
+        is None
+    ), "the runner-report override must be scoped to 'runner:' vm ids"
+
+
+async def _runner_zombie_e2e_fixture(reaper_db, *, now, reported_task_ids):
+    """The full runner-zombie shape as reaper_service sees it: a registered
+    LocalRunner carrying a FRESH self-report, a heartbeat-stale IN_PROGRESS task
+    pinned to it, and the ONE shared 'runner:<id>' vmcontact row kept fresh by a
+    live sibling agent. ``reported_task_ids`` is a callable taking the task so a
+    caller can have the report include or omit it."""
+    from app.models import LocalRunner, VmContact
+
+    project = await _make_project(reaper_db)
+    runner_id = _uuid_mod.uuid4()
+    vm_id = f"runner:{runner_id}"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # Started long ago → well past _RUNNER_REPORT_CLAIM_GRACE_SECONDS.
+        started_at=now - timedelta(minutes=30),
+        # Past the 5min small-scope heartbeat cutoff → orphan candidate.
+        last_heartbeat=now - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        LocalRunner(
+            id=runner_id,
+            project_id=project.id,
+            token_hash="0" * 64,
+            capabilities={
+                "active_task_ids": reported_task_ids(t),
+                "active_work_reported_at": (now - timedelta(seconds=20)).isoformat(),
+            },
+        )
+    )
+    # The single per-runner contact row — a live sibling agent keeps it fresh.
+    reaper_db.add(
+        VmContact(vm_instance_id=vm_id, last_contact_at=now - timedelta(seconds=20))
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    return t, vm_id
+
+
+@pytest.mark.asyncio
+async def test_reaper_service_wires_runner_report_into_relock_and_reaps_zombie(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Z1 END-TO-END — covers the reaper-side WIRING itself.
+
+    The five tests above call ``_relock_orphan_task`` directly with a hand-built
+    dict, so they stay green even if the reaper drops the
+    ``runner_report_lookup=`` kwarg at the call site — i.e. they cover the helper
+    the fix feeds, not the fix. This test drives the real ``reaper_service`` cycle
+    over a genuine runner zombie (LocalRunner row + fresh self-report + the shared
+    vmcontact row a sibling keeps alive) and asserts BOTH that the relock received
+    a non-empty report AND that the task is actually reaped. Remove
+    ``runner_report_lookup=`` (or the ``_build_runner_report_lookup`` call feeding
+    it) and this FAILS — the shared contact aborts the relock and the task stays
+    IN_PROGRESS forever, which is the exact bug Z1 fixes.
+    """
+    now = _utcnow()
+    t, vm_id = await _runner_zombie_e2e_fixture(
+        reaper_db,
+        now=now,
+        # The runner is running a SIBLING, not this task → this agent is gone.
+        reported_task_ids=lambda _t: [str(_uuid_mod.uuid4())],
+    )
+
+    seen_kwargs: list[dict] = []
+    _real_relock = _relock_orphan_task
+
+    async def _spy_relock(*args, **kwargs):
+        seen_kwargs.append(dict(kwargs))
+        return await _real_relock(*args, **kwargs)
+
+    mocker.patch("app.reaper._relock_orphan_task", new=_spy_relock)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert seen_kwargs, "the classified orphan must have reached the relock stage"
+    lookup = seen_kwargs[-1].get("runner_report_lookup")
+    assert lookup, (
+        "reaper_service must BUILD the runner self-report at the relock stage and "
+        "PASS it as runner_report_lookup= — without it the shared-vmcontact abort "
+        "silently un-reaps the zombie on every cycle (Z1)"
+    )
+    assert vm_id in lookup, "the report must be keyed by the task's own runner vm id"
+
+    assert t.status == TaskStatus.QUEUED, (
+        "the zombie must be reaped END-TO-END: the shared 'runner:<id>' vmcontact "
+        "row carries the SIBLING's liveness, and the runner's own fresh report "
+        "omits this task — so the relock must not abort on that contact"
+    )
+    assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reaper_service_spares_task_the_runner_still_reports_active(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Negative control for the wiring above: identical shape, except the runner's
+    fresh report DOES list the task. Its agent is alive and its last_heartbeat
+    write was merely lock-starved (exactly the case the vm_contact override exists
+    for), so the full cycle must leave the task IN_PROGRESS. Guards the Z1 fix
+    against degrading into "reap every task on a runner"."""
+    now = _utcnow()
+    t, _vm_id = await _runner_zombie_e2e_fixture(
+        reaper_db,
+        now=now,
+        reported_task_ids=lambda _t: [str(_t.id), str(_uuid_mod.uuid4())],
+    )
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "a task the runner still self-reports as active must keep the vm_contact "
+        "suppression — its agent is alive, its heartbeat write was lock-starved"
+    )
+    assert t.attempt_count == 0
 
 
 def test_relock_orphan_task_re_export_identity():

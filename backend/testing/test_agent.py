@@ -1723,6 +1723,117 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_malformed_tool_trace_t_does_not_advance_progress(
+    client: AsyncClient, db_session
+):
+    """A tool_trace tail whose ``t`` is not ISO-8601 must advance NEITHER progress
+    stamp.
+
+    ``ToolTraceEntry.t`` is a free-form ``str``, so a malformed tail reaches
+    ``_parse_latest_tool_use_at``. It used to return ``_utcnow()`` there —
+    FABRICATING a tool-use "now" out of a value that proves no progress at all.
+    That stamp was written to ``Task.last_tool_use_at`` AND (monotonically, via
+    GREATEST — hence unrecoverably) to ``VmContact.last_tool_use_at``, and every
+    heartbeat re-fabricated it, so a wedged agent with a malformed trace tail
+    could NEVER be progress-stall reaped. Absent is safe; fabricated is not.
+    """
+    from app.models import VmContact
+
+    project = Project(name="Malformed Tool Trace", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-malformed-t"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm_id)
+    headers = {"x-agent-token": token}
+
+    # Tail carries a non-ISO ``t`` (the free-form-str hole).
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "status_message": "wedged",
+            "tool_trace": [
+                {"t": "not-a-timestamp", "tool": "Bash", "input_preview": "ls"}
+            ],
+        },
+        headers=headers,
+    )
+    # Never crash a heartbeat on a bad telemetry value.
+    assert resp.status_code == 200
+
+    # Off-row progress stamp untouched (the row exists — contact WAS recorded).
+    contact = await db_session.get(VmContact, vm_id)
+    assert contact is not None
+    assert contact.last_contact_at is not None, "liveness contact still recorded"
+    assert contact.last_tool_use_at is None, (
+        "a malformed tool_trace tail must NOT fabricate an off-row progress "
+        "stamp — the GREATEST upsert makes a poisoned value unrecoverable"
+    )
+
+    # On-row progress stamp untouched.
+    await db_session.refresh(task)
+    assert task.last_tool_use_at is None, (
+        "a malformed tool_trace tail must NOT fabricate Task.last_tool_use_at — "
+        "that blinds the reaper's progress-stall watchdog forever"
+    )
+
+    # A well-formed tail still lands (the fix is scoped to the parse failure).
+    db_session.expire(contact)
+    good = (_utcnow() - timedelta(seconds=15)).isoformat()
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "tool_trace": [{"t": good, "tool": "Read", "input_preview": "x"}],
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert task.last_tool_use_at is not None
+    contact2 = await db_session.get(VmContact, vm_id)
+    assert contact2.last_tool_use_at is not None
+
+
+def test_parse_latest_tool_use_at_returns_none_on_malformed_tail():
+    """Unit: the parser returns None (not a fabricated _utcnow()) for an
+    unparseable tail, and still parses a valid ISO-8601 one."""
+    from app.routers.agent import _parse_latest_tool_use_at
+    from app.schemas import ToolTraceEntry
+
+    assert _parse_latest_tool_use_at(None) is None
+    assert _parse_latest_tool_use_at([]) is None
+
+    bad = [ToolTraceEntry(t="garbage", tool="Bash", input_preview="ls")]
+    assert _parse_latest_tool_use_at(bad) is None, (
+        "unparseable tail must yield None so both progress stamps stay untouched"
+    )
+    empty_t = [ToolTraceEntry(t="", tool="Bash", input_preview="ls")]
+    assert _parse_latest_tool_use_at(empty_t) is None
+
+    stamp = _utcnow().replace(microsecond=0)
+    good = [
+        ToolTraceEntry(
+            t=stamp.isoformat() + "Z", tool="Bash", input_preview="ls"
+        )
+    ]
+    parsed = _parse_latest_tool_use_at(good)
+    assert parsed == stamp, "valid ISO-8601 (incl. trailing Z) still parses to naive UTC"
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_persists_valid_prompt_fingerprint(
     client: AsyncClient, db_session
 ):

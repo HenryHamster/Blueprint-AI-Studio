@@ -12,6 +12,7 @@ from sqlalchemy.exc import InvalidRequestError
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, VmContact
+from app.reaper_orphan_classify import _runner_report_excludes_task
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ async def _relock_orphan_task(
     expected_last_heartbeat,
     *,
     vm_liveness_cutoff: datetime | None = None,
+    runner_report_lookup: dict | None = None,
 ) -> Task | None:
     """Re-acquire FOR UPDATE on an orphan task and validate the pre-IO snapshot.
 
@@ -38,10 +40,26 @@ async def _relock_orphan_task(
       - no fresh ``vmcontact`` landed during the unlocked window (heartbeat
         false-reap fix: the agent's last_heartbeat write may be lock-starved, so
         a contact within ``vm_liveness_cutoff`` proves the VM is alive even
-        though ``last_heartbeat`` is unchanged).
+        though ``last_heartbeat`` is unchanged) — UNLESS the task's own fleet
+        runner freshly self-reports that it is no longer running this task
+        (``runner_report_lookup``), which defeats that contact override.
 
     Returns None on any of those conditions failing — caller should ``continue``
     to the next orphan task.
+
+    ``runner_report_lookup`` is the ``{vm_instance_id: (reported_at,
+    frozenset(task_id_strs))}`` map built by
+    ``reaper_orphan_classify._build_runner_report_lookup``. It closes the
+    shared-VmContact zombie mask at THIS stage: every task on a fleet runner
+    shares ``vm_instance_id='runner:<id>'`` and therefore ONE ``vmcontact`` row,
+    so any live sibling agent keeps ``last_contact_at`` fresh and the abort above
+    fires forever on a task whose agent is dead — the reap is correctly
+    classified by ``_classify_orphan`` (which got the runner-report override in
+    PR #14413) and then silently un-reaped here, every cycle. Recomputed against
+    the FRESH (post-relock) row because ``started_at`` may have been stamped
+    during the unlocked I/O window and the exclusion is claim-grace-gated.
+    Fail-safe: absent / stale / pre-grace report, or a non-``runner:`` vm id →
+    the vm_contact abort applies exactly as before.
     """
     if cached_task is not None:
         try:
@@ -80,31 +98,75 @@ async def _relock_orphan_task(
     # lock). Gated on the same cutoff: a genuinely dead VM has no fresh contact
     # and is still reaped. Best-effort — never let a lookup error block the reap.
     if vm_liveness_cutoff is not None and fresh.vm_instance_id:
-        try:
-            _contact_at = (
-                await session.execute(
-                    select(VmContact.last_contact_at).where(
-                        VmContact.vm_instance_id == fresh.vm_instance_id
-                    )
-                )
-            ).scalar_one_or_none()
-        except Exception as _vc_exc:  # noqa: BLE001
+        # Shared-VmContact zombie mask, relock stage (follow-up to #14413, which
+        # only closed it in _classify_orphan). The contact row below is keyed on
+        # vm_instance_id, and ALL tasks on a fleet runner share
+        # 'runner:<id>' — a live sibling's heartbeat keeps it fresh, so the abort
+        # below would un-reap a dead task on every cycle, forever. The runner's
+        # own fresh self-report (active_task_ids) is per-TASK ground truth: when
+        # it omits this task the agent process is gone and the sibling's contact
+        # must not shield it. Evaluated on the FRESH row (started_at may have
+        # been stamped during the unlocked I/O window; the exclusion is
+        # claim-grace-gated on it).
+        #
+        # CONSCIOUS ACCEPTANCE (reviewed 2026-07-12) — this override makes the
+        # runner self-report the LAST safety net: before it, a false positive in
+        # _runner_report_excludes_task could not reap (the contact abort below
+        # caught it — which is precisely why runner zombies were unreapable);
+        # now it can. The one realizable false positive: the runner is `kill -9`d
+        # (graceful shutdown terminates its agent process trees, so only SIGKILL /
+        # OOM / host crash orphans them), its agent children survive
+        # (start_new_session), and the restarted process posts active_task_ids=[]
+        # with active_work_report=True. A surviving agent whose on-row heartbeat
+        # write is ALSO lock-starved for the whole stale window (a fresh
+        # heartbeat means the task is never an orphan candidate at all) is then
+        # reaped despite its own fresh vm_contact. Accepted: that agent is
+        # already doomed — the restarted runner's _cleanup_stale_workspaces
+        # (local_runner.py, every ~60s) rmtree's every workspace dir not in
+        # active_task_ids once its mtime is >=300s old, and the runner has
+        # dropped it from its capacity accounting, so nothing will ever
+        # reconcile its result. Requeuing the task is the correct outcome. The
+        # same is true of the other exclusion path (an overdue agent whose
+        # terminate_process_tree failed is removed from active_tasks anyway) —
+        # in every realizable case the runner has already given up on the agent.
+        _runner_excluded = _runner_report_excludes_task(
+            fresh, vm_liveness_cutoff, runner_report_lookup
+        )
+        if _runner_excluded:
             logger.warning(
-                "[REAPER] vm_contact re-lock lookup failed for task %s vm=%s "
-                "(non-fatal, proceeding with reap): %s",
+                "[REAPER] Orphan re-lock: the runner hosting task %s (vm %s) "
+                "freshly reports it is NOT running this task — the shared "
+                "vm_contact row carries a sibling's liveness, not this task's; "
+                "proceeding with the reap.",
                 task_id,
                 fresh.vm_instance_id,
-                _vc_exc,
             )
-            _contact_at = None
-        if _contact_at is not None and _contact_at >= vm_liveness_cutoff:
-            logger.info(
-                f"[REAPER] Orphan re-lock found task {task_id} vm "
-                f"{fresh.vm_instance_id} contacted the orchestrator at "
-                f"{_contact_at} (>= cutoff {vm_liveness_cutoff}) during external "
-                f"I/O — agent alive (lock-starved heartbeat), skipping reap"
-            )
-            return None
+        else:
+            try:
+                _contact_at = (
+                    await session.execute(
+                        select(VmContact.last_contact_at).where(
+                            VmContact.vm_instance_id == fresh.vm_instance_id
+                        )
+                    )
+                ).scalar_one_or_none()
+            except Exception as _vc_exc:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] vm_contact re-lock lookup failed for task %s vm=%s "
+                    "(non-fatal, proceeding with reap): %s",
+                    task_id,
+                    fresh.vm_instance_id,
+                    _vc_exc,
+                )
+                _contact_at = None
+            if _contact_at is not None and _contact_at >= vm_liveness_cutoff:
+                logger.info(
+                    f"[REAPER] Orphan re-lock found task {task_id} vm "
+                    f"{fresh.vm_instance_id} contacted the orchestrator at "
+                    f"{_contact_at} (>= cutoff {vm_liveness_cutoff}) during external "
+                    f"I/O — agent alive (lock-starved heartbeat), skipping reap"
+                )
+                return None
     if fresh.status != expected_status:
         # Defensive: status changed within the (PROVISIONING, IN_PROGRESS) set
         # — e.g. claim_task flipped PROVISIONING → IN_PROGRESS. Not the same as

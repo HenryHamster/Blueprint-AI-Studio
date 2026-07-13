@@ -342,7 +342,9 @@ def _classify_orphan(
     # runner pin awaiting pull (started_at IS NULL), already protected by
     # _is_runner_pinned_awaiting_pull, so this carve-out is scoped to IN_PROGRESS.
     if task.status == TaskStatus.IN_PROGRESS and _is_resident_session(task):
-        return _classify_resident_session(task, now, vm_contact_lookup)
+        return _classify_resident_session(
+            task, now, vm_contact_lookup, runner_excluded=runner_excluded
+        )
 
     if task.status == TaskStatus.PROVISIONING:
         if task.started_at and task.started_at < fifteen_minutes_ago:
@@ -578,6 +580,8 @@ def _classify_resident_session(
     task,
     now: datetime,
     vm_contact_lookup: dict | None,
+    *,
+    runner_excluded: bool = False,
 ) -> bool:
     """Reap decision for an IN_PROGRESS resident strategic session.
 
@@ -593,17 +597,37 @@ def _classify_resident_session(
     mirroring the other heartbeat-stale branches. The window itself comes from
     ``runtime_config['resident_session_heartbeat_stale_seconds']`` (see
     ``_resident_session_heartbeat_stale_cutoff``), not a hardcoded constant.
+
+    ``runner_excluded`` (computed by the caller via
+    ``_runner_report_excludes_task`` against the normal heartbeat cutoff)
+    OVERRIDES the ``_vm_contact_within_cutoff`` suppression on all three reap
+    paths, exactly as it does on the other heartbeat-stale branches. Without it
+    the resident session was UNRECLAIMABLE on a shared fleet runner: the session
+    is pinned to the operator's box, every task there shares
+    ``vm_instance_id='runner:<id>'`` and thus ONE ``vmcontact`` row, so a single
+    live sibling agent kept ``last_contact_at`` fresh and suppressed the reap
+    past the window forever — and no other reclaim path exists
+    (``_start_claim_is_stale`` covers only provisional spawn claims, and
+    ``start_resident_session`` returns the existing session while a live task
+    exists), so the zombie permanently blocked respawn of the Workday session.
+    The runner's ``active_task_ids`` self-report is per-TASK ground truth and it
+    lists a resident session for its whole life (the runner tracks the spawned
+    agent process in ``active_tasks`` until it exits), so a report that OMITS it
+    means the session process is gone. NOTE this only defeats the shared-contact
+    suppression — the 25-min resident window itself still has to elapse, and the
+    progress-staleness exemption above is untouched (a warm-idle session making
+    no tool calls is still never reaped for that).
     """
     resident_cutoff = _resident_session_heartbeat_stale_cutoff(task, now)
     if task.last_heartbeat is not None:
         if task.last_heartbeat < resident_cutoff:
-            return not _vm_contact_within_cutoff(
+            return runner_excluded or not _vm_contact_within_cutoff(
                 task, resident_cutoff, vm_contact_lookup
             )
         return False
     if task.started_at is not None:
         if task.started_at < resident_cutoff:
-            return not _vm_contact_within_cutoff(
+            return runner_excluded or not _vm_contact_within_cutoff(
                 task, resident_cutoff, vm_contact_lookup
             )
         return False
@@ -613,7 +637,9 @@ def _classify_resident_session(
     # (fresh off-row VM contact still overrides, like every other branch).
     created_at = getattr(task, "created_at", None)
     if created_at is not None and created_at < resident_cutoff:
-        return not _vm_contact_within_cutoff(task, resident_cutoff, vm_contact_lookup)
+        return runner_excluded or not _vm_contact_within_cutoff(
+            task, resident_cutoff, vm_contact_lookup
+        )
     return False
 
 

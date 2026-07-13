@@ -4500,19 +4500,51 @@ _COLD_START_BEACON_MAP: dict[str, str] = {
 }
 
 
+# Process-local count of heartbeats whose tool_trace tail carried an
+# unparseable ``t``. Its job is LOG RATE-LIMITING: _parse_latest_tool_use_at logs
+# the first 5 occurrences and then every 100th, so a fleet-wide agent regression
+# (a build emitting a non-ISO timestamp) leaves a visible trail instead of
+# silently disabling the reaper's progress-stall watchdog for every task on that
+# build. It is deliberately NOT an alertable metric: there is no counter/metrics
+# surface in this process, so the signal is only recoverable by reading the
+# orchestrator logs (grep "unparseable tool_trace tail"). Today no producer can
+# even emit a bad value — agent/src/index.ts recordToolUse / snapshotToolTrace
+# are the only writers of ``t`` and both use ``new Date().toISOString()`` — so
+# this is a tripwire for a FUTURE regression, not a live dashboard.
+_malformed_tool_trace_t_count = 0
+
+
 def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
     """Parse the most-recent tool-use timestamp from a heartbeat's tool_trace tail.
 
-    The agent stamps each tool_trace entry's ``t`` as ISO-8601. Returns the
-    parsed (naive-UTC) timestamp of the last entry, falling back to ``_utcnow``
-    if the tail is present but unparseable so we never crash a heartbeat on a
-    bad value. Returns ``None`` when there is no tool_trace at all (the caller
-    then leaves the off-row progress stamp untouched). Shared by the off-row
-    ``vmcontact`` upsert (Fix 3b) and the on-row ``Task.last_tool_use_at``
-    column write so both derive the same value from one parse.
+    The agent stamps each tool_trace entry's ``t`` as ISO-8601
+    (``new Date().toISOString()``, agent/src/index.ts ``recordToolUse`` /
+    ``snapshotToolTrace`` — the only producer). Returns the parsed (naive-UTC)
+    timestamp of the last entry, or ``None`` when there is no tool_trace at all
+    OR the tail's ``t`` cannot be parsed. The caller writes BOTH progress stamps
+    only when this is not None, so ``None`` leaves them untouched.
+
+    Previously the unparseable path returned ``_utcnow()`` — FABRICATING a
+    tool-use "now" from a value that proves nothing about progress.
+    ``ToolTraceEntry.t`` is a free-form ``str`` (schemas.py), so any non-ISO tail
+    took that path, and the fabricated stamp was written to both
+    ``Task.last_tool_use_at`` AND (monotonically, via ``GREATEST``, hence
+    IRRECOVERABLY) ``VmContact.last_tool_use_at``. Every heartbeat re-fabricated
+    it, so a wedged agent with a malformed trace tail could never be
+    progress-stall reaped — the watchdog was blind for exactly the tasks it
+    exists to catch. Absent is safe (the stall branches fall back to the
+    heartbeat/started_at clocks); fabricated is not.
+
+    Never raises: the heartbeat must not fail on a bad telemetry value. Shared by
+    the off-row ``vmcontact`` upsert (Fix 3b) and the on-row
+    ``Task.last_tool_use_at`` column write so both derive the same value from one
+    parse.
     """
     if not tool_trace:
         return None
+    # Bound OUTSIDE the try so the except handler can log the offending value
+    # without re-indexing (which would re-raise the IndexError it is handling).
+    last_t = None
     try:
         last_t = tool_trace[-1].t
         parsed = datetime.fromisoformat(last_t.replace("Z", "+00:00"))
@@ -4520,8 +4552,22 @@ def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return parsed
-    except (ValueError, AttributeError, IndexError):
-        return _utcnow()
+    except (ValueError, AttributeError, IndexError) as exc:
+        global _malformed_tool_trace_t_count
+        _malformed_tool_trace_t_count += 1
+        if (
+            _malformed_tool_trace_t_count <= 5
+            or _malformed_tool_trace_t_count % 100 == 0
+        ):
+            logger.warning(
+                "[HEARTBEAT] unparseable tool_trace tail timestamp %s — leaving "
+                "both progress stamps untouched rather than fabricating one "
+                "(occurrence #%d): %s",
+                repr(last_t)[:80],
+                _malformed_tool_trace_t_count,
+                exc,
+            )
+        return None
 
 
 async def _record_vm_contact(
