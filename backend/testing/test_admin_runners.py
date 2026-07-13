@@ -348,3 +348,133 @@ class TestRunnerStatsCloudCostAvoided:
 
         # A SUCCEEDED row never carries a tail even with a captured log.
         assert outcomes[str(succeeded.id)]["command_log_tail"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Live-safe runner config: operator PATCH normalization + desired-vs-applied view
+# (pure helpers, no DB) — the orchestrator half of the two-way heartbeat config
+# channel that lets an operator reconfigure a LIVE runner (concurrency, task-type
+# allowlist, GPU-index allowlist) without SSH + daemon restart.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGpuIndicesAllowedNormalization:
+    """``_normalize_gpu_indices_allowed`` is the operator-input validator for the
+    GPU-index allowlist pushed to the daemon over the heartbeat. It must accept
+    the ``"all"`` sentinel, coerce a list to deduped/sorted non-negative ints
+    (so storage — and therefore the config-generation hash — is order-stable),
+    and reject malformed shapes so a bad PATCH never silently corrupts the
+    live-safe config."""
+
+    def test_all_sentinel_passes_through(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        assert _normalize_gpu_indices_allowed("all") == "all"
+
+    def test_list_is_deduped_and_sorted(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        assert _normalize_gpu_indices_allowed([2, 0, 2, 1]) == [0, 1, 2]
+
+    def test_empty_list_is_a_valid_restriction(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        # An empty list is a deliberate "no GPU indices allowed", not an error.
+        assert _normalize_gpu_indices_allowed([]) == []
+
+    def test_negative_index_rejected(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        with pytest.raises(ValueError):
+            _normalize_gpu_indices_allowed([0, -1])
+
+    def test_non_int_entry_rejected(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        with pytest.raises(ValueError):
+            _normalize_gpu_indices_allowed([0, "gpu-1"])
+
+    def test_bool_entry_rejected(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        # bool is an int subclass — must be rejected explicitly so True/False
+        # cannot masquerade as index 1/0.
+        with pytest.raises(ValueError):
+            _normalize_gpu_indices_allowed([True])
+
+    def test_scalar_non_list_rejected(self):
+        from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+        with pytest.raises(ValueError):
+            _normalize_gpu_indices_allowed(3)
+
+
+class TestRunnerConfigView:
+    """``_runner_config_view`` renders the desired-vs-applied LIVE-SAFE config the
+    Fleet UI shows. ``config_pending`` must be True whenever the daemon's last
+    reported generation differs from the server-authoritative desired one —
+    INCLUDING the never-reported case — so an operator can SEE that a config push
+    has not yet converged on the box."""
+
+    def test_desired_reflects_operator_config(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        view = _runner_config_view(
+            {
+                "max_concurrent": 4,
+                "max_concurrent_compute": 2,
+                "task_types": ["fix", "create"],
+                "gpu_indices_allowed": [0, 1],
+            }
+        )
+        assert view["desired"]["max_concurrent"] == 4
+        assert view["desired"]["max_concurrent_compute"] == 2
+        assert view["desired"]["task_types"] == ["fix", "create"]
+        assert view["desired"]["gpu_indices_allowed"] == [0, 1]
+        # Surfaced at the top level for the panel's GPU chip too.
+        assert view["gpu_indices_allowed"] == [0, 1]
+
+    def test_pending_when_daemon_never_reported(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        # No applied_config_generation on caps → the daemon has not confirmed it
+        # applied anything → pending, never falsely "applied".
+        view = _runner_config_view({"max_concurrent": 2})
+        assert view["applied_config_generation"] is None
+        assert view["config_pending"] is True
+
+    def test_not_pending_once_daemon_reports_matching_generation(self):
+        from app.routers.admin_runners import _runner_config_view
+        from app.runner_config import live_safe_config_generation
+
+        caps = {"max_concurrent": 2, "gpu_indices_allowed": [3]}
+        # Simulate the daemon echoing back the generation it now has in effect.
+        caps["applied_config_generation"] = live_safe_config_generation(caps)
+        view = _runner_config_view(caps)
+        assert view["config_pending"] is False
+        assert view["applied_config_generation"] == view["config_generation"]
+
+    def test_pending_when_reported_generation_is_stale(self):
+        from app.routers.admin_runners import _runner_config_view
+
+        # Daemon reported an OLD generation that no longer matches desired.
+        view = _runner_config_view(
+            {"max_concurrent": 8, "applied_config_generation": "stale-generation"}
+        )
+        assert view["config_pending"] is True
+
+    def test_gpu_allowlist_change_flips_pending(self):
+        from app.routers.admin_runners import _runner_config_view
+        from app.runner_config import live_safe_config_generation
+
+        # Daemon has converged on the current allowlist ([0]).
+        caps = {"max_concurrent": 2, "gpu_indices_allowed": [0]}
+        caps["applied_config_generation"] = live_safe_config_generation(caps)
+        assert _runner_config_view(caps)["config_pending"] is False
+
+        # Operator widens the allowlist to [0, 1]: the generation changes, so the
+        # previously-applied generation is now stale → pending again until the
+        # daemon reports the new one. This is the exact "widen dgx-1's GPU
+        # allowlist without SSH" flow the salvaged findings describe.
+        caps["gpu_indices_allowed"] = [0, 1]
+        assert _runner_config_view(caps)["config_pending"] is True

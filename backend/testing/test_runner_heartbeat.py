@@ -309,6 +309,125 @@ async def test_cleanup_trims_old_keeps_recent(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_response_carries_live_safe_config(db_session):
+    """The heartbeat RESPONSE carries the server-authoritative LIVE-SAFE config
+    block (the daemon applies it mid-flight, no restart) plus a deterministic
+    ``config_generation`` marker, alongside the backward-compatible
+    ``enrolled_max_concurrent`` / ``version_hint`` an older daemon reads.
+
+    This is the orchestrator half of the config push the salvaged findings ask
+    for: an operator changes ``max_concurrent`` / GPU allowlist on the row and
+    the running daemon learns of it from the next heartbeat response.
+    """
+    from app.runner_config import config_generation, live_safe_config
+
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": ["fix", "create"],
+            "max_concurrent": 3,
+            "max_concurrent_compute": 1,
+            "gpu_indices_allowed": [0, 1],
+        },
+    )
+
+    resp = await heartbeat(
+        payload=HeartbeatRequest(), runner=runner, session=db_session
+    )
+
+    # Backward-compat fields older daemons read.
+    assert resp["enrolled_max_concurrent"] == 3
+    assert "version_hint" in resp
+
+    # New two-way config channel: the desired live-safe subset + its generation.
+    config = resp["config"]
+    assert config["max_concurrent"] == 3
+    assert config["max_concurrent_compute"] == 1
+    assert config["task_types"] == ["fix", "create"]
+    assert config["gpu_indices_allowed"] == [0, 1]
+    expected_generation = config_generation(live_safe_config(runner.capabilities))
+    assert config["config_generation"] == expected_generation
+    # Also mirrored at the top level so a daemon can compare without descending.
+    assert resp["config_generation"] == expected_generation
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_ingests_applied_config_report_without_clobbering_desired(
+    db_session,
+):
+    """The heartbeat REQUEST carries the daemon's applied-config report. The
+    handler stores it under dedicated caps keys (``applied_config`` /
+    ``applied_config_generation``) so the Fleet UI can tell desired-vs-applied
+    apart — and must NOT overwrite the operator-configured DESIRED subset
+    (``max_concurrent`` / ``task_types`` / ``gpu_indices_allowed``)."""
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": ["fix"],
+            "max_concurrent": 4,
+            "gpu_indices_allowed": [2],
+        },
+    )
+
+    await heartbeat(
+        payload=HeartbeatRequest(
+            applied_config_generation="gen-applied-1",
+            applied_max_concurrent=4,
+            applied_max_concurrent_compute=4,
+            applied_task_types=["fix"],
+            applied_gpu_indices_allowed=[2],
+        ),
+        runner=runner,
+        session=db_session,
+    )
+
+    await db_session.refresh(runner)
+    caps = runner.capabilities
+    # Applied report landed under its dedicated keys.
+    assert caps["applied_config_generation"] == "gen-applied-1"
+    assert caps["applied_config"]["max_concurrent"] == 4
+    assert caps["applied_config"]["max_concurrent_compute"] == 4
+    assert caps["applied_config"]["task_types"] == ["fix"]
+    assert caps["applied_config"]["gpu_indices_allowed"] == [2]
+    # The operator-owned DESIRED subset is untouched by the applied report.
+    assert caps["max_concurrent"] == 4
+    assert caps["task_types"] == ["fix"]
+    assert caps["gpu_indices_allowed"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_config_generation_tracks_gpu_allowlist_change(db_session):
+    """The response ``config_generation`` changes iff the live-safe subset
+    changes — so a daemon (and the Fleet UI) can detect a pushed GPU-allowlist
+    edit by comparing generations, without diffing every field."""
+    from app.routers.admin_runners import _normalize_gpu_indices_allowed
+
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "gpu_indices_allowed": [0]},
+    )
+
+    first = await heartbeat(
+        payload=HeartbeatRequest(), runner=runner, session=db_session
+    )
+    gen_before = first["config_generation"]
+
+    # Operator widens the GPU allowlist on the row (as the admin PATCH does).
+    caps = dict(runner.capabilities)
+    caps["gpu_indices_allowed"] = _normalize_gpu_indices_allowed([0, 1])
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    second = await heartbeat(
+        payload=HeartbeatRequest(), runner=runner, session=db_session
+    )
+    assert second["config_generation"] != gen_before
+    assert second["config"]["gpu_indices_allowed"] == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_post_update_silent_sweep_alerts_and_resolves(db_session, monkeypatch):
     """A runner that reported a new version then went silent triggers the alert;
     a live runner resolves it instead."""
