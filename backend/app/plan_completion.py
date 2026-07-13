@@ -21,6 +21,7 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
     _author_compute_launch_contract,
+    _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
 )
@@ -952,6 +953,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             compute_contract = _author_compute_launch_contract(subtask_def)
             if not compute_contract.get("container_image") and _project_default_container_image:
                 compute_contract["container_image"] = _project_default_container_image
+            _stamp_container_image_pin_status(compute_contract, task)
             child_payload = validate_internal_payload(
                 {
                     "type": "compute_experiment",
@@ -987,6 +989,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "no_progress_timeout_seconds",
                             "input_artifact_job_id",
                             "container_image",
+                            "container_image_digest_pinned",
                             "container_registry_auth",
                             "declared_metric",
                             "arms",

@@ -164,6 +164,41 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
     return contract
 
 
+def _stamp_container_image_pin_status(
+    contract: dict[str, Any],
+    context: Any = None,
+) -> None:
+    """Record whether a contract's resolved ``container_image`` is digest-pinned.
+
+    The images-first substrate promises run-to-run reproducibility via digest
+    pinning, but ``resolve_digest_pinned_default_image`` fails open to the raw
+    mutable manifest tag whenever no matching build record exists. That leaves the
+    operator believing a run is digest-reproducible when it is not, with no signal
+    on the job itself.
+
+    When a ``container_image`` is set, stamp ``container_image_digest_pinned`` onto
+    the contract (True iff the reference is content-addressed) so the flag persists
+    on the spawned child payload and can be surfaced in the UI. A mutable default
+    additionally logs a warning. When no image is declared the flag is left absent
+    (a bare ``bash -lc`` job has no image to pin). ``context`` is any identifier
+    (e.g. a task) included in the warning for correlation.
+    """
+    from app.compute_backends import is_digest_pinned
+
+    image = contract.get("container_image")
+    if not image:
+        return
+    pinned = is_digest_pinned(image)
+    contract["container_image_digest_pinned"] = pinned
+    if not pinned:
+        logger.warning(
+            "[COMPUTE] compute_experiment (%s) defaults to MUTABLE image %r "
+            "(no @sha256: digest) — run-to-run reproducibility is NOT guaranteed",
+            context,
+            image,
+        )
+
+
 def _validate_compute_launch_contract(
     contract: dict[str, Any],
     *,

@@ -15883,6 +15883,112 @@ async def test_resolve_digest_pin_ignores_unbuilt_and_digestless_rows(db_session
     )
 
 
+# ---------------------------------------------------------------------------
+# is_digest_pinned + operator-visible mutable-tag signal: the images-first
+# substrate promises run-to-run reproducibility via digest pinning, so a
+# fail-open to a mutable tag must be visible, not a silent debug note.
+# ---------------------------------------------------------------------------
+def test_is_digest_pinned_truth_table():
+    from app import compute_backends as cb
+
+    assert cb.is_digest_pinned("ghcr.io/org/base@sha256:" + "a" * 64) is True
+    # A plain mutable tag is NOT pinned.
+    assert cb.is_digest_pinned("ghcr.io/org/base:latest") is False
+    assert cb.is_digest_pinned("ghcr.io/org/base") is False
+    # Empty / absent references are not pinned.
+    assert cb.is_digest_pinned(None) is False
+    assert cb.is_digest_pinned("") is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_warns_when_falling_open_to_mutable_tag(
+    db_session, caplog
+):
+    """No build record -> fail-open to the mutable tag AND emit an operator-visible
+    warning (not a silent debug note) that reproducibility is not guaranteed."""
+    import logging as _logging
+
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+    tag = "ghcr.io/org/base:latest"
+    with caplog.at_level(_logging.WARNING, logger="app.compute_backends"):
+        result = await cb.resolve_digest_pinned_default_image(
+            db_session, project.id, tag
+        )
+    assert result == tag
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == _logging.WARNING and "MUTABLE tag" in r.getMessage()
+    ]
+    assert warnings, "expected an operator-visible mutable-tag warning"
+    assert "reproducibility is NOT guaranteed" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_does_not_warn_when_pinned(db_session, caplog):
+    """A build record with a digest resolves to the pinned ref with no warning."""
+    import logging as _logging
+
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+    pinned = "ghcr.io/org/base@sha256:" + "d" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="base",
+            registry_repo="ghcr.io/org",
+            dep_hash="h-pinned",
+            tag="latest",
+            pinned_ref=pinned,
+            digest="sha256:" + "d" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+    with caplog.at_level(_logging.WARNING, logger="app.compute_backends"):
+        result = await cb.resolve_digest_pinned_default_image(
+            db_session, project.id, "ghcr.io/org/base:latest"
+        )
+    assert result == pinned
+    assert not [
+        r for r in caplog.records
+        if r.levelno == _logging.WARNING and "MUTABLE tag" in r.getMessage()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# _stamp_container_image_pin_status: durable per-payload reproducibility flag.
+# ---------------------------------------------------------------------------
+def test_stamp_container_image_pin_status_mutable():
+    from app.compute_experiment_contract import _stamp_container_image_pin_status
+
+    contract = {"container_image": "ghcr.io/org/base:latest"}
+    _stamp_container_image_pin_status(contract, "task-1")
+    assert contract["container_image_digest_pinned"] is False
+
+
+def test_stamp_container_image_pin_status_pinned():
+    from app.compute_experiment_contract import _stamp_container_image_pin_status
+
+    ref = "ghcr.io/org/base@sha256:" + "e" * 64
+    contract = {"container_image": ref}
+    _stamp_container_image_pin_status(contract, "task-1")
+    assert contract["container_image_digest_pinned"] is True
+
+
+def test_stamp_container_image_pin_status_no_image_leaves_flag_absent():
+    from app.compute_experiment_contract import _stamp_container_image_pin_status
+
+    # A bare bash -lc job declares no image; the flag must stay absent so a
+    # "not pinned" signal is never shown for a job that has no image to pin.
+    contract = {"command": "python3 -m foo"}
+    _stamp_container_image_pin_status(contract, "task-1")
+    assert "container_image_digest_pinned" not in contract
+
+
 @pytest.mark.asyncio
 async def test_record_project_compute_image_build_inserts_fresh_row(db_session):
     from app import compute_backends as cb

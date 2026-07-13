@@ -9,7 +9,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
-import { EvidenceTierBadge } from './EvidenceTierBadge';
+import { EvidenceTierBadge, MutableImageBadge } from './EvidenceTierBadge';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -24,6 +24,7 @@ import {
   computeJobViewableArtifacts,
   fmtBytes,
   computeJobEvidenceTier,
+  computeJobImagePinStatus,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
@@ -1663,6 +1664,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   })()}
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
+                  {computeJobImagePinStatus(job) === 'mutable' && <MutableImageBadge />}
                   {!active && (
                     <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />
                   )}

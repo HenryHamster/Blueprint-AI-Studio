@@ -3309,6 +3309,18 @@ async def record_project_compute_image_build(
     return row
 
 
+def is_digest_pinned(ref: str | None) -> bool:
+    """True when an image reference is content-addressed (contains ``@sha256:``).
+
+    A digest-pinned reference (``registry/repo@sha256:...``) resolves to the same
+    image layers on every pull, so two runs of the same compute_experiment are
+    bit-identical over time. A mutable tag (``registry/repo:latest``) does not —
+    it is the reproducibility hazard this predicate lets callers detect. ``None``
+    / empty refs are not pinned.
+    """
+    return bool(ref) and "@sha256:" in ref
+
+
 async def resolve_digest_pinned_default_image(
     session: Any,
     project_id: uuid.UUID,
@@ -3373,9 +3385,16 @@ async def resolve_digest_pinned_default_image(
     if row is not None and row.pinned_ref:
         return row.pinned_ref
 
-    logger.debug(
+    # Fail-open to the mutable tag, but make it operator-VISIBLE: the images-first
+    # substrate's core promise is run-to-run reproducibility via digest pinning,
+    # and defaulting to a mutable tag silently defeats it. A warning here (not a
+    # debug note) is the signal the operator needs to know a run they believe is
+    # digest-reproducible is not. Callers additionally stamp the fact durably onto
+    # the child payload via is_digest_pinned().
+    logger.warning(
         "[COMPUTE] no digest-pinned build record for project=%s image=%s; "
-        "defaulting to mutable tag %s",
+        "defaulting to MUTABLE tag %s — run-to-run reproducibility is NOT "
+        "guaranteed for this image",
         project_id,
         image_name,
         manifest_name,

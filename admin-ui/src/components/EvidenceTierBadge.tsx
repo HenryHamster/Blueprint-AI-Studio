@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle, HelpCircle, XCircle } from 'lucide-react';
+import { AlertCircle, AlertTriangle, CheckCircle, HelpCircle, XCircle } from 'lucide-react';
 
 type EvidenceTier = 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered';
 
@@ -54,6 +54,23 @@ export function EvidenceTierBadge({ tier }: { tier: string | null | undefined })
     >
       <Icon className="w-2.5 h-2.5 shrink-0" />
       {label}
+    </span>
+  );
+}
+
+/** Warning chip for a compute job that ran on a MUTABLE image tag rather than a
+ *  digest-pinned reference. The images-first substrate promises run-to-run
+ *  reproducibility via digest pinning; a mutable tag silently defeats it, so the
+ *  operator must not believe such a run is bit-reproducible. Render only when the
+ *  job's resolved image is known to be mutable (see `computeJobImagePinStatus`). */
+export function MutableImageBadge() {
+  return (
+    <span
+      className="bg-amber-950/30 border-amber-900/50 text-amber-400 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5"
+      title="Runs on a mutable image tag — not digest-pinned; run-to-run reproducibility is not guaranteed"
+    >
+      <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
+      Mutable image
     </span>
   );
 }

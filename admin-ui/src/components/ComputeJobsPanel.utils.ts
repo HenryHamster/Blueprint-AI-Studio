@@ -25,6 +25,21 @@ export function computeJobEvidenceTier(
   if (producedResult) return 'backfilled';
   return 'uncovered';
 }
+/** Digest-pin status of the container image a compute job ran on, derived from
+ *  the resolved `launch_params.container_image` string.
+ *
+ *  - `null`    — no image declared (bare `bash -lc` job); nothing to pin.
+ *  - `pinned`  — content-addressed reference (`registry/repo@sha256:...`); the
+ *    same layers pull every time, so runs are bit-identical over time.
+ *  - `mutable` — a plain tag (`registry/repo:latest`); layers can drift between
+ *    runs, silently defeating A/B reproducibility. */
+export function computeJobImagePinStatus(
+  job: Pick<ComputeJob, 'launch_params'>,
+): 'pinned' | 'mutable' | null {
+  const image = job.launch_params?.container_image;
+  if (!image) return null;
+  return image.includes('@sha256:') ? 'pinned' : 'mutable';
+}
 import { parseTimestamp } from '../utils/time';
 export { formatDurationSec as fmtDuration } from '../utils/time';
 

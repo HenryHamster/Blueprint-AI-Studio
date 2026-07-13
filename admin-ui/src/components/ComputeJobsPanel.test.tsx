@@ -10,6 +10,7 @@ import {
   computeJobMargin,
   computeJobExecutionLocation,
   computeJobEvidenceTier,
+  computeJobImagePinStatus,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
@@ -257,6 +258,25 @@ describe('ComputeJobsPanel helpers', () => {
     expect(computeJobEvidenceTier(makeJob({ backend: 'gcp' }))).toBe('attested');
     expect(computeJobEvidenceTier(makeJob({ backend: 'gcp_compute_engine' }))).toBe('attested');
   });
+
+  test('computeJobImagePinStatus: mutable tag → mutable', () => {
+    expect(
+      computeJobImagePinStatus(makeJob({ launch_params: { container_image: 'ghcr.io/org/base:latest' } })),
+    ).toBe('mutable');
+  });
+
+  test('computeJobImagePinStatus: digest-pinned ref → pinned', () => {
+    expect(
+      computeJobImagePinStatus(
+        makeJob({ launch_params: { container_image: `ghcr.io/org/base@sha256:${'a'.repeat(64)}` } }),
+      ),
+    ).toBe('pinned');
+  });
+
+  test('computeJobImagePinStatus: no image / no launch_params → null', () => {
+    expect(computeJobImagePinStatus(makeJob({ launch_params: { command: 'python x.py' } }))).toBeNull();
+    expect(computeJobImagePinStatus(makeJob({ launch_params: undefined }))).toBeNull();
+  });
 });
 
 describe('ComputeJobsPanel evidence-tier badge rendering', () => {
@@ -310,6 +330,44 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     await waitFor(() => {
       expect(queryByText('Machine verified')).toBeNull();
     });
+  });
+
+  test('renders Mutable image badge for a job whose image lacks a digest', async () => {
+    const job = makeJob({
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      launch_params: { container_image: 'ghcr.io/org/base:latest' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await waitFor(() => {
+      expect(getByText('Mutable image')).toBeTruthy();
+    });
+  });
+
+  test('no Mutable image badge for a digest-pinned image', async () => {
+    const job = makeJob({
+      backend: 'gcp',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      launch_params: { container_image: `ghcr.io/org/base@sha256:${'a'.repeat(64)}` },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { queryByText, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Wait for the job row to render, then confirm no mutable-image warning.
+    await findByText('compute_experiment: sweep');
+    expect(queryByText('Mutable image')).toBeNull();
   });
 
   test('run surface earned-vs-claimed evidence tier never hardcodes machine-verified for cloud jobs', async () => {

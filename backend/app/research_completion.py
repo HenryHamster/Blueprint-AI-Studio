@@ -40,6 +40,7 @@ from app.cochange_decomposition import (
 )
 from app.compute_experiment_contract import (
     _author_compute_launch_contract,
+    _stamp_container_image_pin_status,
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
     resolve_compute_spend_threshold,
@@ -4111,6 +4112,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _compute_contract = _author_compute_launch_contract(finding)
             if not _compute_contract.get("container_image") and _project_default_container_image:
                 _compute_contract["container_image"] = _project_default_container_image
+            _stamp_container_image_pin_status(_compute_contract, task)
             _cc_ok, _cc_reason = _validate_compute_launch_contract(_compute_contract)
             if not _cc_ok:
                 _compute_contract_deferred.append(finding)
@@ -4752,6 +4754,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "no_progress_timeout_seconds",
                             "input_artifact_job_id",
                             "container_image",
+                            "container_image_digest_pinned",
                             "container_registry_auth",
                             "declared_metric",
                             "arms",

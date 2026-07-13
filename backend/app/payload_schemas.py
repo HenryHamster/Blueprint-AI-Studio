@@ -1061,6 +1061,11 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # in ``docker run`` with the result-file directory volume-mounted. Absent ⇒
     # existing bare bash -lc path, unchanged. General — no image hardcoding.
     container_image: str | None = None
+    # Reproducibility signal — set by the spawn path (plan/research completion)
+    # when ``container_image`` resolves. True iff the reference is digest-pinned
+    # (``@sha256:``); False for a mutable tag whose layers can drift between runs,
+    # silently defeating A/B reproducibility. Absent ⇒ no image declared.
+    container_image_digest_pinned: bool | None = None
     # Optional registry credentials for private/gated registries.
     # Shape: {server, username}. The 'password' field is NOT supported in the
     # orchestrated path — there is no delivery channel from create time to the

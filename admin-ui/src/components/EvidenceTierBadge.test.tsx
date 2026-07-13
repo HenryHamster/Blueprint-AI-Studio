@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'vitest';
 import { render } from '@testing-library/react';
-import { EvidenceTierBadge } from './EvidenceTierBadge';
+import { EvidenceTierBadge, MutableImageBadge } from './EvidenceTierBadge';
 
 describe('EvidenceTierBadge — label rendering', () => {
   test('covered tier renders Machine verified label', () => {
@@ -68,5 +68,21 @@ describe('EvidenceTierBadge — label rendering', () => {
   test('uncovered badge tooltip describes self-reported nature', () => {
     const { getByTitle } = render(<EvidenceTierBadge tier="uncovered" />);
     expect(getByTitle('No execution evidence — result is self-reported')).toBeTruthy();
+  });
+});
+
+describe('MutableImageBadge', () => {
+  test('renders the Mutable image label', () => {
+    const { getByText } = render(<MutableImageBadge />);
+    expect(getByText('Mutable image')).toBeTruthy();
+  });
+
+  test('tooltip warns that reproducibility is not guaranteed', () => {
+    const { getByTitle } = render(<MutableImageBadge />);
+    expect(
+      getByTitle(
+        'Runs on a mutable image tag — not digest-pinned; run-to-run reproducibility is not guaranteed',
+      ),
+    ).toBeTruthy();
   });
 });
