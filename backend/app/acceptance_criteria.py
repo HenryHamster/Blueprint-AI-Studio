@@ -1559,7 +1559,18 @@ async def backfill_unverified_merge_evidence(
                 if evidence is None or evidence.test_path is None:
                     continue
 
-                declared_test = evidence.test_path.rpartition("::")[0].strip()
+                # ``partition`` (NOT ``rpartition``): the ``::node`` selector is
+                # OPTIONAL on a named_test declaration (see AcceptanceEvidence's
+                # validator), so a bare test-file path is legal and common.
+                # ``rpartition`` returns '' as its head when the separator is
+                # absent, which silently emptied ``declared_test`` for every such
+                # declaration — ``_paths_match(p, "")`` is False for every changed
+                # file, so the task was skipped and NO evidence was ever recorded.
+                # ``partition`` yields the whole path when there is no selector,
+                # matching acceptance_gate._evaluate_named_test's canonical read.
+                declared_test = evidence.test_path.partition("::")[0].strip()
+                if not declared_test:
+                    continue
                 test_present = any(_paths_match(p, declared_test) for p in changed)
                 if not test_present:
                     continue
