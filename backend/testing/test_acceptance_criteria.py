@@ -453,14 +453,26 @@ async def test_record_evidence_duplicate_is_noop(db_session):
 # ---------------------------------------------------------------------------
 
 
-def _make_evidence(source_kind: str, detail: dict | None = None) -> CriterionEvidence:
-    return CriterionEvidence(
+_UNSET = object()
+
+
+def _make_evidence(
+    source_kind: str,
+    detail: dict | None = None,
+    recorded_at: object = _UNSET,
+) -> CriterionEvidence:
+    kwargs: dict = dict(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         criterion_id=uuid.uuid4(),
         source_kind=source_kind,
         detail=detail,
     )
+    # Only override recorded_at when the caller supplies one, so the model's
+    # default_factory (fresh _utcnow()) still applies for the common case.
+    if recorded_at is not _UNSET:
+        kwargs["recorded_at"] = recorded_at
+    return CriterionEvidence(**kwargs)
 
 
 def test_coverage_uncovered():
@@ -563,6 +575,80 @@ def test_unverified_merge_backfill_reports_distinct_tier():
     assert ac.criterion_coverage_to_evidence_status("backfilled") == "partial"
 
 
+def test_machine_probe_evidence_reports_distinct_probed_tier():
+    """Machine-probe evidence produces the distinct, lower-confidence 'probed' tier.
+
+    ``_evidence_proves_covered`` must NOT treat ``acceptance_window_recompute`` or
+    ``metrics_integrity_sweep`` as machine-verified covering evidence — that would
+    score a mechanism-ran signal at full parity with reachability / proven
+    task_merge, even though it only proves the sweep operated (not that the
+    criterion's own condition holds).  This confirms:
+      - a fresh probe row alone → ``compute_criterion_coverage`` returns ``'probed'``
+      - probe + proven machine evidence → ``'covered'`` (probe doesn't regress)
+      - probe + operator attestation → ``'attested'`` (attestation ranks higher)
+      - probe + backfill → ``'backfilled'`` (backfill ranks higher than probe)
+    """
+    for kind in ("acceptance_window_recompute", "metrics_integrity_sweep"):
+        probe_ev = _make_evidence(kind, detail={"ticks": 3})
+        assert not ac._evidence_proves_covered(probe_ev), (
+            f"{kind} must NOT be treated as machine-verified covering"
+        )
+        assert ac._evidence_is_probed(probe_ev) is True
+        assert ac.compute_criterion_coverage([probe_ev]) == "probed"
+
+        # Machine-verified evidence dominates a probe.
+        proven = _make_evidence("task_merge", detail={"proven": True})
+        assert ac.compute_criterion_coverage([probe_ev, proven]) == "covered"
+
+        # A non-expired operator attestation ranks above a probe.
+        attest = _make_evidence("operator_attestation", detail={"reason": "waiver"})
+        assert ac.compute_criterion_coverage([probe_ev, attest]) == "attested"
+
+        # Unverified-merge backfill ranks above a probe.
+        backfill = _make_evidence(
+            ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND, detail={"backfilled": True}
+        )
+        assert ac.compute_criterion_coverage([probe_ev, backfill]) == "backfilled"
+
+    # probed coverage maps onto the shared EvidenceStatus axis as "partial",
+    # never "proven" — a mechanism-ran probe is not machine-proof.
+    assert ac.criterion_coverage_to_evidence_status("probed") == "partial"
+
+
+def test_stale_machine_probe_falls_back_to_partial():
+    """A machine-probe row older than MACHINE_PROBE_WINDOW_DAYS is no longer 'probed'.
+
+    Expiry is measured off ``recorded_at`` (these rows carry no attestation
+    timestamp), so a stale sweep decays to 'partial' until the sweep re-runs and
+    writes a fresh row.  A probe row with no ``recorded_at`` at all also fails —
+    a missing timestamp cannot grant perpetual trust.
+    """
+    stale = _make_evidence(
+        "metrics_integrity_sweep",
+        detail={"ticks": 1},
+        recorded_at=_utcnow() - timedelta(days=ac.MACHINE_PROBE_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_probed(stale) is False
+    assert ac.compute_criterion_coverage([stale]) == "partial"
+
+    no_ts = _make_evidence(
+        "acceptance_window_recompute", detail={"ticks": 1}, recorded_at=None
+    )
+    assert ac._evidence_is_probed(no_ts) is False
+    assert ac.compute_criterion_coverage([no_ts]) == "partial"
+
+    # A row recorded comfortably inside the window is still valid (use one day
+    # of slack so the predicate's slightly-later _utcnow() cannot tip the
+    # exact-boundary comparison and flake).
+    fresh = _make_evidence(
+        "metrics_integrity_sweep",
+        detail={"ticks": 1},
+        recorded_at=_utcnow() - timedelta(days=ac.MACHINE_PROBE_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_probed(fresh) is True
+    assert ac.compute_criterion_coverage([fresh]) == "probed"
+
+
 # ---------------------------------------------------------------------------
 # criterion_evidence_status (pure function, Component 1)
 # ---------------------------------------------------------------------------
@@ -641,10 +727,43 @@ async def test_coverage_summary_empty(db_session):
 
     assert summary["total"] == 0
     assert summary["covered"] == 0
+    assert summary["probed"] == 0
     assert summary["partial"] == 0
     assert summary["uncovered"] == 0
     assert summary["stuck_count"] == 0
     assert summary["criteria"] == []
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_has_probed_bucket(db_session):
+    """A criterion covered only by a fresh machine probe lands in the 'probed'
+    bucket — distinct from 'covered' — and is included in ``total``."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Probed-only outcome"
+    )
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="acceptance_window_recompute",
+            source_id="aw-probe",
+            detail={"acceptance_window_verified": 1},
+        )
+    )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    assert summary["probed"] == 1
+    assert summary["covered"] == 0
+    assert summary["partial"] == 0
+    assert summary["uncovered"] == 0
+    # 'probed' is counted toward total (backward-compat: total == sum of buckets).
+    assert summary["total"] == 1
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[criterion.criterion_key]["coverage"] == "probed"
 
 
 # ---------------------------------------------------------------------------
@@ -5261,14 +5380,19 @@ def _make_inferred_cochange_task(project, version, *, changed_files, seconds=1):
     )
 
 
-def test_acceptance_window_recompute_evidence_marks_covered():
-    """An ``acceptance_window_recompute`` evidence row is covering on its own."""
-    assert (
-        ac.compute_criterion_coverage(
-            [_make_evidence("acceptance_window_recompute", detail={"acceptance_window_verified": 3})]
-        )
-        == "covered"
+def test_acceptance_window_recompute_evidence_marks_probed():
+    """A fresh ``acceptance_window_recompute`` row is the lower-confidence 'probed' tier.
+
+    The sweep running (and re-scoring non-zero) proves the MECHANISM operated, not
+    that the criterion's own condition holds — so it must NOT be machine-verified
+    ``'covered'``.  It yields the distinct, time-bounded ``'probed'`` tier.
+    """
+    ev = _make_evidence(
+        "acceptance_window_recompute", detail={"acceptance_window_verified": 3}
     )
+    assert ac._evidence_proves_covered(ev) is False
+    assert ac._evidence_is_probed(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "probed"
 
 
 def test_names_acceptance_window_metric_matches_and_rejects():
@@ -5284,14 +5408,15 @@ def test_names_acceptance_window_metric_matches_and_rejects():
 @pytest.mark.asyncio
 async def test_acceptance_window_recompute_records_covering_evidence(db_session):
     """Named acceptance-evidence test: inferred_test_cochange merges flip the
-    acceptance-window criterion from uncovered to covered.
+    acceptance-window criterion from uncovered to the lower-confidence 'probed' tier.
 
     Given an open version whose merge window contains inferred_test_cochange
     merges (COMPLETED write-tasks whose PR co-changed a test AND a production
     file, CI-verified, no explicit verdict) such that the recomputed aggregate
-    scores ``verified > 0``, the recorder records ONE covering
+    scores ``verified > 0``, the recorder records ONE machine-probe
     ``acceptance_window_recompute`` row for the criterion whose text names the
-    metric and ``get_version_coverage_summary`` reports it ``covered``.
+    metric and ``get_version_coverage_summary`` reports it ``probed`` (NOT
+    machine-verified ``covered``).
     """
     from app import release_version as rv
 
@@ -5330,10 +5455,11 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
     # Before: no evidence, criterion uncovered.
     summary_before = await ac.get_version_coverage_summary(db_session, version.id)
     assert summary_before["covered"] == 0
+    assert summary_before["probed"] == 0
     assert summary_before["uncovered"] == 1
 
     recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
-    assert recorded == 1, f"Expected 1 covering row for the target criterion; got {recorded}"
+    assert recorded == 1, f"Expected 1 probe row for the target criterion; got {recorded}"
 
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
@@ -5350,9 +5476,11 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
         str(inferred_task_b.id),
     }
 
-    # After: the criterion flips to covered.
+    # After: the criterion flips to the lower-confidence 'probed' tier — the sweep
+    # ran, but that is NOT machine-verified 'covered'.
     summary_after = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary_after["covered"] == 1
+    assert summary_after["covered"] == 0
+    assert summary_after["probed"] == 1
     assert summary_after["uncovered"] == 0
 
 
@@ -5392,7 +5520,8 @@ async def test_acceptance_window_recompute_covers_via_direction_mapping(db_sessi
     recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
     assert recorded == 1
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
 
 
 @pytest.mark.asyncio
@@ -5487,7 +5616,8 @@ async def test_acceptance_window_recompute_does_not_over_cover(db_session):
         "Unrelated criterion must not receive acceptance-window evidence"
     )
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
     assert summary["uncovered"] == 1
 
 
@@ -6163,6 +6293,39 @@ async def test_owns_uncovered_true_when_owned_criterion_partial(db_session):
 
 
 @pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_probed_only(db_session):
+    """An owned criterion covered ONLY by a machine probe (probed) → True.
+
+    A direction backed solely by a mechanism-ran probe (the sweep operated but
+    the criterion's condition was not machine-verified) must NOT auto-retire as
+    "successful" — only ``'covered'`` clears the completion gate.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Probed outcome"
+    )
+    # A fresh metrics_integrity_sweep row yields the 'probed' tier, not 'covered'.
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="metrics_integrity_sweep",
+            source_id="sweep-probe",
+            detail={"ticks": 2},
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-probe", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-probe")
+        is True
+    )
+
+
+@pytest.mark.asyncio
 async def test_owns_uncovered_false_when_all_covered(db_session):
     """All owned active criteria covered → False (do not block completion)."""
     project = await _make_project(db_session)
@@ -6396,14 +6559,17 @@ async def test_sweep_v22_finding_backfill_selects_v22_not_open_version(db_sessio
 # ---------------------------------------------------------------------------
 
 
-def test_metrics_integrity_sweep_evidence_marks_covered():
-    """A ``metrics_integrity_sweep`` evidence row is covering on its own."""
-    assert (
-        ac.compute_criterion_coverage(
-            [_make_evidence("metrics_integrity_sweep", detail={"ticks": 5})]
-        )
-        == "covered"
-    )
+def test_metrics_integrity_sweep_evidence_marks_probed():
+    """A fresh ``metrics_integrity_sweep`` row is the lower-confidence 'probed' tier.
+
+    The sweep ticking proves the MECHANISM is operating, not that the criterion's
+    own condition holds — so it yields the distinct, time-bounded ``'probed'``
+    tier rather than machine-verified ``'covered'``.
+    """
+    ev = _make_evidence("metrics_integrity_sweep", detail={"ticks": 5})
+    assert ac._evidence_proves_covered(ev) is False
+    assert ac._evidence_is_probed(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "probed"
 
 
 def test_names_metrics_integrity_sweep_matches_and_rejects():
@@ -6421,7 +6587,8 @@ def test_names_metrics_integrity_sweep_matches_and_rejects():
 @pytest.mark.asyncio
 async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_session):
     """When the sweep has run (ticks > 0 in observability), the recorder writes one
-    covering evidence row for the data-integrity criterion and coverage flips to covered."""
+    machine-probe evidence row for the data-integrity criterion and coverage flips
+    to the lower-confidence 'probed' tier (NOT machine-verified 'covered')."""
     import app.metrics_integrity_sweep as mis
     from app import release_version as rv
 
@@ -6460,7 +6627,7 @@ async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_ses
     )
 
     recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
-    assert recorded == 1, f"Expected 1 covering row; got {recorded}"
+    assert recorded == 1, f"Expected 1 probe row; got {recorded}"
 
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
@@ -6469,9 +6636,11 @@ async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_ses
     assert row.detail["ticks"] == 1
     assert row.detail["mode"] == "observe"
 
-    # After: the criterion flips to covered.
+    # After: the criterion flips to the lower-confidence 'probed' tier — the sweep
+    # ticked, but that is NOT machine-verified 'covered'.
     summary_after = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary_after["covered"] == 1
+    assert summary_after["covered"] == 0
+    assert summary_after["probed"] == 1
     assert summary_after["uncovered"] == 0
 
     mis._reset_observability_for_tests()
@@ -6523,7 +6692,8 @@ async def test_metrics_integrity_coverage_evidence_via_direction_mapping(db_sess
     recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
     assert recorded == 1
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["covered"] == 1
+    assert summary["covered"] == 0
+    assert summary["probed"] == 1
 
     mis._reset_observability_for_tests()
 

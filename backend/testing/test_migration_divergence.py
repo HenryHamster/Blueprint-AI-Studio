@@ -16,6 +16,7 @@ from app.migration_chain import (
     find_content_divergent_revisions,
     find_deployed_migration_content_edits,
     plan_integration_side_renumber,
+    validate_combined_migration_chain,
 )
 from app.migration_reconciliation import (
     AUTHORIZED_DIVERGENCES,
@@ -1563,6 +1564,171 @@ async def test_defect_class_2_mixed_restore_and_real_edit_blocks(mocker):
     assert edited in reason
     # The byte-identical restore must NOT be named as a tamper.
     assert restored not in reason
+
+
+# ===========================================================================
+# In-place restore reachability — validate_combined_migration_chain must NOT
+# treat a MODIFIED migration that already exists on the target branch as a
+# newly-added revision. Folding a modified existing migration into the
+# added-migration collision check falsely reports "revision already exists on
+# the target branch" (or "anchors off the current head") and hard-blocks the
+# merge BEFORE the deployed-migration restore/immutability checks can clear a
+# byte-identical restore. This is the exact mechanism that made every attempt
+# to restore the unauthorized 0459 down_revision renumber (v25 migration-
+# identity reconciliation) block, so the qualifier's body-immutability phase
+# never cleared (prior repair PRs merged EMPTY diffs).
+# ===========================================================================
+
+
+def test_combined_chain_flags_inplace_modified_existing_revision_by_default():
+    """Baseline (no exemption): a source keyed at an existing revision id is
+    flagged as an 'already exists' collision — the raw added-vs-existing rule."""
+    existing = ["0457_x.py", "0458_add_perf_indexes.py", "0459_alert_index.py"]
+    added = {
+        "backend/alembic/versions/0459_alert_index.py": _migration_source(
+            "0459", "0458"
+        )
+    }
+    reason = validate_combined_migration_chain(existing, added)
+    assert reason is not None
+    assert "0459" in reason
+    assert "already exists" in reason
+
+
+def test_combined_chain_exempts_inplace_modified_existing_revision():
+    """With the modified revision declared in ``inplace_modified_revisions``, the
+    in-place edit of an existing migration is NOT a chain extension and must be
+    exempted from the collision (a) AND head-anchor (b) checks — the combined
+    chain is valid ('None'). A restored 0459 legitimately keeps its revision id
+    and its deployed down_revision (0458), even though it anchors well below the
+    numeric head, so the anchor check must not fire either."""
+    existing = [
+        "0457_x.py",
+        "0458_add_perf_indexes.py",
+        "0459_alert_index.py",
+        "0525_task_evaluating_updated_at_index.py",
+    ]
+    added = {
+        "backend/alembic/versions/0459_alert_index.py": _migration_source(
+            "0459", "0458"
+        )
+    }
+    assert (
+        validate_combined_migration_chain(
+            existing, added, inplace_modified_revisions={"0459"}
+        )
+        is None
+    )
+
+
+def test_combined_chain_still_flags_unexempted_added_collision():
+    """The exemption is revision-scoped: a genuinely NEW added migration that
+    reuses an existing revision id still blocks even when a DIFFERENT revision is
+    exempted. The exemption never becomes a blanket waiver of duplicate ids."""
+    existing = ["0457_x.py", "0458_add_perf_indexes.py", "0459_alert_index.py"]
+    # 0458 is a real duplicate addition; 0459 is the in-place-modified one.
+    added = {
+        "backend/alembic/versions/0458_new_dup.py": _migration_source("0458", "0457"),
+        "backend/alembic/versions/0459_alert_index.py": _migration_source(
+            "0459", "0458"
+        ),
+    }
+    reason = validate_combined_migration_chain(
+        existing, added, inplace_modified_revisions={"0459"}
+    )
+    assert reason is not None
+    assert "0458" in reason
+    assert "already exists" in reason
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_allows_inplace_restore_of_existing_target_migration(
+    mocker,
+):
+    """END-TO-END regression for the v25 0459 reconciliation deadlock.
+
+    The candidate branch (automain) ALREADY carries 0459 (an unauthorized
+    down_revision renumber). A PR restores 0459 in place to the byte-identical
+    deployed copy on main. Because 0459 is on BOTH the target branch and the
+    promotion target, the pre-fix guard folded the ``modified`` 0459 into the
+    added-migration set and hard-blocked with 'revision 0459 already exists on
+    the target branch' at the combined-chain check — BEFORE the byte-identical
+    restore exemption could clear it. With the in-place-modification exemption
+    the combined-chain check no longer fires and the restore is allowed
+    ('ok', None); its immutability is still enforced by the restore check (a
+    byte-identical restore passes)."""
+    basename = "0459_add_alert_project_created_index.py"
+    modified_path = f"{_VERSIONS_DIR}/{basename}"
+    deployed_src = _migration_source("0459", "0458")
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0459", "0458")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            # Integration/target branch ALREADY carries 0459 (the real condition
+            # the earlier restore tests omitted, which is why they passed while
+            # production still blocked).
+            integration=[
+                "0457_x.py",
+                "0458_add_perf_indexes.py",
+                basename,
+                "0525_task_evaluating_updated_at_index.py",
+            ],
+            # Deployed main carries the migration whose identity is being restored.
+            promotion=["0457_x.py", "0458_add_perf_indexes.py", basename],
+        ),
+    )
+    # PR head bytes are byte-identical to the deployed copy on main → restore.
+    _mock_migration_texts(mocker, deployed={basename: deployed_src})
+    assert await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    ) == ("ok", None)
+
+
+@pytest.mark.asyncio
+async def test_premerge_guard_still_blocks_inplace_edit_of_existing_target_migration(
+    mocker,
+):
+    """The exemption is NOT a weakening: a MODIFIED existing-on-target migration
+    whose PR head bytes DIFFER from the deployed copy (a real in-place tamper,
+    not a restore) must still BLOCK. Exempting it from the 'already exists'
+    collision only routes it to the deployed-migration immutability check, which
+    catches the genuine body edit."""
+    basename = "0459_add_alert_project_created_index.py"
+    modified_path = f"{_VERSIONS_DIR}/{basename}"
+    head_src = _migration_source("0459", "0458")
+    deployed_src = head_src + "# deployed-only line\n"  # real body difference
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_modified_migration_file(modified_path, "0459", "0458")]
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_branch(
+            integration=[
+                "0457_x.py",
+                "0458_add_perf_indexes.py",
+                basename,
+                "0525_task_evaluating_updated_at_index.py",
+            ],
+            promotion=["0457_x.py", "0458_add_perf_indexes.py", basename],
+        ),
+    )
+    _mock_migration_texts(
+        mocker, deployed={basename: deployed_src}, head={basename: head_src}
+    )
+    status, reason = await _validate_rollup_migration_chain(
+        "tok", "acme", "widget", 1, "automain", promotion_target="main"
+    )
+    assert status == "block"
+    assert basename in reason
+    assert "immutable" in reason or "deployed" in reason
 
 
 # ===========================================================================

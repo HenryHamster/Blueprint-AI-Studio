@@ -472,9 +472,11 @@ async def reconcile_backfill(
     )
 
     # Metric-derived acceptance-window coverage: re-score the version's
-    # acceptance-window aggregate and, when it is genuinely non-zero, record
-    # covering evidence for the criteria that track that metric. Best-effort and
-    # idempotent — runs on every reconcile so an operator can force it manually.
+    # acceptance-window aggregate and, when it is genuinely non-zero, record a
+    # machine-probe evidence row for the criteria that track that metric. This
+    # grants the lower-confidence, time-bounded ``'probed'`` tier (the sweep ran)
+    # — NOT full machine-verified ``'covered'``. Best-effort and idempotent —
+    # runs on every reconcile so an operator can force it manually.
     from app.release_version import current_open_version
 
     open_version = await current_open_version(session, project_id)

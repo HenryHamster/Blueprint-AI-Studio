@@ -483,7 +483,10 @@ def validate_standalone_chain(
 
 
 def validate_combined_migration_chain(
-    existing_filenames: list[str], added_sources: dict[str, str]
+    existing_filenames: list[str],
+    added_sources: dict[str, str],
+    *,
+    inplace_modified_revisions: set[str] | None = None,
 ) -> str | None:
     """Validate a rollup's added migrations against the target branch's chain.
 
@@ -505,9 +508,28 @@ def validate_combined_migration_chain(
     or stale revision and the fix. The in-isolation checks still run first, so
     this is a strict superset of :func:`validate_added_migrations`.
 
+    ``inplace_modified_revisions`` names revision ids that this rollup edits
+    IN PLACE — a migration whose file already exists on the target branch and
+    keeps its revision id (a ``modified`` PR file, not an ``added`` one). Such a
+    file is NOT a new chain extension: it keeps its revision id and its existing
+    chain position by design, so subjecting it to the added-migration collision
+    check (a) or the head-anchor check (b) would falsely report it as a
+    duplicate revision or as anchoring off the current head. These edits are
+    exempted here and their immutability is enforced separately by the
+    deployed-migration restore/immutability checks in the pre-merge guard. This
+    is what makes the byte-identical RESTORE of an unauthorized in-place
+    down_revision renumber (v25 migration-identity reconciliation) reachable
+    instead of being hard-blocked at this earlier collision check.
+
     With no existing migrations (empty/greenfield target) it degrades exactly to
     :func:`validate_added_migrations`.
     """
+    if inplace_modified_revisions:
+        added_sources = {
+            path: src
+            for path, src in added_sources.items()
+            if _filename_revision_prefix(path) not in inplace_modified_revisions
+        }
     reason = validate_added_migrations(added_sources)
     if reason is not None:
         return reason

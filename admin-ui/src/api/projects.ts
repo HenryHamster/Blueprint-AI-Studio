@@ -445,7 +445,7 @@ export interface ChangelogEntry {
 export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
-  coverage: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered';
+  coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
@@ -469,6 +469,11 @@ export interface VersionCriterionCoverage {
    *  derived from task history, not operator attestation. May be absent from
    *  older backends; treat undefined as 0. */
   backfilled?: number;
+  /** Active criteria covered ONLY by a non-expired probe (lower-confidence,
+   *  time-bounded machine signal — an expired attestation or stale probe row).
+   *  A distinct tier that is NOT included in `covered`, `attested`, or
+   *  `backfilled`. May be absent from older backends; treat undefined as 0. */
+  probed?: number;
   partial: number;
   uncovered: number;
   retracted?: number;

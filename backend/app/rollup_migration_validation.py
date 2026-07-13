@@ -297,7 +297,34 @@ async def _validate_rollup_migration_chain(
             f"could not list target branch '{target_branch}' migrations to "
             f"validate the combined Alembic chain: {_exc_detail(e)}",
         )
-    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    # In-place edits of migrations that ALREADY exist on the target branch are
+    # NOT new chain extensions — they keep their revision id and existing chain
+    # position (a ``modified`` PR file, not an ``added`` one). Folding them into
+    # the added-migration collision/anchor check would falsely report the
+    # revision as a duplicate ("already exists on the target branch") or as
+    # anchoring off the current head, which is exactly what made the v25 0459
+    # byte-identical RESTORE unreachable — the collision fired here before the
+    # deployed-migration restore/immutability checks below could clear it. Their
+    # immutability is enforced by those later checks (byte-identical restore
+    # passes; any real body edit still blocks).
+    existing_revisions_on_target = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    inplace_modified_revisions = {
+        rev
+        for f in files
+        if f.get("status") == "modified"
+        and _touches_alembic_versions(f.get("filename", ""))
+        and (rev := _filename_revision_prefix(f.get("filename", ""))) is not None
+        and rev in existing_revisions_on_target
+    }
+    reason = validate_combined_migration_chain(
+        existing_filenames,
+        added_sources,
+        inplace_modified_revisions=inplace_modified_revisions,
+    )
     if reason is not None:
         return ("block", reason)
 

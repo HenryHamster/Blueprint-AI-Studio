@@ -169,6 +169,7 @@ const COVERAGE_BADGE: Record<CriterionCoverageEntry['coverage'], { label: string
   covered:   { label: 'covered',   className: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' },
   attested:  { label: 'attested',  className: 'bg-amber-600/20 text-amber-400 border border-amber-600/40' },
   backfilled:{ label: 'backfilled',className: 'bg-slate-600/40 text-slate-300 border border-slate-500/40' },
+  probed:    { label: 'probed',    className: 'bg-sky-600/20 text-sky-300 border border-sky-600/40' },
   partial:   { label: 'partial',   className: 'bg-amber-500/20 text-amber-400 border border-amber-500/30' },
   uncovered: { label: 'uncovered', className: 'bg-slate-700/60 text-slate-400 border border-slate-600/40' },
 };
@@ -220,6 +221,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
           </span>
         )}
         {(coverage.backfilled ?? 0) > 0 && <span className="text-ui-sm text-slate-500" data-testid="backfilled-count-badge">{coverage.backfilled} backfilled</span>}
+        {(coverage.probed ?? 0) > 0 && <span className="text-ui-sm text-sky-300" data-testid="probed-count-badge">{coverage.probed} probed</span>}
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
         {inactiveCount > 0 && (

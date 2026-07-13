@@ -187,6 +187,24 @@ def _names_metrics_integrity_sweep(text: str | None) -> bool:
 #: in one place.
 ATTESTATION_WINDOW_DAYS = 7
 
+#: Coverage-tier constant: how long a machine-probe evidence row
+#: (``acceptance_window_recompute`` / ``metrics_integrity_sweep``) counts as
+#: (lower-confidence) *probed* coverage before it expires and the criterion
+#: falls back to its underlying evidence state.  These kinds prove only that
+#: the mechanism RAN and re-scored non-zero / ticked — NOT that the criterion's
+#: own condition holds — so they are a visibly distinct, time-bounded tier,
+#: never full parity with the machine-verified kinds recognised by
+#: :func:`_evidence_proves_covered`.  Measured from ``recorded_at`` (these rows
+#: carry no attestation timestamp), so a stale probe decays to ``partial``.
+MACHINE_PROBE_WINDOW_DAYS = 14
+
+#: ``source_kind`` set for machine-probe coverage evidence — a mechanism-ran
+#: signal that grants the lower-confidence, time-bounded ``'probed'`` tier via
+#: :func:`_evidence_is_probed` rather than full ``'covered'`` parity.
+_MACHINE_PROBE_EVIDENCE_KINDS: frozenset[str] = frozenset(
+    {ACCEPTANCE_WINDOW_EVIDENCE_KIND, METRICS_INTEGRITY_EVIDENCE_KIND}
+)
+
 #: Tolerance for a slightly-future ``attested_at`` timestamp caused by benign
 #: clock skew between the attesting client and the server.  A value at most this
 #: far in the future is still honoured; anything further ahead is rejected as the
@@ -203,15 +221,16 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     that says the merge really reached the integration branch.
     ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
     without acceptance-proof is not sufficient to qualify the criterion.
-    ``acceptance_window_recompute`` is covered on its own; it is a metric-derived
-    signal recorded by :func:`record_acceptance_window_coverage_evidence` only
-    when the version's acceptance-window aggregate re-scores genuinely non-zero
-    (``write_total > 0`` and ``verified > 0``), so its mere presence already
-    encodes a populated, non-false-zero denominator.
-    ``metrics_integrity_sweep`` is covered on its own; it is recorded by
-    :func:`record_metrics_integrity_coverage_evidence` only when the standing
-    sweep has completed at least one tick (``ticks > 0``) in observe or enforce
-    mode, so its presence encodes that the mechanism is actively operating.
+
+    ``acceptance_window_recompute`` and ``metrics_integrity_sweep`` are
+    deliberately NOT covering here.  Both prove only that a standing MECHANISM
+    ran and re-scored non-zero / ticked once — not that the criterion's own
+    success condition holds — and both are operator-triggerable via
+    reconcile-backfill.  They earn the visibly distinct, time-bounded
+    ``'probed'`` coverage tier instead (see :func:`_evidence_is_probed` and the
+    ``'probed'`` branch in :func:`compute_criterion_coverage`), so a criterion
+    covered solely by a machine probe scores below one with genuine
+    machine-verified evidence.
 
     ``operator_attestation`` is deliberately NOT covering here.  An operator
     attestation is a lower-confidence, time-bounded waiver — see
@@ -221,10 +240,6 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     All other source_kinds are not sufficient on their own.
     """
     if e.source_kind == "reachability":
-        return True
-    if e.source_kind == ACCEPTANCE_WINDOW_EVIDENCE_KIND:
-        return True
-    if e.source_kind == METRICS_INTEGRITY_EVIDENCE_KIND:
         return True
     if e.source_kind == "task_merge":
         return isinstance(e.detail, dict) and e.detail.get("proven") is True
@@ -331,6 +346,36 @@ def _evidence_is_backfilled(e: CriterionEvidence) -> bool:
     if e.source_kind != UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND:
         return False
     return isinstance(e.detail, dict) and e.detail.get("backfilled") is True
+
+
+def _evidence_is_probed(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record is a NON-EXPIRED machine-probe signal.
+
+    Returns ``True`` only for a ``source_kind`` in
+    :data:`_MACHINE_PROBE_EVIDENCE_KINDS` (``acceptance_window_recompute`` /
+    ``metrics_integrity_sweep``) whose ``recorded_at`` is within
+    :data:`MACHINE_PROBE_WINDOW_DAYS` of now.  Semantics mirror
+    :func:`_evidence_is_attested` / :func:`_evidence_is_backfilled`:
+
+      * These rows carry no attestation timestamp, so expiry is measured off
+        ``recorded_at`` — a probe with no ``recorded_at`` cannot grant perpetual
+        trust and returns ``False``.
+      * A ``recorded_at`` older than the window returns ``False`` so the
+        criterion falls back to its underlying (partial/uncovered) state until
+        the sweep re-runs and writes a fresh probe row.
+
+    Probe evidence is a lower-confidence tier: it proves the mechanism RAN, not
+    that the criterion's condition holds.  The ``'probed'`` coverage status (see
+    :func:`compute_criterion_coverage`) is visibly distinct and scores below the
+    machine-verified ``'covered'`` tier.
+    """
+    if e.source_kind not in _MACHINE_PROBE_EVIDENCE_KINDS:
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=MACHINE_PROBE_WINDOW_DAYS
+    )
 
 
 MAX_CRITERIA_PER_VERSION = 50
@@ -744,6 +789,7 @@ def criterion_coverage_to_evidence_status(coverage: str) -> str:
         "covered": "proven",
         "attested": "partial",
         "backfilled": "partial",
+        "probed": "partial",
         "partial": "partial",
         "uncovered": "unproven",
     }
@@ -770,13 +816,12 @@ def criterion_evidence_status(evidence: list[CriterionEvidence]) -> str:
 def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 
-    Priority: ``covered`` > ``attested`` > ``backfilled`` > ``partial`` > ``uncovered``.
+    Priority: ``covered`` > ``attested`` > ``backfilled`` > ``probed`` > ``partial`` > ``uncovered``.
 
     Returns:
       'covered'    — at least one record is machine-verified covering evidence
-                     (``reachability``, ``acceptance_window_recompute``,
-                     ``metrics_integrity_sweep``, ``audit_finding_backfill``
-                     always; ``task_merge`` only with ``detail["proven"] is True``)
+                     (``reachability``, ``audit_finding_backfill`` always;
+                     ``task_merge`` only with ``detail["proven"] is True``)
       'attested'   — no machine-verified evidence, but a NON-EXPIRED operator
                      attestation is present (a lower-confidence, time-bounded
                      waiver — see :func:`_evidence_is_attested`)
@@ -785,8 +830,14 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
                      present (the named_test shipped in the PR's changed files,
                      but the merge was never CI-verified — see
                      :func:`_evidence_is_backfilled`)
-      'partial'    — evidence exists but none is covering, attested, or backfilled
-                     (includes an EXPIRED attestation)
+      'probed'     — no covering/attested/backfilled evidence, but a NON-EXPIRED
+                     machine-probe record is present (``acceptance_window_recompute``
+                     / ``metrics_integrity_sweep`` — the mechanism ran and
+                     re-scored non-zero / ticked, but that only proves the sweep
+                     operated, not that the criterion's condition holds — see
+                     :func:`_evidence_is_probed`)
+      'partial'    — evidence exists but none is covering, attested, backfilled,
+                     or probed (includes an EXPIRED attestation or a stale probe)
       'uncovered'  — no evidence at all
     """
     if not evidence:
@@ -797,6 +848,8 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
         return "attested"
     if any(_evidence_is_backfilled(e) for e in evidence):
         return "backfilled"
+    if any(_evidence_is_probed(e) for e in evidence):
+        return "probed"
     return "partial"
 
 
@@ -912,10 +965,12 @@ async def direction_owns_uncovered_criterion(
     NOTE: As of the attested-tier introduction, an ``'attested'`` criterion
     (lower-confidence operator attestation) is treated as NOT covering for
     direction-completion gating — only ``'covered'`` (machine-verified evidence
-    such as ``reachability``, ``task_merge`` with ``proven=True``,
-    ``acceptance_window_recompute``, ``metrics_integrity_sweep``, or
-    ``audit_finding_backfill``) is sufficient.  This is intentional: a direction
-    backed solely by operator attestation should not auto-retire as "successful"
+    such as ``reachability``, ``task_merge`` with ``proven=True``, or
+    ``audit_finding_backfill``) is sufficient.  A criterion covered only by a
+    lower-confidence tier (``'attested'``, ``'backfilled'``, or ``'probed'`` —
+    the latter a machine-probe / sweep-ran signal) is likewise treated as NOT
+    covering.  This is intentional: a direction backed solely by operator
+    attestation or a mechanism-ran probe should not auto-retire as "successful"
     without machine corroboration.  If the direction later acquires machine
     evidence, the criterion coverage flips to ``'covered'`` and the direction
     may complete normally.
@@ -2381,6 +2436,7 @@ async def get_version_coverage_summary(
             'covered': N,
             'attested': N,
             'backfilled': N,
+            'probed': N,
             'partial': N,
             'uncovered': N,
             'retracted': N,
@@ -2398,7 +2454,7 @@ async def get_version_coverage_summary(
                 {
                     'criterion_key': str,
                     'text': str,
-                    'coverage': 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered',
+                    'coverage': 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered',
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
@@ -2409,13 +2465,17 @@ async def get_version_coverage_summary(
             ],
         }
 
-    ``total`` and the coverage buckets (covered + attested + backfilled + partial + uncovered)
-    count active criteria only, and ``total`` remains their sum for backward
-    compatibility. ``attested`` is a distinct, lower-confidence tier: active
-    criteria whose only covering signal is a non-expired operator attestation.
-    ``backfilled`` is a distinct, lower-confidence tier for criteria covered
-    solely by unverified-merge backfill evidence (the test shipped in the PR's
-    changed files but the merge was never CI-verified).
+    ``total`` and the coverage buckets (covered + attested + backfilled + probed
+    + partial + uncovered) count active criteria only, and ``total`` remains
+    their sum for backward compatibility. ``attested`` is a distinct,
+    lower-confidence tier: active criteria whose only covering signal is a
+    non-expired operator attestation. ``backfilled`` is a distinct,
+    lower-confidence tier for criteria covered solely by unverified-merge
+    backfill evidence (the test shipped in the PR's changed files but the merge
+    was never CI-verified). ``probed`` is a distinct, lower-confidence,
+    time-bounded tier for criteria covered solely by a non-expired machine-probe
+    signal (``acceptance_window_recompute`` / ``metrics_integrity_sweep`` — the
+    sweep mechanism ran, but that does not prove the criterion's own condition).
     Inactive rows remain in ``criteria`` for audit, with
     ``retracted``/``superseded`` split by lifecycle status and ``inactive``
     carrying their aggregate. ``stuck_reason``
@@ -2430,6 +2490,7 @@ async def get_version_coverage_summary(
         "covered": 0,
         "attested": 0,
         "backfilled": 0,
+        "probed": 0,
         "partial": 0,
         "uncovered": 0,
     }
@@ -2585,6 +2646,7 @@ async def get_version_coverage_summary(
         "covered": counts["covered"],
         "attested": counts["attested"],
         "backfilled": counts["backfilled"],
+        "probed": counts["probed"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
         "retracted": inactive_counts["retracted"],
