@@ -252,7 +252,7 @@ fi
 # guard it too: if base_commit..HEAD is empty, this branch ships nothing and must
 # not report COMPLETED-with-PR. Route to the sanctioned no-op exits instead. Skip
 # only when the base commit was never recorded (cannot compute the diff
-# faithfully) — the ./pr-side guard is the primary line of defense there.
+# faithfully) — the pr-side guard is the primary line of defense there.
 _BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}"
 if [ -s "$_BASE_COMMIT_FILE" ]; then
   _BASE_COMMIT=$(cat "$_BASE_COMMIT_FILE")

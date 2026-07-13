@@ -21,6 +21,7 @@ from app.efficiency_snapshot import (
     AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
+    AXIS_PROMPT_CACHE_READ_SHARE,
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
@@ -58,6 +59,7 @@ from app.efficiency_snapshot import (
     _compute_cold_start_breakdown_p50,
     _compute_job_cost_usd,
     _compute_job_is_priced,
+    _compute_prompt_cache_read_share,
     _compute_prompt_static_bytes,
     _compute_total_cost_per_verified_task,
     _compute_verified_merge_count,
@@ -1546,6 +1548,155 @@ def test_total_cost_per_verified_task_in_all_axes():
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in ALL_AXES
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK == "total_cost_per_verified_task"
     assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in AXIS_CONSUMERS
+
+
+def _make_cache_task(
+    project_id,
+    *,
+    task_type: str,
+    input_tokens: int,
+    cache_read_tokens: int,
+    verified: bool,
+):
+    """A merged task carrying LLM cache tokens, bucketed under ``task_type``.
+
+    When ``verified`` is False the merge is a degraded fall-open
+    (unverified_merge_reason set), so it counts toward the token-based
+    prompt_cache_read_share but is EXCLUDED from the verified-merge denominator.
+    """
+    now = _utcnow()
+    context: dict = {"pr_merged": True}
+    if not verified:
+        context["review_loop"] = {"unverified_merge_reason": "ci_unavailable"}
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context=context,
+        payloads=[{"type": task_type}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": 500,
+            "total_cache_read_input_tokens": cache_read_tokens,
+            "llm_call_count": 5,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_and_verified_task_axes(db_session):
+    """Named acceptance test for the two prompt-cache cost-baseline axes.
+
+    Exercises both new seams end-to-end:
+
+    1. ``prompt_cache_read_share`` is the token-weighted rollup of the per-task-type
+       ``cache_read_share`` from ``compute_llm_cost_by_task_type`` — it counts EVERY
+       task's tokens (verified or not), and reconciles exactly with that breakdown.
+    2. ``total_cost_per_verified_task``'s denominator is the VERIFIED merge count
+       (fall-open merges excluded), and its drift_pct is suppressed while the
+       verified-merge count is below ``VERIFIED_TASK_DRIFT_MIN_COUNT``.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two verified merges across two task types + one degraded fall-open merge.
+    #   code_change (verified): 1000 input, 400 cache-read  -> type share 0.40
+    #   research    (verified): 1000 input, 200 cache-read  -> type share 0.20
+    #   code_change (UNVERIFIED fall-open): 2000 input, 1000 cache-read
+    # Fleet prompt_cache_read_share = (400+200+1000) / (1000+1000+2000) = 0.40
+    # Verified-merge denominator = 2 (the fall-open task is excluded).
+    tasks = [
+        _make_cache_task(
+            project.id,
+            task_type="code_change",
+            input_tokens=1000,
+            cache_read_tokens=400,
+            verified=True,
+        ),
+        _make_cache_task(
+            project.id,
+            task_type="research",
+            input_tokens=1000,
+            cache_read_tokens=200,
+            verified=True,
+        ),
+        _make_cache_task(
+            project.id,
+            task_type="code_change",
+            input_tokens=2000,
+            cache_read_tokens=1000,
+            verified=False,
+        ),
+    ]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.commit()
+
+    # --- Axis 2: prompt_cache_read_share (pure-function seam) -----------------
+    share = _compute_prompt_cache_read_share(tasks)
+    assert share == 0.40
+
+    # It must reconcile with the per-task-type breakdown it rolls up.
+    rows = compute_llm_cost_by_task_type(tasks)
+    roll_input = sum(int(r["total_input_tokens"]) for r in rows)
+    roll_cache = sum(int(r["total_cache_read_input_tokens"]) for r in rows)
+    assert roll_input == 4000
+    assert round(roll_cache / roll_input, 4) == share
+
+    # --- Axis 1: verified-merge denominator excludes fall-open merges ---------
+    assert _compute_verified_merge_count(tasks) == 2
+
+    # --- Both axes flow through compute_current_axes --------------------------
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_PROMPT_CACHE_READ_SHARE] == 0.40
+    assert axes["total_cost_per_verified_task_denominator"] == 2
+    assert axes[AXIS_TOTAL_COST_PER_VERIFIED_TASK] is not None
+
+    # --- Both axes seed the immutable baseline and flow through drift ---------
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap[AXIS_PROMPT_CACHE_READ_SHARE] == 0.40
+
+    drift = await read_baseline_with_drift(db_session, project.id)
+    cache_axis = drift["axes"][AXIS_PROMPT_CACHE_READ_SHARE]
+    assert cache_axis["current"] == 0.40
+    assert cache_axis["baseline"] == 0.40
+    # First snapshot == baseline, so drift is defined (0.0) — proves the new axis
+    # is wired into the ALL_AXES drift loop, not silently dropped.
+    assert cache_axis["drift_pct"] == 0.0
+
+    # Verified-merge count (2) is below the floor, so its axis drift is suppressed.
+    verified_axis = drift["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert verified_axis["current"] is not None
+    assert verified_axis["drift_pct"] is None, (
+        f"Expected drift_pct=None when verified_count=2 < {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+
+
+def test_prompt_cache_read_share_in_all_axes():
+    """The prompt-cache axis must be registered in ALL_AXES and AXIS_CONSUMERS."""
+    assert AXIS_PROMPT_CACHE_READ_SHARE in ALL_AXES
+    assert AXIS_PROMPT_CACHE_READ_SHARE == "prompt_cache_read_share"
+    assert AXIS_PROMPT_CACHE_READ_SHARE in AXIS_CONSUMERS
+
+
+def test_prompt_cache_read_share_none_without_input_tokens():
+    """No input tokens in the window -> None (no divide-by-zero), like siblings."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    empty = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    assert _compute_prompt_cache_read_share([empty]) is None
 
 
 # ---------------------------------------------------------------------------

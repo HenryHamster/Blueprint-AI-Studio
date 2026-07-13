@@ -125,6 +125,14 @@ AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
 AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
 AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
+# Prompt-cache lever's DIRECT effect signal: the fleet-level rollup of the
+# per-task-type ``cache_read_share`` already surfaced by
+# ``compute_llm_cost_by_task_type``. Kept distinct from AXIS_LLM_CACHE_HIT_RATE
+# (which is computed independently from raw attempts) so the fleet number is a
+# token-weighted aggregate that reconciles EXACTLY with the per-task-type cost
+# table operators read, giving the cost-reduction direction a baselined
+# denominator for the prompt-restructuring lever's before/after measurement.
+AXIS_PROMPT_CACHE_READ_SHARE = "prompt_cache_read_share"
 
 # Minimum verified-merge count before drift_pct is emitted for
 # AXIS_TOTAL_COST_PER_VERIFIED_TASK. Below this threshold the ratio is too noisy
@@ -171,6 +179,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_LLM_CACHE_HIT_RATE,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
+    AXIS_PROMPT_CACHE_READ_SHARE,
     AXIS_REWORK_COST_SHARE,
     AXIS_SALVAGE_COUNT,
     AXIS_SALVAGE_MERGE_RATE,
@@ -234,6 +243,10 @@ AXIS_CONSUMERS: dict[str, dict] = {
     },
     AXIS_TOTAL_COST_PER_VERIFIED_TASK: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_PROMPT_CACHE_READ_SHARE: {
+        "pending": "prompt-cache lever direct-effect axis — baselined for the v24 "
+        "cost-reduction direction; awaiting a UI consumer"
     },
     AXIS_REWORK_COST_SHARE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
@@ -360,7 +373,12 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      its numerator alongside VM+LLM cost, so experiment compute is visible to the
 #      cost/efficiency ranking; a compute_cost_attribution honesty block (priced vs
 #      unpriced coverage) is added mirroring llm_cost_pricing_coverage.
-METRIC_DEF_VERSION = "v14"
+# v15: prompt_cache_read_share axis added — fleet-level token-weighted rollup of the
+#      per-task-type cache_read_share (cache_read_input_tokens / input_tokens across
+#      task-type buckets), the prompt-cache lever's direct-effect signal. Baselined
+#      on the pre-lever codebase so a later prompt-restructuring change is measured
+#      against a frozen denominator.
+METRIC_DEF_VERSION = "v15"
 
 
 async def _load_recent_tasks(
@@ -2552,6 +2570,29 @@ def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
     return round(total_cache_read / total_input, 4)
 
 
+def _compute_prompt_cache_read_share(tasks: list[Task]) -> float | None:
+    """Prompt-cache lever's direct effect: fleet rollup of per-task-type cache_read_share.
+
+    Sums ``total_cache_read_input_tokens`` and ``total_input_tokens`` across every
+    task-type bucket produced by :func:`compute_llm_cost_by_task_type` and returns
+    their token-weighted ratio. Sourcing from that rollup (rather than re-walking
+    raw attempts like :func:`_compute_llm_cache_hit_rate`) guarantees the fleet
+    number reconciles EXACTLY with the per-task-type cost table the operator reads:
+    it is the token-weighted mean of the very ``cache_read_share`` values that
+    table displays. This is the prompt-cache lever's baselined before/after signal.
+
+    Returns ``None`` when the window carries no input tokens (no divide-by-zero),
+    mirroring the ``None`` contract of the sibling cache axis.
+    """
+    total_input = 0
+    total_cache_read = 0
+    for row in compute_llm_cost_by_task_type(tasks):
+        total_input += int(row.get("total_input_tokens") or 0)
+        total_cache_read += int(row.get("total_cache_read_input_tokens") or 0)
+    if total_input <= 0:
+        return None
+    return round(total_cache_read / total_input, 4)
+
 
 def _compute_total_cost_per_verified_task(
     tasks: list[Task],
@@ -3018,6 +3059,7 @@ async def compute_current_axes(
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         AXIS_PROMPT_STATIC_BYTES: await _compute_prompt_static_bytes(),
         AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
+        AXIS_PROMPT_CACHE_READ_SHARE: _compute_prompt_cache_read_share(tasks),
         AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(
             tasks, compute_cost_by_task
         ),

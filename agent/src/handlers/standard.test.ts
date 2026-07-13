@@ -215,8 +215,10 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, handleSalvageBundle, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
-import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, handleSalvageBundle, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance, assembleStandardPrompt, type StandardPromptSections } from './standard.js';
+import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner, git } from '../index.js';
+import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
+import { VIEWPORT_INFRA_SKIP_GUIDANCE } from './fresh-reviewer.js';
 import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { readClaudeMd, extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
@@ -1057,6 +1059,142 @@ describe('code-change helper guidance is in prompt', () => {
     expect(prompt).toContain('./pr');
     expect(prompt).toContain('./done');
     expect(prompt).toContain('./fail');
+  });
+});
+
+// ── Cache-optimized prompt prefix ─────────────────────────────────────────────
+// The v24 cost lever: the automatically-cacheable prompt prefix (Anthropic
+// prefix caching bills a cache read at ~10% of base input) is maximized by
+// placing ALL stable literal/config guidance in one contiguous leading prefix
+// and ALL task-variable content in a contiguous trailing tail. Two builds of
+// the same handler for an identical payload but different wall-clock / git HEAD
+// must produce a BYTE-IDENTICAL stable prefix. This is a byte-ORDER change:
+// every section still ships, only its position moves.
+describe('stable prompt prefix is byte-identical across wall-clock and HEAD', () => {
+  const STABLE_SECTIONS = {
+    claudeMdPrefix: '## Codebase Instructions\nBE CONSISTENT\n\n',
+    isRetry: false,
+    codeChangeHelperGuidance: '\n\n## Helpers\n./check ./pr open ./done ./fail\n',
+    taskTypeFocusBlock: '\n\n## Focus\nfocus-block-text\n',
+    taskTypeHint: '\n\nHint: task-type-hint-text\n',
+    firstTaskSection: '',
+    fetchGuidance: '## MID-RUN FETCH\nfetch-verbs\n',
+  } as const;
+
+  function sections(variable: Partial<StandardPromptSections>): StandardPromptSections {
+    return {
+      ...STABLE_SECTIONS,
+      acceptanceEvidenceNotice: '',
+      playbookSection: '',
+      skillsSection: '',
+      retryContext: '',
+      provenanceNotice: '',
+      corePrompt: 'CORE_TASK_PROMPT',
+      reservedRevisionGuidance: '',
+      srFeedbackBlock: '',
+      promptSuffix: '',
+      prTitlePrefixNote: '',
+      ...variable,
+    };
+  }
+
+  it('yields an identical stable prefix when only task-variable content changes (wall-clock/HEAD proxy)', () => {
+    // Wall-clock- and HEAD-derived text (relative-day strings, live SHAs) only
+    // ever lands in task-variable sections. Two builds differing ONLY in those
+    // sections must share a byte-identical stable prefix while the tail differs.
+    const build1 = assembleStandardPrompt(sections({
+      corePrompt: 'implement X — updated 2 days ago — HEAD abc1234',
+      provenanceNotice: '',
+    }));
+    const build2 = assembleStandardPrompt(sections({
+      corePrompt: 'implement X — updated 9 days ago — HEAD def5678',
+      provenanceNotice: 'PROVENANCE_DELTA',
+    }));
+    expect(build1.stablePrefix).toBe(build2.stablePrefix);
+    expect(build1.stablePrefix.length).toBeGreaterThan(0);
+    expect(build1.variableBody).not.toBe(build2.variableBody);
+  });
+
+  it('places every stable guidance constant strictly before any task-variable section', () => {
+    const { finalPrompt } = assembleStandardPrompt(sections({
+      corePrompt: 'UNIQUE_TASK_VARIABLE_MARKER',
+      acceptanceEvidenceNotice: 'ACCEPTANCE_MARKER',
+      retryContext: 'RETRY_MARKER',
+      srFeedbackBlock: 'SR_FEEDBACK_MARKER',
+    }));
+    const firstVariableIdx = Math.min(
+      ...['UNIQUE_TASK_VARIABLE_MARKER', 'ACCEPTANCE_MARKER', 'RETRY_MARKER', 'SR_FEEDBACK_MARKER']
+        .map((m) => finalPrompt.indexOf(m))
+        .filter((i) => i >= 0),
+    );
+    for (const stable of [
+      STABLE_SECTIONS.claudeMdPrefix,
+      PLAYBOOK_GUIDANCE,
+      DEFAULT_TOOL_GUIDANCE,
+      VIEWPORT_INFRA_SKIP_GUIDANCE,
+      STABLE_SECTIONS.codeChangeHelperGuidance,
+      STABLE_SECTIONS.taskTypeFocusBlock,
+    ]) {
+      const idx = finalPrompt.indexOf(stable);
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(firstVariableIdx);
+    }
+  });
+
+  it('preserves every sent section (byte-order change only, nothing dropped)', () => {
+    const s = sections({
+      corePrompt: 'CORE',
+      acceptanceEvidenceNotice: 'AE',
+      playbookSection: 'PB',
+      skillsSection: 'SK',
+      srFeedbackBlock: 'SR',
+      reservedRevisionGuidance: 'RR',
+      promptSuffix: 'PS',
+      prTitlePrefixNote: 'PT',
+    });
+    const { finalPrompt } = assembleStandardPrompt(s);
+    for (const piece of [
+      s.claudeMdPrefix, s.codeChangeHelperGuidance, s.taskTypeFocusBlock, s.taskTypeHint,
+      'CORE', 'AE', 'PB', 'SK', 'SR', 'RR', 'PS', 'PT',
+      PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, VIEWPORT_INFRA_SKIP_GUIDANCE,
+    ]) {
+      expect(finalPrompt).toContain(piece);
+    }
+  });
+
+  it('handleCreate leads with stable guidance and is byte-identical across wall-clock and HEAD', async () => {
+    vi.clearAllMocks();
+    const MARKER = 'END_TO_END_TASK_VARIABLE_MARKER_9f3a';
+    const task = { title: 'T', description: '', context: {}, project_context: {} };
+
+    // Build 1 — git HEAD "aaaaaaaa", wall-clock T0.
+    vi.mocked(git).mockReturnValue('aaaaaaaa');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    await handleCreate(TASK_ID, { prompt: MARKER }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt1 = capturedPrompt();
+
+    // Build 2 — different git HEAD, wall-clock advanced 30 days.
+    vi.mocked(runCodeChangeTask).mockClear();
+    vi.mocked(git).mockReturnValue('bbbbbbbb');
+    nowSpy.mockReturnValue(1_700_000_000_000 + 30 * 86_400_000);
+    await handleCreate(TASK_ID, { prompt: MARKER }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt2 = capturedPrompt();
+    nowSpy.mockRestore();
+
+    // The reorder: stable guidance constants precede the task-variable marker.
+    const markerIdx1 = prompt1.indexOf(MARKER);
+    expect(markerIdx1).toBeGreaterThan(0);
+    expect(prompt1.indexOf(PLAYBOOK_GUIDANCE)).toBeGreaterThanOrEqual(0);
+    expect(prompt1.indexOf(PLAYBOOK_GUIDANCE)).toBeLessThan(markerIdx1);
+    expect(prompt1.indexOf(DEFAULT_TOOL_GUIDANCE)).toBeLessThan(markerIdx1);
+    expect(prompt1.indexOf(VIEWPORT_INFRA_SKIP_GUIDANCE)).toBeLessThan(markerIdx1);
+
+    // The stable prefix (everything up to the first task-variable byte) is
+    // byte-identical across the two builds despite different wall-clock/HEAD.
+    const prefix1 = prompt1.slice(0, markerIdx1);
+    const prefix2 = prompt2.slice(0, prompt2.indexOf(MARKER));
+    expect(prefix1.length).toBeGreaterThan(0);
+    expect(prefix1).toBe(prefix2);
   });
 });
 

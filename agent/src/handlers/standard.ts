@@ -315,6 +315,88 @@ export function resolveVisualAcceptance(
   return { component, width };
 }
 
+/**
+ * Section strings for a standard-handler prompt, split by cache-stability.
+ * See {@link assembleStandardPrompt}.
+ */
+export interface StandardPromptSections {
+  // ── Stable prefix (deterministic literal/config guidance) ──────────────────
+  /** ## Codebase Instructions block (CLAUDE.md), or '' when the provider auto-injects it. */
+  claudeMdPrefix: string;
+  /** Whether this is a retry (toggles a retry-specific failure-guidance block; still stable for identical payload). */
+  isRetry: boolean;
+  /** ./check + ./pr + ./done + ./fail helper guidance. */
+  codeChangeHelperGuidance: string;
+  /** Task-type focus block (constant per task type). */
+  taskTypeFocusBlock: string;
+  /** Task-type hint (constant per task type + base branch). */
+  taskTypeHint: string;
+  /** First-task-on-repo guidance, or ''. */
+  firstTaskSection: string;
+  /** Read-only ./fetch verb guidance, or '' when no project_id. */
+  fetchGuidance: string;
+  // ── Variable tail (task-payload / project-aggregate content) ────────────────
+  acceptanceEvidenceNotice: string;
+  playbookSection: string;
+  skillsSection: string;
+  retryContext: string;
+  provenanceNotice: string;
+  /** buildPrompt() output — carries contextPrefix + rawPrompt (the per-task core). */
+  corePrompt: string;
+  reservedRevisionGuidance: string;
+  /** Self-review feedback + execution-evidence blocks (project-aggregate, slow-moving). */
+  srFeedbackBlock: string;
+  promptSuffix: string;
+  prTitlePrefixNote: string;
+}
+
+/**
+ * Assemble a standard-handler prompt so the automatically-cacheable prefix is
+ * maximized: ALL stable literal/config guidance forms one contiguous leading
+ * prefix, and ALL task-variable content forms a contiguous trailing tail.
+ *
+ * This is a byte-ORDER change only — every section that was sent before is
+ * still sent; only its position changes. Anthropic prefix caching bills a
+ * cache read at ~10% of base input, so a variable byte appearing early would
+ * bust the automatic prefix match for everything after it. Keeping the stable
+ * guidance first means two builds of the same handler for an identical payload
+ * but different wall-clock / git HEAD produce a BYTE-IDENTICAL stable prefix
+ * (none of the prefix sections read the clock or HEAD).
+ *
+ * Returns the leading `stablePrefix`, the trailing `variableBody`, and their
+ * concatenation `finalPrompt` (fileTree/repoMap/analysis are appended by the
+ * caller, after the tail).
+ */
+export function assembleStandardPrompt(s: StandardPromptSections): {
+  stablePrefix: string;
+  variableBody: string;
+  finalPrompt: string;
+} {
+  const stablePrefix =
+    s.claudeMdPrefix
+    + PLAYBOOK_GUIDANCE
+    + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
+    + assembleFailureGuidanceBlocks(s.isRetry)
+    + VIEWPORT_INFRA_SKIP_GUIDANCE
+    + s.codeChangeHelperGuidance
+    + s.taskTypeFocusBlock
+    + s.taskTypeHint
+    + s.firstTaskSection
+    + `\n\n${s.fetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const variableBody =
+    s.acceptanceEvidenceNotice
+    + s.playbookSection
+    + s.skillsSection
+    + s.retryContext
+    + s.provenanceNotice
+    + s.corePrompt
+    + s.reservedRevisionGuidance
+    + s.srFeedbackBlock
+    + s.promptSuffix
+    + s.prTitlePrefixNote;
+  return { stablePrefix, variableBody, finalPrompt: stablePrefix + variableBody };
+}
+
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const {
     taskId, payload, task, ghToken, owner, repo, ws, statusRef,
@@ -415,7 +497,40 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
   const isRetry = !!retryContext;
-  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + skillsSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks(isRetry) + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  // ── Cache-optimized prompt assembly ────────────────────────────────────────
+  // Stable literal/config guidance forms one contiguous leading prefix; all
+  // task-variable content forms a contiguous trailing tail. This maximizes the
+  // automatically-cacheable prefix for Anthropic prefix caching (cache reads
+  // billed at ~10% of base input) across a dispatch burst. See
+  // assembleStandardPrompt. Section groups below are also reused for the
+  // prompt-size telemetry further down, so they are computed exactly once.
+  const codeChangeHelperGuidance = buildCodeChangeHelperGuidance({ buildConfig, owner, repo });
+  const corePromptBody = buildPrompt({ contextPrefix, parentCtx, rawPrompt });
+  const srFeedbackBlock =
+    loosenHintSection
+    + coFailurePairsSection
+    + severityCalibrationHintSection
+    + precisionRecallQuadrantHintSection
+    + executionEvidenceSection;
+  const { finalPrompt } = assembleStandardPrompt({
+    claudeMdPrefix,
+    isRetry,
+    codeChangeHelperGuidance,
+    taskTypeFocusBlock,
+    taskTypeHint,
+    firstTaskSection,
+    fetchGuidance: stdFetchGuidance,
+    acceptanceEvidenceNotice,
+    playbookSection,
+    skillsSection,
+    retryContext,
+    provenanceNotice,
+    corePrompt: corePromptBody,
+    reservedRevisionGuidance,
+    srFeedbackBlock,
+    promptSuffix,
+    prTitlePrefixNote,
+  });
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
@@ -843,12 +958,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // getLlmTelemetry() reports prompt bulk for standard-handler runs the same
   // way it already does for plan/research. Group logically distinct sections;
   // the builder caps output at 3 largest, so fine granularity is harmless.
-  const corePromptBody = buildPrompt({ contextPrefix, parentCtx, rawPrompt });
-  const srFeedbackBlock = loosenHintSection
-    + coFailurePairsSection
-    + severityCalibrationHintSection
-    + precisionRecallQuadrantHintSection
-    + executionEvidenceSection;
+  // corePromptBody and srFeedbackBlock are computed once at assembly time above.
   const guidanceFooter = PLAYBOOK_GUIDANCE
     + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
     + assembleFailureGuidanceBlocks(isRetry)
@@ -865,7 +975,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ['core_prompt', corePromptBody],
     ['reserved_revision', reservedRevisionGuidance],
     ['task_guidance', taskGuidance],
-    ['code_change_helper', buildCodeChangeHelperGuidance({ buildConfig, owner, repo })],
+    ['code_change_helper', codeChangeHelperGuidance],
     ['sr_feedback', srFeedbackBlock],
     ['guidance_footer', guidanceFooter],
     ['fetch_tool_guidance', fetchToolBlock],
