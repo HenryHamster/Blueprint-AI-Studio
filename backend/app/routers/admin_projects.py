@@ -1148,10 +1148,21 @@ async def delete_project_admin(
     await session.delete(project)
     await session.commit()
 
-    # Evict from GitHub token cache
-    from app.routers.agent import _github_token_cache
+    # Evict from GitHub token cache (both the per-project entry and the repo's
+    # mint-anchored install token — the project is gone, nothing should keep
+    # serving a token for its repo).
+    #
+    # Then forget the project -> repo mapping itself. The project no longer
+    # exists, so keeping it would leak an entry for the process lifetime AND
+    # leave a stale mapping that lets a later invalidate_github_token_cache()
+    # for this (recycled) id reach into a repo it no longer owns.
+    from app.routers.agent import (
+        forget_project_repo,
+        invalidate_github_token_cache,
+    )
 
-    _github_token_cache.pop(str(project_id), None)
+    invalidate_github_token_cache(str(project_id))
+    forget_project_repo(str(project_id))
 
     return {
         "message": f"Project {project_id} deleted",
@@ -1272,9 +1283,9 @@ async def reset_project_admin(
     reset_project_state(str(project_id))
 
     # Evict from GitHub token cache so the next cycle re-fetches cleanly.
-    from app.routers.agent import _github_token_cache
+    from app.routers.agent import invalidate_github_token_cache
 
-    _github_token_cache.pop(str(project_id), None)
+    invalidate_github_token_cache(str(project_id))
 
     return {
         "message": f"Project {project_id} reset to clean",

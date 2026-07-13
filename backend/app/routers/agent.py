@@ -560,10 +560,15 @@ async def verify_agent_token(
 
 from app.github_token_resolver import (  # noqa: F401
     _GITHUB_TOKEN_TTL,
+    _TOKEN_MIN_REMAINING_LIFE,
     _github_token_cache,
     _github_token_cache_lock,
+    cache_project_token,
+    forget_project_repo,
+    get_cached_project_token,
     get_github_token_for_task,
     invalidate_github_token_cache,
+    remember_project_repo,
 )
 
 

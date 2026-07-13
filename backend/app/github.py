@@ -131,14 +131,29 @@ async def probe_rate_limit() -> bool:
     # Pull any currently-cached installation token — doesn't spend quota
     # on a refresh.  If nothing's cached, skip the probe; real activity
     # will populate the pill soon enough.
-    from app.github_token_resolver import _github_token_cache
+    #
+    # github_auth's per-repo cache is the authoritative home for App-discovery
+    # tokens (the common case). The resolver's per-project cache only holds
+    # tokens IT minted (stored-installation fallback), so check both — checking
+    # only the latter would leave the quota pill dark on most deployments.
+    from app.github_auth import any_cached_installation_token
+    from app.github_token_resolver import (
+        _github_token_cache,
+        _TOKEN_MIN_REMAINING_LIFE,
+        _remaining_life,
+    )
 
-    cached_token: str | None = None
-    for entry in _github_token_cache.values():
-        token = entry.get("token")
-        if token and token.startswith(("ghs_", "ghu_")):
-            cached_token = token
-            break
+    cached_token: str | None = any_cached_installation_token()
+    if not cached_token:
+        for entry in _github_token_cache.values():
+            token = entry.get("token")
+            if (
+                token
+                and token.startswith(("ghs_", "ghu_"))
+                and _remaining_life(entry) >= _TOKEN_MIN_REMAINING_LIFE
+            ):
+                cached_token = token
+                break
     if not cached_token:
         return False
     headers = {
