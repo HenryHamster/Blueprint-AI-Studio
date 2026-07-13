@@ -1921,16 +1921,46 @@ def test_on_disk_0458b_0459_reconciliation_state():
 
 
 def test_expected_schema_revision_tracks_new_head():
-    """EXPECTED_SCHEMA_REVISION must track the current structural head (0528).
+    """EXPECTED_SCHEMA_REVISION must track the chain's ACTUAL structural head.
 
-    Bumped 0527 -> 0528 by the ``taskcontact`` migration, following the same
-    convention as the 0526 -> 0527 bump: this literal tracks whatever the chain's
-    single head currently is, so adding a head migration must move it in lockstep
-    or ``_verify_schema_version`` refuses to boot.
+    ``_verify_schema_version`` refuses to boot when the two disagree, so every new
+    head migration must move this literal in lockstep.
+
+    DERIVED, NOT HARDCODED. This assertion used to pin a literal ("0527", then
+    "0528"), which made it a guaranteed CI red for EVERY new migration — the test
+    failed for the one reason that is NOT a bug (the chain legitimately advanced),
+    and each break was "fixed" by retyping the next number, so it never actually
+    guarded the lockstep it exists to guard. Computing the head from the migration
+    files makes it fail if and only if EXPECTED_SCHEMA_REVISION genuinely drifts
+    from the head, which is the real invariant.
     """
+    import os
+    import re
+
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0528"
+    versions_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+    chain: dict[str, str | None] = {}
+    for fname in os.listdir(versions_dir):
+        if not (fname.endswith(".py") and fname[0].isdigit()):
+            continue
+        src = open(os.path.join(versions_dir, fname), encoding="utf-8").read()
+        rev = re.search(r"^revision(?::\s*str)?\s*=\s*['\"]([^'\"]+)['\"]", src, re.M)
+        down = re.search(
+            r"^down_revision(?::[^=]+)?\s*=\s*(?:['\"]([^'\"]+)['\"]|None)", src, re.M
+        )
+        if rev:
+            chain[rev.group(1)] = down.group(1) if (down and down.group(1)) else None
+
+    downs = {d for d in chain.values() if d}
+    heads = sorted(r for r in chain if r not in downs)
+    assert len(heads) == 1, f"expected a single structural head, got {heads}"
+
+    assert EXPECTED_SCHEMA_REVISION == heads[0], (
+        f"EXPECTED_SCHEMA_REVISION is {EXPECTED_SCHEMA_REVISION!r} but the migration "
+        f"chain's structural head is {heads[0]!r} — the app will refuse to boot. Bump "
+        f"EXPECTED_SCHEMA_REVISION in backend/app/main.py to match the new head."
+    )
 
 
 # ===========================================================================

@@ -1685,9 +1685,18 @@ class TestSchemaRevisionSync:
         )
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
-        # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...) wrapper
+        # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...)
+        # wrapper, AND a bare module-constant name:
+        #     _TITLE_IDX = "ix_task_title_trgm"
+        #     op.create_index(_TITLE_IDX, "task", ["title"], ...)
+        #
+        # Requiring a quoted LITERAL here silently missed every migration that binds
+        # its index name to a constant — the index IS created, but this guard reported
+        # it "missing from migrations" and demanded a create_index call that was
+        # already there. (0529 even carries a comment asserting it was covered.)
+        # Accept either form; a constant is resolved against `consts` below.
         create_idx_re = re.compile(
-            r"create_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]\s*\)?\s*,"
+            r"create_index\(\s*(?:op\.f\(\s*)?(?:['\"](\w+)['\"]|(\w+))\s*\)?\s*,"
             r"\s*['\"](\w+)['\"]\s*,\s*\[([^\]]+)\]",
             re.DOTALL,
         )
@@ -1695,6 +1704,38 @@ class TestSchemaRevisionSync:
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_start_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
         str_re = re.compile(r"['\"](\w+)['\"]")
+        # RAW-SQL index creation, e.g.
+        #   op.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_task_title_trgm "
+        #              "ON task USING gin (title gin_trgm_ops)")
+        #
+        # `op.create_index()` CANNOT emit CONCURRENTLY (it runs inside a transaction),
+        # so a concurrently-built index — the only safe way to add one to a large live
+        # table — MUST be raw SQL.  Scanning only for `op.create_index(...)` therefore
+        # reported every such index as "missing from migrations" even though the
+        # migration creates it, which pressures authors either to bypass this guard or
+        # to avoid CONCURRENTLY on a hot table.  Recognise the raw form too.
+        #
+        # Captures: index name, table, and the column list inside the trailing
+        # parenthesised expression (`gin_trgm_ops`-style operator classes and other
+        # bare identifiers are filtered out below by intersecting with real columns).
+        # `_GLUE` swallows an adjacent-string-literal break, which these migrations use:
+        #     f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_TITLE_IDX} "
+        #     f"ON task USING gin (title gin_trgm_ops)"
+        # i.e. the raw source between tokens can contain: quote, newline, indent, f-prefix.
+        _GLUE = r"[\s\"'frb]*"
+        raw_create_idx_re = re.compile(
+            r"CREATE\s+INDEX" + _GLUE + r"\s*(?:CONCURRENTLY" + _GLUE + r"\s*)?"
+            r"(?:IF\s+NOT\s+EXISTS" + _GLUE + r"\s*)?"
+            r"\{?(\w+)\}?"                        # name, or {_PY_CONST} interpolation
+            + _GLUE + r"\s*ON\s+(\w+)"            # table
+            + _GLUE + r"\s*(?:USING\s+\w+)?"      # optional access method
+            + _GLUE + r"\s*\(([^)]*)\)",          # column expression list
+            re.IGNORECASE | re.DOTALL,
+        )
+        # Resolve `f"...{_TITLE_IDX}..."` style interpolation: migrations commonly bind
+        # the index name to a module constant.  Map constant -> literal so the raw-SQL
+        # scan can name the index it creates.
+        const_re = re.compile(r"^(_\w+)\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
 
         def _matched_block(text: str, start: int) -> str:
             depth, end = 1, start
@@ -1721,12 +1762,35 @@ class TestSchemaRevisionSync:
             # where the create would otherwise overwrite the drop target in idx_by_name.
             idx_by_name_snapshot = dict(idx_by_name)
 
+            consts = dict(const_re.findall(content))
+
             for m in create_idx_re.finditer(content):
-                name, table, cols_raw = m.group(1), m.group(2), m.group(3)
+                # group 1 = quoted literal name, group 2 = bare constant name
+                raw_name = m.group(1) or m.group(2) or ""
+                name = consts.get(raw_name, raw_name)
+                table, cols_raw = m.group(3), m.group(4)
                 cols = frozenset(str_re.findall(cols_raw))
                 if cols:
                     entry = (table, cols)
                     idx_by_name[name] = entry
+                    effective.add(entry)
+
+            # Raw-SQL creates (CONCURRENTLY etc.) — see raw_create_idx_re above.
+            for m in raw_create_idx_re.finditer(content):
+                name = consts.get(m.group(1), m.group(1))
+                table, cols_raw = m.group(2), m.group(3)
+                # The expression list carries operator classes / functions alongside
+                # the columns (e.g. "title gin_trgm_ops").  Keep only tokens that are
+                # REAL columns of that table, so an opclass can never masquerade as one.
+                sa_table = SQLModel.metadata.tables.get(table)
+                if sa_table is None:
+                    continue
+                real_cols = {c.name for c in sa_table.columns}
+                cols = frozenset(t for t in str_re.findall(cols_raw) if t in real_cols)
+                if cols:
+                    entry = (table, cols)
+                    if name:
+                        idx_by_name[name] = entry
                     effective.add(entry)
 
             for ct in create_table_re.finditer(content):
