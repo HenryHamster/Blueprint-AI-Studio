@@ -484,6 +484,10 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "stale_reason": stale_reason,
         "agent_available": (runner.capabilities or {}).get("agent_available"),
         "agent_unavailable_reason": (runner.capabilities or {}).get("agent_unavailable_reason"),
+        # Per-leg ok/failed breakdown ({bwrap_sandbox, agent_dist, node_runtime,
+        # docker} -> bool) so the fleet panel can render a checklist. None when the
+        # runner (old build) never reported it.
+        "agent_unavailable_legs": (runner.capabilities or {}).get("agent_unavailable_legs"),
         "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
         # Trust telemetry surfaced to the panel.
         "last_successful_job_at": (

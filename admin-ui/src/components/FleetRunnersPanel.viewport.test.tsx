@@ -28,6 +28,16 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
       agent_backend: 'bwrap',
       compute_backend: 'docker',
     },
+    // Live-config block so the per-job GPU count + task-type allowlist editors
+    // render in the acceptance-evidence capture at 1280px.
+    config: {
+      config_generation: 'gen-abc',
+      applied_config_generation: 'gen-abc',
+      config_pending: false,
+      gpu_indices_allowed: 'all',
+      gpus_per_job: 2,
+      desired: { task_types: 'all' },
+    },
     last_seen_at: new Date(Date.now() - 30_000).toISOString(),
     created_at: '2026-06-01T00:00:00Z',
   },

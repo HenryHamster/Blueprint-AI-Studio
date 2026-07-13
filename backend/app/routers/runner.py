@@ -363,9 +363,17 @@ class HeartbeatRequest(BaseModel):
     active_work_report: StrictBool = True
     agent_available: StrictBool | None = None
     # Why the agent is unavailable (null when agent_available=True or unknown).
-    # Named failing leg(s): "bwrap not available", "agent binary not found",
-    # "node runtime not functional", "docker agent unavailable", or compound.
+    # COMPOUND, "; "-joined string enumerating EVERY failing leg — the runner no
+    # longer stops at the first-matched cause, so a sandbox+no-docker box surfaces
+    # all of e.g. "bwrap sandbox unavailable; node runtime not functional; docker
+    # agent unavailable" instead of a single opaque phrase.
     agent_unavailable_reason: str | None = None
+    # Per-leg ok/failed breakdown of the four independent legs that gate the agent
+    # backends: {bwrap_sandbox, agent_dist, node_runtime, docker} -> bool. Optional
+    # (old runners omit it); rides in capabilities JSONB so the fleet panel can
+    # render a per-leg checklist rather than parse the reason string. Stored as-is
+    # when present; None/omitted keeps the prior behaviour byte-for-byte.
+    agent_unavailable_legs: dict | None = None
     # Runner-DECLARED agent capability floor (optional; old runners omit it). A
     # docker-only runner (docker+image, NO bwrap) can run only the read-only agent
     # slice and declares those types here so the orchestrator intersects them with
@@ -777,6 +785,13 @@ async def heartbeat(
         caps["agent_unavailable_reason"] = (
             None if payload.agent_available else payload.agent_unavailable_reason
         )
+    # Per-leg breakdown ({bwrap_sandbox, agent_dist, node_runtime, docker} -> bool).
+    # Additive JSONB, no migration. The runner emits this whenever the leg states
+    # are known (even when agent_available=True, where every leg that mattered is
+    # ok), so store it as-is; absent/None for old runners that omit it, matching the
+    # absent-tolerant contract.
+    if payload.agent_unavailable_legs is not None:
+        caps["agent_unavailable_legs"] = payload.agent_unavailable_legs
     # Runner-DECLARED agent capability floor. Stored under its own caps key so the
     # orchestrator can intersect it with the operator-configured `task_types`
     # ceiling. CRITICAL: this is a runner capability, NOT operator config — we never

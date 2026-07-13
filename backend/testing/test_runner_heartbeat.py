@@ -144,6 +144,56 @@ async def test_heartbeat_persists_snapshot_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_agent_unavailable_legs(db_session):
+    """The per-leg breakdown map rides in capabilities JSONB alongside the
+    compound reason string, so the fleet panel can render a per-leg checklist."""
+    _project, runner = await _make_runner(db_session)
+
+    legs = {
+        "bwrap_sandbox": False,
+        "agent_dist": True,
+        "node_runtime": False,
+        "docker": False,
+    }
+    await heartbeat(
+        payload=HeartbeatRequest(
+            agent_available=False,
+            agent_unavailable_reason=(
+                "bwrap sandbox unavailable; node runtime not functional; "
+                "docker agent unavailable"
+            ),
+            agent_unavailable_legs=legs,
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["agent_unavailable_legs"] == legs
+    # The richer compound reason is stored verbatim.
+    assert (
+        runner.capabilities["agent_unavailable_reason"]
+        == "bwrap sandbox unavailable; node runtime not functional; "
+        "docker agent unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_legs_is_tolerated(db_session):
+    """An older runner that omits agent_unavailable_legs heartbeats unchanged —
+    the key is simply absent from capabilities, no error."""
+    _project, runner = await _make_runner(db_session)
+
+    resp = await heartbeat(
+        payload=HeartbeatRequest(agent_available=True),
+        runner=runner,
+        session=db_session,
+    )
+    assert resp["ok"] is True
+    await db_session.refresh(runner)
+    assert "agent_unavailable_legs" not in runner.capabilities
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_without_report_does_not_refresh_stamp(db_session):
     """A heartbeat that is NOT a genuine active-work report (active_work_report
     False) must NOT refresh active_work_reported_at nor clobber the active set.

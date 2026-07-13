@@ -603,6 +603,100 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('2 slots free');
   });
 
+  test('renders per-leg agent-unavailable breakdown when the structured legs map is present', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: false,
+          agent_unavailable_reason: 'bwrap sandbox missing; node runtime missing',
+          agent_unavailable_legs: {
+            bwrap_sandbox: false,
+            agent_dist: true,
+            node_runtime: false,
+            docker: true,
+          },
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const legsRow = el.querySelector('[data-testid="fleet-runner-agent-legs"]');
+    expect(legsRow).not.toBeNull();
+
+    // All four legs are shown, each labelled.
+    const bwrap = el.querySelector('[data-testid="fleet-runner-agent-leg-bwrap_sandbox"]');
+    const dist = el.querySelector('[data-testid="fleet-runner-agent-leg-agent_dist"]');
+    const node = el.querySelector('[data-testid="fleet-runner-agent-leg-node_runtime"]');
+    const docker = el.querySelector('[data-testid="fleet-runner-agent-leg-docker"]');
+    expect(bwrap?.textContent).toContain('bwrap');
+    expect(dist?.textContent).toContain('agent dist');
+    expect(node?.textContent).toContain('node');
+    expect(docker?.textContent).toContain('docker');
+
+    // Failing legs are distinguishable from passing ones (state + red styling).
+    expect(bwrap?.getAttribute('data-leg-ok')).toBe('false');
+    expect(node?.getAttribute('data-leg-ok')).toBe('false');
+    expect(dist?.getAttribute('data-leg-ok')).toBe('true');
+    expect(docker?.getAttribute('data-leg-ok')).toBe('true');
+    expect(bwrap?.textContent).toContain('✗');
+    expect(node?.textContent).toContain('✗');
+    expect(dist?.textContent).toContain('✓');
+    expect(docker?.textContent).toContain('✓');
+    expect(bwrap?.className).toContain('border-red-500/30');
+    expect(dist?.className).toContain('border-emerald-500/30');
+
+    // With the structured map present, the pill is the bare 'agent ✗' (the folded
+    // string is not repeated), but the full reason stays available as its tooltip.
+    const agentPill = Array.from(el.querySelectorAll('span')).find(
+      s => s.textContent === 'agent ✗',
+    );
+    expect(agentPill).toBeTruthy();
+    expect(agentPill?.getAttribute('title')).toBe('bwrap sandbox missing; node runtime missing');
+    expect(el.textContent).not.toContain('agent ✗: bwrap sandbox missing');
+  });
+
+  test('falls back to the folded agent_unavailable_reason string when no legs map is present', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: false,
+          agent_unavailable_reason: 'bwrap sandbox missing; docker unavailable',
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Older runner without the structured map: no per-leg row, folded string shown.
+    expect(el.querySelector('[data-testid="fleet-runner-agent-legs"]')).toBeNull();
+    expect(el.textContent).toContain('agent ✗: bwrap sandbox missing; docker unavailable');
+  });
+
   test('distinguishes unknown runner slots from full capacity', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
@@ -876,6 +970,7 @@ describe('FleetRunnersPanel — behavioral', () => {
           active_task_count: 1,
           active_compute_job_count: 1,
           max_concurrent: 3,
+          available_slots: 1,
           stale_reason: null,
           agent_available: true,
           liveness_window_seconds: 300,
@@ -1325,6 +1420,191 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
     expect(el.querySelector('button[aria-label="Edit GPU allowlist"]')).toBeNull();
+  });
+
+  // ── Live config: per-job GPU count + task-type allowlist editors ─────────────
+
+  test('editing gpus_per_job calls updateRunnerCapabilities with the new count', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 1,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Current value is surfaced, editor closed.
+    expect(el.textContent).toContain('1 GPUs/job');
+    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
+    expect(input).not.toBeNull();
+    await act(async () => { typeInto(input, '4'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
+    expect(saveBtn).not.toBeNull();
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpus_per_job: 4,
+    });
+  });
+
+  test('the gpus_per_job input clamps out-of-range values to 1–8', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 2,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const editBtn = el.querySelector('button[aria-label="Edit GPUs per job"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const input = el.querySelector('input[aria-label="GPUs per job"]') as HTMLInputElement;
+    // Above the max clamps to 8.
+    await act(async () => { typeInto(input, '99'); });
+    const saveBtn = el.querySelector('button[aria-label="Save GPUs per job"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      gpus_per_job: 8,
+    });
+  });
+
+  test('the gpus_per_job editor is absent for non-GPU runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          gpus_per_job: 1,
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit GPUs per job"]')).toBeNull();
+  });
+
+  test('editing task_types to a list calls updateRunnerCapabilities with the parsed array', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: 'all' },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).toContain('tasks: all');
+    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
+    expect(editBtn).not.toBeNull();
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
+    expect(allToggle).not.toBeNull();
+    expect(allToggle.checked).toBe(true);
+    await act(async () => { allToggle.click(); });
+
+    const listInput = el.querySelector('input[aria-label="Task types allowed"]') as HTMLInputElement;
+    expect(listInput).not.toBeNull();
+    await act(async () => { typeInto(listInput, 'compute_experiment, code_change, compute_experiment'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Deduped, trimmed list preserving input order.
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      task_types: ['compute_experiment', 'code_change'],
+    });
+  });
+
+  test('saving task_types with "all" checked sends the "all" sentinel', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: ['compute_experiment'] },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).toContain('tasks: compute_experiment');
+    const editBtn = el.querySelector('button[aria-label="Edit task types"]');
+    await act(async () => { (editBtn as HTMLButtonElement).click(); });
+
+    const allToggle = el.querySelector('input[aria-label="Allow all task types"]') as HTMLInputElement;
+    // Opened from a restricted list → starts unchecked.
+    expect(allToggle.checked).toBe(false);
+    await act(async () => { allToggle.click(); });
+
+    const saveBtn = el.querySelector('button[aria-label="Save task types"]');
+    await act(async () => { (saveBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(updateRunnerCapabilities).toHaveBeenCalledWith('proj-test', 'runner-abc123', {
+      task_types: 'all',
+    });
+  });
+
+  test('the task_types editor is suppressed for strategic runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        config: {
+          config_generation: 'gen-abc',
+          applied_config_generation: 'gen-abc',
+          config_pending: false,
+          gpu_indices_allowed: 'all',
+          desired: { task_types: ['design_doc_update', 'strategic_review'] },
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('button[aria-label="Edit task types"]')).toBeNull();
   });
 
   // ── Cloud-cost-avoided rollup in the telemetry detail ────────────────────────

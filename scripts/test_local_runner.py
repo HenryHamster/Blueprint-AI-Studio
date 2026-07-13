@@ -775,6 +775,122 @@ class TestHeartbeatLiveConfig(unittest.TestCase):
             self.assertEqual(body["applied_max_concurrent"], 3)
 
 
+class TestHeartbeatAgentUnavailableLegs(unittest.TestCase):
+    """_heartbeat_loop reports EVERY failing agent leg, not just the first.
+
+    The four independent legs gating the agent backends — bwrap sandbox, agent
+    dist, node runtime, docker — must each surface independently: a compound
+    ``agent_unavailable_reason`` naming every failed leg AND a structured
+    ``agent_unavailable_legs`` map of leg -> ok bool.
+    """
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _drive_once(self, *, agent_sandbox_ok, binary_present, node_ok, docker_ok):
+        """Run one heartbeat tick with each leg's state pinned; return the body."""
+        caps = iso.Capabilities()  # truthy caps → per-leg map is emitted
+        bodies = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            bodies.append(dict(body))
+            calls[0] += 1
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        binary = ["node", "/x/agent"] if binary_present else None
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        with patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_write_status_json"), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=binary), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=node_ok), \
+             patch.object(local_runner, "_docker_agent_possible", return_value=docker_ok), \
+             patch.object(iso, "probe_llm_clis", return_value={}), \
+             patch("time.sleep", lambda *_: None):
+            local_runner._heartbeat_loop(
+                "https://api.example.com", "tok", active_tasks, lock, {},
+                agent_sandbox_ok=agent_sandbox_ok, caps=caps, agent_image="img:latest",
+            )
+        self.assertTrue(bodies)
+        return bodies[0]
+
+    def test_multiple_failing_legs_all_named_in_reason(self):
+        """Sandbox + node + docker all failing => reason enumerates ALL, not one."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=True, node_ok=False, docker_ok=False,
+        )
+        self.assertFalse(body["agent_available"])
+        reason = body["agent_unavailable_reason"]
+        self.assertIn("bwrap sandbox unavailable", reason)
+        self.assertIn("node runtime not functional", reason)
+        self.assertIn("docker agent unavailable", reason)
+        # Compound string joins the failed legs (not a single first-match phrase).
+        self.assertEqual(reason.count(";"), 2)
+
+    def test_agent_unavailable_legs_map_reflects_each_leg(self):
+        """Every leg's ok/failed boolean is reported independently in the map."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=False, node_ok=True, docker_ok=False,
+        )
+        legs = body["agent_unavailable_legs"]
+        self.assertEqual(
+            legs,
+            {
+                "bwrap_sandbox": False,
+                "agent_dist": False,
+                "node_runtime": True,
+                "docker": False,
+            },
+        )
+        # All four failing legs relevant to unavailability are named; node ok is not.
+        reason = body["agent_unavailable_reason"]
+        self.assertIn("bwrap sandbox unavailable", reason)
+        self.assertIn("agent dist not built", reason)
+        self.assertIn("docker agent unavailable", reason)
+        self.assertNotIn("node runtime", reason)
+
+    def test_agent_available_clears_reason_and_reports_legs(self):
+        """When the bwrap trio is satisfied the agent is available: reason None,
+        legs still reported (all the legs that mattered are ok)."""
+        body = self._drive_once(
+            agent_sandbox_ok=True, binary_present=True, node_ok=True, docker_ok=False,
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertIsNone(body["agent_unavailable_reason"])
+        self.assertEqual(
+            body["agent_unavailable_legs"],
+            {
+                "bwrap_sandbox": True,
+                "agent_dist": True,
+                "node_runtime": True,
+                "docker": False,
+            },
+        )
+
+    def test_docker_only_box_available_without_host_node_or_binary(self):
+        """A docker-only box (no bwrap, no host dist/node) is still available via
+        docker; the legs map shows the failed bwrap legs but reason stays None."""
+        body = self._drive_once(
+            agent_sandbox_ok=False, binary_present=False, node_ok=False, docker_ok=True,
+        )
+        self.assertTrue(body["agent_available"])
+        self.assertIsNone(body["agent_unavailable_reason"])
+        self.assertEqual(
+            body["agent_unavailable_legs"],
+            {
+                "bwrap_sandbox": False,
+                "agent_dist": False,
+                "node_runtime": False,
+                "docker": True,
+            },
+        )
+
+
 # ── Stale workspace cleanup ────────────────────────────────────────────────────
 
 class TestStaleWorkspaceCleanup(unittest.TestCase):

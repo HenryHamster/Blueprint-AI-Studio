@@ -683,6 +683,52 @@ class TestRunnerHealthAgentUnavailableReason:
         assert h["agent_available"] is False
         assert h["agent_unavailable_reason"] is None
 
+    def test_unavailable_runner_surfaces_compound_reason_and_legs(self):
+        # The compound reason (every failing leg, "; "-joined) AND the structured
+        # per-leg map are both surfaced verbatim from capabilities JSONB, so the
+        # fleet panel can render a per-leg checklist instead of parsing a string.
+        legs = {
+            "bwrap_sandbox": False,
+            "agent_dist": True,
+            "node_runtime": False,
+            "docker": False,
+        }
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": (
+                        "bwrap sandbox unavailable; node runtime not functional; "
+                        "docker agent unavailable"
+                    ),
+                    "agent_unavailable_legs": legs,
+                }
+            )
+        )
+        assert h["agent_available"] is False
+        assert h["agent_unavailable_legs"] == legs
+        # Every failing leg is named in the compound reason.
+        assert "bwrap sandbox unavailable" in h["agent_unavailable_reason"]
+        assert "node runtime not functional" in h["agent_unavailable_reason"]
+        assert "docker agent unavailable" in h["agent_unavailable_reason"]
+
+    def test_old_runner_without_legs_field_returns_none(self):
+        # Old runners don't send agent_unavailable_legs — surfaced as None (absent
+        # in caps), never a KeyError.
+        h = _runner_health(
+            _health_runner(
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "agent_available": False,
+                    "agent_unavailable_reason": "bwrap not available",
+                }
+            )
+        )
+        assert h["agent_unavailable_legs"] is None
+
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
 

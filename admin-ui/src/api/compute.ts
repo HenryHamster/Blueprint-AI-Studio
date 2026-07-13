@@ -1739,6 +1739,15 @@ export interface FleetRunner {
     stale_reason: string | null;
     agent_available?: boolean | null;
     agent_unavailable_reason?: string | null;
+    // Per-leg ok/failed breakdown of the four agent-backend legs so the fleet
+    // panel can render a checklist instead of parsing one folded reason string.
+    // null/absent when the runner (older build) never reported it.
+    agent_unavailable_legs?: {
+      bwrap_sandbox?: boolean;
+      agent_dist?: boolean;
+      node_runtime?: boolean;
+      docker?: boolean;
+    } | null;
     liveness_window_seconds: number;
     // Trust telemetry surfaced from the backend health computation.
     last_successful_job_at?: string | null;
@@ -1759,6 +1768,7 @@ export interface FleetRunner {
       max_concurrent_compute?: number | null;
       task_types?: string | string[];
       gpu_indices_allowed?: 'all' | number[];
+      gpus_per_job?: number;
     };
     config_generation?: string;
     applied?: Record<string, unknown> | null;
@@ -1767,6 +1777,10 @@ export interface FleetRunner {
     // echoed the matching generation (includes the never-reported case).
     config_pending?: boolean;
     gpu_indices_allowed?: 'all' | number[];
+    // Number of GPUs the runner reserves per compute job (server-authoritative,
+    // mirrored top-level for the fleet editor). Absent on runners enrolled before
+    // this contract; defaults to 1 GPU per job.
+    gpus_per_job?: number;
   };
   last_seen_at: string | null;
   created_at: string | null;
@@ -1852,6 +1866,7 @@ export async function updateRunnerCapabilities(
     task_types?: string | string[];
     max_concurrent_compute?: number;
     gpu_indices_allowed?: 'all' | number[];
+    gpus_per_job?: number;
   },
 ): Promise<FleetRunner> {
   const res = await apiFetch(

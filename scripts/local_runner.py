@@ -1871,10 +1871,15 @@ def _heartbeat_loop(
             # orchestrator stops pinning agent tasks here. When agent_image is None
             # this collapses to the prior bwrap-only behavior (no regression).
             agent_binary_present = _locate_agent_binary() is not None
+            # Probe the node runtime once and reuse it below — this is the single
+            # source of truth for both the bwrap advertisement leg and the per-leg
+            # breakdown, so the compound reason string cannot disagree with the
+            # advertisement (an earlier version re-probed inside the reason chain).
+            node_runtime_ok = _node_runtime_ok()
             bwrap_agent_ok = (
                 agent_sandbox_ok
                 and agent_binary_present
-                and _node_runtime_ok()
+                and node_runtime_ok
             )
             # A docker-only box (docker+image WITHOUT bwrap) advertises
             # agent_available=True but can run ONLY the read-only slice
@@ -1887,22 +1892,47 @@ def _heartbeat_loop(
             # a distinct runner capability, not a clobber of operator config.
             docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
             agent_available = bwrap_agent_ok or docker_agent_ok
+            # Per-leg breakdown of the FOUR independent legs that gate the agent
+            # backends, so the fleet UI can render a checklist rather than parse a
+            # string. Emitted whenever the leg states are known (caps is not None);
+            # None for the old-caller path below, matching the absent-tolerant
+            # heartbeat contract. Note the docker leg does NOT require the host
+            # node/binary (the runtime lives in the prod image), while the bwrap
+            # path requires sandbox + dist + node together.
+            if caps is not None:
+                agent_unavailable_legs: dict | None = {
+                    "bwrap_sandbox": bool(agent_sandbox_ok),
+                    "agent_dist": bool(agent_binary_present),
+                    "node_runtime": bool(node_runtime_ok),
+                    "docker": bool(docker_agent_ok),
+                }
+            else:
+                agent_unavailable_legs = None
             # Granular unavailability reason (engine's FleetRunnersPanel
             # observability field): when NEITHER backend leg is satisfiable, say
-            # WHY so the orchestrator/operator sees the cause rather than a bare
-            # agent_available=False. Derived from HEAD's dual-backend booleans.
+            # WHY so the orchestrator/operator sees the cause. Enumerate EVERY
+            # failing leg (compound, "; "-joined) rather than stopping at the first
+            # match, so the operator can tell precisely which legs failed instead of
+            # an opaque single-cause string. None when agent_available is True.
             if agent_available:
                 agent_unavailable_reason: str | None = None
-            elif not agent_binary_present:
-                agent_unavailable_reason = "agent binary not found"
-            elif agent_sandbox_ok and not _node_runtime_ok():
-                agent_unavailable_reason = "node runtime not functional"
-            elif not agent_sandbox_ok and not docker_agent_ok:
-                agent_unavailable_reason = (
-                    "bwrap sandbox unavailable and no docker agent backend"
-                )
             else:
-                agent_unavailable_reason = "no usable agent backend (bwrap or docker)"
+                # Ordered (failed-flag, phrase) pairs — a leg contributes its phrase
+                # only when it actually failed. The bwrap trio (sandbox/dist/node)
+                # and the docker leg are all independent, so a sandbox+no-docker box
+                # now surfaces BOTH causes instead of folding them into one string.
+                _leg_reasons = [
+                    (not agent_sandbox_ok, "bwrap sandbox unavailable"),
+                    (not agent_binary_present, "agent dist not built"),
+                    (not node_runtime_ok, "node runtime not functional"),
+                    (not docker_agent_ok, "docker agent unavailable"),
+                ]
+                failed_phrases = [phrase for failed, phrase in _leg_reasons if failed]
+                agent_unavailable_reason = (
+                    "; ".join(failed_phrases)
+                    if failed_phrases
+                    else "no usable agent backend (bwrap or docker)"
+                )
             # Runner-DECLARED agent capability floor. A docker-ONLY box (docker+image
             # but NO bwrap) can only run the read-only agent slice — the prod agent
             # image is read-only-parity and write/heavy types would DECLINE at claim
@@ -1961,6 +1991,7 @@ def _heartbeat_loop(
                 "active_work_report": True,
                 "agent_available": agent_available,
                 "agent_unavailable_reason": agent_unavailable_reason,
+                "agent_unavailable_legs": agent_unavailable_legs,
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,

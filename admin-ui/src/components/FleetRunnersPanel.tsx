@@ -37,6 +37,16 @@ function deviceStatusLabel(status: string): { label: string; cls: string } {
   return { label: status.replace(/_/g, ' '), cls: 'text-neutral-500' };
 }
 
+// The four agent-backend legs, in the order the daemon checks them, with the
+// short labels shown on the per-leg breakdown badges when a runner's agent is
+// unavailable and the structured legs map is present.
+const AGENT_LEG_LABELS: ReadonlyArray<{ key: string; label: string }> = [
+  { key: 'bwrap_sandbox', label: 'bwrap' },
+  { key: 'agent_dist', label: 'agent dist' },
+  { key: 'node_runtime', label: 'node' },
+  { key: 'docker', label: 'docker' },
+];
+
 /** True when the runner is live (recent heartbeat) but its jobs are failing —
  *  the "connected but failing" false-green the trust telemetry exists to catch. */
 function isRunnerDegraded(runner: FleetRunner): boolean {
@@ -195,6 +205,53 @@ function parseGpuIndexList(text: string): number[] {
     out.push(value);
   }
   return out.sort((a, b) => a - b);
+}
+
+// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
+// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
+const GPUS_PER_JOB_MIN = 1;
+const GPUS_PER_JOB_MAX = 8;
+
+/** Current per-job GPU count for a runner, from the server-authoritative config.
+ *  Absent means the default of 1 GPU per job (backward compatible). */
+function gpusPerJobValue(runner: FleetRunner): number {
+  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
+  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
+}
+
+/** Current task-type allowlist for a runner. Prefers the server-authoritative
+ *  desired config; falls back to the runner-reported capabilities for runners
+ *  enrolled before the live-config contract (no config block). Absent / "all"
+ *  means every task type is eligible. */
+function taskTypesValue(runner: FleetRunner): 'all' | string[] {
+  const desired = runner.config?.desired?.task_types;
+  if (Array.isArray(desired)) return desired;
+  if (desired === 'all') return 'all';
+  const reported = runner.capabilities.task_types;
+  if (Array.isArray(reported)) return reported;
+  return 'all';
+}
+
+function taskTypesLabel(runner: FleetRunner): string {
+  const value = taskTypesValue(runner);
+  if (value === 'all') return 'tasks: all';
+  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
+}
+
+/** Parse an operator-typed task-type list ("compute_experiment, code_change")
+ *  into a deduped, trimmed, non-empty string array — the shape the PATCH
+ *  endpoint normalizes ('all' when empty is handled by the caller). */
+function parseTaskTypeList(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    const trimmed = token.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
 }
 
 function isStrategicRunner(runner: FleetRunner): boolean {
@@ -531,6 +588,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const [editingGpuAllowlist, setEditingGpuAllowlist] = useState<string | null>(null);
   const [gpuAllowlistAll, setGpuAllowlistAll] = useState<boolean>(true);
   const [gpuAllowlistText, setGpuAllowlistText] = useState<string>('');
+  const [editingGpusPerJob, setEditingGpusPerJob] = useState<string | null>(null);
+  const [editGpusPerJob, setEditGpusPerJob] = useState<number>(GPUS_PER_JOB_MIN);
+  const [editingTaskTypes, setEditingTaskTypes] = useState<string | null>(null);
+  const [taskTypesAll, setTaskTypesAll] = useState<boolean>(true);
+  const [taskTypesText, setTaskTypesText] = useState<string>('');
   const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
@@ -687,6 +749,40 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     setGpuAllowlistAll(current === 'all');
     setGpuAllowlistText(current === 'all' ? '' : current.join(','));
     setEditingGpuAllowlist(runner.id);
+  };
+
+  const handleUpdateGpusPerJob = async (runner: FleetRunner, gpusPerJob: number) => {
+    const clamped = Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(gpusPerJob)));
+    setUpdatingCapabilities(runner.id);
+    setEditingGpusPerJob(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { gpus_per_job: clamped });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const handleUpdateTaskTypes = async (runner: FleetRunner, taskTypes: 'all' | string[]) => {
+    setUpdatingCapabilities(runner.id);
+    setEditingTaskTypes(null);
+    try {
+      await updateRunnerCapabilities(projectId, runner.id, { task_types: taskTypes });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdatingCapabilities(null);
+    }
+  };
+
+  const beginEditTaskTypes = (runner: FleetRunner) => {
+    const current = taskTypesValue(runner);
+    setTaskTypesAll(current === 'all');
+    setTaskTypesText(current === 'all' ? '' : current.join(', '));
+    setEditingTaskTypes(runner.id);
   };
 
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
@@ -1066,6 +1162,131 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         </span>
                       )
                     )}
+                    {runner.capabilities.has_gpu && (
+                      editingGpusPerJob === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
+                          data-testid="fleet-runner-gpus-per-job-editor"
+                        >
+                          <input
+                            type="number"
+                            min={GPUS_PER_JOB_MIN}
+                            max={GPUS_PER_JOB_MAX}
+                            value={editGpusPerJob}
+                            onChange={e => setEditGpusPerJob(
+                              Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Number(e.target.value) || GPUS_PER_JOB_MIN)),
+                            )}
+                            className="w-10 bg-transparent text-center text-xs text-purple-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            aria-label="GPUs per job"
+                            autoFocus
+                          />
+                          <span>GPUs/job</span>
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => handleUpdateGpusPerJob(runner, editGpusPerJob)}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save GPUs per job"
+                                aria-label="Save GPUs per job"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingGpusPerJob(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel GPUs per job"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-purple-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                          {`${gpusPerJobValue(runner)} GPUs/job`}
+                          <button
+                            onClick={() => {
+                              setEditGpusPerJob(gpusPerJobValue(runner));
+                              setEditingGpusPerJob(runner.id);
+                            }}
+                            className="text-purple-300/70 hover:text-purple-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            title="Edit GPUs per job"
+                            aria-label="Edit GPUs per job"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
+                    )}
+                    {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
+                      editingTaskTypes === runner.id ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300"
+                          data-testid="fleet-runner-task-types-editor"
+                        >
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={taskTypesAll}
+                              onChange={e => setTaskTypesAll(e.target.checked)}
+                              aria-label="Allow all task types"
+                            />
+                            all
+                          </label>
+                          {!taskTypesAll && (
+                            <input
+                              type="text"
+                              value={taskTypesText}
+                              onChange={e => setTaskTypesText(e.target.value)}
+                              placeholder="compute_experiment, code_change"
+                              aria-label="Task types allowed"
+                              className="w-40 bg-transparent text-center text-xs text-blue-300 outline-none"
+                              autoFocus
+                            />
+                          )}
+                          {updatingCapabilities !== runner.id ? (
+                            <>
+                              <button
+                                onClick={() => {
+                                  const list = parseTaskTypeList(taskTypesText);
+                                  handleUpdateTaskTypes(runner, taskTypesAll || list.length === 0 ? 'all' : list);
+                                }}
+                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Save task types"
+                                aria-label="Save task types"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => setEditingTaskTypes(null)}
+                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
+                                title="Cancel"
+                                aria-label="Cancel task types"
+                              >
+                                <span className="text-xs">✕</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-blue-300 animate-pulse">saving…</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                          {taskTypesLabel(runner)}
+                          <button
+                            onClick={() => beginEditTaskTypes(runner)}
+                            className="text-blue-300/70 hover:text-blue-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
+                            title="Edit task types"
+                            aria-label="Edit task types"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </span>
+                      )
+                    )}
                     {runner.health?.agent_available !== undefined && (
                       <span
                         className={`rounded border px-1.5 py-0.5 text-xs ${
@@ -1077,9 +1298,35 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       >
                         {runner.health.agent_available
                           ? 'agent ✓'
-                          : runner.health.agent_unavailable_reason
+                          : runner.health.agent_unavailable_reason && !runner.health.agent_unavailable_legs
                             ? `agent ✗: ${runner.health.agent_unavailable_reason}`
                             : 'agent ✗'}
+                      </span>
+                    )}
+                    {runner.health?.agent_available === false && runner.health.agent_unavailable_legs && (
+                      <span
+                        className="inline-flex flex-wrap items-center gap-1"
+                        data-testid="fleet-runner-agent-legs"
+                      >
+                        {AGENT_LEG_LABELS.map(({ key, label }) => {
+                          const ok = runner.health?.agent_unavailable_legs?.[key as keyof typeof runner.health.agent_unavailable_legs];
+                          if (ok === undefined) return null;
+                          return (
+                            <span
+                              key={key}
+                              data-testid={`fleet-runner-agent-leg-${key}`}
+                              data-leg-ok={ok ? 'true' : 'false'}
+                              className={`rounded border px-1.5 py-0.5 text-xs ${
+                                ok
+                                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                  : 'border-red-500/30 bg-red-500/10 text-red-300'
+                              }`}
+                              title={ok ? `${label} ok` : `${label} failed`}
+                            >
+                              {label} {ok ? '✓' : '✗'}
+                            </span>
+                          );
+                        })}
                       </span>
                     )}
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
