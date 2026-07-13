@@ -1024,6 +1024,18 @@ runtime_config: Dict = {
     # only read-only (non-merging) task types are accepted.
     # Set via /api/admin/settings.
     "cloud_run_task_type_allowlist": [],
+    # Operator-approved, audited Alembic migration-divergence exemptions. Each
+    # entry is a dict carrying the AuthorizedDivergence match fields (revision,
+    # parent_revision, deployed_identity, integration_identity, created_table,
+    # integration_revision) PLUS audit metadata (added_by, added_at ISO-8601,
+    # reason). The effective exemption list the deployed migration-safety gates
+    # consult is (baked AUTHORIZED_DIVERGENCES) UNION (valid entries here), so a
+    # NEW operator-approved exemption is honored WITHOUT a redeploy — see
+    # migration_reconciliation.effective_authorized_divergences(). Default EMPTY
+    # (no runtime exemptions until an operator adds one), so the change is inert
+    # on merge. Malformed entries are dropped defensively on rehydrate — this
+    # value gates a safety check and a garbage row must never weaken it.
+    "migration_divergence_exemptions": [],
     # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
     # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
     # where the maintainer reconciles every demand-active project once
@@ -2352,6 +2364,30 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set(
                             "cloud_run_task_type_allowlist",
                             sorted({str(t).strip() for t in raw_allow if str(t).strip()}),
+                        )
+                if "migration_divergence_exemptions" in config_json:
+                    # Persisted operator-approved Alembic migration-divergence
+                    # exemptions. Validate/normalize each entry through the SAME
+                    # helper the resolver uses so the DB store and the live gate
+                    # agree on what counts as well-formed, and DROP malformed
+                    # rows — this value gates a deploy-safety check, so a garbage
+                    # row must never weaken it. Lazy import avoids a module-level
+                    # cycle (migration_reconciliation reads runtime_config).
+                    raw_exemptions = config_json["migration_divergence_exemptions"]
+                    if isinstance(raw_exemptions, (list, tuple)):
+                        from app.migration_reconciliation import (
+                            normalize_runtime_divergence_exemption,
+                        )
+
+                        normalized_exemptions = [
+                            norm
+                            for entry in raw_exemptions
+                            if (norm := normalize_runtime_divergence_exemption(entry))
+                            is not None
+                        ]
+                        _set(
+                            "migration_divergence_exemptions",
+                            normalized_exemptions,
                         )
                 if "warm_pool_account_retarget_enabled" in config_json:
                     _set(

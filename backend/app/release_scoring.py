@@ -21,7 +21,7 @@ from typing import Any
 from app.ci_resolution import (
     _CI_RED,
 )
-from app.migration_reconciliation import AUTHORIZED_DIVERGENCES
+from app.migration_reconciliation import effective_authorized_divergences
 
 logger = logging.getLogger(__name__)
 
@@ -973,6 +973,78 @@ def compute_composite(
     }
 
 
+# --- Execution-site classification of promotion blockers --------------------
+# Every hard-blocker code compute_composite() (and the qualifier's downstream
+# gates) can emit is classified by WHERE the responsible check runs, so an
+# operator or agent can tell — WITHOUT hand-diagnosing the release machinery —
+# whether a fix landing on automain will actually take effect before the very
+# promotion it is meant to unblock.
+#
+#   "deployed"  — the check runs in the DEPLOYED (main) process at the deployed
+#                 SHA and compares the candidate against the deployed promotion
+#                 target / production's recorded schema.  A fix to this check on
+#                 automain is INERT until it is itself promoted (release-machinery
+#                 self-reference): the divergence self-clears only on promotion.
+#   "candidate" — the check runs against CANDIDATE content (the merged diff, the
+#                 candidate's CI, a smoketest executing candidate code).  A fix on
+#                 automain resolves the blocker on the NEXT qualification, no
+#                 redeploy required.
+EXECUTION_SITE_DEPLOYED = "deployed"
+EXECUTION_SITE_CANDIDATE = "candidate"
+
+BLOCKER_EXECUTION_SITE: dict[str, str] = {
+    # Deployed-side: both compare the candidate against the deployed promotion
+    # target / production's live recorded schema; the divergence self-clears only
+    # once the version itself promotes, so a fix on automain is inert until then.
+    "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
+    "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
+    # Candidate-side: resolvable by an automain fix that lands in the next
+    # candidate tree — CI, the merged diff, or a smoketest running candidate code.
+    "ci_not_green": EXECUTION_SITE_CANDIDATE,
+    "ci_unresolved": EXECUTION_SITE_CANDIDATE,
+    "smoketest_startup_failed": EXECUTION_SITE_CANDIDATE,
+    "audit_missing": EXECUTION_SITE_CANDIDATE,
+    "test_file_deleted": EXECUTION_SITE_CANDIDATE,
+    "criterion_coverage_incomplete": EXECUTION_SITE_CANDIDATE,
+    "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
+    "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
+    "uncorroborated_attestation": EXECUTION_SITE_CANDIDATE,
+}
+
+# Short operator-facing phrase per execution-site, appended to blocker labels.
+EXECUTION_SITE_LABELS: dict[str, str] = {
+    EXECUTION_SITE_DEPLOYED: (
+        "this check runs DEPLOYED-side — a fix on automain is inert until this "
+        "version itself promotes"
+    ),
+    EXECUTION_SITE_CANDIDATE: (
+        "this check runs CANDIDATE-side — a fix on automain clears it on the next "
+        "qualification"
+    ),
+}
+
+
+def blocker_execution_site(blocker: str | None) -> str | None:
+    """Classify a promotion-blocker code by where the responsible check runs.
+
+    Returns ``"deployed"`` (inert-until-promote) or ``"candidate"`` (clearable by
+    an automain fix), or ``None`` when there is no blocker or the code is not
+    classified (unknown / force-promote sentinels such as
+    ``qualification_superseded``).
+    """
+    if not blocker:
+        return None
+    return BLOCKER_EXECUTION_SITE.get(blocker)
+
+
+def blocker_execution_site_label(blocker: str | None) -> str | None:
+    """Human-readable execution-site phrase for a blocker, or None if unclassified."""
+    site = blocker_execution_site(blocker)
+    if site is None:
+        return None
+    return EXECUTION_SITE_LABELS.get(site)
+
+
 _AUDIT_DEDUCTIONS: dict[str, float] = {
     "critical": 0.30,
     "blocker": 0.30,
@@ -1073,17 +1145,27 @@ def _finding_subject_is_authorized_divergence(f: dict) -> bool:
     ).lower()
     if not text:
         return False
-    for div in AUTHORIZED_DIVERGENCES:
+    # Effective list = baked floor UNION operator-approved runtime store, resolved
+    # at call time so a newly-added runtime exemption de-dups its audit finding
+    # without a redeploy.
+    for div in effective_authorized_divergences():
         if div.revision.lower() not in text:
             continue
-        if any(p in text for p in _REVISION_IDENTITY_PHRASES):
-            return True
-        # The back-merge identity swap named explicitly (both migration
-        # identities of the reused revision) is itself the divergence concern.
-        if (
+        matched = any(p in text for p in _REVISION_IDENTITY_PHRASES) or (
+            # The back-merge identity swap named explicitly (both migration
+            # identities of the reused revision) is itself the divergence concern.
             div.deployed_identity.lower() in text
             and div.integration_identity.lower() in text
-        ):
+        )
+        if matched:
+            if div.is_runtime:
+                logger.info(
+                    "[release-audit] authorized-divergence finding de-dup for "
+                    "revision %r via RUNTIME exemption authorized by %r: %s",
+                    div.revision,
+                    div.added_by,
+                    div.reason,
+                )
             return True
     return False
 

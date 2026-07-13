@@ -5,17 +5,27 @@ divergence detector that catches the back-merge renumber class (prod incident
 Pure, no DB — filename-list comparison only.
 """
 
+import contextlib
 from unittest.mock import AsyncMock
 
 import pytest
 
+import app.runtime_config_state as _rcs
 from app.migration_chain import (
+    find_content_divergence_records,
     find_content_divergent_revisions,
     find_deployed_migration_content_edits,
     plan_integration_side_renumber,
 )
+from app.migration_reconciliation import (
+    AUTHORIZED_DIVERGENCES,
+    RUNTIME_EXEMPTIONS_CONFIG_KEY,
+    effective_authorized_divergences,
+    normalize_runtime_divergence_exemption,
+)
 from app.release_scoring import compute_composite
 from app.rollup_migration_validation import (
+    _divergence_record_is_authorized,
     _validate_rollup_migration_chain,
     check_qualification_migration_identity,
 )
@@ -1749,3 +1759,342 @@ def test_expected_schema_revision_tracks_new_head():
     from app.main import EXPECTED_SCHEMA_REVISION
 
     assert EXPECTED_SCHEMA_REVISION == "0527"
+
+
+# ===========================================================================
+# Runtime-augmentable, audited migration-divergence exemptions.
+#
+# The authorized-divergence list is no longer a baked code constant alone: the
+# EFFECTIVE list the deployed safety gates consult is
+#   (baked AUTHORIZED_DIVERGENCES) UNION (operator-approved DB-backed runtime
+#    store, exposed as runtime_config["migration_divergence_exemptions"]).
+# so a NEW operator-approved exemption is honored by the deployed gate WITHOUT a
+# redeploy. These tests lock the four contract points:
+#   (a) empty runtime store -> effective list == baked constant (no behavior change)
+#   (b) an exact-match runtime exemption flips an otherwise-unauthorized
+#       divergence from block -> pass, surfaced as authorized-with-note
+#   (c) a runtime entry that does NOT exactly match still hard-blocks
+#   (d) a malformed runtime entry is dropped and never weakens the gate
+# ===========================================================================
+
+
+@contextlib.contextmanager
+def _runtime_exemptions(entries):
+    """Temporarily set the live in-memory runtime exemption store, mutating the
+    SAME dict object the resolver reads (a re-bind would be invisible to the
+    resolver's lazy import). Restores the prior value on exit."""
+    prev = _rcs.runtime_config.get(RUNTIME_EXEMPTIONS_CONFIG_KEY)
+    _rcs.runtime_config[RUNTIME_EXEMPTIONS_CONFIG_KEY] = entries
+    try:
+        yield
+    finally:
+        if prev is None:
+            _rcs.runtime_config.pop(RUNTIME_EXEMPTIONS_CONFIG_KEY, None)
+        else:
+            _rcs.runtime_config[RUNTIME_EXEMPTIONS_CONFIG_KEY] = prev
+
+
+def _runtime_exemption_entry(**overrides) -> dict:
+    """A well-formed runtime exemption dict (all match fields + audit metadata).
+    Defaults exactly match the reused divergence 0138 digest_cache_table ->
+    task_blocked_state_fields used across these tests."""
+    entry = {
+        "revision": "0138",
+        "parent_revision": "0137",
+        "deployed_identity": "digest_cache_table",
+        "integration_identity": "task_blocked_state_fields",
+        "created_table": "",
+        "integration_revision": "",
+        "added_by": "operator@blueprint",
+        "added_at": "2026-07-13T00:00:00Z",
+        "reason": "authorized reconciled 0138 back-merge renumber (test)",
+    }
+    entry.update(overrides)
+    return entry
+
+
+# --- (a) empty runtime store: effective list == baked constant --------------
+
+
+def test_effective_list_equals_baked_when_runtime_store_empty():
+    """With no runtime exemptions the effective list IS the baked constant — the
+    baked floor is preserved verbatim and behavior is unchanged."""
+    with _runtime_exemptions([]):
+        eff = effective_authorized_divergences()
+    assert eff == AUTHORIZED_DIVERGENCES
+    # The baked entries carry NO runtime provenance — they are the immutable floor.
+    assert all(not d.is_runtime for d in eff)
+
+
+def test_effective_list_equals_baked_when_key_absent():
+    """A totally absent key (never written) also yields exactly the baked list."""
+    prev = _rcs.runtime_config.pop(RUNTIME_EXEMPTIONS_CONFIG_KEY, None)
+    try:
+        assert effective_authorized_divergences() == AUTHORIZED_DIVERGENCES
+    finally:
+        if prev is not None:
+            _rcs.runtime_config[RUNTIME_EXEMPTIONS_CONFIG_KEY] = prev
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_unaffected_by_empty_runtime_store(mocker):
+    """Existing block behavior is unchanged with an empty runtime store: an
+    unauthorized 0138 divergence still hard-blocks exactly as before."""
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+    with _runtime_exemptions([]):
+        verdict, detail = await check_qualification_migration_identity(
+            "tok", "acme", "widget", "cand-sha", "main"
+        )
+    assert verdict == "block"
+    assert "0138" in detail
+
+
+# --- (b) exact-match runtime exemption flips block -> pass ------------------
+
+
+def test_effective_list_appends_valid_runtime_exemption():
+    """A valid runtime entry is appended as a runtime-flagged AuthorizedDivergence
+    that carries its audit metadata; the baked floor stays first and unchanged."""
+    with _runtime_exemptions([_runtime_exemption_entry()]):
+        eff = effective_authorized_divergences()
+    assert len(eff) == len(AUTHORIZED_DIVERGENCES) + 1
+    assert eff[: len(AUTHORIZED_DIVERGENCES)] == AUTHORIZED_DIVERGENCES
+    runtime_entry = eff[-1]
+    assert runtime_entry.is_runtime is True
+    assert runtime_entry.revision == "0138"
+    assert runtime_entry.added_by == "operator@blueprint"
+    assert "test" in runtime_entry.reason
+
+
+def test_record_authorized_by_runtime_exemption_and_logs_operator(caplog):
+    """A detected reused-0138 divergence that matches a runtime exemption is
+    authorized, and an audit log line names the operator + reason (so the gate
+    record shows a HUMAN authorized it, not the code)."""
+    record = find_content_divergence_records(
+        ["0138_digest_cache_table.py"], ["0138_task_blocked_state_fields.py"]
+    )[0]
+    assert record["kind"] == "reused"
+    # Without the exemption the divergence is unauthorized.
+    with _runtime_exemptions([]):
+        assert _divergence_record_is_authorized(record) is False
+    # With the exact-match exemption it is authorized AND an operator-named audit
+    # line is emitted.
+    with _runtime_exemptions([_runtime_exemption_entry()]), caplog.at_level(
+        "WARNING"
+    ):
+        assert _divergence_record_is_authorized(record) is True
+    assert any(
+        "operator@blueprint" in r.getMessage() and "0138" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_runtime_exemption_flips_block_to_pass(mocker):
+    """An otherwise-unauthorized 0138 divergence that EXACTLY matches a runtime
+    exemption is waved through: verdict ('ok', authorized-with-note) instead of
+    ('block', ...) — the no-redeploy mechanism working end-to-end through the
+    deployed gate."""
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+    with _runtime_exemptions([_runtime_exemption_entry()]):
+        verdict, detail = await check_qualification_migration_identity(
+            "tok", "acme", "widget", "cand-sha", "main"
+        )
+    assert verdict == "ok"
+    assert detail is not None
+    assert "authorized" in detail.lower()
+    assert "0138" in detail
+
+
+# --- (c) non-exact runtime entry still hard-blocks --------------------------
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_runtime_exemption_wrong_identity_still_blocks(
+    mocker,
+):
+    """Exact-match semantics are preserved: a runtime entry for revision 0138 with
+    a DIFFERENT integration identity does NOT match the detected divergence, so
+    the gate still hard-blocks — no fuzzy/substring widening."""
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+    mismatch = _runtime_exemption_entry(
+        integration_identity="some_completely_other_migration"
+    )
+    with _runtime_exemptions([mismatch]):
+        verdict, detail = await check_qualification_migration_identity(
+            "tok", "acme", "widget", "cand-sha", "main"
+        )
+    assert verdict == "block"
+    assert "0138" in detail
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_runtime_exemption_wrong_revision_still_blocks(
+    mocker,
+):
+    """A runtime entry for an UNRELATED revision id does not authorize the 0138
+    divergence — the gate still blocks."""
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+    wrong_rev = _runtime_exemption_entry(revision="9999", parent_revision="9998")
+    with _runtime_exemptions([wrong_rev]):
+        verdict, detail = await check_qualification_migration_identity(
+            "tok", "acme", "widget", "cand-sha", "main"
+        )
+    assert verdict == "block"
+    assert "0138" in detail
+
+
+# --- (d) malformed runtime entry is dropped, never weakens the gate ---------
+
+
+def test_normalize_drops_malformed_entries():
+    """The shared normalizer fail-closes: non-dicts and entries missing any
+    required match/audit field are dropped (returns None)."""
+    assert normalize_runtime_divergence_exemption("not-a-dict") is None
+    assert normalize_runtime_divergence_exemption(None) is None
+    assert normalize_runtime_divergence_exemption({}) is None
+    # Missing added_by (no operator named) -> not an authorized record.
+    assert (
+        normalize_runtime_divergence_exemption(
+            _runtime_exemption_entry(added_by="")
+        )
+        is None
+    )
+    # Missing reason -> dropped.
+    assert (
+        normalize_runtime_divergence_exemption(_runtime_exemption_entry(reason=""))
+        is None
+    )
+    # Missing a core identity field -> dropped.
+    assert (
+        normalize_runtime_divergence_exemption(
+            _runtime_exemption_entry(integration_identity="")
+        )
+        is None
+    )
+    # A well-formed entry is normalized to an all-string dict.
+    ok = normalize_runtime_divergence_exemption(_runtime_exemption_entry())
+    assert ok is not None
+    assert ok["revision"] == "0138"
+    assert ok["added_by"] == "operator@blueprint"
+
+
+def test_effective_list_ignores_malformed_runtime_entries():
+    """Malformed rows never reach the effective list — they cannot smuggle a
+    weakening into the gate."""
+    with _runtime_exemptions(
+        ["garbage", 42, {}, _runtime_exemption_entry(added_by="")]
+    ):
+        eff = effective_authorized_divergences()
+    assert eff == AUTHORIZED_DIVERGENCES
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_malformed_runtime_entry_still_blocks(mocker):
+    """A malformed runtime exemption (missing operator) is ignored, so the 0138
+    divergence it superficially names still hard-blocks — a garbage row must
+    never weaken a safety gate."""
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=["0138_digest_cache_table.py"],
+            candidate_list=["0138_task_blocked_state_fields.py"],
+        ),
+    )
+    malformed = _runtime_exemption_entry(added_by="")  # no operator -> dropped
+    with _runtime_exemptions([malformed]):
+        verdict, detail = await check_qualification_migration_identity(
+            "tok", "acme", "widget", "cand-sha", "main"
+        )
+    assert verdict == "block"
+    assert "0138" in detail
+
+
+def test_baked_invariants_operate_on_baked_constant_not_runtime(caplog):
+    """A runtime exemption is a gate-authorization record ONLY — it has NO on-disk
+    file requirement. The baked-tuple on-disk invariants must keep operating on
+    the baked constant, unaffected by any runtime addition."""
+    # A runtime exemption naming a revision with NO on-disk migration file is
+    # still valid as a gate record (the on-disk check applies to the baked floor).
+    phantom = _runtime_exemption_entry(
+        revision="0138",
+        deployed_identity="phantom_no_file_a",
+        integration_identity="phantom_no_file_b",
+    )
+    with _runtime_exemptions([phantom]):
+        eff = effective_authorized_divergences()
+    # The baked floor is unchanged and still first.
+    assert eff[: len(AUTHORIZED_DIVERGENCES)] == AUTHORIZED_DIVERGENCES
+    # The runtime addition exists purely as an authorization record.
+    assert eff[-1].is_runtime is True
+    assert eff[-1].deployed_identity == "phantom_no_file_a"
+
+
+def test_rehydrate_normalizes_and_drops_malformed_exemptions():
+    """sync_runtime_config_from_state rehydrates the exemption store from
+    runtime_config_json, keeping well-formed rows and dropping malformed ones."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.models import DeploymentStatus
+    from app.runtime_config_state import sync_runtime_config_from_state
+
+    good = _runtime_exemption_entry()
+    state = SimpleNamespace(
+        status=DeploymentStatus.STABLE,
+        runtime_config_json={
+            "migration_divergence_exemptions": [good, "garbage", {}, 7],
+        },
+    )
+    # Null out every other persisted column the sync reads so only the exemption
+    # branch does work (all attribute reads use getattr(..., None) or `is not None`).
+    for attr in (
+        "runtime_max_concurrent_vms",
+        "runtime_max_retries",
+        "runtime_max_autonomous_tasks_per_hour",
+        "runtime_max_global_autonomous_tasks_per_hour",
+        "runtime_autonomous_research_interval_minutes",
+        "runtime_pause_reason",
+        "runtime_config_updated_at",
+    ):
+        if not hasattr(state, attr):
+            setattr(state, attr, None)
+
+    prev = _rcs.runtime_config.get(RUNTIME_EXEMPTIONS_CONFIG_KEY)
+    try:
+        asyncio.run(sync_runtime_config_from_state(state))
+        stored = _rcs.runtime_config.get(RUNTIME_EXEMPTIONS_CONFIG_KEY)
+        assert isinstance(stored, list)
+        # Only the one well-formed row survived normalization.
+        assert len(stored) == 1
+        assert stored[0]["revision"] == "0138"
+        assert stored[0]["added_by"] == "operator@blueprint"
+    finally:
+        if prev is None:
+            _rcs.runtime_config.pop(RUNTIME_EXEMPTIONS_CONFIG_KEY, None)
+        else:
+            _rcs.runtime_config[RUNTIME_EXEMPTIONS_CONFIG_KEY] = prev

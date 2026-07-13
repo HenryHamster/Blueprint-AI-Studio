@@ -1,5 +1,6 @@
 """Alembic migration-chain validation used by rollup auto-merge."""
 
+import logging
 import os
 
 from fastapi import HTTPException
@@ -20,9 +21,11 @@ from app.migration_chain import (
 )
 from app.migration_path import is_migration_file
 from app.migration_reconciliation import (
-    AUTHORIZED_DIVERGENCES,
     AuthorizedDivergence,
+    effective_authorized_divergences,
 )
+
+logger = logging.getLogger(__name__)
 
 # Alembic versions directory, used to resolve a bare migration basename (as
 # returned by ``github.list_versions_at_ref``) back to its full repo path for a
@@ -615,7 +618,7 @@ async def enforce_premerge_migration_guard(
 
 def _divergence_record_is_authorized(
     record: dict,
-    authorized: tuple[AuthorizedDivergence, ...] = AUTHORIZED_DIVERGENCES,
+    authorized: tuple[AuthorizedDivergence, ...] | None = None,
 ) -> bool:
     """Is *record* an EXACT match for an authorized, already-handled divergence?
 
@@ -630,27 +633,39 @@ def _divergence_record_is_authorized(
     authorized renumber: ``reused`` matches the colliding revision + its identity
     pair; ``renumbered`` matches the deployed identity moving from the colliding
     revision to its renumbered slot.
+
+    The effective authorized list is resolved at CALL time (baked floor UNION the
+    operator-approved runtime store) unless a caller passes an explicit tuple, so
+    a newly-added runtime exemption is honored without a redeploy. When a RUNTIME
+    (non-baked) exemption is what waves a divergence through, an audit log line
+    names the revision, the operator and the reason — so the gate record shows a
+    human authorized this, not the code.
     """
+    if authorized is None:
+        authorized = effective_authorized_divergences()
     for auth in authorized:
-        if (
+        matched = (
             record["kind"] == "reused"
             and record["revision"] == auth.revision
-            and {
-                record["base_identity"],
-                record["head_identity"],
-            }
+            and {record["base_identity"], record["head_identity"]}
             == {auth.deployed_identity, auth.integration_identity}
-        ):
-            return True
-        if (
+        ) or (
             record["kind"] == "renumbered"
             and record["identity"] == auth.deployed_identity
-            and {
-                record["base_revision"],
-                record["head_revision"],
-            }
+            and {record["base_revision"], record["head_revision"]}
             == {auth.revision, auth.integration_revision}
-        ):
+        )
+        if matched:
+            if auth.is_runtime:
+                logger.warning(
+                    "[migration-guard] Alembic revision-identity divergence at "
+                    "revision %r waved through by RUNTIME exemption authorized by "
+                    "%r (added_at=%s): %s",
+                    auth.revision,
+                    auth.added_by,
+                    auth.added_at or "unknown",
+                    auth.reason,
+                )
             return True
     return False
 

@@ -199,6 +199,8 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
+    blocker_execution_site,
+    blocker_execution_site_label,
     compute_enforce_confidence_preview,
     DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
     MAX_COMPLETION_DEBT_WEIGHT,
@@ -3889,6 +3891,17 @@ async def _dual_write_dimension_results(
             # transient failure re-runs ONLY the still-unavailable dimensions and
             # never discards the ones that already passed for the same tree.
             continue
+        _detail = spec["detail"]
+        # Tag a blocked dimension's fact with WHERE its check runs (deployed-side
+        # inert-until-promote vs candidate-side clearable by an automain fix), so
+        # the per-dimension ledger view carries the same execution-site signal as
+        # last_qualification.  Wrap non-dict details so we never clobber them.
+        _spec_site = blocker_execution_site(spec["blocker"])
+        if _spec_site is not None:
+            if isinstance(_detail, dict):
+                _detail = {**_detail, "execution_site": _spec_site}
+            else:
+                _detail = {"execution_site": _spec_site, "detail": _detail}
         await _upsert_dimension_result(
             session,
             version,
@@ -3897,7 +3910,7 @@ async def _dual_write_dimension_results(
             status=spec["status"],
             sub_score=spec["sub_score"],
             blocker=spec["blocker"],
-            detail=spec["detail"],
+            detail=_detail,
             producing_task_id=spec["producing_task_id"],
             audited_surface_hash=spec.get("audited_surface_hash"),
         )
@@ -5516,6 +5529,11 @@ async def _finalize_qualification(
         "confidence": composite["confidence"],
         "sub_scores": extended_sub_scores,
         "blocker": composite["blocker"],
+        # Execution-site of the responsible check (dir: tag promotion blockers
+        # inert-until-promote). "deployed" = a fix on automain is inert until this
+        # version itself promotes; "candidate" = an automain fix clears it next
+        # qualification; None when there is no blocker or it is unclassified.
+        "execution_site": blocker_execution_site(composite["blocker"]),
         "threshold": policy.get("threshold"),
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
@@ -5720,6 +5738,12 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # Tag the blocker with WHERE its check runs so the operator sees
+            # whether a fix on automain takes effect pre-promotion (candidate-side)
+            # or is inert until this version itself promotes (deployed-side).
+            _site_phrase = blocker_execution_site_label(composite["blocker"])
+            if _site_phrase:
+                blocker_label = f"{blocker_label} ({_site_phrase})"
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
@@ -5743,12 +5767,14 @@ async def _finalize_qualification(
                 "threshold": policy.get("threshold"),
                 "sub_scores": composite["sub_scores"],
                 "blocker": composite["blocker"],
+                "execution_site": blocker_execution_site(composite["blocker"]),
             },
         )
         return {
             "status": "not_promoted",
             "confidence": composite["confidence"],
             "blocker": composite["blocker"],
+            "execution_site": blocker_execution_site(composite["blocker"]),
         }
 
     if not promotion_enabled:

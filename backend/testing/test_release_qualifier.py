@@ -4508,6 +4508,63 @@ async def test_independent_blocker_does_not_increment_infra_streak(db_session, m
     )
 
 
+@pytest.mark.asyncio
+async def test_finalize_tags_candidate_side_blocker_execution_site(db_session, mocker):
+    """A candidate-side blocker (test_file_deleted) is surfaced execution_site='candidate'.
+
+    Acceptance evidence (dir: tag promotion blockers inert-until-promote): a
+    blocker whose responsible check runs against CANDIDATE content — here a
+    deleted test file the audit surfaced — must be tagged as clearable by an
+    automain fix (execution_site='candidate') on both the finalize return dict
+    and the persisted last_qualification, and the per-dimension ledger detail.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    # A deleted test file classified genuine_erosion nulls test_erosion, driving
+    # compute_composite to the test_file_deleted hard blocker (candidate-side).
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": -5,
+            },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; test removed to stop a failing build.",
+                }
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result["blocker"] == "test_file_deleted"
+    assert result["execution_site"] == "candidate"
+
+    lq = version.last_qualification
+    assert lq["blocker"] == "test_file_deleted"
+    assert lq["execution_site"] == "candidate"
+
+
 class TestReconcileRefutedJustificationGate:
     """Backend reason-substantiveness gate for refuted_false_positive verdicts.
 
@@ -9717,6 +9774,64 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     assert by_dim2["audit"].status == "passed"
     assert by_dim2["audit"].sub_score == 1.0
     assert by_dim2["smoketest"].status == "passed"
+
+
+@pytest.mark.asyncio
+async def test_dual_write_tags_blocked_dimension_execution_site(db_session):
+    """The per-dimension ledger tags the blocked dimension's detail with its
+    execution-site (dir: tag promotion blockers inert-until-promote).
+
+    A DEPLOYED-side blocker (migration-identity collision, which flows through the
+    comprehensive dual-write rather than the early audit/test-erosion writes) is
+    tagged execution_site='deployed' on its ledger row — signalling it is inert
+    until this version itself promotes — while dimensions that did not block carry
+    no execution-site tag.
+    """
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "deadbeef" * 5  # 40-char candidate SHA
+
+    base_record = {
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "ci_resolution": {"state": "green"},
+        "smoketest_enabled": True,
+        "sub_scores": {},
+        # Deployed-side gate fired: revision-identity collision against the
+        # deployed promotion target.
+        "migration_safety": "block",
+        "migration_safety_detail": "0459 collides with the deployed head",
+        "migration_apply_safety": "ok",
+    }
+    composite = {"blocker": "migration_identity_collision"}
+
+    await rq._dual_write_dimension_results(db_session, version, base_record, composite)
+    await db_session.commit()
+
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_dim = {r.dimension: r for r in rows}
+
+    # Deployed-side: migration-identity block is inert until this version promotes.
+    assert by_dim["migration_identity"].status == "blocked"
+    assert by_dim["migration_identity"].blocker == "migration_identity_collision"
+    assert (
+        (by_dim["migration_identity"].detail or {}).get("execution_site")
+        == "deployed"
+    )
+
+    # Dimensions that did not block carry no execution-site tag.
+    assert by_dim["ci"].status == "passed"
+    assert by_dim["ci"].blocker is None
+    assert (by_dim["migration_apply"].detail or {}).get("execution_site") is None
 
 
 # ---------------------------------------------------------------------------
@@ -26142,6 +26257,10 @@ async def test_calcification_alert_fires_for_repeated_hard_blockers(db_session):
     assert "calcifying" in alerts[0].title
     assert "ci_not_green" in alerts[0].title
     assert "CI is not green" in alerts[0].message
+    # Execution-site tag: ci_not_green is candidate-side, so the alert tells the
+    # operator an automain fix clears it next qualification (dir: tag promotion
+    # blockers inert-until-promote).
+    assert "CANDIDATE-side" in alerts[0].message
 
     msgs = await _messages_for(db_session, project.id, "release_calcifying")
     assert len(msgs) == 1

@@ -33,6 +33,7 @@ from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
 from app.qualification_state_resolver import apply_verdict_substitution
+from app.release_scoring import blocker_execution_site as _blocker_execution_site
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -65,6 +66,7 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "started_at",
         "finalized_at",
         "blocker",
+        "execution_site",
         "sub_scores",
         "ci_resolution",
         "audit_missing_reason",
@@ -756,6 +758,12 @@ async def agent_fetch_qualification(
             "error": lq.get("error") or None,
             "detail": lq.get("detail") or None,
             "blocker": lq.get("blocker") or None,
+            # Execution-site of the blocker so an agent reading this surface knows
+            # whether a fix on automain clears it next qualification (candidate-side)
+            # or is inert until this version itself promotes (deployed-side).
+            # Prefer the stored value; derive from the blocker for older records.
+            "execution_site": lq.get("execution_site")
+            or _blocker_execution_site(lq.get("blocker")),
             "qualify_request_blocked": lq.get("qualify_request_blocked") or None,
             "qualify_request_blocked_at": lq.get("qualify_request_blocked_at") or None,
             "source": "qualification_verdict",

@@ -1796,6 +1796,88 @@ async def test_qualification_fetch_carries_block_reason_fields(
 
 
 @pytest.mark.asyncio
+async def test_qualification_fetch_surfaces_blocker_execution_site(
+    client: AsyncClient, db_session
+):
+    """The fetch verb surfaces the blocker's execution-site so an agent can tell
+    whether a fix on automain takes effect pre-promotion (dir: tag promotion
+    blockers inert-until-promote).
+
+    A DEPLOYED-side blocker (migration-identity collision) is surfaced as
+    execution_site='deployed'; a CANDIDATE-side blocker is 'candidate' and is
+    DERIVED from the blocker code even when an older record carries no stored
+    execution_site field.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    # --- deployed-side: stored execution_site is surfaced verbatim (verdict path) ---
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-site-dep"
+    )
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "abcdef12" * 5,
+        "blocker": "migration_identity_collision",
+        "execution_site": "deployed",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abcdef12" * 5,
+        confidence=0.0,
+        terminal_status="not_promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["blocker"] == "migration_identity_collision"
+    assert body["execution_site"] == "deployed"
+
+    # --- candidate-side: DERIVED from the blocker when not stored (verdict path) ---
+    project2, task2, version2 = await _make_project_with_version(
+        db_session, vm="agent-vm-site-cand"
+    )
+    version2.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "beefbeef" * 5,
+        "blocker": "ci_not_green",
+        # deliberately NO execution_site key — simulates an older record.
+    }
+    flag_modified(version2, "last_qualification")
+    db_session.add(version2)
+    verdict2 = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project2.id,
+        release_version_id=version2.id,
+        candidate_sha="beefbeef" * 5,
+        confidence=0.0,
+        terminal_status="not_promoted",
+    )
+    db_session.add(verdict2)
+    await db_session.commit()
+
+    token2 = create_agent_token(str(task2.id), task2.vm_instance_id)
+    res2 = await client.get(
+        f"/api/agent/projects/{project2.id}/qualification",
+        headers={"x-agent-token": token2},
+    )
+    assert res2.status_code == 200, res2.text
+    body2 = res2.json()
+    assert body2["blocker"] == "ci_not_green"
+    assert body2["execution_site"] == "candidate"
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_qualification_no_open_version(
     client: AsyncClient, db_session
 ):

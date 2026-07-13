@@ -3739,6 +3739,15 @@ async def _apply_settings(
                             "direction_review_recommendation_threshold", 2
                         )
                     ),
+                    # Preserve the operator-approved migration-divergence exemption
+                    # store when persisting settings. This dict is rebuilt wholesale
+                    # and overwrites state.runtime_config_json, so without echoing the
+                    # key here an unrelated settings PATCH would silently drop
+                    # exemptions written via the dedicated admin router on the next
+                    # restart. Managed by admin_migration_exemptions; only echoed here.
+                    "migration_divergence_exemptions": _runtime_config.get(
+                        "migration_divergence_exemptions", []
+                    ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:
                     runtime_config_json.pop("direction_refractory_minutes", None)

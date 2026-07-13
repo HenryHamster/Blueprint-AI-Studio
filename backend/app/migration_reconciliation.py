@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -52,6 +52,20 @@ class AuthorizedDivergence:
     integration_identity: str  # what ``revision`` names on ``automain`` (on disk)
     created_table: str  # table the integration identity creates (absence = signature)
     integration_revision: str  # where the deployed identity moved to on automain
+
+    # Audit + provenance metadata. Empty for the baked-in floor
+    # (``AUTHORIZED_DIVERGENCES``); populated ONLY for operator-approved RUNTIME
+    # exemptions rehydrated from the DB-backed runtime config. Declared
+    # ``compare=False`` so authorization matching stays keyed EXCLUSIVELY on the
+    # migration-identity fields above — a runtime exemption authorizes a
+    # divergence only on an exact identity match, identical to the baked path,
+    # and never via its audit fields. ``is_runtime`` lets a consumer emit an
+    # audit log line naming the operator when a RUNTIME (non-baked) exemption is
+    # what waved a divergence through.
+    added_by: str = field(default="", compare=False)  # operator who authorized
+    added_at: str = field(default="", compare=False)  # ISO-8601 authorization time
+    reason: str = field(default="", compare=False)  # human justification
+    is_runtime: bool = field(default=False, compare=False)  # not the baked floor
 
 
 # The one authorized, handled divergence. Importable so the qualification gate
@@ -93,7 +107,118 @@ AUTHORIZED_DIVERGENCES: tuple[AuthorizedDivergence, ...] = (
     AUTHORIZED_0458_DIVERGENCE,
 )
 
+# Runtime-config key holding the operator-approved, DB-backed exemption store.
+# Each stored entry is a dict carrying the six AuthorizedDivergence match fields
+# PLUS audit metadata (added_by / added_at / reason). The effective exemption
+# list consumed by the safety gates is (baked constant) UNION (valid runtime
+# entries), so a NEW operator-approved exemption is honored by the DEPLOYED gate
+# WITHOUT a redeploy: operator writes DB -> sync_runtime_config_from_state
+# refreshes the in-memory runtime_config -> the next gate evaluation reads it via
+# effective_authorized_divergences().
+RUNTIME_EXEMPTIONS_CONFIG_KEY = "migration_divergence_exemptions"
+
 _VERSIONS_DIR = Path(__file__).resolve().parent.parent / "alembic" / "versions"
+
+
+def normalize_runtime_divergence_exemption(entry: object) -> dict | None:
+    """Validate + normalize ONE runtime exemption dict; return a clean all-string
+    dict, or ``None`` if malformed.
+
+    This value gates a deploy-safety check, so validation is strict and
+    fail-closed: a garbage row must NEVER weaken the gate. An entry is well-formed
+    only when it carries a non-empty revision, parent_revision, deployed_identity,
+    integration_identity AND the audit trail that makes it an *authorized* record
+    (``added_by`` naming the operator and a ``reason``). ``created_table`` and
+    ``integration_revision`` may be empty (the baked 0458 entry leaves them empty
+    too). Shared by BOTH the rehydrate path (runtime_config_state) and the resolver
+    below so the DB store and the live gate agree on what counts as well-formed.
+    """
+    if not isinstance(entry, dict):
+        return None
+
+    def _s(key: str) -> str:
+        val = entry.get(key)
+        return str(val).strip() if val is not None else ""
+
+    revision = _s("revision")
+    parent_revision = _s("parent_revision")
+    deployed_identity = _s("deployed_identity")
+    integration_identity = _s("integration_identity")
+    added_by = _s("added_by")
+    reason = _s("reason")
+    # Required fields — anything missing means the row cannot authorize anything.
+    if not (
+        revision
+        and parent_revision
+        and deployed_identity
+        and integration_identity
+        and added_by
+        and reason
+    ):
+        return None
+    return {
+        "revision": revision,
+        "parent_revision": parent_revision,
+        "deployed_identity": deployed_identity,
+        "integration_identity": integration_identity,
+        "created_table": _s("created_table"),
+        "integration_revision": _s("integration_revision"),
+        "added_by": added_by,
+        "added_at": _s("added_at"),
+        "reason": reason,
+    }
+
+
+def _runtime_authorized_divergences() -> tuple[AuthorizedDivergence, ...]:
+    """Parse the LIVE in-memory runtime-config exemption store into
+    ``AuthorizedDivergence`` records (audit metadata preserved on each, for
+    logging; ignored for matching). Reads ``runtime_config`` lazily so this module
+    stays importable with NO database (the existing unit tests require that). Any
+    malformed entry is dropped defensively — a bad row never weakens the gate.
+    """
+    try:
+        from app.runtime_config_state import runtime_config
+    except Exception:  # noqa: BLE001 — no runtime config available (e.g. unit tests)
+        return ()
+
+    raw = runtime_config.get(RUNTIME_EXEMPTIONS_CONFIG_KEY)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+
+    out: list[AuthorizedDivergence] = []
+    for entry in raw:
+        norm = normalize_runtime_divergence_exemption(entry)
+        if norm is None:
+            continue
+        out.append(
+            AuthorizedDivergence(
+                revision=norm["revision"],
+                parent_revision=norm["parent_revision"],
+                deployed_identity=norm["deployed_identity"],
+                integration_identity=norm["integration_identity"],
+                created_table=norm["created_table"],
+                integration_revision=norm["integration_revision"],
+                added_by=norm["added_by"],
+                added_at=norm["added_at"],
+                reason=norm["reason"],
+                is_runtime=True,
+            )
+        )
+    return tuple(out)
+
+
+def effective_authorized_divergences() -> tuple[AuthorizedDivergence, ...]:
+    """The effective authorized-divergence list the safety gates consult:
+    the immutable baked-in floor UNION the operator-approved runtime store.
+
+    The baked ``AUTHORIZED_DIVERGENCES`` tuple is the floor and is never weakened;
+    runtime exemptions are purely additive. Callers must invoke this at CALL time
+    (not import time) so a newly-added exemption is honored without a redeploy.
+    """
+    runtime = _runtime_authorized_divergences()
+    if not runtime:
+        return AUTHORIZED_DIVERGENCES
+    return AUTHORIZED_DIVERGENCES + runtime
 
 
 class ReconcileOutcome(NamedTuple):

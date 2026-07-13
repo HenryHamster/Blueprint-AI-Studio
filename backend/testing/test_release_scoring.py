@@ -19,6 +19,8 @@ harness without Postgres.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app import release_scoring as rs
 
 # Fixed policy mirroring promotion_policy.yaml; threshold pinned low so the
@@ -965,3 +967,76 @@ class TestFailClosedCategoryVerdicts:
         for verdicts in (fail_closed, never_graded):
             result = rs.compute_composite(**_perfect_kwargs(category_verdicts=verdicts))
             assert result["blocker"] == "criterion_coverage_incomplete"
+
+
+class TestBlockerExecutionSite:
+    """The pure execution-site classification of promotion blockers.
+
+    Tags each hard-blocker code by WHERE the responsible check runs so operators
+    and agents can tell whether a fix on automain takes effect pre-promotion
+    (candidate-side) or is inert until the version itself promotes
+    (deployed-side / release-machinery self-reference).
+    """
+
+    def test_migration_blockers_are_deployed_side(self):
+        # Both migration gates compare the candidate against the DEPLOYED
+        # promotion target / production schema — inert-until-promote.
+        assert (
+            rs.blocker_execution_site("migration_identity_collision")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+        assert (
+            rs.blocker_execution_site("migration_apply_drift")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+
+    def test_candidate_side_blockers(self):
+        # These all fire on candidate content — a fix on automain clears them on
+        # the next qualification.
+        for code in (
+            "ci_not_green",
+            "ci_unresolved",
+            "smoketest_startup_failed",
+            "audit_missing",
+            "test_file_deleted",
+            "criterion_coverage_incomplete",
+            "merge_grade_misses",
+            "capability_proof_gate_blocked",
+            "uncorroborated_attestation",
+        ):
+            assert (
+                rs.blocker_execution_site(code) == rs.EXECUTION_SITE_CANDIDATE
+            ), code
+
+    def test_none_and_unknown_return_none(self):
+        assert rs.blocker_execution_site(None) is None
+        assert rs.blocker_execution_site("") is None
+        # A force-promote / unclassified sentinel is deliberately unclassified.
+        assert rs.blocker_execution_site("qualification_superseded") is None
+        assert rs.blocker_execution_site("some_future_blocker") is None
+
+    def test_every_compute_composite_blocker_code_is_classified(self):
+        # Every hard-blocker code compute_composite() can emit must have an
+        # execution-site — a new blocker without a classification is a bug.
+        import re
+
+        src = (Path(rs.__file__)).read_text()
+        emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+        assert emitted, "expected to find blocker assignments in release_scoring"
+        for code in emitted:
+            assert rs.blocker_execution_site(code) is not None, code
+
+    def test_labels_match_site_and_are_distinct(self):
+        deployed_label = rs.blocker_execution_site_label(
+            "migration_identity_collision"
+        )
+        candidate_label = rs.blocker_execution_site_label("ci_not_green")
+        assert deployed_label == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+        assert candidate_label == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_CANDIDATE]
+        assert deployed_label != candidate_label
+        # Deployed phrase conveys inert-until-promote; candidate phrase does not.
+        assert "inert" in deployed_label
+        assert "next qualification" in candidate_label
+        # No blocker / unclassified → no label.
+        assert rs.blocker_execution_site_label(None) is None
+        assert rs.blocker_execution_site_label("qualification_superseded") is None
