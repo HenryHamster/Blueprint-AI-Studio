@@ -5839,6 +5839,161 @@ class TestReportCommandLogDropsArbitraryKeys:
         )
 
 
+class TestInputArtifactDownloadEndpoint:
+    """The runner-facing cross-job checkpoint-resume download endpoint.
+
+    Scoped exactly like the report/artifact endpoints (pinned runner + same
+    project), and additionally checks the predecessor belongs to the runner's
+    project before streaming its durable bundle.
+    """
+
+    async def _make_pinned_job(self, db_session, project, runner, meta):
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id), **meta},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return job
+
+    @pytest.mark.asyncio
+    async def test_streams_predecessor_bundle(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(job_id):
+            return b"BUNDLE-BYTES" if str(job_id) == str(predecessor.id) else None
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.content == b"BUNDLE-BYTES"
+        assert resp.headers["content-type"] == "application/gzip"
+
+    @pytest.mark.asyncio
+    async def test_404_when_no_input_artifact_reference(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = await self._make_pinned_job(db_session, project, runner, {})
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_404_when_predecessor_in_other_project(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        other = await _make_project(db_session, owner_id="other-owner")
+        runner, token = await _make_runner(db_session, project.id)
+        # Predecessor lives in a DIFFERENT project — must never be streamed.
+        foreign = ComputeJob(
+            project_id=other.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.SUCCEEDED,
+            polling_metadata={},
+        )
+        db_session.add(foreign)
+        await db_session.commit()
+        await db_session.refresh(foreign)
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(foreign.id)},
+        )
+
+        async def fake_download(job_id):
+            return b"SHOULD-NOT-BE-SERVED"
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_404_when_bundle_missing(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(job_id):
+            return None
+
+        monkeypatch.setattr(
+            storage, "download_compute_job_artifact_bundle", fake_download
+        )
+
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_next_compute_job_includes_input_artifact_job_id(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor_id = str(uuid.uuid4())
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo resume",
+                "input_artifact_job_id": predecessor_id,
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["input_artifact_job_id"] == predecessor_id
+
+
 class TestReportInterimProgressAndLiveOutput:
     """Interim-report protocol: live_output tail + self-reported progress records.
 

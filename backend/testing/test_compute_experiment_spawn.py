@@ -113,6 +113,69 @@ def test_author_contract_tolerates_non_dict_nested():
     assert contract["command"] == "run"
 
 
+def test_author_contract_collects_input_artifact_job_id():
+    predecessor = str(uuid.uuid4())
+    finding = {
+        "command": "resume.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "input_artifact_job_id": predecessor,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["input_artifact_job_id"] == predecessor
+
+
+def test_validate_contract_accepts_valid_input_artifact_job_id():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": str(uuid.uuid4()),
+        },
+        require_smoke=False,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_contract_rejects_malformed_input_artifact_job_id():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": "not-a-uuid",
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "input_artifact_job_id" in reason
+
+
+def test_compute_experiment_payload_retains_input_artifact_job_id():
+    """The validated compute_experiment payload must keep input_artifact_job_id
+    so the orchestrator dispatch consumer can rehydrate the predecessor bundle.
+
+    Regression guard: the field was previously absent from the schema, so the
+    contract-authored/orchestrator resume reference was silently dropped at
+    validation before it could reach create_compute_job.
+    """
+    from app.payload_schemas import ComputeExperimentPayload
+
+    predecessor = str(uuid.uuid4())
+    payload = ComputeExperimentPayload.model_validate(
+        {
+            "command": "resume.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+            "input_artifact_job_id": predecessor,
+        }
+    )
+    assert payload.input_artifact_job_id == predecessor
+    assert payload.model_dump().get("input_artifact_job_id") == predecessor
+
+
 def test_author_contract_forwards_accelerator():
     # GPU accelerator and provisioning_model are forwarded when flat on finding
     finding = {

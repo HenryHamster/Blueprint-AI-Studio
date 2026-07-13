@@ -91,6 +91,8 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "container_registry_auth",
         "allow_host_fallback",
         "spawn_followup",
+        "no_progress_timeout_seconds",
+        "input_artifact_job_id",
         "runner_target",
         "vram_gb",
     ):
@@ -236,6 +238,40 @@ def _validate_compute_launch_contract(
         )
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
+
+    no_progress_timeout = contract.get("no_progress_timeout_seconds")
+    if no_progress_timeout is not None:
+        try:
+            npt = int(no_progress_timeout)
+        except (TypeError, ValueError):
+            return (
+                False,
+                f"no_progress_timeout_seconds is not an integer "
+                f"({no_progress_timeout!r})",
+            )
+        if not npt > 0:
+            return False, (
+                f"no_progress_timeout_seconds must be positive (got {npt})"
+            )
+        if npt > deadline:
+            return False, (
+                f"no_progress_timeout_seconds ({npt}) must not exceed "
+                f"deadline_seconds ({deadline})"
+            )
+
+    input_artifact_job_id = contract.get("input_artifact_job_id")
+    if input_artifact_job_id is not None:
+        # Shape check only — the orchestrator does the authoritative same-project +
+        # bundle-exists validation at create_compute_job time (needs the DB). Here we
+        # only reject an obviously-malformed UUID so a bad reference is caught early.
+        try:
+            uuid.UUID(str(input_artifact_job_id))
+        except (ValueError, AttributeError, TypeError):
+            return (
+                False,
+                f"input_artifact_job_id must be a UUID string "
+                f"({input_artifact_job_id!r})",
+            )
 
     container_image = contract.get("container_image")
     if container_image is not None:

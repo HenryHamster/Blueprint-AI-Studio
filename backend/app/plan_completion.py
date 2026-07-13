@@ -984,6 +984,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "require_durable_artifact",
                             "sweep_id",
                             "setup_step",
+                            "no_progress_timeout_seconds",
+                            "input_artifact_job_id",
                             "container_image",
                             "container_registry_auth",
                             "declared_metric",

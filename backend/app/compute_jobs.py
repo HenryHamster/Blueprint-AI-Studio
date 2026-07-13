@@ -458,6 +458,7 @@ async def create_compute_job(
     container_image: str | None = None,
     container_registry_auth: dict | None = None,
     allow_host_fallback: bool = False,
+    no_progress_timeout_seconds: int | None = None,
     declared_metric: str | None = None,
     input_artifact_job_id: str | None = None,
 ) -> ComputeJob:
@@ -505,6 +506,20 @@ async def create_compute_job(
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
     capped_deadline = clamp_deadline_seconds(deadline_seconds)
+    # Validate and clamp no_progress_timeout_seconds: positive, not exceeding the
+    # runtime deadline, and never shorter than 60s (a shorter window would false-
+    # fire on normal compute startup / dependency install).
+    capped_np_timeout: int | None = None
+    if no_progress_timeout_seconds is not None:
+        raw_np = int(no_progress_timeout_seconds)
+        if raw_np < 0:
+            raise ValueError(
+                f"no_progress_timeout_seconds must be positive (got {raw_np})"
+            )
+        if raw_np == 0:
+            capped_np_timeout = None  # 0 = disable
+        else:
+            capped_np_timeout = max(60, min(raw_np, capped_deadline))
     # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
     # cost rate, and provisioning path all resolve the same supported shape.
     persisted_accelerator = accel_spec.name if accel_spec is not None else None
@@ -582,6 +597,7 @@ async def create_compute_job(
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
         container_image=container_image,
+        no_progress_timeout_seconds=capped_np_timeout,
         input_artifact_job_id=resolved_input_artifact_job_id,
     )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
@@ -668,6 +684,8 @@ async def create_compute_job(
         polling_metadata["declared_metric"] = declared_metric.strip()
     if setup_step is not None:
         polling_metadata["setup_step"] = setup_step
+    if capped_np_timeout is not None:
+        polling_metadata["no_progress_timeout_seconds"] = capped_np_timeout
     if container_image:
         polling_metadata["container_image"] = container_image
         if container_registry_auth and isinstance(container_registry_auth, dict):
@@ -1057,6 +1075,7 @@ def _build_launch_request_fingerprint(
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
     container_image: str | None = None,
+    no_progress_timeout_seconds: int | None = None,
     input_artifact_job_id: str | None = None,
 ) -> str:
     payload = {
@@ -1072,6 +1091,7 @@ def _build_launch_request_fingerprint(
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
         "live_proof_requirement": live_proof_requirement,
+        "no_progress_timeout_seconds": no_progress_timeout_seconds,
         "input_artifact_job_id": input_artifact_job_id,
     }
     return hashlib.sha256(
@@ -2723,6 +2743,16 @@ async def _apply_task_terminal_cancellation(
         return True
 
 
+def _coerce_uuid(value: Any) -> uuid.UUID | None:
+    """Best-effort parse of a persisted UUID string; None on any malformed value."""
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     meta = job.polling_metadata or {}
     env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
@@ -2767,6 +2797,11 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         setup_step=meta.get("setup_step") or None,
         container_image=meta.get("container_image") or None,
         container_registry_auth=container_registry_auth,
+        no_progress_timeout_seconds=(
+            int(meta.get("no_progress_timeout_seconds"))
+            if meta.get("no_progress_timeout_seconds") is not None
+            else None
+        ),
         input_artifact_job_id=meta.get("input_artifact_job_id") or None,
     )
 

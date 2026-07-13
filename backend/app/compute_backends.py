@@ -55,6 +55,9 @@ _ARTIFACT_UPLOAD_B64 = base64.b64encode(
 _TERMINAL_RECORD_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "terminal_record.py").read_bytes()
 ).decode("ascii")
+_ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "artifact_download.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,82 @@ def _load_result_json(result_path: str) -> Any:
     """Synchronous helper for run_preflight_smoke — offloaded via asyncio.to_thread
     so that file I/O and json.loads don't block the event loop."""
     return json.loads(Path(result_path).read_text(encoding="utf-8"))
+
+
+def _is_safe_tar_member(name: str) -> bool:
+    """True when a tar member name is safe to extract under a destination dir.
+
+    Rejects absolute paths and any member that would escape the destination via
+    ``..`` traversal (either a leading component or an embedded one). Both POSIX
+    (``/``) and Windows (``\\``) separators are normalized so a crafted bundle
+    cannot slip a traversal segment past the check.
+    """
+    if not name:
+        return False
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("~"):
+        return False
+    # os.path.splitdrive guards against Windows drive-absolute (``C:\\``) members.
+    if os.path.splitdrive(normalized)[0]:
+        return False
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    return ".." not in parts
+
+
+def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
+    """Extract a ``.tar.gz`` artifact bundle into ``dest_dir``, path-traversal-safe.
+
+    Members with absolute paths or ``..`` traversal are SKIPPED (never extracted),
+    so a malicious or corrupt predecessor bundle can only ever write inside
+    ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
+    could point outside the destination even when the member name itself is safe.
+    Returns the count of members actually extracted.
+
+    Raises ``tarfile.TarError`` (or ``OSError``) on an unreadable/corrupt archive
+    so the caller can fail the job with a clear reason rather than proceeding
+    against a half-populated workspace.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    extracted = 0
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if member.islnk() or member.issym():
+                continue
+            if not _is_safe_tar_member(member.name):
+                logger.warning(
+                    "Skipping unsafe artifact-bundle member %r during rehydration",
+                    member.name,
+                )
+                continue
+            tar.extract(member, path=dest_dir)
+            extracted += 1
+    return extracted
+
+
+async def _rehydrate_input_artifact_bundle(
+    input_artifact_job_id: str, dest_dir: str
+) -> int:
+    """Fetch a predecessor's durable bundle and extract it into ``dest_dir``.
+
+    Raises ``RuntimeError`` when the predecessor bundle is missing or unreadable
+    so the job fails LOUDLY with a clear reason instead of silently running
+    against an empty workspace. Returns the number of files rehydrated.
+    """
+    bundle = await storage.download_compute_job_artifact_bundle(input_artifact_job_id)
+    if bundle is None:
+        raise RuntimeError(
+            "input_artifact_rehydration_failed: predecessor compute job "
+            f"{input_artifact_job_id} has no durable artifact bundle to resume from"
+        )
+    try:
+        return await asyncio.to_thread(
+            _safe_extract_artifact_bundle, bundle, dest_dir
+        )
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(
+            "input_artifact_rehydration_failed: predecessor bundle for "
+            f"{input_artifact_job_id} could not be extracted: {exc}"
+        ) from exc
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -88,11 +167,19 @@ RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
 # disk under the job's state root, and the GCP backend uploads it to a per-job
 # durable object prefix before poweroff.
 ARTIFACT_DIR_ENV = "BLUEPRINT_ARTIFACT_DIR"
+# Well-known env var pointing the launched command at a progress file it may
+# periodically touch or write to signal liveness. Any write (mtime bump or
+# changed content) counts as progress. The no-progress watchdog polls this
+# file; when no_progress_timeout_seconds is set and the file has not advanced
+# within that window, the job is killed early with terminal reason
+# ``no_progress_timeout`` and exit code 125.
+PROGRESS_FILE_ENV = "BLUEPRINT_PROGRESS_FILE"
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
 _GCP_ARTIFACT_DIR_PATH = "/tmp/blueprint_compute_artifacts"
 _GCP_ARTIFACT_BUNDLE_PATH = "/tmp/blueprint_compute_artifacts.tar.gz"
+_GCP_PROGRESS_FILE_PATH = "/tmp/blueprint_compute_progress.json"
 # Durable terminal record the startup script writes into the artifact dir right
 # before poweroff. It carries the authoritative outcome (status/exit/reason +
 # the same base64 metric/log/release payloads as the serial markers) so a job
@@ -298,6 +385,12 @@ class ComputeLaunchSpec:
     # Registry credentials for private/gated registries.  Only {server, username}
     # survive to the persisted launch spec; password is never written to the DB.
     container_registry_auth: dict | None = None
+    # Optional no-progress watchdog timeout in seconds. When set, the execution
+    # backend monitors the progress file (BLUEPRINT_PROGRESS_FILE) and terminates
+    # the job early with exit code 125 + terminal reason ``no_progress_timeout``
+    # if the file's mtime/size has not advanced within this window. Unset/None
+    # means the watchdog is inert and the job runs to its full runtime deadline.
+    no_progress_timeout_seconds: int | None = None
     # Optional cross-job checkpoint resume source: the id of a prior compute job
     # whose durable artifact bundle is fetched and extracted into the artifact dir
     # BEFORE the command runs, so a long job resumes from its predecessor's latest
@@ -645,6 +738,17 @@ class LocalSubprocessComputeBackend:
         # Offload sync file I/O (os.makedirs, _write_local_state_text, os.remove)
         # to a thread-pool thread so the event loop is not blocked during job launch.
         await asyncio.to_thread(_launch_setup_state_dir, external_id, started_at_iso)
+        # Cross-job checkpoint resume: rehydrate the predecessor's durable bundle
+        # into the artifact dir BEFORE the wrapper command runs, so the command
+        # sees the checkpoint already present in $BLUEPRINT_ARTIFACT_DIR. The
+        # wrapper's later `mkdir -p` is idempotent and never removes these files.
+        # A missing/unreadable bundle raises (fails the job LOUDLY) rather than
+        # letting the command run against an empty workspace.
+        if spec.input_artifact_job_id is not None:
+            await _rehydrate_input_artifact_bundle(
+                spec.input_artifact_job_id,
+                _local_artifact_dir_for_external_id(external_id),
+            )
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
         wrapper_command = _build_local_wrapper_command(
@@ -656,6 +760,7 @@ class LocalSubprocessComputeBackend:
             cwd=spec.cwd,
             env=spec.env,
             repo_clone=spec.repo_clone,
+            no_progress_timeout_seconds=spec.no_progress_timeout_seconds,
         )
         # Offload subprocess.Popen to a thread-pool thread — Popen itself is fast
         # but its preexec_fn / env setup can block the event loop.
@@ -1007,13 +1112,26 @@ class RunnerSubprocessBackend:
                 if runner_exec_status == "succeeded"
                 else ComputeJobStatus.FAILED
             )
+            if cjs == ComputeJobStatus.SUCCEEDED:
+                message = "compute job succeeded"
+            elif exit_code == 125:
+                # No-progress watchdog kill on the runner. The runner /report
+                # endpoint carries only exec_status/exit_code (no reason field),
+                # so translate the reserved exit code here into a terminal reason
+                # string classify_compute_terminal_reason keys on. Without this the
+                # kill collapses to CODE_ERROR (burns retry budget, misattributes
+                # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
+                # -subprocess paths which emit REASON=no_progress_timeout directly.
+                message = "no_progress_timeout"
+            else:
+                message = "compute job failed"
             return ComputeStatusResult(
                 status=cjs,
                 exit_code=exit_code if exit_code is not None else (0 if cjs == ComputeJobStatus.SUCCEEDED else None),
                 finished_at=finished_at or _utcnow(),
                 metrics=metrics,
                 command_log=command_log,
-                message="compute job succeeded" if cjs == ComputeJobStatus.SUCCEEDED else "compute job failed",
+                message=message,
             )
         # Unknown status string — treat as still running.
         return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
@@ -1234,6 +1352,7 @@ def _build_container_run_prefix(
     """
     result_file = f"{container_out_dir}/result.json"
     artifact_dir = f"{container_out_dir}/artifacts"
+    progress_file = f"{container_out_dir}/progress.json"
     parts = ["docker", "run", "--rm"]
     if gpus:
         parts += ["--gpus", "all"]
@@ -1241,6 +1360,7 @@ def _build_container_run_prefix(
         "-v", shlex.quote(f"{host_out_dir}:{container_out_dir}"),
         "-e", shlex.quote(f"{RESULT_FILE_ENV}={result_file}"),
         "-e", shlex.quote(f"{ARTIFACT_DIR_ENV}={artifact_dir}"),
+        "-e", shlex.quote(f"{PROGRESS_FILE_ENV}={progress_file}"),
     ]
     for host_path, container_path in extra_mounts or []:
         parts += ["-v", shlex.quote(f"{host_path}:{container_path}")]
@@ -1262,12 +1382,14 @@ def _build_local_wrapper_command(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     repo_clone: dict | None = None,
+    no_progress_timeout_seconds: int | None = None,
 ) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
     result_path = shlex.quote(_local_result_path_for_external_id(external_id))
     artifact_dir = shlex.quote(_local_artifact_dir_for_external_id(external_id))
+    progress_file = shlex.quote(_local_progress_file_path_for_external_id(external_id))
     command_log_path = shlex.quote(
         os.path.join(
             _local_artifact_dir_for_external_id(external_id),
@@ -1370,6 +1492,44 @@ SETUP_EOF
 fi"""
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
+    _no_progress_watchdog_block = ""
+    _np_watchdog_cleanup = ""
+    if no_progress_timeout_seconds is not None and no_progress_timeout_seconds > 0:
+        _np_seconds = int(no_progress_timeout_seconds)
+        _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file is untouched
+# for {_np_seconds}s. Runs in parallel with the command as a SLIDING window —
+# each interval that advances the progress mtime resets the deadline, so a job
+# that progresses then stalls is still cut on the next quiet interval (matches
+# the GCP startup-script and scripts/local_runner.py watchdogs).
+touch {progress_file} 2>/dev/null || true
+(
+  _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+  while true; do
+    sleep {_np_seconds}
+    _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    if [ "$_NP_NOW" = "$_NP_START" ]; then
+      # No progress in the last window — terminal reason no_progress_timeout.
+      FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      cat > {terminal_path} <<NP_EOF
+STATUS=FAILED
+EXIT_CODE=125
+FINISHED_AT=$FINISHED_AT
+REASON=no_progress_timeout
+METRICS=
+COMMAND_LOG=
+RELEASE_ECHO=
+NP_EOF
+      kill -TERM -$$ 2>/dev/null || true
+      sleep 2
+      kill -KILL -$$ 2>/dev/null || true
+      exit 0
+    fi
+    _NP_START=$_NP_NOW
+  done
+) &
+_NP_WATCHDOG_PID=$!
+"""
+        _np_watchdog_cleanup = 'kill "$_NP_WATCHDOG_PID" 2>/dev/null || true'
     return f"""mkdir -p {state_dir}
 mkdir -p {artifact_dir}
 printf '%s\\n' "$$" > {pid_path}
@@ -1378,8 +1538,10 @@ rm -f {result_path}
 rm -f {command_log_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+export {PROGRESS_FILE_ENV}={progress_file}
 {setup_step_block}
 {container_setup_block}
+{_no_progress_watchdog_block}
 EXIT_CODE=0
 if python3 - \
   {command_literal} \
@@ -1453,6 +1615,7 @@ else
   STATUS=FAILED
   EXIT_CODE=$?
 fi
+{_np_watchdog_cleanup}
 FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 METRICS_B64=""
 if [ -f {result_path} ]; then
@@ -1531,6 +1694,14 @@ def _local_artifact_metadata(external_id: str | None) -> dict[str, str]:
     """
     path = _local_artifact_dir_for_external_id(external_id)
     return {"artifact_dir": path, "artifact_uri": f"file://{path}"}
+
+
+def _local_progress_file_path_for_external_id(external_id: str | None) -> str:
+    """Progress file path for a local job — polled by the no-progress watchdog."""
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        "progress.json",
+    )
 
 
 def _read_local_live_tail(job: ComputeJob) -> dict[str, Any] | None:
@@ -2141,6 +2312,7 @@ def _build_gcp_startup_script(
     # both reference, so assign them before repo_setup_block is built below.
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    progress_file = shlex.quote(_GCP_PROGRESS_FILE_PATH)
     # Container mode: when the contract declares a runtime image, the command runs
     # inside `docker run` instead of a bare `bash -lc`. The VM artifact dir is
     # bind-mounted into the container so result.json and artifacts written inside
@@ -2156,6 +2328,19 @@ def _build_gcp_startup_script(
             _GCP_ARTIFACT_DIR_PATH, "result.json"
         )
         result_file = shlex.quote(container_result_host_path)
+        # In container mode _build_container_run_prefix points the container's
+        # BLUEPRINT_PROGRESS_FILE at container_out_dir/progress.json. For GCP
+        # host_out_dir == container_out_dir == _GCP_ARTIFACT_DIR_PATH, so the
+        # command writes progress to _GCP_ARTIFACT_DIR_PATH/progress.json on the
+        # host — a different file from the standalone _GCP_PROGRESS_FILE_PATH the
+        # bare-mode export uses. Repoint the host-visible progress_file (which the
+        # no-progress watchdog stat's) at that same file so the watchdog observes
+        # the container's mtime advances instead of killing a live job at the
+        # first no_progress_timeout window.
+        container_progress_host_path = os.path.join(
+            _GCP_ARTIFACT_DIR_PATH, "progress.json"
+        )
+        progress_file = shlex.quote(container_progress_host_path)
         _container_extra_mounts: list[tuple[str, str]] | None = None
         _container_workdir: str | None = None
         _container_extra_env: dict[str, str] | None = None
@@ -2240,7 +2425,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -2281,7 +2466,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 setup_step_failed "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi"
@@ -2332,7 +2517,7 @@ def _build_gcp_startup_script(
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
             + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             + "  upload_artifacts\n"
-            + '  kill "$TTL_PID" 2>/dev/null || true\n'
+            + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
             + "  exit 1\n"
             + "fi\n"
@@ -2405,9 +2590,16 @@ def _build_gcp_startup_script(
     terminal_record_b64 = _TERMINAL_RECORD_B64
     orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
     job_id_q = shlex.quote(str(spec.job_id))
+    np_timeout = (
+        max(60, int(spec.no_progress_timeout_seconds))
+        if spec.no_progress_timeout_seconds is not None
+        and spec.no_progress_timeout_seconds > 0
+        else 0
+    )
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
+_NP_TIMEOUT_SECONDS={np_timeout}
 echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
 echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
 echo '{terminal_record_b64}' | base64 -d > /tmp/blueprint_terminal_record.py
@@ -2454,6 +2646,33 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
   poweroff || shutdown -h now || true
 ) &
 TTL_PID=$!
+# No-progress watchdog: parallel to the TTL watchdog. When
+# no_progress_timeout_seconds is set, this watchdog polls the progress file's
+# mtime and kills the VM early if the job has stalled with no progress signal.
+# When unset/0 the watchdog skip-branch makes the block a no-op.
+touch {progress_file} 2>/dev/null || true
+(
+  if [ "$_NP_TIMEOUT_SECONDS" -gt 0 ]; then
+    _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    while true; do
+      sleep "$_NP_TIMEOUT_SECONDS"
+      _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+      if [ "$_NP_NOW" = "$_NP_START" ]; then
+        python3 /tmp/blueprint_terminal_record.py \
+          {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
+          >/dev/null 2>&1 || true
+        echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
+        echo "{_SERIAL_STATUS_PREFIX}FAILED"
+        echo "{_SERIAL_EXIT_PREFIX}125"
+        upload_artifacts
+        poweroff || shutdown -h now || true
+        exit 0
+      fi
+      _NP_START=$_NP_NOW
+    done
+  fi
+) &
+_NP_WATCHDOG_PID=$!
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
 _compute_heartbeat() {{
@@ -2478,6 +2697,7 @@ echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+export {PROGRESS_FILE_ENV}={progress_file}
 rm -f {result_file}
 rm -f {command_log_path}
 mkdir -p {artifact_dir}
@@ -2528,7 +2748,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" "$_HEARTBEAT_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """

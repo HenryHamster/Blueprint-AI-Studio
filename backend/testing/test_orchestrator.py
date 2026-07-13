@@ -195,6 +195,29 @@ def test_dispatch_prep_contention_quarantine_threshold_is_bounded():
     )
 
 
+def test_build_compute_launch_kwargs_forwards_no_progress_timeout():
+    """_build_compute_launch_kwargs must forward no_progress_timeout_seconds from
+    the compute_experiment payload to create_compute_job kwargs — like every peer
+    optional launch field (setup_step, container_image, allow_host_fallback) — so a
+    task launched directly by the orchestrator gets the same no-progress watchdog an
+    agent-launched job would. Omitting it silently dropped the field."""
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    kwargs = _build_compute_launch_kwargs(
+        {"no_progress_timeout_seconds": 300},
+        command="python3 run.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=1800,
+    )
+    assert kwargs["no_progress_timeout_seconds"] == 300
+
+    # Absent field ⇒ not forwarded (backend default / inert watchdog).
+    kwargs_absent = _build_compute_launch_kwargs(
+        {}, command="python3 run.py", spend_cap_usd=5.0, deadline_seconds=1800
+    )
+    assert "no_progress_timeout_seconds" not in kwargs_absent
+
+
 # ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
 
 

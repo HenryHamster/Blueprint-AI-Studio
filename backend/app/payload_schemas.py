@@ -1045,6 +1045,18 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # budget is consumed by the main command. Use to install dependencies that are
     # absent from the base VM image (e.g. `pip install -r requirements.txt`).
     setup_step: str | None = None
+    # Optional no-progress watchdog window (peer of runtime deadline). When set and
+    # positive, a job that writes no intermediate progress to BLUEPRINT_PROGRESS_FILE
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    # Absent/None ⇒ inert watchdog; the job runs to its runtime deadline unchanged.
+    no_progress_timeout_seconds: int | None = None
+    # Optional cross-job checkpoint resume reference. When set to a prior compute
+    # job's id, that job's durable artifact bundle is rehydrated into this job's
+    # workspace before the command runs (see compute_jobs.create_compute_job /
+    # compute_backends._rehydrate_input_artifact_bundle). Absent ⇒ fresh workspace,
+    # unchanged. Validated as a UUID string at create time; a missing/foreign/
+    # bundle-less reference fails loud rather than silently running empty.
+    input_artifact_job_id: str | None = None
     # Optional container image URI. When set the compute backend wraps the command
     # in ``docker run`` with the result-file directory volume-mounted. Absent ⇒
     # existing bare bash -lc path, unchanged. General — no image hardcoding.

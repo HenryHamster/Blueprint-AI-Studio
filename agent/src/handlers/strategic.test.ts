@@ -245,6 +245,7 @@ const {
     'calcMessageAge',
     'classifyFailureCategory',
     'formatCochangeHints',
+    'formatCriteriaRubric',
     'formatDecompositionOutcomes',
     'formatPastRetirementCritiques',
     'formatPreviousDecisionOutcomes',

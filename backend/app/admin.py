@@ -2228,6 +2228,10 @@ class ComputeExperimentTaskPayload(BaseModel):
     container_image: str | None = None
     container_registry_auth: dict[str, str] | None = None
     setup_step: str | None = None
+    # No-progress watchdog window (peer of the runtime deadline). When set and
+    # positive, a stalled job that writes no progress to BLUEPRINT_PROGRESS_FILE
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    no_progress_timeout_seconds: int | None = None
     # Optional pin to a specific enrolled runner (soft preference by default;
     # strict=true dispatches only to that runner and holds with an explicit
     # reason while it is ineligible). Validated against the project's enrolled
@@ -3176,6 +3180,7 @@ async def create_compute_experiment_task(
         "container_image",
         "container_registry_auth",
         "setup_step",
+        "no_progress_timeout_seconds",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -3287,6 +3292,7 @@ async def create_compute_experiment_task(
                 "container_image",
                 "container_registry_auth",
                 "setup_step",
+                "no_progress_timeout_seconds",
                 "runner_target",
             )
             if launch_contract.get(k) is not None

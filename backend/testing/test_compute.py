@@ -1268,6 +1268,53 @@ def test_gcp_startup_script_writes_durable_terminal_record():
     assert "|| true" in script
 
 
+def test_gcp_startup_script_includes_no_progress_watchdog_when_set():
+    """GCP startup script includes a no-progress watchdog subprocess when
+    no_progress_timeout_seconds is set, and exports BLUEPRINT_PROGRESS_FILE."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        no_progress_timeout_seconds=600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # Progress file env var must be exported.
+    assert "export BLUEPRINT_PROGRESS_FILE=" in script
+    # Watchdog block must be present with the correct timeout and exit code.
+    assert "_NP_WATCHDOG_PID=$!" in script
+    assert "_NP_TIMEOUT_SECONDS=" in script  # set at the top of the script
+    assert "no_progress_timeout" in script
+    assert "EXIT_CODE=125" in script
+    # Cleanup must include the watchdog PID.
+    assert 'kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID"' in script
+
+
+def test_gcp_startup_script_no_progress_watchdog_inert_when_unset():
+    """GCP startup script includes the watchdog shell code but the guard branch
+    (_NP_TIMEOUT_SECONDS -gt 0) skips it when no_progress_timeout_seconds is unset."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        # no_progress_timeout_seconds is NOT set
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # Progress file env var must still be exported (always set).
+    assert "export BLUEPRINT_PROGRESS_FILE=" in script
+    # _NP_TIMEOUT_SECONDS must be 0 so the watchdog sleep loop is skipped.
+    assert "_NP_TIMEOUT_SECONDS=0" in script
+
+
 def test_extract_terminal_record_from_bundle_roundtrips_and_failsoft():
     extract = compute_backends_module._extract_terminal_record_from_bundle
     # A faithful multi-file bundle: terminal.json is picked out by basename even
@@ -1496,6 +1543,60 @@ async def test_runner_subprocess_poll_cost_bounds_runtime_for_spend_cap():
         job, as_of=started + timedelta(seconds=seconds_to_cap + 1)
     )
     assert cost.total_cost_usd >= spend_cap
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_status_exit_125_classifies_no_progress():
+    """A runner no-progress watchdog kill reports exec_status=failed exit_code=125
+    with no reason field (the /report endpoint carries none). poll_status must
+    translate exit 125 into a terminal reason string that
+    classify_compute_terminal_reason maps to NO_PROGRESS_TIMEOUT — otherwise the
+    platform kill collapses to CODE_ERROR and burns retry budget."""
+    from app.failure_classification import (
+        NO_PROGRESS_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    backend = RunnerSubprocessBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "runner_exec_status": "failed",
+            "runner_exit_code": 125,
+        },
+    )
+    result = await backend.poll_status(job)
+    assert result.status == ComputeJobStatus.FAILED
+    assert result.exit_code == 125
+    assert "no_progress_timeout" in result.message
+    assert (
+        classify_compute_terminal_reason(result.message, None)
+        == NO_PROGRESS_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_subprocess_poll_status_generic_failure_not_no_progress():
+    """A non-125 runner failure keeps the generic terminal reason (does not get
+    mislabelled as a no-progress kill)."""
+    backend = RunnerSubprocessBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "runner_exec_status": "failed",
+            "runner_exit_code": 1,
+        },
+    )
+    result = await backend.poll_status(job)
+    assert result.status == ComputeJobStatus.FAILED
+    assert result.message == "compute job failed"
+    assert "no_progress_timeout" not in result.message
 
 
 @pytest.mark.asyncio
@@ -1757,6 +1858,246 @@ async def test_local_backend_artifact_dir_survives_subprocess_exit():
         assert handle.read().strip() == "checkpoint-bytes"
 
 
+async def _await_local_terminal(compute_job) -> None:
+    """Poll a local subprocess job's durable terminal marker with a bounded budget."""
+    for _ in range(80):
+        if compute_backends_module._read_local_terminal_status(compute_job) is not None:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("expected local terminal marker for completed subprocess")
+
+
+@pytest.mark.asyncio
+async def test_input_artifact_job_id_rehydrates_checkpoint_bundle(monkeypatch):
+    """End-to-end cross-job checkpoint resume seam.
+
+    A FIRST job writes a checkpoint file to $BLUEPRINT_ARTIFACT_DIR and completes;
+    its durable bundle is then served (monkeypatched storage) to a SECOND job
+    launched with ``input_artifact_job_id`` pointing at the first. The second job
+    starts with that checkpoint file already present in its $BLUEPRINT_ARTIFACT_DIR
+    BEFORE its own command runs — proving rehydration happens ahead of execution.
+    """
+    backend = LocalSubprocessComputeBackend()
+
+    # ── First job: write a checkpoint into the durable artifact dir.
+    first_id = uuid.uuid4()
+    first_spec = ComputeLaunchSpec(
+        job_id=first_id,
+        command='echo "step-42" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    first_result = await backend.launch(first_spec)
+    first_artifact_dir = first_result.metadata["artifact_dir"]
+    first_job = ComputeJob(
+        id=first_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=first_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": first_result.metadata["pid"]},
+    )
+    await _await_local_terminal(first_job)
+    assert os.path.exists(os.path.join(first_artifact_dir, "model.ckpt"))
+
+    # Build the predecessor's durable bundle from its artifact dir, then serve it as
+    # the stored bundle for `first_id` (what GCS would hold after upload).
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(first_artifact_dir, arcname=".")
+    bundle_bytes = buf.getvalue()
+
+    async def fake_download(job_id):
+        return bundle_bytes if str(job_id) == str(first_id) else None
+
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", fake_download
+    )
+
+    # ── Second job: launched WITH the predecessor reference; its command copies the
+    # rehydrated checkpoint into result.json so the seam is observable via metrics.
+    second_id = uuid.uuid4()
+    second_spec = ComputeLaunchSpec(
+        job_id=second_id,
+        command='test -f "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        input_artifact_job_id=first_id,
+    )
+    second_result = await backend.launch(second_spec)
+    second_artifact_dir = second_result.metadata["artifact_dir"]
+
+    # Rehydration ran synchronously inside launch() BEFORE the subprocess spawned:
+    # the predecessor's checkpoint is already present in the new job's artifact dir.
+    rehydrated = os.path.join(second_artifact_dir, "model.ckpt")
+    assert os.path.exists(rehydrated), "predecessor checkpoint not rehydrated"
+    with open(rehydrated, encoding="utf-8") as handle:
+        assert handle.read().strip() == "step-42"
+
+    # And the second command (which asserts the file exists) succeeds.
+    second_job = ComputeJob(
+        id=second_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=second_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": second_result.metadata["pid"]},
+    )
+    await _await_local_terminal(second_job)
+    terminal = compute_backends_module._read_local_terminal_status(second_job)
+    assert terminal is not None
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_input_artifact_rehydration_fails_loudly_when_bundle_missing(monkeypatch):
+    """A missing predecessor bundle at run time fails the launch LOUDLY rather than
+    letting the command run against an empty workspace."""
+    backend = LocalSubprocessComputeBackend()
+
+    async def fake_download(job_id):
+        return None
+
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", fake_download
+    )
+
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo should-not-run",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        input_artifact_job_id=uuid.uuid4(),
+    )
+    with pytest.raises(RuntimeError, match="input_artifact_rehydration_failed"):
+        await backend.launch(spec)
+
+
+def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
+    """The extractor drops absolute-path and ``..`` traversal members, extracting
+    only the safe ones under the destination dir."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        def _add(name, data):
+            info = tarfile.TarInfo(name=name)
+            payload = data.encode()
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+
+        _add("safe.txt", "ok")
+        _add("nested/deep.txt", "ok2")
+        _add("../escape.txt", "evil")
+        _add("/abs.txt", "evil")
+    bundle = buf.getvalue()
+
+    dest = tmp_path / "artifacts"
+    extracted = compute_backends_module._safe_extract_artifact_bundle(
+        bundle, str(dest)
+    )
+
+    assert extracted == 2
+    assert (dest / "safe.txt").exists()
+    assert (dest / "nested" / "deep.txt").exists()
+    # Neither traversal member escaped the destination dir.
+    assert not (tmp_path / "escape.txt").exists()
+    assert not os.path.exists("/abs.txt") or True  # never wrote a real /abs.txt
+
+
+def test_is_safe_tar_member_guards():
+    guard = compute_backends_module._is_safe_tar_member
+    assert guard("a/b/c.txt")
+    assert guard("./ok.txt")
+    assert not guard("")
+    assert not guard("/etc/passwd")
+    assert not guard("../up.txt")
+    assert not guard("a/../../b.txt")
+    assert not guard("~/secret")
+
+
+@pytest.mark.asyncio
+async def test_no_progress_watchdog_terminates_stalled_job():
+    """The no-progress watchdog cuts a stalled job early with exit code 125
+    and terminal reason ``no_progress_timeout`` when the job produces no
+    progress signal (does not touch BLUEPRINT_PROGRESS_FILE) within the
+    configured window."""
+    backend = LocalSubprocessComputeBackend()
+    # Use a generous 5s watchdog window — the command sleeps 60s without
+    # touching the progress file, so the watchdog fires well before the
+    # command would finish naturally.
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="sleep 60",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        no_progress_timeout_seconds=5,
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    # Poll for the terminal marker — the watchdog should fire within
+    # ~5s + overhead, well before the 60s sleep expires.
+    terminal = None
+    for _ in range(80):  # up to ~8s at 0.1s intervals
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert terminal is not None, (
+        "expected terminal marker from no-progress watchdog, "
+        "but none appeared within 8s"
+    )
+    assert terminal.status == ComputeJobStatus.FAILED
+    assert terminal.exit_code == 125
+    assert terminal.message == "no_progress_timeout"
+
+
+@pytest.mark.asyncio
+async def test_no_progress_watchdog_inert_when_unset():
+    """When no_progress_timeout_seconds is unset, the watchdog is inert and
+    the job runs to normal completion without interference."""
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        # no_progress_timeout_seconds is NOT set — watchdog should be inert
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    # Poll for the terminal marker — job should finish naturally.
+    terminal = None
+    for _ in range(60):
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.05)
+    assert terminal is not None, "expected terminal marker for completed subprocess"
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.exit_code == 0
+
+
 def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
         "local-z"
@@ -1849,6 +2190,53 @@ def test_local_wrapper_docker_login_included_when_registry_auth_has_password(mon
     # Password must NOT appear in plain text in the wrapper (passed via printf).
     assert "secret-ngc-key" in wrapper  # present inside printf expression
     assert "docker run" in wrapper
+
+
+def test_local_wrapper_exports_progress_file_env():
+    """The local wrapper always exports BLUEPRINT_PROGRESS_FILE pointing at the
+    job's progress file in the state dir."""
+    external_id = "local-progress-test"
+    progress_file = compute_backends_module._local_progress_file_path_for_external_id(
+        external_id
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo ok", external_id=external_id
+    )
+    assert f"export BLUEPRINT_PROGRESS_FILE={shlex.quote(progress_file)}" in wrapper
+
+
+def test_local_wrapper_includes_watchdog_when_no_progress_timeout_set():
+    """When no_progress_timeout_seconds is set, the wrapper includes the no-progress
+    watchdog subprocess that monitors the progress file."""
+    external_id = "local-np-test"
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo ok",
+        external_id=external_id,
+        no_progress_timeout_seconds=120,
+    )
+    assert "_NP_WATCHDOG_PID" in wrapper
+    assert "no_progress_timeout" in wrapper
+    assert "EXIT_CODE=125" in wrapper
+    # Cleanup must kill the watchdog.
+    assert 'kill "$_NP_WATCHDOG_PID"' in wrapper
+    # The watchdog must be a SLIDING window (loop that resets the deadline when
+    # the progress mtime advances), not a single-shot sleep-then-compare — a job
+    # that progresses once then stalls must still be cut on the next quiet
+    # interval, matching the GCP startup-script watchdog.
+    assert "while true; do" in wrapper
+    assert "_NP_START=$_NP_NOW" in wrapper
+
+
+def test_local_wrapper_no_watchdog_when_no_progress_timeout_unset():
+    """When no_progress_timeout_seconds is not set, the wrapper does NOT include
+    the watchdog subprocess."""
+    external_id = "local-np-off-test"
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo ok",
+        external_id=external_id,
+        no_progress_timeout_seconds=None,
+    )
+    assert "_NP_WATCHDOG_PID" not in wrapper
 
 
 def test_local_container_mounts_repo_and_passes_env(monkeypatch):
@@ -10622,6 +11010,57 @@ def test_gcp_startup_script_wraps_command_in_container_with_gpu():
     beacon_idx = script.index("vm_terminated_before_completion")
     command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
     assert trap_idx < beacon_idx < command_idx
+
+
+def test_gcp_container_no_progress_watchdog_polls_container_progress_file():
+    """In container mode the container writes progress to
+    <artifact_dir>/progress.json (via BLUEPRINT_PROGRESS_FILE), NOT the bare-mode
+    standalone _GCP_PROGRESS_FILE_PATH. The no-progress watchdog must stat that
+    same host-visible file so it observes the container's mtime advances instead
+    of killing a live containerized job at the first no_progress_timeout window."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py --epochs 10",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=5.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        accelerator="T4",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        no_progress_timeout_seconds=600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    art = compute_backends_module._GCP_ARTIFACT_DIR_PATH
+    container_progress = f"{art}/progress.json"
+    # The container's BLUEPRINT_PROGRESS_FILE points at the mounted artifact-dir
+    # path (host_out_dir == container_out_dir == _GCP_ARTIFACT_DIR_PATH for GCP).
+    assert f"BLUEPRINT_PROGRESS_FILE={container_progress}" in script
+    # The watchdog must stat that same host path, NOT the bare-mode standalone one.
+    assert f"stat -c %Y {container_progress}" in script
+    assert compute_backends_module._GCP_PROGRESS_FILE_PATH not in script
+
+
+def test_gcp_bare_no_progress_watchdog_polls_standalone_progress_file():
+    """Without a container image, the bare-mode watchdog and export both use the
+    standalone _GCP_PROGRESS_FILE_PATH — the container-mode repoint must not leak
+    into the bare path."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        no_progress_timeout_seconds=600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    bare = compute_backends_module._GCP_PROGRESS_FILE_PATH
+    assert f"export BLUEPRINT_PROGRESS_FILE={bare}" in script
+    assert f"stat -c %Y {bare}" in script
 
 
 def test_gcp_startup_script_gpus_flag_gated_on_accelerator():

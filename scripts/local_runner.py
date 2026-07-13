@@ -2621,6 +2621,90 @@ def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_di
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
 
 
+def _is_safe_tar_member(name: str) -> bool:
+    """True when a tar member name is safe to extract under a destination dir.
+
+    Rejects absolute paths and any member that would escape the destination via
+    ``..`` traversal. Mirrors the orchestrator-side check in
+    ``compute_backends._is_safe_tar_member`` so runner and cloud rehydration reject
+    the same crafted-bundle shapes.
+    """
+    if not name:
+        return False
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("~"):
+        return False
+    if os.path.splitdrive(normalized)[0]:
+        return False
+    parts = [p for p in normalized.split("/") if p not in ("", ".")]
+    return ".." not in parts
+
+
+def _rehydrate_input_artifact(
+    orchestrator_url: str,
+    token: str,
+    job_id: str,
+    artifact_dir: str,
+) -> None:
+    """Fetch a predecessor's durable bundle and extract it into ``artifact_dir``.
+
+    Cross-job checkpoint resume: downloads the bundle streamed by
+    ``GET /api/runner/compute-job/{job_id}/input-artifact`` (scoped server-side to
+    this pinned runner + same project) and extracts it, path-traversal-safe, into
+    the job's artifact dir BEFORE the command runs so the command sees the
+    checkpoint already present in ``$BLUEPRINT_ARTIFACT_DIR``.
+
+    Raises ``RuntimeError`` on any download/extract failure so the caller fails the
+    job LOUDLY with a clear reason rather than running against an empty workspace.
+    """
+    url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            bundle = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: HTTP {exc.code} fetching "
+            f"predecessor bundle for job {job_id}"
+        ) from exc
+    except Exception as exc:  # network/URL errors
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: error fetching predecessor "
+            f"bundle for job {job_id}: {exc}"
+        ) from exc
+
+    os.makedirs(artifact_dir, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+            extracted = 0
+            for member in tar.getmembers():
+                if member.islnk() or member.issym():
+                    continue
+                if not _is_safe_tar_member(member.name):
+                    print(
+                        f"[compute] skipping unsafe artifact-bundle member "
+                        f"{member.name!r} during rehydration for job {job_id}",
+                        flush=True,
+                    )
+                    continue
+                tar.extract(member, path=artifact_dir)
+                extracted += 1
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(
+            f"input_artifact_rehydration_failed: could not extract predecessor "
+            f"bundle for job {job_id}: {exc}"
+        ) from exc
+    print(
+        f"[compute] rehydrated {extracted} checkpoint file(s) from predecessor "
+        f"for job {job_id}",
+        flush=True,
+    )
+
+
 def _parse_result_metrics(result_file: str) -> dict | None:
     """Read numeric metrics from a job's result.json (best-effort, tolerant)."""
     try:
@@ -2671,6 +2755,11 @@ def _run_compute_job(
     repo_token = job_body.get("repo_token") or None
     accelerator_type = job_body.get("accelerator_type") or None
     allow_host_fallback = bool(job_body.get("allow_host_fallback", False))
+    # No-progress watchdog timeout: when set, the runner monitors the progress file
+    # and kills the job early if no progress signal is seen within this window.
+    no_progress_timeout_seconds = job_body.get("no_progress_timeout_seconds")
+    if no_progress_timeout_seconds is not None:
+        no_progress_timeout_seconds = max(60, int(no_progress_timeout_seconds))
     input_artifact_job_id = job_body.get("input_artifact_job_id") or None
 
     caps = capabilities if capabilities is not None else _get_capabilities()
@@ -2847,6 +2936,14 @@ def _run_compute_job(
             mem_limit=mem_limit,
             allow_host_fallback=allow_host_fallback,
         )
+        # NOTE: BLUEPRINT_PROGRESS_FILE is NOT set here. plan_compute_execution
+        # already injects it into plan.env with the correct IN-SANDBOX path
+        # (translated from progress_file_host to the per-backend mount, e.g.
+        # /tmp/blueprint_out, /workspace, or SANDBOX_WORKSPACE). Overriding it
+        # with the host-absolute `progress_file` would point the command at a
+        # path that is not mounted inside the container, so the host would never
+        # observe progress writes (breaking both the progress-tail protocol and
+        # the no-progress watchdog, which stat() the host `progress_file`).
         if plan.declined:
             print(f"[compute] DECLINED job {job_id} (fail-closed): {plan.decline_reason}", flush=True)
             outcome = "failure"
@@ -3031,6 +3128,10 @@ def _run_compute_job(
             if runtime_deadline_seconds is not None
             else None
         )
+        # No-progress watchdog: track the last time the progress file was touched.
+        # Initial state is "progress at start" so the window begins from launch.
+        _np_last_progress = start_time
+        _np_last_mtime: float | None = None
 
         def _teardown() -> None:
             iso.terminate_process_tree(
@@ -3064,6 +3165,29 @@ def _run_compute_job(
                     progress=progress_tail.poll(),
                 )
                 return
+
+            # No-progress watchdog: check if the progress file has been touched
+            # since the last observation. Any mtime bump counts as progress.
+            if no_progress_timeout_seconds is not None:
+                try:
+                    _cur_mtime = os.stat(progress_file).st_mtime
+                except OSError:
+                    _cur_mtime = None
+                # Any advance counts as progress, INCLUDING the first appearance of
+                # the file (transition from "no file yet" to a valid mtime). Gating
+                # on `_np_last_mtime is not None` would miss that first write and
+                # measure the window from job start instead of from first progress.
+                if _cur_mtime is not None and (
+                    _np_last_mtime is None or _cur_mtime > _np_last_mtime
+                ):
+                    _np_last_progress = now
+                _np_last_mtime = _cur_mtime
+                if now - _np_last_progress >= no_progress_timeout_seconds:
+                    _teardown()
+                    outcome = "failure"
+                    _report_compute_job(orchestrator_url, token, job_id,
+                                         exec_status="failed", exit_code=125)
+                    return
 
             if _shutdown_event.is_set():
                 _teardown()

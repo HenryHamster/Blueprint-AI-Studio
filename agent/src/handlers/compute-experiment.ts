@@ -159,6 +159,13 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   if (payload.requires_live_release !== undefined) body.live_proof = payload.requires_live_release;
   const setupStep = strVal(payload.setup_step);
   if (setupStep) body.setup_step = setupStep;
+  // Forward the optional no-progress watchdog window (peer of deadline_seconds) so a
+  // stalled job is cut early. Only forwarded when a positive number is present —
+  // jobs without it keep their exact existing launch body (inert watchdog).
+  const noProgressTimeout = payload.no_progress_timeout_seconds;
+  if (typeof noProgressTimeout === 'number' && noProgressTimeout > 0) {
+    body.no_progress_timeout_seconds = noProgressTimeout;
+  }
   // Forward declared_metric so the platform-executed pre-flight smoke knows
   // which metric to verify is captured. Only forwarded when present — CPU/GPU
   // jobs without a declared metric are byte-for-byte unchanged.

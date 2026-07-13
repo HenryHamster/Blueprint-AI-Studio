@@ -308,6 +308,9 @@ def classify_compute_terminal_reason(
       they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
       CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
+    - reason contains "no_progress_timeout" → NO_PROGRESS_TIMEOUT
+      (job was cut early by the no-progress watchdog — a configurable platform
+      kill, not a code defect)
     - default → CODE_ERROR (genuine command/work defect)
     """
     if vm_phase == "provisioning":
@@ -320,6 +323,8 @@ def classify_compute_terminal_reason(
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
+        if "no_progress_timeout" in lower:
+            return NO_PROGRESS_TIMEOUT
     return CODE_ERROR
 
 # Administrative cancellation — orchestrator or operator terminated the task before

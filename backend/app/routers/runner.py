@@ -1185,6 +1185,7 @@ async def next_compute_job(
         "repo_token": repo_token,
         "accelerator_type": job.accelerator_type,
         "allow_host_fallback": refreshed_meta.get("allow_host_fallback", False),
+        "no_progress_timeout_seconds": refreshed_meta.get("no_progress_timeout_seconds"),
         # Cross-job checkpoint resume: when set, the runner fetches this
         # predecessor's durable bundle and extracts it into the artifact dir
         # before spawning the subprocess. Validated at create_compute_job time.

@@ -1144,6 +1144,19 @@ def _build_compute_launch_kwargs(
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
     if payload.get("allow_host_fallback"):
         kwargs["allow_host_fallback"] = bool(payload["allow_host_fallback"])
+    # No-progress watchdog window (peer of runtime deadline). Forwarded when set so
+    # a stalled job is cut early; create_compute_job validates/clamps it. Integer
+    # field, so it uses a plain presence check rather than the string `_present`.
+    if payload.get("no_progress_timeout_seconds") is not None:
+        kwargs["no_progress_timeout_seconds"] = payload["no_progress_timeout_seconds"]
+    # Cross-job checkpoint resume: forward the optional predecessor reference so the
+    # new job rehydrates that job's durable bundle before its command runs.
+    # create_compute_job does the authoritative same-project + bundle-exists check.
+    input_artifact_job_id = payload.get("input_artifact_job_id") or (
+        payload.get("compute_experiment") or {}
+    ).get("input_artifact_job_id")
+    if _present(input_artifact_job_id):
+        kwargs["input_artifact_job_id"] = input_artifact_job_id
     # declared_metric names the contract metric the no-progress watchdog watches
     # for a stall. Accept the nested compute_experiment form too, mirroring how the
     # accelerator is read above. (The multi-arm command is still synthesized at task

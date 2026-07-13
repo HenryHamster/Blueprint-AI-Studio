@@ -6009,6 +6009,75 @@ class TestCredentialFileTraversalGuard(unittest.TestCase):
             self.assertNotIn("skipping", output.lower())
 
 
+class TestInputArtifactRehydration(unittest.TestCase):
+    """Cross-job checkpoint resume: the runner rehydrates a predecessor's durable
+    bundle into the job's artifact dir before the command runs, path-traversal-safe."""
+
+    def test_is_safe_tar_member(self):
+        g = local_runner._is_safe_tar_member
+        self.assertTrue(g("a/b.txt"))
+        self.assertTrue(g("./ok.txt"))
+        self.assertFalse(g(""))
+        self.assertFalse(g("/etc/passwd"))
+        self.assertFalse(g("../up.txt"))
+        self.assertFalse(g("a/../../b.txt"))
+        self.assertFalse(g("~/secret"))
+
+    def _make_bundle(self, entries):
+        buf = io.BytesIO()
+        with __import__("tarfile").open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in entries:
+                info = __import__("tarfile").TarInfo(name=name)
+                payload = data.encode()
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+        return buf.getvalue()
+
+    def test_rehydrate_extracts_safe_members_only(self):
+        bundle = self._make_bundle(
+            [("model.ckpt", "step-42"), ("../evil.txt", "x"), ("/abs.txt", "x")]
+        )
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return bundle
+
+        with tempfile.TemporaryDirectory() as dest:
+            with patch("urllib.request.urlopen", return_value=_Resp()):
+                local_runner._rehydrate_input_artifact(
+                    "http://orchestrator", "tok", "job-1", dest
+                )
+            self.assertTrue(os.path.isfile(os.path.join(dest, "model.ckpt")))
+            with open(os.path.join(dest, "model.ckpt"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "step-42")
+            # Traversal members never escaped the destination.
+            self.assertFalse(
+                os.path.exists(os.path.join(os.path.dirname(dest), "evil.txt"))
+            )
+
+    def test_rehydrate_raises_on_download_error(self):
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as dest:
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError(
+                    "http://x", 404, "not found", {}, None
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    local_runner._rehydrate_input_artifact(
+                        "http://orchestrator", "tok", "job-1", dest
+                    )
+            self.assertIn("input_artifact_rehydration_failed", str(ctx.exception))
+
+
 class TestDockerImageCacheHygiene(unittest.TestCase):
     """Runner Docker image cache hygiene (_prune_docker_images)."""
 

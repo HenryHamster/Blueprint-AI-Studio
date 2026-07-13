@@ -59,22 +59,26 @@ class LaunchComputeJobRequest(BaseModel):
     # clone and BEFORE the main command. On failure the job fails immediately
     # with reason `setup_step_failed`; no main-command budget is consumed.
     setup_step: str | None = Field(default=None, max_length=10000)
+    # Optional no-progress watchdog window (peer of deadline_seconds). When set and
+    # positive, a job that writes no intermediate progress (BLUEPRINT_PROGRESS_FILE)
+    # within this many seconds is torn down early with reason `no_progress_timeout`.
+    # Omission = inert watchdog; create_compute_job validates/clamps the value.
+    no_progress_timeout_seconds: int | None = Field(default=None, gt=0)
     # Optional container image URI and registry auth. When container_image is set
     # the backend wraps the command in docker run. Only {server, username} are
     # accepted — password is rejected at create time (no delivery channel to the
     # backend launcher exists in the orchestrated path).
     container_image: str | None = Field(default=None, max_length=512)
     container_registry_auth: Dict[str, Any] | None = None
+    # Optional cross-job checkpoint resume: UUID of a PREDECESSOR compute job whose
+    # durable artifact bundle is rehydrated into this job's BLUEPRINT_ARTIFACT_DIR
+    # before the command runs. create_compute_job validates that the predecessor
+    # belongs to the same project and has a stored bundle. Omission = fresh workspace.
+    input_artifact_job_id: str | None = Field(default=None, max_length=64)
     # Optional metric name the no-progress watchdog watches for a stall. When set,
     # a still-running job whose reported metric plateaus over the watchdog window
     # is cut early instead of burning its full deadline. Omission = no watchdog.
     declared_metric: str | None = Field(default=None, min_length=1, max_length=128)
-    # Optional cross-job checkpoint resume: the id of a prior compute job whose
-    # durable artifact bundle is hydrated into $BLUEPRINT_ARTIFACT_DIR before the
-    # command runs, so a long/interrupted job resumes from its predecessor's
-    # latest checkpoint instead of restarting from zero. Validated at launch time
-    # (must exist, same project, and have produced a durable bundle).
-    input_artifact_job_id: str | None = Field(default=None, max_length=64)
 
 
 @router.post("/compute-jobs")
@@ -143,6 +147,7 @@ async def launch_compute_job(
             live_proof=req.live_proof,
             live_proof_marker=req.live_proof_marker,
             setup_step=req.setup_step,
+            no_progress_timeout_seconds=req.no_progress_timeout_seconds,
             container_image=req.container_image,
             container_registry_auth=req.container_registry_auth,
             declared_metric=req.declared_metric,
