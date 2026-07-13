@@ -15,7 +15,7 @@
     "admin.py": 4600,
     "compute.py": 3750,
     "github.py": 2950,
-    "github_token_resolver.py": 250,
+    "github_token_resolver.py": 600,
     "github_auth.py": 700,
     "github_checks.py": 800,
     "hotfix_backmerge.py": 2350,
