@@ -815,3 +815,153 @@ class TestCategoryGateNonEngagingPaths:
         # Real verdicts: gate fires and keeps the unmet category blocked.
         assert out["blocker"] == "criterion_coverage_incomplete"
         assert out["confidence"] == 0.0
+
+    def test_ci_unresolved_recovery_with_all_met_verdicts_promotes(self):
+        """ci_unresolved recovery with all-met persisted verdicts clears the gate
+        and promotes once CI resolves.
+
+        This confirms the happy-path through path 3: when the finalize recorded
+        all-met category verdicts and CI was the only blocker, recovery promotes.
+        """
+        from app.release_promotion import _recover_confidence_from_ci_unresolved
+
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "tier": "judged",
+                    "citations": [{"kind": "diff", "ref": "a.py:1"}],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "met",
+                    "tier": "machine",
+                    "citations": [{"kind": "test", "ref": "testing/test_b.py"}],
+                },
+            ],
+        }
+        out = _recover_confidence_from_ci_unresolved(record)
+        # All categories met — CI was the only blocker; recovery promotes.
+        assert out.get("blocker") is None
+        assert out["confidence"] > 0.0
+        assert out.get("confidence_recovered_from_ci_unresolved") is True
+
+    def test_contentless_goal_full_chain_shows_gate_skip_then_fallback_blocks(self):
+        """Full chain for path 1: evaluate_merge_grade(contentless goal) → None
+        category_verdicts → compute_composite would skip gate → but
+        _never_graded_category_verdicts blocks when fed to compute_composite.
+
+        This documents the two-step safety: the evaluator deliberately returns
+        None (skip), and the qualifier MUST call _never_graded_category_verdicts
+        to synthesize fail-closed verdicts for any active criteria.
+        """
+        from app.release_qualifier import _never_graded_category_verdicts
+
+        active_cats = [{"category_key": "c-auth"}, {"category_key": "c-dashboard"}]
+        active_keys = {c["category_key"] for c in active_cats}
+
+        # Step 1: evaluate_merge_grade returns category_verdicts=None for a
+        # contentless goal — the per-category gate is not engaged at this level.
+        eval_out = rs.evaluate_merge_grade("test", None, active_cats)
+        assert eval_out["category_verdicts"] is None
+        assert eval_out["status"] == "not_applicable"
+
+        # Step 2: passing None directly to compute_composite SKIPS the gate.
+        skipped = rs.compute_composite(**_perfect_kwargs(category_verdicts=None))
+        assert skipped["blocker"] is None
+        assert skipped["promote"] is True
+
+        # Step 3: the qualifier's _never_graded_category_verdicts synthesizes
+        # not_met for every active key, and compute_composite then BLOCKS.
+        fallback = _never_graded_category_verdicts(active_keys)
+        blocked = rs.compute_composite(**_perfect_kwargs(category_verdicts=fallback))
+        assert blocked["blocker"] == "criterion_coverage_incomplete"
+        assert blocked["promote"] is False
+        assert blocked["confidence"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _fail_closed_category_verdicts — the ledger-error / unverified fallback gate
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosedCategoryVerdicts:
+    """Tests for _fail_closed_category_verdicts — the safety-net that fires when
+    a merge-grade DID run but the per-category verdicts cannot be read from the
+    ledger (write failed, read raised, or returned no active-criterion rows).
+
+    This is distinct from _never_graded_category_verdicts (no grade ran at all):
+    _fail_closed marks verdicts ``"unverified"`` (a grade happened but we cannot
+    trust its result), while _never_graded marks them ``"not_met"`` (no grade
+    ever happened).  Both feed ``"not_met"``-class verdicts to compute_composite
+    and block with ``criterion_coverage_incomplete``.
+    """
+
+    def _fn(self, active_keys):
+        from app.release_qualifier import _fail_closed_category_verdicts
+        return _fail_closed_category_verdicts(active_keys)
+
+    def test_empty_active_keys_returns_none(self):
+        """No active criteria → returns None so compute_composite skips the gate.
+
+        An empty rubric has nothing to gate on; returning None preserves the
+        no-criteria path rather than synthesising a spurious block.
+        """
+        assert self._fn(set()) is None
+        assert self._fn(set([None])) is None  # only None keys → filtered out
+
+    def test_non_empty_keys_returns_unverified_verdicts(self):
+        """Each active criterion key gets an ``unverified`` verdict row, sorted."""
+        result = self._fn({"c-2", "c-1", "c-3"})
+        assert result is not None
+        assert [v["category_key"] for v in result] == ["c-1", "c-2", "c-3"]
+        assert all(v["status"] == "unverified" for v in result)
+        assert all(v["tier"] == "unverified" for v in result)
+
+    def test_none_keys_are_filtered_out(self):
+        """None entries in the active_keys set are silently discarded."""
+        result = self._fn({"c-1", None, "c-2"})
+        assert result is not None
+        keys = [v["category_key"] for v in result]
+        assert None not in keys
+        assert set(keys) == {"c-1", "c-2"}
+
+    def test_unverified_verdicts_block_compute_composite(self):
+        """Unverified verdicts (``status != "met"``) engage the category gate
+        and force ``criterion_coverage_incomplete`` — a grade that cannot be
+        trusted is treated as a failure, not a pass."""
+        result = self._fn({"c-auth", "c-dashboard"})
+        composite = rs.compute_composite(**_perfect_kwargs(category_verdicts=result))
+        assert composite["promote"] is False
+        assert composite["confidence"] == 0.0
+        assert composite["blocker"] == "criterion_coverage_incomplete"
+
+    def test_single_active_key_produces_one_verdict(self):
+        """A single active criterion key yields exactly one verdict row."""
+        result = self._fn({"c-only"})
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["category_key"] == "c-only"
+        assert result[0]["status"] == "unverified"
+
+    def test_different_from_never_graded_status(self):
+        """``_fail_closed`` uses ``"unverified"`` status; ``_never_graded`` uses
+        ``"not_met"``.  Both block compute_composite, but the distinction lets
+        operators and logs see whether a grade ran (and was unreadable) vs.
+        whether no grade ever ran at all.
+        """
+        from app.release_qualifier import _never_graded_category_verdicts
+
+        fail_closed = self._fn({"c-1"})
+        never_graded = _never_graded_category_verdicts({"c-1"})
+        assert fail_closed[0]["status"] == "unverified"
+        assert never_graded[0]["status"] == "not_met"
+        # Both still block the gate identically.
+        for verdicts in (fail_closed, never_graded):
+            result = rs.compute_composite(**_perfect_kwargs(category_verdicts=verdicts))
+            assert result["blocker"] == "criterion_coverage_incomplete"
