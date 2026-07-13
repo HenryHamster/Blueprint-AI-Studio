@@ -50,7 +50,7 @@ import subprocess
 import sys
 import tarfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 
 # ── Content hashing ──────────────────────────────────────────────────────────
@@ -230,6 +230,107 @@ def scan_inputs_for_credentials(
     return findings
 
 
+def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, bytes]]:
+    """Resolve the credential-scannable layer tarballs from a ``docker save``
+    archive.
+
+    Supports BOTH archive layouts that ``docker save`` can emit:
+
+    * **Classic docker-save layout** — each layer is a ``<hash>/layer.tar``
+      member at the top level (referenced by ``manifest.json``'s ``Layers``).
+    * **OCI image layout** — the archive is an OCI store: an ``index.json``
+      points (by digest) at an image manifest blob under
+      ``blobs/<algo>/<hex>``; that manifest's ``layers[].digest`` entries in
+      turn resolve to layer blobs under ``blobs/<algo>/<hex>``. Multi-arch
+      images nest an OCI index that references per-arch manifests, so index
+      references are walked recursively.
+
+    Returns a list of ``(label, raw_layer_bytes)`` tuples. An **empty list**
+    means NO recognizable layers were found — the caller MUST treat that as a
+    fail-closed error (the scan would otherwise silently pass unexamined
+    layers).
+    """
+    members = {m.name: m for m in outer.getmembers()}
+
+    def _read(name: str) -> Optional[bytes]:
+        m = members.get(name)
+        if m is None or not m.isfile():
+            return None
+        fh = outer.extractfile(m)
+        if fh is None:
+            return None
+        return fh.read()
+
+    layers: List[Tuple[str, bytes]] = []
+
+    # ── Classic docker-save layout: <hash>/layer.tar ─────────────────────────
+    for name, m in members.items():
+        if m.isfile() and name.endswith("layer.tar"):
+            data = _read(name)
+            if data is not None:
+                layers.append((name, data))
+    if layers:
+        return layers
+
+    # ── OCI image layout: index.json → manifest blob → layer blobs ───────────
+    index_bytes = _read("index.json")
+    if index_bytes is None:
+        return layers  # neither classic nor OCI — caller fails closed
+
+    def _blob_path(digest: str) -> Optional[str]:
+        # An OCI digest is "<algo>:<hex>"; the blob lives at blobs/<algo>/<hex>.
+        if not isinstance(digest, str) or ":" not in digest:
+            return None
+        algo, _, hexd = digest.partition(":")
+        if not algo or not hexd:
+            return None
+        return f"blobs/{algo}/{hexd}"
+
+    seen: Set[str] = set()
+
+    def _walk_manifest(digest: str) -> None:
+        if digest in seen:
+            return
+        seen.add(digest)
+        path = _blob_path(digest)
+        if path is None:
+            return
+        raw = _read(path)
+        if raw is None:
+            return
+        try:
+            doc = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(doc, dict):
+            return
+        # Nested OCI index (multi-arch) → recurse into referenced manifests.
+        for sub in doc.get("manifests", []) or []:
+            if isinstance(sub, dict) and isinstance(sub.get("digest"), str):
+                _walk_manifest(sub["digest"])
+        # Image manifest → collect the layer blobs it references.
+        for layer in doc.get("layers", []) or []:
+            if not isinstance(layer, dict):
+                continue
+            lpath = _blob_path(layer.get("digest"))
+            if lpath is None:
+                continue
+            ldata = _read(lpath)
+            if ldata is not None:
+                layers.append((f"blob:{lpath}", ldata))
+
+    try:
+        index_doc = json.loads(index_bytes)
+    except (ValueError, UnicodeDecodeError):
+        return layers
+    if isinstance(index_doc, dict):
+        for man in index_doc.get("manifests", []) or []:
+            if isinstance(man, dict) and isinstance(man.get("digest"), str):
+                _walk_manifest(man["digest"])
+
+    return layers
+
+
 def scan_image_layers_for_credentials(
     image_ref: str, *, _run=subprocess.run
 ) -> List[str]:
@@ -240,6 +341,12 @@ def scan_image_layers_for_credentials(
     inputs.  This catches secrets baked in at build-time (e.g. via
     ``RUN curl http://secrets-server/token > /root/.creds`` or a pip package
     that installs a credential helper) that are invisible in the source inputs.
+
+    Both archive layouts ``docker save`` can produce are handled — the classic
+    ``<hash>/layer.tar`` layout and the OCI ``index.json`` + ``blobs/`` store
+    (see :func:`_resolve_image_layers`). When the archive yields NO recognizable
+    layers, the scan **fails closed** (raises ``RuntimeError``) rather than
+    silently passing unexamined content.
 
     Returns a list of human-readable findings (empty = clean).  Network/auth
     errors in ``docker save`` are propagated as ``RuntimeError`` so callers
@@ -261,13 +368,19 @@ def scan_image_layers_for_credentials(
     findings: List[str] = []
     try:
         with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:*") as outer:
-            for member in outer.getmembers():
-                if not member.name.endswith("layer.tar"):
-                    continue
-                layer_fh = outer.extractfile(member)
-                if layer_fh is None:
-                    continue
-                layer_data = layer_fh.read()
+            layers = _resolve_image_layers(outer)
+            if not layers:
+                # Fail CLOSED: an archive with no classic layer.tar members and
+                # no resolvable OCI blob layers is unscannable, not clean. A
+                # silent empty-findings pass here would let an OCI-layout image
+                # (or a malformed/unexpected archive) skip the credential gate.
+                raise RuntimeError(
+                    "credential layer-scan found no recognizable layers in the "
+                    f"docker save archive for {image_ref!r} (neither classic "
+                    "layer.tar members nor a resolvable OCI index.json/blobs "
+                    "layout) — failing closed"
+                )
+            for label, layer_data in layers:
                 try:
                     with tarfile.open(fileobj=io.BytesIO(layer_data), mode="r:*") as layer:
                         for fmember in layer.getmembers():
@@ -280,8 +393,8 @@ def scan_image_layers_for_credentials(
                             if ffh is None:
                                 continue
                             content = ffh.read()
-                            label = f"layer:{member.name}!{fmember.name}"
-                            findings.extend(_scan_content_patterns(label, content))
+                            flabel = f"layer:{label}!{fmember.name}"
+                            findings.extend(_scan_content_patterns(flabel, content))
                 except tarfile.TarError:
                     # Corrupted layer — skip rather than crashing.
                     pass

@@ -15760,6 +15760,146 @@ def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
     assert len(layer_scan_called_with) == 1
 
 
+# ---------------------------------------------------------------------------
+# scan_image_layers_for_credentials: classic + OCI archive layouts, fail-closed
+# ---------------------------------------------------------------------------
+
+# A credential blob that trips the github_app_token pattern (ghs_ + >=20 chars).
+_LEAKED_CRED = b"export TOKEN=ghs_" + b"A" * 24 + b"\n"
+
+
+def _tar_bytes(entries: dict) -> bytes:
+    """Build an uncompressed tar archive from {member_name: bytes}."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _fake_docker_save(stdout_bytes: bytes):
+    """Return a _run callable that emulates a successful `docker save`."""
+
+    def _run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = stdout_bytes
+            stderr = b""
+
+        return P()
+
+    return _run
+
+
+def _classic_save_archive(leak: bytes) -> bytes:
+    """A classic docker-save archive: <hash>/layer.tar members + manifest.json."""
+    layer_tar = _tar_bytes({"root/.creds": leak})
+    return _tar_bytes(
+        {
+            "0a1b2c/layer.tar": layer_tar,
+            "config.json": b"{}",
+            "manifest.json": b'[{"Layers":["0a1b2c/layer.tar"]}]',
+        }
+    )
+
+
+def _oci_save_archive(leak: bytes) -> bytes:
+    """An OCI-layout docker-save archive: index.json + blobs/sha256/<digest>."""
+    layer_tar = _tar_bytes({"root/.creds": leak})
+    layer_digest = "l" * 64
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": "sha256:" + ("c" * 64)},
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:" + layer_digest,
+                }
+            ],
+        }
+    ).encode()
+    manifest_digest = "m" * 64
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:" + manifest_digest,
+                }
+            ],
+        }
+    ).encode()
+    return _tar_bytes(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": index,
+            "blobs/sha256/" + manifest_digest: manifest,
+            "blobs/sha256/" + layer_digest: layer_tar,
+            "blobs/sha256/" + ("c" * 64): b"{}",
+        }
+    )
+
+
+def test_scan_image_layers_classic_format_detects_leak():
+    """Classic docker-save layer.tar members are still scanned (regression)."""
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(_classic_save_archive(_LEAKED_CRED))
+    )
+    assert any("github_app_token" in f for f in findings), findings
+
+
+def test_scan_image_layers_classic_format_clean_passes():
+    """A classic archive with no credential material yields no findings."""
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(_classic_save_archive(b"nothing secret here\n"))
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_oci_format_detects_leak():
+    """OCI-layout images (blobs/sha256/...) are resolved via index/manifest and scanned."""
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(_oci_save_archive(_LEAKED_CRED))
+    )
+    assert any("github_app_token" in f for f in findings), findings
+
+
+def test_scan_image_layers_oci_format_clean_passes():
+    """A clean OCI-layout archive resolves its layer and finds nothing."""
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(_oci_save_archive(b"nothing secret here\n"))
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_no_recognizable_layers_fails_closed():
+    """An archive with neither layer.tar members nor an OCI store must ERROR, not pass."""
+    # Only a manifest.json — no layer.tar, no index.json/blobs.
+    bogus = _tar_bytes({"manifest.json": b"[]", "config.json": b"{}"})
+    with pytest.raises(RuntimeError, match="no recognizable layers"):
+        _bci.scan_image_layers_for_credentials(
+            "img:tag", _run=_fake_docker_save(bogus)
+        )
+
+
+def test_scan_image_layers_oci_unresolvable_blobs_fails_closed():
+    """An OCI index whose referenced blobs are absent yields zero layers → fail closed."""
+    index = json.dumps(
+        {"schemaVersion": 2, "manifests": [{"digest": "sha256:" + ("m" * 64)}]}
+    ).encode()
+    # index.json present but the manifest blob it points at is missing.
+    bogus = _tar_bytes({"oci-layout": b"{}", "index.json": index})
+    with pytest.raises(RuntimeError, match="no recognizable layers"):
+        _bci.scan_image_layers_for_credentials(
+            "img:tag", _run=_fake_docker_save(bogus)
+        )
+
+
 def test_build_and_push_missing_dockerfile_raises(tmp_path):
     repo = str(tmp_path / "empty")
     (tmp_path / "empty").mkdir()
