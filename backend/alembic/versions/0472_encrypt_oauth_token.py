@@ -30,7 +30,7 @@ depends_on = None
 def upgrade() -> None:
     bind = op.get_bind()
 
-    from app.field_encryption import encrypt_field
+    from app.field_encryption import decrypt_field, encrypt_field
 
     column = "oauth_token"
     rows = bind.execute(
@@ -41,6 +41,26 @@ def upgrade() -> None:
 
     updated = 0
     for row_id, plaintext in rows:
+        # ALREADY-ENCRYPTED GUARD — DO NOT REMOVE.
+        #
+        # Migration 0468 (already applied on `main`) ALSO encrypts oauth_token:
+        # "Encrypt persisted MaxPlanAccount oauth_token values."  So by the time
+        # this migration runs on a production database, every value is ALREADY
+        # ciphertext.  Passing that ciphertext to encrypt_field() treats it as
+        # plaintext and produces ciphertext-of-ciphertext — a single decrypt then
+        # yields the inner ciphertext, not the token, and EVERY MaxPlan account
+        # credential is permanently destroyed.
+        #
+        # The pre-existing `encrypted == plaintext` check below cannot catch this:
+        # encrypting ciphertext yields DIFFERENT ciphertext, so it never fires.
+        #
+        # decrypt_field() returns its input UNCHANGED when the value is not valid
+        # ciphertext (see its docstring — that fallback exists so a rolling deploy
+        # does not break pre-encryption plaintext).  So a value that decrypts to
+        # something DIFFERENT from itself is already encrypted → skip it.  This
+        # mirrors the `_decrypt_if_encrypted` guard migration 0468 already uses.
+        if decrypt_field(plaintext) != plaintext:
+            continue
         encrypted = encrypt_field(plaintext)
         if encrypted == plaintext:
             continue
