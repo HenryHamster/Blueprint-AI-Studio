@@ -35,6 +35,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     VmContact,
+    TaskContact,
     KnowledgeDocument,
     SourceKind,
     _on_task_terminal_callbacks,
@@ -42,6 +43,7 @@ from app.models import (
     _utcnow,
 )
 from app.time_utils import _to_naive_utc
+from app.reaper_orphan_classify import _is_multiplexed_vm_instance_id
 from app.schemas import (
     ArtifactDownloadResponse,
     BuildDiscoveryReport,
@@ -4578,6 +4580,7 @@ def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
 async def _record_vm_contact(
     vm_instance_id: str | None,
     last_tool_use_at: datetime | None = None,
+    task_id: uuid.UUID | str | None = None,
 ) -> None:
     """Record an uncontended liveness signal that the orchestrator heard from a VM.
 
@@ -4610,6 +4613,20 @@ async def _record_vm_contact(
     tool-bearing ones can't blank a fresh progress signal; a heartbeat that
     carries no tool telemetry passes ``None`` and leaves the stored value
     untouched.
+
+    ``task_id`` (multiplexed-runner zombie fix) additionally upserts the SAME two
+    stamps onto a TASK-scoped ``taskcontact`` row, in this same independent
+    session/commit. ``vmcontact`` is keyed on ``vm_instance_id`` — "one row per
+    VM" — which is true for GCE (one task per VM) but FALSE for fleet runners:
+    ``local_runner.py`` multiplexes many tasks onto one ``runner:<id>`` vm id, so
+    every task on a runner shares ONE row and the ``func.greatest`` advance above
+    is fed by ANY agent on that runner. A hung-but-heartbeating agent next to a
+    working sibling then reads as "progressing" forever (2026-07-12 zombie
+    class). The per-task row restores the one-row-per-unit-of-work identity the
+    reaper's overrides assume; the reaper reads it for ``runner:`` vm ids and
+    keeps reading ``vmcontact`` for GCE ids. Written on EVERY heartbeat (not just
+    tool-bearing ones) so a live task always has a fresh row, and best-effort like
+    the rest of this function.
     """
     if not vm_instance_id:
         return
@@ -4659,12 +4676,94 @@ async def _record_vm_contact(
                         or last_tool_use_at > existing.last_tool_use_at
                     ):
                         existing.last_tool_use_at = last_tool_use_at
+
+            # The TASK-scoped write must NEVER be able to lose the SHARED write.
+            # Sharing one transaction with the ``vmcontact`` upsert above means a
+            # taskcontact-only failure — most plausibly an FK violation, because
+            # ``taskcontact.task_id`` REFERENCES task(id) and the task row can be
+            # purged mid-flight, which ``vmcontact`` (no FK) is immune to — would
+            # poison the transaction and take the ``vmcontact`` upsert down with
+            # it. That would silently drop the lock-starvation liveness signal for
+            # that beat, i.e. this fix could CAUSE a false-reap of a live agent on
+            # the very path it exists to protect. A SAVEPOINT scopes the damage to
+            # the task-scoped row: on failure we roll back only the nested block,
+            # and the outer commit below still lands ``vmcontact`` exactly as it
+            # did before this fix existed. Best-effort, like the rest of this
+            # function — a missing taskcontact row is never evidence of death (the
+            # reaper falls back to the shared row when it is absent).
+            # ``runner:`` vm ids ONLY. The reaper consults the task-scoped row
+            # solely when _is_multiplexed_vm_id(task) is True; a GCE agent VM runs
+            # exactly one task, so its ``vmcontact`` row already IS that task's row
+            # and a ``taskcontact`` twin would be written on every heartbeat and
+            # read by nobody — one dead row per task, forever.
+            #
+            # Shares the READER's predicate rather than re-spelling the prefix
+            # test: if writer and reader ever disagreed, the reader would see an
+            # ABSENT row and fall back to the SHARED vmcontact row — silently
+            # restoring the sibling-masking bug this table exists to kill.
+            if task_id is not None and _is_multiplexed_vm_instance_id(vm_instance_id):
+                try:
+                    async with contact_session.begin_nested():
+                        if dialect == "postgresql":
+                            task_insert_values = {
+                                "task_id": task_id,
+                                "last_contact_at": now,
+                            }
+                            task_set_ = {"last_contact_at": now}
+                            if last_tool_use_at is not None:
+                                task_insert_values["last_tool_use_at"] = last_tool_use_at
+                                task_set_["last_tool_use_at"] = func.greatest(
+                                    TaskContact.last_tool_use_at, last_tool_use_at
+                                )
+                            task_stmt = _pg_insert(TaskContact).values(
+                                **task_insert_values
+                            )
+                            task_stmt = task_stmt.on_conflict_do_update(
+                                index_elements=[TaskContact.task_id],
+                                set_=task_set_,
+                            )
+                            await contact_session.execute(task_stmt)
+                        else:
+                            task_key = (
+                                task_id
+                                if isinstance(task_id, uuid.UUID)
+                                else uuid.UUID(str(task_id))
+                            )
+                            existing_task = await contact_session.get(
+                                TaskContact, task_key
+                            )
+                            if existing_task is None:
+                                contact_session.add(
+                                    TaskContact(
+                                        task_id=task_key,
+                                        last_contact_at=now,
+                                        last_tool_use_at=last_tool_use_at,
+                                    )
+                                )
+                            else:
+                                existing_task.last_contact_at = now
+                                if last_tool_use_at is not None and (
+                                    existing_task.last_tool_use_at is None
+                                    or last_tool_use_at > existing_task.last_tool_use_at
+                                ):
+                                    existing_task.last_tool_use_at = last_tool_use_at
+                except Exception as _tc_exc:  # noqa: BLE001 — never lose vmcontact
+                    logger.warning(
+                        "[VM_CONTACT] taskcontact upsert failed for task=%s vm=%s "
+                        "(non-fatal, vmcontact still committed; reaper falls back "
+                        "to the shared row): %s",
+                        task_id,
+                        vm_instance_id,
+                        _tc_exc,
+                    )
+
             await contact_session.commit()
     except Exception as exc:  # noqa: BLE001 — best-effort, never break heartbeat
         logger.warning(
-            "[VM_CONTACT] upsert failed for vm=%s (non-fatal, falling back to "
-            "last_heartbeat): %s",
+            "[VM_CONTACT] upsert failed for vm=%s task=%s (non-fatal, falling back "
+            "to last_heartbeat): %s",
             vm_instance_id,
+            task_id,
             exc,
         )
 
@@ -4730,8 +4829,17 @@ async def agent_heartbeat(
     # too, so the reaper's PROGRESS-stall branch can false-reap a live,
     # actively-PROGRESSING agent. Parsed ONCE here from the tool_trace tail and
     # reused below for the on-row column write so both stay in sync.
+    #
+    # Multiplexed-runner zombie fix: also carry BOTH stamps onto a TASK-scoped
+    # ``taskcontact`` row. ``vmcontact`` is keyed per-VM, but a fleet runner
+    # multiplexes many tasks onto one ``runner:<id>`` vm id — so the shared row is
+    # advanced by ANY agent on that runner and a hung agent beside a working
+    # sibling reads as "progressing" forever. ``req.task_id`` is already proven
+    # equal to the JWT ``sub`` above, so this key is as trusted as the vm id.
     _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
-    await _record_vm_contact(token.get("vm_instance_id"), _latest_tool_use_at)
+    await _record_vm_contact(
+        token.get("vm_instance_id"), _latest_tool_use_at, task_id=req.task_id
+    )
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking

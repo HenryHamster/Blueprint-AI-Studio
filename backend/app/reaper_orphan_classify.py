@@ -69,10 +69,72 @@ def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
     return ordered[:cap], len(ordered) - cap
 
 
+def _is_multiplexed_vm_instance_id(vm_id) -> bool:
+    """True iff *vm_id* is a fleet-runner id, i.e. SHARED by many concurrent tasks.
+
+    The single definition of "is this vm id multiplexed", shared by the WRITER
+    (``routers/agent.py::_record_vm_contact``, which decides whether to write a
+    ``taskcontact`` row) and the READERS (``_is_multiplexed_vm_id`` below, the
+    reaper's candidate filters, and ``reaper_relock._relock_contact_at``).
+
+    They MUST agree. If the writer ever stopped writing a row that a reader still
+    expects, that reader would see an ABSENT row and fall back to the SHARED
+    ``vmcontact`` row — silently restoring the exact sibling-masking bug this
+    table was added to kill, with no error anywhere. Keeping one predicate makes
+    that divergence impossible to introduce by editing one side.
+    """
+    return isinstance(vm_id, str) and vm_id.startswith("runner:")
+
+
+def _is_multiplexed_vm_id(task) -> bool:
+    """True iff this task's vm id is a fleet runner, i.e. SHARED with sibling tasks.
+
+    ``vmcontact`` is primary-keyed on ``vm_instance_id`` — "one row per VM". For a
+    GCE agent VM that identity is also "one row per TASK" (one task per VM), which
+    is what the off-row contact/progress overrides below silently assume. For a
+    fleet runner it is FALSE: ``scripts/local_runner.py`` multiplexes many
+    concurrent tasks onto one ``vm_instance_id='runner:<id>'``, so ALL of them
+    share one ``vmcontact`` row and ANY agent's heartbeat advances it for
+    everybody. Reading that shared row as if it were a per-task signal is what
+    let a hung agent hide behind a working sibling forever (2026-07-12 zombie
+    class); for these vm ids the overrides must consult the TASK-scoped
+    ``taskcontact`` row instead.
+    """
+    return _is_multiplexed_vm_instance_id(getattr(task, "vm_instance_id", None))
+
+
+def _has_task_contact_row(task, task_contact_lookup: dict | None) -> bool:
+    """True iff a TASK-scoped ``taskcontact`` row exists for this task.
+
+    This is the rollout-safety oracle, and the reason the caller passes a
+    ``{task_id: last_contact_at}`` map rather than only the nullable tool-use map:
+    ``taskcontact.last_contact_at`` is NOT NULL, so presence in that map is exactly
+    "a row exists". The distinction matters enormously —
+
+      * row ABSENT  → we have no task-scoped truth (task predates this fix, or has
+        not heartbeated since deploy). Absence is NEVER evidence of death: fall
+        back to the shared ``vmcontact`` row, i.e. today's behaviour.
+      * row PRESENT → it is authoritative for this task. Do NOT fall back to the
+        shared row even when the task-scoped stamp is NULL or stale — falling back
+        there is precisely the sibling-masking bug being fixed (a hung agent that
+        never called a tool has a row whose ``last_tool_use_at`` is NULL, while the
+        shared row is kept fresh by its working sibling).
+    """
+    if not task_contact_lookup:
+        return False
+    task_id = getattr(task, "id", None)
+    if task_id is None:
+        return False
+    return str(task_id) in task_contact_lookup
+
+
 def _vm_contact_within_cutoff(
-    task, hb_cutoff: datetime, vm_contact_lookup: dict | None
+    task,
+    hb_cutoff: datetime,
+    vm_contact_lookup: dict | None,
+    task_contact_lookup: dict | None = None,
 ) -> bool:
-    """True iff the orchestrator heard from this task's VM within ``hb_cutoff``.
+    """True iff the orchestrator heard from this TASK's agent within ``hb_cutoff``.
 
     Heartbeat false-reap fix (option B): the heartbeat handler upserts an
     uncontended ``vmcontact`` row keyed on ``vm_instance_id`` BEFORE it touches
@@ -83,20 +145,38 @@ def _vm_contact_within_cutoff(
     dead agent (crashed / preempted / OOM — sends no requests) has a stale or
     absent contact row and is reaped exactly as before. Old / absent rows fall
     back to the existing ``last_heartbeat`` behaviour (no regression).
+
+    Multiplexed-runner fix: on a fleet runner the ``vmcontact`` row is shared by
+    every task on that runner, so a live sibling's contact would prove "alive" for
+    a task whose own agent process is hung or dead. When ``task_contact_lookup``
+    carries a TASK-scoped row for a ``runner:`` task we read THAT row and never the
+    shared one. GCE (1 task per VM) is untouched: its ``vmcontact`` row already IS
+    the task's row, so the genuine lock-starvation protection this override exists
+    for keeps working exactly as before.
+
+    ``task_contact_lookup`` defaults to ``None`` so callers that have not been
+    migrated (and ``_classify_resident_session``) keep the previous behaviour.
     """
-    if not vm_contact_lookup:
-        return False
     vm_id = getattr(task, "vm_instance_id", None)
     if not vm_id:
+        return False
+    if _is_multiplexed_vm_id(task) and _has_task_contact_row(task, task_contact_lookup):
+        last_contact = task_contact_lookup.get(str(task.id))
+        return last_contact is not None and last_contact >= hb_cutoff
+    if not vm_contact_lookup:
         return False
     last_contact = vm_contact_lookup.get(vm_id)
     return last_contact is not None and last_contact >= hb_cutoff
 
 
 def _vm_tool_use_within_cutoff(
-    task, progress_cutoff: datetime, vm_tool_use_lookup: dict | None
+    task,
+    progress_cutoff: datetime,
+    vm_tool_use_lookup: dict | None,
+    task_tool_use_lookup: dict | None = None,
+    task_contact_lookup: dict | None = None,
 ) -> bool:
-    """True iff the orchestrator heard a tool-use from this VM after ``progress_cutoff``.
+    """True iff the orchestrator heard a tool-use from THIS TASK after ``progress_cutoff``.
 
     Fix 3b: the PROGRESS-stall branch reaps a fresh-heartbeating agent whose
     on-row ``Task.last_tool_use_at`` is stale. But that on-row write shares the
@@ -111,11 +191,36 @@ def _vm_tool_use_within_cutoff(
     Unlike the heartbeat-stale ``_vm_contact_within_cutoff`` override, this does
     NOT key on the mere fact of contact (a hung agent still heartbeats) — it
     keys on actual TOOL-USE recency, so genuine stall detection is preserved.
+
+    Multiplexed-runner fix (the P0 this function was the root of): keying the
+    PROGRESS signal on ``vm_instance_id`` is only sound when one task owns the VM.
+    A fleet runner multiplexes many tasks onto one ``runner:<id>`` vm id, and the
+    heartbeat handler advances the shared ``vmcontact.last_tool_use_at`` with
+    ``GREATEST(...)`` from ANY of them — so a hung-but-heartbeating agent (wedged
+    LLM call / spin loop) co-resident with ANY actively working sibling read as
+    "progressing" forever and was NEVER stall-reaped. It could not be rescued by
+    the runner self-report (#14413) either: a hung-but-alive process is still in
+    the runner's ``active_task_ids``. With no absolute IN_PROGRESS ceiling
+    anywhere, nothing else ever fired — a permanent zombie holding a runner slot,
+    an account slot, and pinning its parent lineage.
+
+    So for ``runner:`` vm ids we read the TASK-scoped ``taskcontact`` row: the
+    sibling's tool calls are no longer this task's progress. GCE tasks keep
+    reading ``vmcontact`` (where the row is already task-scoped), preserving the
+    lock-starvation protection. A ``runner:`` task with NO task-scoped row yet
+    (pre-rollout / not yet heartbeated) falls back to the shared row — absence is
+    never evidence of death. See ``_has_task_contact_row``.
     """
-    if not vm_tool_use_lookup:
-        return False
     vm_id = getattr(task, "vm_instance_id", None)
     if not vm_id:
+        return False
+    if _is_multiplexed_vm_id(task) and _has_task_contact_row(task, task_contact_lookup):
+        # Authoritative for this task. A NULL / stale task-scoped stamp means THIS
+        # agent is not progressing, whatever its siblings are doing — no fallback
+        # to the shared row (that fallback IS the bug).
+        last_tool_use = (task_tool_use_lookup or {}).get(str(task.id))
+        return last_tool_use is not None and last_tool_use >= progress_cutoff
+    if not vm_tool_use_lookup:
         return False
     last_tool_use = vm_tool_use_lookup.get(vm_id)
     return last_tool_use is not None and last_tool_use >= progress_cutoff
@@ -270,6 +375,8 @@ def _classify_orphan(
     vm_contact_lookup: dict | None = None,
     vm_tool_use_lookup: dict | None = None,
     runner_report_lookup: dict | None = None,
+    task_contact_lookup: dict | None = None,
+    task_tool_use_lookup: dict | None = None,
 ) -> bool:
     """Single source of truth for the orphan-detection state machine.
 
@@ -308,6 +415,22 @@ def _classify_orphan(
     longer running. Absent / stale / pre-grace report → the vm_contact
     override applies exactly as before.
 
+    ``task_contact_lookup`` (``{task_id_str: last_contact_at}``) and
+    ``task_tool_use_lookup`` (``{task_id_str: last_tool_use_at}``) are the
+    TASK-scoped twins of the two vm-keyed maps, batch-fetched from ``taskcontact``
+    in the same sweep. They exist because ``vmcontact``'s "one row per VM" key is
+    only "one row per TASK" on GCE — a fleet runner multiplexes many tasks onto one
+    ``runner:<id>`` vm id, so the shared row's stamps are advanced by ANY agent on
+    that runner. For ``runner:`` vm ids the overrides therefore read these
+    task-scoped maps instead of the vm-keyed ones, which is what stops a working
+    sibling from masking a hung agent's stall (and, on the heartbeat-stale
+    branches, from masking a hung agent's death that ``_runner_report_excludes_task``
+    cannot see because the hung process is still in ``active_task_ids``). GCE tasks
+    are unaffected — they keep reading the vm-keyed maps, so their genuine
+    lock-starvation false-reap protection is preserved. A ``runner:`` task with no
+    ``taskcontact`` row yet falls back to the vm-keyed maps (absence is not
+    evidence of death). Both default to ``None`` → previous behaviour.
+
     State machine (unchanged):
       PROVISIONING:
         - started_at > 15min ago                        → absolute provision ceiling
@@ -343,7 +466,11 @@ def _classify_orphan(
     # _is_runner_pinned_awaiting_pull, so this carve-out is scoped to IN_PROGRESS.
     if task.status == TaskStatus.IN_PROGRESS and _is_resident_session(task):
         return _classify_resident_session(
-            task, now, vm_contact_lookup, runner_excluded=runner_excluded
+            task,
+            now,
+            vm_contact_lookup,
+            runner_excluded=runner_excluded,
+            task_contact_lookup=task_contact_lookup,
         )
 
     if task.status == TaskStatus.PROVISIONING:
@@ -355,7 +482,7 @@ def _classify_orphan(
             # vm_contact override: a fresh contact within hb_cutoff means the VM
             # is alive (lock-starved last_heartbeat write) — don't reap.
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, hb_cutoff, vm_contact_lookup
+                task, hb_cutoff, vm_contact_lookup, task_contact_lookup
             )
         if (
             task.vm_provisioned_at
@@ -377,7 +504,7 @@ def _classify_orphan(
             # (requeue→repin→reap). It is bounded instead by the 6h local-runner
             # hold sweep (orchestrator.py _fail_stale_local_runner_holds).
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, hb_cutoff, vm_contact_lookup
+                task, hb_cutoff, vm_contact_lookup, task_contact_lookup
             )
         return False
 
@@ -386,7 +513,7 @@ def _classify_orphan(
             # Agent crashed mid-run — UNLESS we heard from the VM within the
             # same cutoff (lock-starved last_heartbeat write); then it's alive.
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, hb_cutoff, vm_contact_lookup
+                task, hb_cutoff, vm_contact_lookup, task_contact_lookup
             )
         if (
             task.last_heartbeat is None
@@ -400,7 +527,7 @@ def _classify_orphan(
             # override: a fresh contact within hb_cutoff proves the VM is alive
             # (its last_heartbeat write was lock-starved), so don't reap.
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, hb_cutoff, vm_contact_lookup
+                task, hb_cutoff, vm_contact_lookup, task_contact_lookup
             )
         if (
             task.last_heartbeat is None
@@ -413,7 +540,7 @@ def _classify_orphan(
             # if the VM is demonstrably alive (fresh contact within hb_cutoff)
             # this is not a dead-VM orphan — suppress the reap.
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, hb_cutoff, vm_contact_lookup
+                task, hb_cutoff, vm_contact_lookup, task_contact_lookup
             )
         if (
             task.last_heartbeat
@@ -455,7 +582,11 @@ def _classify_orphan(
             # from attempt 1). The started_at check ensures the
             # current attempt has actually had time to call tools.
             return not _vm_tool_use_within_cutoff(
-                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
+                task,
+                _progress_stale_cutoff(task, now),
+                vm_tool_use_lookup,
+                task_tool_use_lookup,
+                task_contact_lookup,
             )
         if (
             task.last_heartbeat
@@ -482,7 +613,11 @@ def _classify_orphan(
             # the agent DID record a tool use that the lock-starved heartbeat
             # failed to land on the task row — it is progressing, don't reap.
             return not _vm_tool_use_within_cutoff(
-                task, _progress_stale_cutoff(task, now), vm_tool_use_lookup
+                task,
+                _progress_stale_cutoff(task, now),
+                vm_tool_use_lookup,
+                task_tool_use_lookup,
+                task_contact_lookup,
             )
         return False
 
@@ -582,6 +717,7 @@ def _classify_resident_session(
     vm_contact_lookup: dict | None,
     *,
     runner_excluded: bool = False,
+    task_contact_lookup: dict | None = None,
 ) -> bool:
     """Reap decision for an IN_PROGRESS resident strategic session.
 
@@ -617,18 +753,34 @@ def _classify_resident_session(
     suppression — the 25-min resident window itself still has to elapse, and the
     progress-staleness exemption above is untouched (a warm-idle session making
     no tool calls is still never reaped for that).
+
+    ``runner_excluded`` alone is NOT sufficient, which is why this function also
+    takes ``task_contact_lookup``. It closes only the *process-gone* half: the
+    runner's report has to OMIT the task. The other half — the session process is
+    **hung but alive** (wedged LLM call), has stopped heartbeating, and is
+    therefore STILL listed in ``active_task_ids`` — makes ``runner_excluded``
+    ``False`` by construction, and the shared-row read below then suppressed the
+    reap forever off a sibling's heartbeat. That is the exact case this table
+    exists to close. The resident session is pinned to a fleet runner
+    (``strategic_resident_session.py`` sets ``vm_instance_id = f"runner:{id}"``)
+    that also claims ordinary tasks, so a co-resident sibling is the normal case,
+    not an edge case — and because ``start_resident_session`` returns the existing
+    (dead) session while its task row is alive, an unreapable session means the
+    Workday session can NEVER respawn. Reading the TASK-scoped row instead makes
+    the reap depend on THIS session's own liveness. GCE and pre-rollout rows fall
+    back to the shared row exactly as before (see ``_vm_contact_within_cutoff``).
     """
     resident_cutoff = _resident_session_heartbeat_stale_cutoff(task, now)
     if task.last_heartbeat is not None:
         if task.last_heartbeat < resident_cutoff:
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, resident_cutoff, vm_contact_lookup
+                task, resident_cutoff, vm_contact_lookup, task_contact_lookup
             )
         return False
     if task.started_at is not None:
         if task.started_at < resident_cutoff:
             return runner_excluded or not _vm_contact_within_cutoff(
-                task, resident_cutoff, vm_contact_lookup
+                task, resident_cutoff, vm_contact_lookup, task_contact_lookup
             )
         return False
     # Degenerate row: neither a heartbeat nor a started_at was ever recorded.
@@ -638,7 +790,7 @@ def _classify_resident_session(
     created_at = getattr(task, "created_at", None)
     if created_at is not None and created_at < resident_cutoff:
         return runner_excluded or not _vm_contact_within_cutoff(
-            task, resident_cutoff, vm_contact_lookup
+            task, resident_cutoff, vm_contact_lookup, task_contact_lookup
         )
     return False
 

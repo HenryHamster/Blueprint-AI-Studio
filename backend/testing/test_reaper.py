@@ -8205,6 +8205,410 @@ def test_classify_orphan_fresh_offrow_tool_use_suppresses_zero_toolcall_stall():
     )
 
 
+# ── Task-scoped progress/contact on MULTIPLEXED runners ─────────────────────
+# vmcontact is primary-keyed on vm_instance_id ("one row per VM"), but a fleet
+# runner multiplexes MANY tasks onto one vm id (runner:<id>) — so every task on
+# that runner shares ONE contact/progress row, advanced by ANY agent's heartbeat
+# (func.greatest). A hung-but-heartbeating agent (wedged LLM call / spin loop)
+# next to ANY actively-working sibling therefore read as "progressing" forever
+# and was NEVER stall-reaped. The runner self-report (#14413) cannot rescue this
+# by construction: a hung-but-ALIVE process is still in active_task_ids. With no
+# absolute IN_PROGRESS ceiling anywhere, nothing else ever fired → permanent
+# zombie holding a runner slot, an account slot, and pinning its parent lineage.
+#
+# Fix: for runner: vm ids the overrides read the TASK-scoped taskcontact row.
+# GCE (1 task per VM) keeps reading vmcontact — its genuine lock-starvation
+# false-reap protection must survive untouched.
+
+_RUNNER_VM = "runner:cafe-f00d"
+
+
+def _hung_task_on_busy_runner(now, *, last_tool_use_at=None):
+    """The P0 shape: fresh heartbeat (process alive, still calling /heartbeat),
+    stale ON-ROW last_tool_use_at (it is hung — no tool calls), hosted on a runner
+    that ALSO runs a healthy, actively-working sibling."""
+    return _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),  # hung, but still heartbeating
+        last_tool_use_at=(
+            last_tool_use_at
+            if last_tool_use_at is not None
+            else now - timedelta(minutes=10)  # past the 8min small progress cutoff
+        ),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id=_RUNNER_VM,
+    )
+
+
+def test_hung_task_masked_by_working_sibling_is_now_stall_reaped():
+    """THE P0. A hung agent on a runner whose SHARED vmcontact progress stamp is
+    kept fresh by an actively-working sibling is now reaped: the task-scoped row
+    (its own, stale) is authoritative, so the sibling's tool calls no longer count
+    as this task's progress."""
+    now = _utcnow()
+    t = _hung_task_on_busy_runner(now)
+    # The sibling is working hard → shared vm-keyed progress stamp is fresh.
+    sibling_fed_vm_tool_use = {_RUNNER_VM: now - timedelta(seconds=15)}
+
+    # BEFORE (vm-keyed only): the sibling's freshness masks the stall → NOT reaped.
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=sibling_fed_vm_tool_use
+        )
+        is False
+    ), "regression guard: this is the masking bug being fixed"
+
+    # AFTER: the task's OWN row exists (it heartbeats) but its own tool stamp is
+    # stale → genuinely hung → REAPED, despite the fresh sibling-fed shared row.
+    task_contact = {str(t.id): now - timedelta(seconds=30)}  # it IS heartbeating
+    task_tool_use = {}  # ...but has made NO tool calls (hung)
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=sibling_fed_vm_tool_use,
+            task_contact_lookup=task_contact,
+            task_tool_use_lookup=task_tool_use,
+        )
+        is True
+    ), (
+        "a hung agent whose own task-scoped progress stamp is stale must be "
+        "stall-reaped even though a working sibling keeps the SHARED vmcontact "
+        "row fresh (the 2026-07-12 permanent-zombie class)"
+    )
+
+
+def test_runner_task_making_its_own_tool_calls_is_still_not_reaped():
+    """The other side: a runner task that IS progressing (its OWN task-scoped tool
+    stamp is fresh) keeps the lock-starvation suppression. The fix must not turn
+    every runner task into a reap candidate."""
+    now = _utcnow()
+    t = _hung_task_on_busy_runner(now)  # on-row stamp stale (lock-starved write)
+    task_contact = {str(t.id): now - timedelta(seconds=20)}
+    task_tool_use = {str(t.id): now - timedelta(seconds=45)}  # ITS OWN fresh tools
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            task_contact_lookup=task_contact,
+            task_tool_use_lookup=task_tool_use,
+        )
+        is False
+    ), (
+        "a runner task with a FRESH task-scoped tool-use stamp is progressing — its "
+        "on-row stamp was merely lock-starved; it must not be reaped"
+    )
+
+
+def test_gce_single_task_vm_lock_starvation_override_is_unchanged():
+    """MUST NOT REGRESS: for a 1-task-per-VM GCE task the vmcontact row IS the
+    task's row, so the vm-keyed progress override stays fully in force. This is the
+    genuine lock-starvation false-reap protection (Fix 3b) — a lock-starved but
+    actively-PROGRESSING GCE agent must still be spared, with NO task-scoped row
+    present (and even when unrelated task-scoped rows are in the lookup)."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=10),  # on-row stamp lock-starved
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-gce-single",  # NOT a runner: id
+    )
+    vm_tool_use = {"vm-gce-single": now - timedelta(seconds=20)}  # off-row: alive
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=vm_tool_use,
+            # Task-scoped lookups populated for OTHER tasks must not disturb GCE.
+            task_contact_lookup={"some-other-task": now},
+            task_tool_use_lookup={"some-other-task": now},
+        )
+        is False
+    ), (
+        "GCE 1-task-per-VM tasks must keep the vm-keyed progress override — "
+        "deleting it there re-exposes them to lock-starved false stall-reaps"
+    )
+    # And a GCE task with a genuinely stale off-row stamp is still reaped.
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup={"vm-gce-single": now - timedelta(minutes=11)},
+        )
+        is True
+    )
+
+
+def test_heartbeat_stale_hung_process_still_in_active_task_ids_is_reaped():
+    """The second half of the gap #14413 left open: a hung process that STOPS
+    heartbeating but stays in the runner's active_task_ids (the thread is alive, so
+    _runner_report_excludes_task returns False) was saved forever by the shared
+    contact row. Its task-scoped contact is stale → now reaped."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
+        started_at=now - timedelta(minutes=30),
+        vm_instance_id=_RUNNER_VM,
+    )
+    sibling_fed_contact = {_RUNNER_VM: now - timedelta(seconds=20)}  # sibling alive
+    # The runner still lists the task (the hung thread is alive) → no exclusion.
+    report = {
+        _RUNNER_VM: (now - timedelta(seconds=20), frozenset({str(t.id), "other"}))
+    }
+    assert (
+        _runner_report_excludes_task(t, now - timedelta(minutes=5), report) is False
+    ), "precondition: a hung-but-alive process is still in active_task_ids"
+
+    # BEFORE: shared contact + no runner exclusion → suppressed forever.
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=sibling_fed_contact,
+            runner_report_lookup=report,
+        )
+        is False
+    ), "regression guard: the heartbeat-stale half of the shared-row mask"
+
+    # AFTER: its OWN contact row is stale (it stopped heartbeating) → reaped.
+    task_contact = {str(t.id): now - timedelta(minutes=10)}
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup=sibling_fed_contact,
+            runner_report_lookup=report,
+            task_contact_lookup=task_contact,
+        )
+        is True
+    ), (
+        "a hung process that stopped heartbeating but is still in active_task_ids "
+        "must be reaped — its own task-scoped contact is stale; the sibling-fed "
+        "shared row must not shield it"
+    )
+
+
+def test_runner_task_with_fresh_task_scoped_contact_still_suppressed():
+    """A runner task whose OWN contact is fresh (alive; last_heartbeat write merely
+    lock-starved) keeps the heartbeat-stale suppression."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=30),
+        vm_instance_id=_RUNNER_VM,
+    )
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=20)},
+            task_contact_lookup={str(t.id): now - timedelta(seconds=20)},
+        )
+        is False
+    )
+
+
+def test_absent_task_scoped_row_falls_back_to_shared_row():
+    """ROLLOUT SAFETY: absence of a task-scoped row is NEVER evidence of death. A
+    runner task that has not yet heartbeated under the new handler (no taskcontact
+    row) must degrade to the previous shared-row behaviour, not become reapable."""
+    now = _utcnow()
+    hung = _hung_task_on_busy_runner(now)
+    sibling_fed_vm_tool_use = {_RUNNER_VM: now - timedelta(seconds=15)}
+    # No task-scoped row at all (empty lookups) → old behaviour: suppressed.
+    assert (
+        _classify_orphan(
+            hung,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=sibling_fed_vm_tool_use,
+            task_contact_lookup={},
+            task_tool_use_lookup={},
+        )
+        is False
+    ), "no task-scoped row → fall back to today's behaviour (no false-reap)"
+
+    # Rows exist for OTHER tasks on the same runner, but not this one → still
+    # falls back for THIS task (presence is checked per-task, not per-runner).
+    assert (
+        _classify_orphan(
+            hung,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=sibling_fed_vm_tool_use,
+            task_contact_lookup={"sibling-task": now},
+            task_tool_use_lookup={"sibling-task": now},
+        )
+        is False
+    )
+
+
+def test_task_scoped_row_present_with_null_tool_stamp_does_not_fall_back():
+    """The subtle one: a task-scoped row EXISTS but its last_tool_use_at is NULL
+    (the agent heartbeats but has never recorded a tool call). This must NOT be
+    treated like an absent row — falling back to the sibling-fed shared row there
+    would silently restore the whole masking bug. Presence is decided by
+    taskcontact.last_contact_at (NOT NULL), never by the nullable tool stamp."""
+    now = _utcnow()
+    t = _hung_task_on_busy_runner(now)
+    sibling_fed_vm_tool_use = {_RUNNER_VM: now - timedelta(seconds=15)}
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=sibling_fed_vm_tool_use,
+            task_contact_lookup={str(t.id): now - timedelta(seconds=30)},  # row EXISTS
+            task_tool_use_lookup={},  # ...with a NULL tool stamp
+        )
+        is True
+    ), (
+        "row-exists-but-tool-stamp-NULL must reap, not fall back to the shared row "
+        "(falling back would restore the sibling mask)"
+    )
+
+
+def test_zero_tool_anthropic_stall_branch_is_also_task_scoped():
+    """The second stall branch (fresh heartbeat, NO tool use ever, anthropic) must
+    consult the task-scoped row too — otherwise a sibling's tool calls still mask a
+    never-progressed hung anthropic agent."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=None,  # never called a tool
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id=_RUNNER_VM,
+        context={"llm_provider": "anthropic"},
+    )
+    sibling_fed_vm_tool_use = {_RUNNER_VM: now - timedelta(seconds=15)}
+    # BEFORE: sibling's tool calls suppress the zero-tool stall.
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=sibling_fed_vm_tool_use
+        )
+        is False
+    )
+    # AFTER: its own row has no tool use → reaped.
+    assert (
+        _classify_orphan(
+            t,
+            now,
+            has_open_pr=False,
+            vm_tool_use_lookup=sibling_fed_vm_tool_use,
+            task_contact_lookup={str(t.id): now - timedelta(seconds=30)},
+            task_tool_use_lookup={},
+        )
+        is True
+    )
+
+
+def test_resident_session_hung_on_shared_runner_is_reaped():
+    """N1: the resident session is reapable when ITS OWN contact stamp goes stale,
+    even though a working sibling keeps the SHARED vmcontact row fresh.
+
+    The Workday resident session is pinned to a fleet runner
+    (strategic_resident_session.py: vm_instance_id = f"runner:{id}") that also
+    claims ordinary tasks. If the session wedges on an LLM call and stops
+    heartbeating, it stays in the runner's active_task_ids (the process is alive),
+    so runner_excluded is False by construction — #14549's fix cannot see it. The
+    sibling's heartbeats then kept the shared row fresh and suppressed the reap
+    past the resident window FOREVER. Because start_resident_session returns the
+    existing session while its task row lives, that zombie meant Workday could
+    NEVER respawn.
+
+    No runner_report_lookup is passed, so _runner_report_excludes_task is False —
+    that is the precondition, not an oversight."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=40),  # past the 25-min window
+        started_at=now - timedelta(hours=3),
+        vm_instance_id=_RUNNER_VM,
+        context={"_resident_session": True},
+    )
+    reap = _classify_orphan(
+        t,
+        now,
+        has_open_pr=False,
+        # A live sibling on the SAME runner keeps the shared row warm.
+        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},
+        # THIS session's own row is stale — it stopped heartbeating 40min ago.
+        task_contact_lookup={str(t.id): now - timedelta(minutes=40)},
+        task_tool_use_lookup={},
+    )
+    assert reap is True, (
+        "a resident session whose OWN task-scoped contact is stale must be reaped "
+        "even while a sibling keeps the shared vmcontact row fresh — otherwise the "
+        "Workday session is unreclaimable and can never respawn"
+    )
+
+
+def test_resident_session_with_fresh_task_scoped_contact_is_not_reaped():
+    """The must-not-break direction: a resident session that IS alive (its own
+    task-scoped contact is fresh) must never be reaped, even though its
+    last_heartbeat is stale — that is the lock-starved-heartbeat case the contact
+    override exists for. Guards against the fix over-reaping live Workday
+    sessions."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=40),
+        started_at=now - timedelta(hours=3),
+        vm_instance_id=_RUNNER_VM,
+        context={"_resident_session": True},
+    )
+    reap = _classify_orphan(
+        t,
+        now,
+        has_open_pr=False,
+        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},
+        task_contact_lookup={str(t.id): now - timedelta(seconds=20)},  # ALIVE
+        task_tool_use_lookup={},
+    )
+    assert reap is False, (
+        "a resident session with a FRESH task-scoped contact is alive (its "
+        "last_heartbeat write was lock-starved) and must not be reaped"
+    )
+
+
+def test_resident_session_absent_task_scoped_row_falls_back_to_shared():
+    """Rollout safety for the resident branch: with NO task-scoped row (pre-deploy,
+    or not yet heartbeated under the new handler) the classification falls back to
+    the shared vmcontact row — today's behaviour. Absence is never evidence of
+    death, so deploying this cannot false-reap a live Workday session."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=40),
+        started_at=now - timedelta(hours=3),
+        vm_instance_id=_RUNNER_VM,
+        context={"_resident_session": True},
+    )
+    reap = _classify_orphan(
+        t,
+        now,
+        has_open_pr=False,
+        vm_contact_lookup={_RUNNER_VM: now - timedelta(seconds=30)},  # fresh shared
+        task_contact_lookup={},  # no row for this task
+        task_tool_use_lookup={},
+    )
+    assert reap is False, (
+        "absent task-scoped row must fall back to the shared vmcontact row "
+        "(fresh -> no reap), preserving today's behaviour for pre-rollout sessions"
+    )
+
+
 # ── Fix 3a: _relock_orphan_task vm_liveness override is reason-gated ─────────
 
 
@@ -8603,6 +9007,168 @@ async def test_reaper_service_spares_task_the_runner_still_reports_active(
         "suppression — its agent is alive, its heartbeat write was lock-starved"
     )
     assert t.attempt_count == 0
+
+
+# ── RELOCK stage reads the TASK-scoped contact row on multiplexed runners ────
+# Without these, the heartbeat-stale half of the multiplexed-runner fix is INERT
+# end-to-end: _classify_orphan correctly classifies the hung task as an orphan and
+# then _relock_orphan_task silently un-reaps it, every cycle, because it re-read
+# the SHARED vmcontact row that a working sibling keeps fresh.
+
+
+@pytest.mark.asyncio
+async def test_relock_multiplexed_runner_reads_task_scoped_contact_not_shared(
+    reaper_db,
+):
+    """THE Blocker-2 case. A hung agent on a fleet runner, co-resident with a
+    working sibling: the SHARED vmcontact row is fresh (the sibling's heartbeats
+    advance it), but this task's OWN taskcontact row is stale. The relock must read
+    the TASK-scoped row and let the heartbeat-stale reap proceed.
+
+    On the shared-row code this returns None (reap aborted) forever → permanent
+    zombie. The runner self-report gate cannot close this: a hung-but-alive process
+    is still listed in active_task_ids."""
+    from app.models import TaskContact, VmContact
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    runner_vm = "runner:relock-zombie"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=runner_vm,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=40),
+        last_heartbeat=now - timedelta(minutes=30),  # hung: stopped heartbeating
+    )
+    reaper_db.add(t)
+    # The SHARED row is FRESH — a live sibling on the same runner keeps it warm.
+    reaper_db.add(
+        VmContact(
+            vm_instance_id=runner_vm, last_contact_at=now - timedelta(seconds=10)
+        )
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    # This task's OWN row is STALE (its agent died 30min ago).
+    reaper_db.add(
+        TaskContact(task_id=t.id, last_contact_at=now - timedelta(minutes=30))
+    )
+    await reaper_db.commit()
+
+    cutoff = now - timedelta(minutes=5)
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=cutoff,
+    )
+    assert relocked is not None, (
+        "relock must consult the TASK-scoped taskcontact row for a runner: vm id. "
+        "The sibling-fed SHARED vmcontact row is fresh, but THIS task's agent is "
+        "dead — reading the shared row here is exactly what made the "
+        "heartbeat-stale reap inert (permanent zombie)."
+    )
+    assert relocked.id == t.id
+
+
+@pytest.mark.asyncio
+async def test_relock_multiplexed_runner_fresh_task_contact_still_suppresses(
+    reaper_db,
+):
+    """The false-reap guard must survive on runners: a task whose OWN taskcontact
+    row is fresh is alive-but-lock-starved (its contended last_heartbeat write was
+    skipped). The relock must still abort the reap. This is the case that made
+    Option B unacceptable — the fix must not reap lock-starved-but-progressing
+    runner tasks."""
+    from app.models import TaskContact, VmContact
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    runner_vm = "runner:relock-lockstarved"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=runner_vm,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(minutes=10),  # lock-starved: stale on-row
+    )
+    reaper_db.add(t)
+    reaper_db.add(
+        VmContact(
+            vm_instance_id=runner_vm, last_contact_at=now - timedelta(seconds=10)
+        )
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    # THIS task's own row is FRESH — it is alive and heartbeating off-row.
+    reaper_db.add(
+        TaskContact(task_id=t.id, last_contact_at=now - timedelta(seconds=15))
+    )
+    await reaper_db.commit()
+
+    cutoff = now - timedelta(minutes=5)
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=cutoff,
+    )
+    assert relocked is None, (
+        "a fresh TASK-scoped contact proves THIS agent is alive (lock-starved "
+        "heartbeat) — the reap must still be aborted on a multiplexed runner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_relock_multiplexed_runner_absent_task_contact_falls_back_to_shared(
+    reaper_db,
+):
+    """Rollout safety at the relock stage: a runner task with NO taskcontact row
+    (pre-deploy, or not yet heartbeated under the new handler) must fall back to the
+    shared vmcontact row — today's behaviour. An ABSENT row is never evidence of
+    death, so such a task cannot be false-reaped by shipping this."""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    runner_vm = "runner:relock-prerollout"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=runner_vm,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    reaper_db.add(
+        VmContact(
+            vm_instance_id=runner_vm, last_contact_at=now - timedelta(seconds=10)
+        )
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+    # NO TaskContact row is created for this task.
+
+    cutoff = now - timedelta(minutes=5)
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=cutoff,
+    )
+    assert relocked is None, (
+        "absent taskcontact row must fall back to the shared vmcontact row "
+        "(fresh → abort), preserving today's behaviour for pre-rollout tasks"
+    )
 
 
 def test_relock_orphan_task_re_export_identity():

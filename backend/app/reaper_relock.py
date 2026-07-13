@@ -11,10 +11,63 @@ from datetime import datetime
 from sqlalchemy.exc import InvalidRequestError
 from sqlmodel import select
 
-from app.models import Task, TaskStatus, VmContact
-from app.reaper_orphan_classify import _runner_report_excludes_task
+from app.models import Task, TaskContact, TaskStatus, VmContact
+from app.reaper_orphan_classify import (
+    _is_multiplexed_vm_id,
+    _runner_report_excludes_task,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def _relock_contact_at(session, fresh) -> tuple[datetime | None, str]:
+    """Fresh-read the liveness contact stamp that is authoritative FOR THIS TASK.
+
+    The relock stage deliberately re-queries (rather than reusing the sweep-time
+    lookup maps ``_classify_orphan`` was given): its whole job is to catch a
+    contact that landed DURING the unlocked external-I/O window, which can be
+    30-120s wide. A stale dict would defeat that. So this mirrors
+    ``_classify_orphan``'s *semantics* with the relock's *fresh-read* design.
+
+    Which row is authoritative depends on whether the vm id is shared:
+
+      * ``runner:<id>`` (fleet runner, MANY tasks per vm id) → the ``vmcontact``
+        row is SHARED with every sibling task on that runner, so a live sibling's
+        heartbeat keeps it fresh and it proves nothing about THIS task. Read the
+        TASK-scoped ``taskcontact`` row instead. ``taskcontact.last_contact_at``
+        is NOT NULL, so "returned a value" is exactly "a row exists" — and a row
+        that exists is authoritative: we do NOT fall back to the shared row when
+        its stamp is merely stale, because that fallback IS the sibling-masking
+        bug (a hung agent's own stamp goes stale while its sibling keeps the
+        shared row fresh forever).
+      * row ABSENT for a ``runner:`` task → pre-rollout / not yet heartbeated
+        under the new handler. Absence is NEVER evidence of death: fall back to
+        the shared row, i.e. exactly today's behaviour. No task can be
+        false-reaped by rolling this out.
+      * GCE agent VM (one task per VM) → ``vmcontact`` already IS the task's row.
+        Read it unchanged, byte-for-byte, preserving the genuine
+        lock-starved-but-alive false-reap protection this override exists for.
+
+    Returns ``(last_contact_at | None, scope)`` where ``scope`` is ``"taskcontact"``
+    or ``"vmcontact"``, purely so the caller can log WHICH signal it acted on.
+    """
+    if _is_multiplexed_vm_id(fresh):
+        _tc_at = (
+            await session.execute(
+                select(TaskContact.last_contact_at).where(
+                    TaskContact.task_id == fresh.id
+                )
+            )
+        ).scalar_one_or_none()
+        if _tc_at is not None:
+            return _tc_at, "taskcontact"
+    return (
+        await session.execute(
+            select(VmContact.last_contact_at).where(
+                VmContact.vm_instance_id == fresh.vm_instance_id
+            )
+        )
+    ).scalar_one_or_none(), "vmcontact"
 
 
 async def _relock_orphan_task(
@@ -142,29 +195,38 @@ async def _relock_orphan_task(
                 fresh.vm_instance_id,
             )
         else:
+            # The runner still CLAIMS this task — but that is exactly the
+            # hung-but-alive case, and it says nothing about whether the task's
+            # own agent is making progress. Reading the SHARED vmcontact row here
+            # is what made the heartbeat-stale reap inert: a working sibling on the
+            # same runner keeps it fresh, so the abort below fired forever on a
+            # task whose agent was dead. _runner_report_excludes_task cannot close
+            # that by construction — a hung-but-alive process is still listed in
+            # ``active_task_ids``, so the branch above is False precisely here.
+            # _relock_contact_at picks the row that is authoritative for THIS task:
+            # the TASK-scoped ``taskcontact`` row for ``runner:`` ids when one
+            # exists, and the shared ``vmcontact`` row for GCE (1 task per VM,
+            # where it already IS the task's row) and for pre-rollout tasks with no
+            # row yet. Fresh-read, like the query it replaces.
             try:
-                _contact_at = (
-                    await session.execute(
-                        select(VmContact.last_contact_at).where(
-                            VmContact.vm_instance_id == fresh.vm_instance_id
-                        )
-                    )
-                ).scalar_one_or_none()
+                _contact_at, _contact_scope = await _relock_contact_at(session, fresh)
             except Exception as _vc_exc:  # noqa: BLE001
                 logger.warning(
-                    "[REAPER] vm_contact re-lock lookup failed for task %s vm=%s "
+                    "[REAPER] contact re-lock lookup failed for task %s vm=%s "
                     "(non-fatal, proceeding with reap): %s",
                     task_id,
                     fresh.vm_instance_id,
                     _vc_exc,
                 )
                 _contact_at = None
+                _contact_scope = "vmcontact"
             if _contact_at is not None and _contact_at >= vm_liveness_cutoff:
                 logger.info(
                     f"[REAPER] Orphan re-lock found task {task_id} vm "
                     f"{fresh.vm_instance_id} contacted the orchestrator at "
-                    f"{_contact_at} (>= cutoff {vm_liveness_cutoff}) during external "
-                    f"I/O — agent alive (lock-starved heartbeat), skipping reap"
+                    f"{_contact_at} (>= cutoff {vm_liveness_cutoff}, scope "
+                    f"{_contact_scope}) during external I/O — agent alive "
+                    f"(lock-starved heartbeat), skipping reap"
                 )
                 return None
     if fresh.status != expected_status:

@@ -47,6 +47,7 @@ from app.models import (
     TaskHistory,
     TaskStatus,
     VmContact,
+    TaskContact,
     bank_task_current_attempt,
 )
 from app.compute import (
@@ -191,6 +192,7 @@ from app.reaper_orphan_classify import (
     _select_orphans_for_cycle,
     _vm_contact_within_cutoff,  # noqa: F401
     _vm_tool_use_within_cutoff,  # noqa: F401
+    _is_multiplexed_vm_id,
     _classify_orphan,
     _HEARTBEAT_STALE_DEFAULTS,  # noqa: F401
     _HEARTBEAT_EFFORT_FLOORS,  # noqa: F401
@@ -525,6 +527,49 @@ async def reaper_service():
                         for vm_id, _last_contact, last_tool in contact_rows
                         if last_tool is not None
                     }
+                # Multiplexed-runner fix: the two maps above are keyed on
+                # ``vm_instance_id``, which is only one-row-per-TASK on GCE. A fleet
+                # runner multiplexes many tasks onto one ``runner:<id>`` vm id, so
+                # ANY agent's heartbeat advances the shared row and a hung agent
+                # beside a working sibling never reads as stalled (2026-07-12 zombie
+                # class). Batch-fetch the TASK-scoped ``taskcontact`` rows for the
+                # SAME candidates; _classify_orphan reads these instead of the
+                # vm-keyed maps for ``runner:`` vm ids and keeps using the vm-keyed
+                # maps for GCE. ``last_contact_at`` is NOT NULL, so presence in
+                # task_contact_lookup is the "row exists" oracle that lets an ABSENT
+                # row (pre-rollout) fall back to the old behaviour while a PRESENT
+                # row with a NULL/stale tool stamp correctly reaps.
+                task_contact_lookup: dict[str, datetime] = {}
+                task_tool_use_lookup: dict[str, datetime] = {}
+                # Only ``runner:`` tasks: _classify_orphan consults the task-scoped
+                # row solely when _is_multiplexed_vm_id(task) is True, so fetching
+                # rows for GCE tasks (1 task per VM — their vmcontact row already IS
+                # the task's row) would load rows nothing ever reads.
+                candidate_task_ids = [
+                    t.id
+                    for t in active_tasks
+                    if t.vm_instance_id and _is_multiplexed_vm_id(t)
+                ]
+                if candidate_task_ids:
+                    task_contact_rows = (
+                        await session.execute(
+                            select(
+                                TaskContact.task_id,
+                                TaskContact.last_contact_at,
+                                TaskContact.last_tool_use_at,
+                            ).where(TaskContact.task_id.in_(candidate_task_ids))
+                        )
+                    ).all()
+                    task_contact_lookup = {
+                        str(task_id): last_contact
+                        for task_id, last_contact, _last_tool in task_contact_rows
+                        if last_contact is not None
+                    }
+                    task_tool_use_lookup = {
+                        str(task_id): last_tool
+                        for task_id, _last_contact, last_tool in task_contact_rows
+                        if last_tool is not None
+                    }
                 # Fleet-runner self-reports: defeats the shared-VmContact
                 # suppression for a task whose OWN runner freshly reports it is
                 # no longer running it (zombie tasks on busy runners; see
@@ -563,6 +608,8 @@ async def reaper_service():
                         vm_contact_lookup=vm_contact_lookup,
                         vm_tool_use_lookup=vm_tool_use_lookup,
                         runner_report_lookup=runner_report_lookup,
+                        task_contact_lookup=task_contact_lookup,
+                        task_tool_use_lookup=task_tool_use_lookup,
                     ):
                         continue
                     orphaned_ids.append(task.id)
@@ -711,6 +758,39 @@ async def reaper_service():
                             for vm_id, _last_contact, last_tool in step2_contact_rows
                             if last_tool is not None
                         }
+                    # Re-fetch the TASK-scoped rows with the refreshed clock too:
+                    # a heartbeat from THIS task that landed during lock acquisition
+                    # must abort the reap, mirroring the vm_contact re-fetch above.
+                    # Without this the Step-2 re-verify would see no task-scoped row
+                    # and fall back to the shared (sibling-fed) vm row.
+                    # Same ``runner:``-only filter as the Step-1 fetch above.
+                    step2_task_ids = [
+                        t.id
+                        for t in orphaned_tasks
+                        if t.vm_instance_id and _is_multiplexed_vm_id(t)
+                    ]
+                    step2_task_contact_lookup: dict[str, datetime] = {}
+                    step2_task_tool_use_lookup: dict[str, datetime] = {}
+                    if step2_task_ids:
+                        step2_task_rows = (
+                            await session.execute(
+                                select(
+                                    TaskContact.task_id,
+                                    TaskContact.last_contact_at,
+                                    TaskContact.last_tool_use_at,
+                                ).where(TaskContact.task_id.in_(step2_task_ids))
+                            )
+                        ).all()
+                        step2_task_contact_lookup = {
+                            str(task_id): last_contact
+                            for task_id, last_contact, _last_tool in step2_task_rows
+                            if last_contact is not None
+                        }
+                        step2_task_tool_use_lookup = {
+                            str(task_id): last_tool
+                            for task_id, _last_contact, last_tool in step2_task_rows
+                            if last_tool is not None
+                        }
                     # Re-fetch the runner self-reports with the refreshed clock
                     # too: a runner heartbeat that landed during lock
                     # acquisition and now INCLUDES the task (e.g. the claim
@@ -729,6 +809,8 @@ async def reaper_service():
                             vm_contact_lookup=step2_contact_lookup,
                             vm_tool_use_lookup=step2_tool_use_lookup,
                             runner_report_lookup=step2_runner_report_lookup,
+                            task_contact_lookup=step2_task_contact_lookup,
+                            task_tool_use_lookup=step2_task_tool_use_lookup,
                         )
                     ]
                     orphaned_tasks = verified

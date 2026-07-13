@@ -1834,6 +1834,134 @@ def test_parse_latest_tool_use_at_returns_none_on_malformed_tail():
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_writes_task_scoped_contact_on_multiplexed_runner(
+    client: AsyncClient, db_session
+):
+    """Multiplexed-runner zombie fix (writer side). A fleet runner pins MANY tasks
+    to ONE vm_instance_id ('runner:<id>'), so the vmcontact row is SHARED and its
+    last_tool_use_at is advanced by ANY agent on that runner (func.greatest). This
+    is what let a working sibling mask a hung agent's stall forever.
+
+    The heartbeat must therefore ALSO write a TASK-scoped taskcontact row, so the
+    two co-resident tasks end up with INDEPENDENT progress stamps: the working
+    sibling's tool calls advance the shared row and its OWN row, while the hung
+    task's row keeps a NULL/stale last_tool_use_at — which is exactly the signal
+    the reaper needs to reap it."""
+    from app.models import TaskContact, VmContact
+
+    project = Project(name="Runner Task Contact", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_vm = "runner:1111-2222"
+    hung = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=runner_vm,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    working = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=runner_vm,  # SAME vm id — the multiplexing that causes the bug
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(hung)
+    db_session.add(working)
+    await db_session.commit()
+    await db_session.refresh(hung)
+    await db_session.refresh(working)
+
+    # The hung agent heartbeats but calls NO tools (wedged LLM call / spin loop).
+    hung_headers = {"x-agent-token": create_agent_token(str(hung.id), runner_vm)}
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(hung.id), "status_message": "still alive"},
+        headers=hung_headers,
+    )
+    assert resp.status_code == 200
+
+    # The healthy sibling heartbeats WITH fresh tool calls.
+    working_headers = {"x-agent-token": create_agent_token(str(working.id), runner_vm)}
+    recent = (_utcnow() - timedelta(seconds=10)).isoformat()
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(working.id),
+            "tool_trace": [{"t": recent, "tool": "Bash", "input_preview": "ls"}],
+        },
+        headers=working_headers,
+    )
+    assert resp.status_code == 200
+
+    # The SHARED vmcontact row is polluted by the sibling — this is the bug's
+    # mechanism, and it is preserved (other consumers still rely on this row).
+    shared = await db_session.get(VmContact, runner_vm)
+    assert shared is not None
+    assert shared.last_tool_use_at is not None, (
+        "the shared row carries the sibling's tool use — this is exactly the "
+        "signal that used to mask the hung task"
+    )
+
+    # But the TASK-scoped rows are independent, which is what breaks the mask.
+    hung_row = await db_session.get(TaskContact, hung.id)
+    working_row = await db_session.get(TaskContact, working.id)
+
+    assert hung_row is not None, (
+        "every heartbeat must write a task-scoped row (not only tool-bearing ones) "
+        "— absence would make the reaper fall back to the shared, masked row"
+    )
+    assert hung_row.last_contact_at is not None  # it IS alive and heartbeating
+    assert hung_row.last_tool_use_at is None, (
+        "the hung task made no tool calls: its OWN progress stamp must stay NULL "
+        "even though its sibling advanced the shared vmcontact row"
+    )
+
+    assert working_row is not None
+    assert working_row.last_tool_use_at is not None, (
+        "the working sibling's own progress stamp carries its tool use"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_contact_failure_does_not_lose_vm_contact_write(db_session):
+    """A taskcontact-only failure must NOT take the shared vmcontact write down.
+
+    The two upserts share one session. ``taskcontact.task_id`` REFERENCES task(id)
+    (``vmcontact`` has no FK and is immune), so a task row purged mid-flight makes
+    the taskcontact INSERT raise an FK violation — which, in one un-nested
+    transaction, poisons the whole thing and drops the vmcontact write too. That
+    would lose the lock-starvation liveness signal for that beat, i.e. this fix
+    could CAUSE a false-reap of a live agent on the very path it exists to protect.
+
+    The SAVEPOINT must scope the damage to the task-scoped row. Exercises the real
+    Postgres path with a task_id that does not exist in ``task``."""
+    import uuid as _uuid
+
+    from app.models import TaskContact, VmContact
+    from app.routers.agent import _record_vm_contact
+
+    runner_vm = "runner:savepoint-isolation"
+    ghost_task_id = _uuid.uuid4()  # never inserted → FK violation on taskcontact
+
+    # Must not raise: the whole function is best-effort.
+    await _record_vm_contact(runner_vm, None, task_id=ghost_task_id)
+
+    contact = await db_session.get(VmContact, runner_vm)
+    assert contact is not None, (
+        "the shared vmcontact row MUST still be committed even though the "
+        "task-scoped write failed — otherwise a taskcontact FK violation silently "
+        "destroys the liveness signal the reaper's false-reap guard depends on"
+    )
+    assert contact.last_contact_at is not None
+
+    assert await db_session.get(TaskContact, ghost_task_id) is None, (
+        "the failed task-scoped write must have been rolled back to the savepoint"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_persists_valid_prompt_fingerprint(
     client: AsyncClient, db_session
 ):

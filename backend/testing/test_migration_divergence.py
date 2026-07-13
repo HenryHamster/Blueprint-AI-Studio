@@ -1921,10 +1921,16 @@ def test_on_disk_0458b_0459_reconciliation_state():
 
 
 def test_expected_schema_revision_tracks_new_head():
-    """EXPECTED_SCHEMA_REVISION must track the new structural head (0527)."""
+    """EXPECTED_SCHEMA_REVISION must track the current structural head (0528).
+
+    Bumped 0527 -> 0528 by the ``taskcontact`` migration, following the same
+    convention as the 0526 -> 0527 bump: this literal tracks whatever the chain's
+    single head currently is, so adding a head migration must move it in lockstep
+    or ``_verify_schema_version`` refuses to boot.
+    """
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0527"
+    assert EXPECTED_SCHEMA_REVISION == "0528"
 
 
 # ===========================================================================

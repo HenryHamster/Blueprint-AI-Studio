@@ -3185,6 +3185,77 @@ class VmContact(SQLModel, table=True):
     )
 
 
+class TaskContact(SQLModel, table=True):
+    """TASK-scoped twin of :class:`VmContact` — off-row liveness/progress for ONE task.
+
+    ``VmContact`` is primary-keyed on ``vm_instance_id`` — "one row per VM". That
+    identity holds for GCE agent VMs (one task per VM, so the VM row IS the task
+    row) but is FALSE for fleet runners: ``scripts/local_runner.py`` multiplexes
+    MANY concurrent tasks onto a single ``vm_instance_id='runner:<id>'``. Every
+    task on that runner therefore shares ONE ``vmcontact`` row, and the heartbeat
+    handler advances its ``last_tool_use_at`` with ``GREATEST(...)`` from ANY
+    agent's heartbeat on that runner.
+
+    The consequence was a permanent zombie class (2026-07-12): a hung-but-
+    heartbeating agent (wedged LLM call, spin loop) co-resident with ANY actively
+    working sibling is never stall-reaped, because the sibling's tool calls keep
+    the SHARED progress stamp fresh and the reaper's ``agent_stalled`` override
+    reads that shared stamp. The runner self-report fix (#14413,
+    ``_runner_report_excludes_task``) cannot help by construction: a hung-but-
+    alive process is still listed in the runner's ``active_task_ids``. With no
+    absolute IN_PROGRESS runtime ceiling anywhere, nothing else ever fires — the
+    task holds a runner slot, an account slot, and pins its parent lineage
+    forever. The same shared-row masking also survives on the heartbeat-stale
+    branch for a hung process that stops heartbeating but stays in
+    ``active_task_ids``.
+
+    This table restores the "one row per unit of work" identity that the reaper's
+    overrides actually assume, keyed on ``task_id``. The heartbeat handler
+    (``routers/agent.py::_record_vm_contact``) upserts BOTH rows on the same
+    independent session: the shared ``vmcontact`` row (unchanged — every existing
+    consumer keeps working) and this per-task row. The reaper's contact/progress
+    overrides then read THIS row for ``runner:``-prefixed vm ids, where a shared
+    row is a fleet-wide signal rather than a task signal, and keep reading
+    ``vmcontact`` for 1-task-per-VM GCE ids, where the shared row is already
+    task-scoped by construction (so GCE lock-starvation protection is preserved
+    byte-for-byte).
+
+    Rollout safety: an ABSENT row is never evidence of death — the reaper falls
+    back to the shared ``vmcontact`` row (i.e. today's behaviour) when no per-task
+    row exists yet, so a task that has not yet heartbeated under the new handler
+    cannot be false-reaped. A row is written on EVERY heartbeat (not only
+    tool-bearing ones), so a live task acquires one within a single heartbeat
+    interval (~30-60s) of deploy. Once the row exists it is authoritative for that
+    task, which is exactly what defeats the sibling mask.
+
+    Both stamps carry the same lock-starvation immunity as ``VmContact``: they are
+    written OFF the contended ``Task`` row, on a session committed independently of
+    the request session, so the rollup holding the task row FOR UPDATE can never
+    starve them. ``last_tool_use_at`` is advanced monotonically (never regressed to
+    NULL or to an older value) so a tool-less heartbeat between two tool-bearing
+    ones cannot blank a fresh progress signal.
+
+    Created on Postgres by alembic 0528 and on the SQLite test fixture by
+    ``SQLModel.metadata.create_all``.
+    """
+
+    task_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="CASCADE"),
+            primary_key=True,
+        )
+    )
+    last_contact_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_tool_use_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+
 class MessageType(str, Enum):
     QUESTION = "QUESTION"
     FEEDBACK = "FEEDBACK"
