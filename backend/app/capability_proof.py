@@ -290,7 +290,13 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
         # Avoid duplicating a proof entry for the same task.
         if any(e.get("task_id") == task_id for e in entries):
             continue
-        entries.append(entry)
+        # Append an independent copy per capability. The shared ``entry`` is
+        # built once above, but appending it by reference would alias the SAME
+        # dict across every capability's list in a multi-capability task, so a
+        # later mutation (or downstream enrichment) of one capability's entry
+        # would silently bleed into the others. Copy so each entry is a distinct
+        # object.
+        entries.append(dict(entry))
         # Cap at _MAX_PROOF_ENTRIES_PER_CAPABILITY (keep most recent).
         if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
             entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]

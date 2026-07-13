@@ -36951,3 +36951,97 @@ async def test_finalize_new_candidate_sha_writes_new_dimension_rows(
         f"both SHAs should produce the same set of dimension rows; "
         f"sha_1={dims_sha1}, sha_2={dims_sha2}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolved_status", ["passed", "failed", "blocked"])
+async def test_redrive_isolation_proven_evidence(db_session, resolved_status):
+    """_upsert_dimension_result must never downgrade a resolved dimension fact
+    (passed/failed/blocked) to a non-resolved status such as 'unavailable'.
+
+    This is the primitive-level isolation guard: when a qualification redrive
+    encounters an infra failure AFTER a dimension has already settled, the
+    _upsert_dimension_result primitive itself rejects the downgrade write,
+    preserving the settled fact even when the call bypasses the higher-level
+    guard in _record_infra_dimension_unavailable.
+
+    Also verifies that resolved→resolved transitions (e.g. failed→passed) ARE
+    still permitted — the guard only blocks non-resolved overwrites.
+    """
+    from app import release_qualifier as rq
+    from app.models import QualificationDimensionResult
+    from sqlalchemy import select as sa_select
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "aabbccddaabbccddaabbccddaabbccddaabbccdd"
+
+    # Seed a pre-resolved dimension row at the primitive layer.
+    seed_row = QualificationDimensionResult(
+        project_id=version.project_id,
+        release_version_id=version.id,
+        candidate_sha=candidate_sha,
+        dimension="ci",
+        status=resolved_status,
+        sub_score=1.0 if resolved_status == "passed" else 0.0,
+    )
+    db_session.add(seed_row)
+    await db_session.flush()
+
+    # Attempt to downgrade directly via _upsert_dimension_result (bypassing
+    # _record_infra_dimension_unavailable's caller-side guard).
+    await rq._upsert_dimension_result(
+        db_session,
+        version,
+        candidate_sha,
+        "ci",
+        status="unavailable",
+        detail={"infra_error": "simulated_redrive_infra_failure"},
+    )
+    await db_session.flush()
+
+    row = (
+        await db_session.execute(
+            sa_select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+                QualificationDimensionResult.dimension == "ci",
+            )
+        )
+    ).scalar_one_or_none()
+    assert row is not None, "dimension row must still exist"
+    assert row.status == resolved_status, (
+        f"primitive-level guard failed: resolved status '{resolved_status}' was "
+        f"downgraded to '{row.status}' by a non-resolved write"
+    )
+    # detail must NOT have been overwritten with the infra-failure payload.
+    assert not (
+        isinstance(row.detail, dict) and "infra_error" in row.detail
+    ), "infra_error detail must not overwrite a resolved row"
+
+    # Verify the inverse: resolved→resolved transitions are still permitted.
+    # A re-qualification that legitimately flips passed→failed must be recorded.
+    new_resolved_status = "failed" if resolved_status == "passed" else "passed"
+    await rq._upsert_dimension_result(
+        db_session,
+        version,
+        candidate_sha,
+        "ci",
+        status=new_resolved_status,
+        blocker="ci_not_green" if new_resolved_status == "failed" else None,
+    )
+    await db_session.flush()
+
+    row2 = (
+        await db_session.execute(
+            sa_select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+                QualificationDimensionResult.dimension == "ci",
+            )
+        )
+    ).scalar_one_or_none()
+    assert row2 is not None
+    assert row2.status == new_resolved_status, (
+        f"resolved→resolved transition must be permitted: expected '{new_resolved_status}', "
+        f"got '{row2.status}'"
+    )

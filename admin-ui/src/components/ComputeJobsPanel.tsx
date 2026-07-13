@@ -1613,12 +1613,17 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       {job.task_title ?? job.task_id ?? job.id}
                     </div>
                   )}
-                  <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
+                  <div
+                    className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words"
+                    data-testid="compute-job-provenance"
+                  >
                     {backendLabel}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
-                    {job.external_compute_id ? ` · ${job.external_compute_id}` : ''}
+                    {job.external_compute_id ? (
+                      <> · <span data-testid="compute-job-vm-identity">VM {job.external_compute_id}</span></>
+                    ) : ''}
                   </div>
                   {(() => {
                     const runner = job.runner;

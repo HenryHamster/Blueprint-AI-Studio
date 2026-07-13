@@ -187,6 +187,14 @@ def _names_metrics_integrity_sweep(text: str | None) -> bool:
 #: in one place.
 ATTESTATION_WINDOW_DAYS = 7
 
+#: Tolerance for a slightly-future ``attested_at`` timestamp caused by benign
+#: clock skew between the attesting client and the server.  A value at most this
+#: far in the future is still honoured; anything further ahead is rejected as the
+#: window anchor (it would otherwise grant effectively perpetual trust) and the
+#: attestation falls back to ``recorded_at`` — see
+#: :func:`_attestation_reference_timestamp`.
+ATTESTATION_FUTURE_SKEW_SECONDS = 60
+
 
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the machine-verified 'covered' condition.
@@ -234,45 +242,72 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     return False
 
 
+def _attestation_reference_timestamp(e: CriterionEvidence) -> datetime | None:
+    """Return the time-window anchor for an operator attestation, or ``None``.
+
+    Shared by :func:`_evidence_is_attested` and
+    :func:`_compute_attestation_expires_at` so the two can never drift on how
+    they pick the reference timestamp.  A single rule chooses the anchor:
+
+      * Use ``detail["attested_at"]`` only when it is present, parseable, AND
+        not in the future beyond a small clock-skew tolerance
+        (:data:`ATTESTATION_FUTURE_SKEW_SECONDS`).  A future-dated
+        ``attested_at`` would otherwise make ``now - attested_at`` negative —
+        always inside the window — granting effectively perpetual trust and
+        pushing the computed expiry arbitrarily far into the future.  Such a
+        value is rejected as the anchor and we fall back to ``recorded_at``.
+      * Otherwise (absent, unparseable, or too-far-future ``attested_at``) fall
+        back to ``recorded_at`` so the attestation is still time-bounded — a
+        missing, corrupt, or future timestamp cannot grant perpetual trust.
+      * When neither is usable (``recorded_at`` is also ``None``) return
+        ``None`` — there is no reference point, so the attestation cannot be
+        time-bounded and must not be trusted.
+    """
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    attested_at_raw = detail.get("attested_at")
+    if attested_at_raw:
+        try:
+            attested_at = _coerce_naive_utc(
+                datetime.fromisoformat(str(attested_at_raw))
+            )
+        except (TypeError, ValueError):
+            attested_at = None
+        if attested_at is not None:
+            # Reject a timestamp dated meaningfully in the future; it would
+            # otherwise extend (or perpetuate) the window.  A small tolerance
+            # absorbs benign client/server clock skew.
+            if (attested_at - _utcnow()) <= timedelta(
+                seconds=ATTESTATION_FUTURE_SKEW_SECONDS
+            ):
+                return attested_at
+    if e.recorded_at is None:
+        return None
+    return _coerce_naive_utc(e.recorded_at)
+
+
 def _evidence_is_attested(e: CriterionEvidence) -> bool:
     """Whether a single evidence record is a NON-EXPIRED operator attestation.
 
     Returns ``True`` only for ``source_kind == "operator_attestation"`` whose
-    timestamp is within :data:`ATTESTATION_WINDOW_DAYS` of now.  Semantics:
+    reference timestamp (see :func:`_attestation_reference_timestamp`) is within
+    :data:`ATTESTATION_WINDOW_DAYS` of now.  Semantics:
 
-      * An attestation with no ``attested_at`` key falls back to ``recorded_at``
-        as the reference timestamp, so the attestation is still time-bounded —
-        a missing timestamp cannot grant perpetual trust.
-      * An unparseable ``attested_at`` value also falls back to ``recorded_at``
-        as the reference timestamp, so the attestation is still time-bounded —
-        a corrupt timestamp cannot grant perpetual trust.
-      * A parseable timestamp older than the window returns ``False`` so the
+      * An attestation with no ``attested_at`` key, an unparseable one, or one
+        dated in the future falls back to ``recorded_at`` as the reference
+        timestamp, so the attestation is still time-bounded — a missing,
+        corrupt, or future timestamp cannot grant perpetual trust.
+      * A reference timestamp older than the window returns ``False`` so the
         criterion falls back to its underlying (partial/uncovered) state until
         the operator re-attests and refreshes the timer.
+      * When there is no usable reference timestamp at all the attestation is
+        not trusted (``False``).
     """
     if e.source_kind != "operator_attestation":
         return False
-    detail = e.detail if isinstance(e.detail, dict) else {}
-    attested_at_raw = detail.get("attested_at")
-    if not attested_at_raw:
-        # No attested_at key — fall back to recorded_at so the attestation is
-        # still time-bounded (a missing timestamp cannot grant perpetual trust).
-        if e.recorded_at is None:
-            return False
-        return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
-            days=ATTESTATION_WINDOW_DAYS
-        )
-    try:
-        attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
-    except (TypeError, ValueError):
-        # Unparseable timestamp — fall back to recorded_at so the attestation is
-        # still time-bounded even when attested_at is corrupt.
-        if e.recorded_at is None:
-            return False
-        return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
-            days=ATTESTATION_WINDOW_DAYS
-        )
-    return (_utcnow() - attested_at) <= timedelta(days=ATTESTATION_WINDOW_DAYS)
+    ref = _attestation_reference_timestamp(e)
+    if ref is None:
+        return False
+    return (_utcnow() - ref) <= timedelta(days=ATTESTATION_WINDOW_DAYS)
 
 
 def _evidence_is_backfilled(e: CriterionEvidence) -> bool:
@@ -769,31 +804,23 @@ def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | 
     """Return the ISO-8601 expiry timestamp of the latest valid attestation, or None.
 
     Iterates evidence in reverse (latest first) and returns the expiry of the
-    first non-expired operator_attestation.  When ``attested_at`` is absent or
-    unparseable, falls back to ``recorded_at`` as the reference timestamp so the
-    attestation is still time-bounded — a missing or corrupt timestamp cannot
-    grant perpetual trust.  Called only when coverage == ``'attested'``.
+    first non-expired operator_attestation.  The expiry is anchored to the same
+    reference timestamp :func:`_evidence_is_attested` used to decide validity
+    (see :func:`_attestation_reference_timestamp`): ``attested_at`` when present,
+    parseable, and not future-dated; otherwise ``recorded_at``.  Sharing that
+    anchor guarantees the reported expiry can never drift from the validity
+    decision — in particular a future-dated ``attested_at`` cannot push the
+    expiry arbitrarily far out.  Called only when coverage == ``'attested'``.
     """
     for e in reversed(evidence):
         if not _evidence_is_attested(e):
             continue
-        detail = e.detail if isinstance(e.detail, dict) else {}
-        attested_at_raw = detail.get("attested_at")
-        if not attested_at_raw:
-            # No attested_at key — fall back to recorded_at so the attestation is
-            # still time-bounded (a missing timestamp cannot grant perpetual trust).
-            if e.recorded_at is None:
-                return None
-            return (_coerce_naive_utc(e.recorded_at) + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
-        try:
-            attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
-            return (attested_at + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
-        except (TypeError, ValueError):
-            # Unparseable timestamp — fall back to recorded_at so the attestation is
-            # still time-bounded even when attested_at is corrupt.
-            if e.recorded_at is None:
-                return None
-            return (_coerce_naive_utc(e.recorded_at) + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
+        ref = _attestation_reference_timestamp(e)
+        if ref is None:
+            # Should not happen — _evidence_is_attested already guarantees a
+            # non-None anchor — but guard defensively rather than crash.
+            return None
+        return (ref + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
     return None
 
 

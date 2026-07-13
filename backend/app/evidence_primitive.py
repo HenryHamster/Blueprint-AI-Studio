@@ -103,6 +103,43 @@ ATTESTATION_ONLY_KINDS: frozenset[str] = frozenset({"operator_attestation"})
 #: :func:`_proven_tier`.
 _NON_MACHINE_KINDS: frozenset[str] = BACKING_ONLY_KINDS | ATTESTATION_ONLY_KINDS
 
+#: Total order over :data:`EvidenceStatus`, ascending in confidence. This is the
+#: single canonical ranking of the tiers the seam already owns — the vocabulary
+#: and its classifiers live here, so the ORDER over those tiers belongs here too
+#: rather than being re-encoded ad hoc in each consumer. The three no-backing
+#: states (``contradicted`` / ``unverified`` / ``unproven``) share rank 0: none
+#: of them supplies any corroboration, so no consumer should prefer one over
+#: another. ``partial`` (refs exist but none proven, or attestation-only) sits
+#: above them, then structural-only ``path_proven`` (files exist at HEAD), then
+#: fully machine-verified ``proven`` at the top.
+EVIDENCE_STATUS_RANK: dict[str, int] = {
+    "contradicted": 0,
+    "unverified": 0,
+    "unproven": 0,
+    "partial": 1,
+    "path_proven": 2,
+    "proven": 3,
+}
+
+
+def evidence_status_rank(status: Any) -> int:
+    """Rank an :data:`EvidenceStatus` on the canonical confidence order.
+
+    Pure and IO-free. Normalizes ``status`` case-insensitively (mirroring
+    :func:`claim_contradicts_evidence`) and returns its
+    :data:`EVIDENCE_STATUS_RANK` ordinal; any unknown / malformed status ranks
+    ``0`` (the no-corroboration floor) so a consumer folding two tiers never
+    silently upgrades on a value it does not understand.
+
+    Use this whenever code must compare two evidence tiers — e.g. "never
+    downgrade a stronger tier when folding a second signal in" — so every
+    surface shares one ordering instead of re-deriving it.
+    """
+    if status is None:
+        return 0
+    return EVIDENCE_STATUS_RANK.get(str(status).strip().lower(), 0)
+
+
 #: Claimed statuses that assert a gap's work is done/settled. A done-type claim
 #: whose evidence does not back it up is the "working/closed but unproven/absent"
 #: contradiction. ``active``/``blocked`` are in-progress and never contradict.

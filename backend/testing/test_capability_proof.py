@@ -287,6 +287,44 @@ class TestRecordCapabilityProof:
         assert "cap-beta" in recorded
         assert len(project.capability_proof_records) == 2
 
+    def test_c245909e8_capability_proof_gate(self):
+        """Each capability of a multi-cap task gets an INDEPENDENT proof entry.
+
+        Named acceptance test for criterion c-245909e8. A single ``entry`` dict
+        is built once inside ``record_capability_proof``; before the fix it was
+        appended by reference to every capability's list, aliasing the same dict
+        across all capabilities. That means mutating (or later enriching) one
+        capability's entry would silently corrupt the others.
+
+        This asserts the recorded entries are DISTINCT objects and that mutating
+        one does not bleed into the other — the behavior the production hardening
+        guarantees.
+        """
+        project = _make_project()
+        task = _make_task(verdict=_named_test_verdict())
+        task.context["provides_capability"] = ["cap-alpha", "cap-beta"]
+
+        with patch("app.capability_proof.flag_modified"):
+            recorded = record_capability_proof(task, project)
+
+        assert set(recorded) == {"cap-alpha", "cap-beta"}
+        alpha_entry = project.capability_proof_records["cap-alpha"][0]
+        beta_entry = project.capability_proof_records["cap-beta"][0]
+
+        # Distinct objects, not the same aliased dict.
+        assert alpha_entry is not beta_entry
+
+        # Equal by value at record time (built from one shared source).
+        assert alpha_entry == beta_entry
+
+        # Mutating one entry must NOT bleed into the other.
+        alpha_entry["proof_ref"] = "mutated-alpha-ref"
+        assert beta_entry["proof_ref"] != "mutated-alpha-ref"
+        assert (
+            project.capability_proof_records["cap-beta"][0]["proof_ref"]
+            != "mutated-alpha-ref"
+        )
+
 
 def test_proof_ref_and_kind_from_production_verdict_shape():
     """proof_kind and proof_ref must reflect the real stored verdict shape.

@@ -10,12 +10,14 @@ from typing import get_args
 from app.evidence_primitive import (
     ATTESTATION_ONLY_KINDS,
     BACKING_ONLY_KINDS,
+    EVIDENCE_STATUS_RANK,
     PATH_BACKED_KINDS,
     EvidenceStatus,
     ProofKind,
     claim_contradicts_evidence,
     classify_evidence,
     classify_evidence_tiered,
+    evidence_status_rank,
 )
 
 
@@ -329,3 +331,79 @@ def test_none_claim_never_contradicts():
 
 def test_claim_status_is_case_insensitive():
     assert claim_contradicts_evidence("CLOSED", "UNPROVEN") is True
+
+
+# --- Tier total-order (evidence_status_rank / EVIDENCE_STATUS_RANK) -----------
+
+
+def test_c0f76cf44_evidence_primitive_tier():
+    """Acceptance seam for c-0f76cf44: the evidence-primitive tier order is a
+    strict, monotone total order that a fold can trust to "never downgrade a
+    stronger tier".
+
+    Exercises the hoisted ordering end-to-end: fully machine-verified ``proven``
+    outranks structural-only ``path_proven``, which outranks ``partial``, which
+    outranks the three no-corroboration states — and those three tie at the
+    floor so no consumer prefers one indeterminate/absent signal over another.
+    """
+    # Strict ascending chain across the confidence tiers.
+    assert (
+        evidence_status_rank("unproven")
+        < evidence_status_rank("partial")
+        < evidence_status_rank("path_proven")
+        < evidence_status_rank("proven")
+    )
+    # The three no-backing states share the floor rank — none corroborates.
+    assert (
+        evidence_status_rank("contradicted")
+        == evidence_status_rank("unverified")
+        == evidence_status_rank("unproven")
+        == 0
+    )
+    # path_proven ranks strictly between partial and proven (the structural tier).
+    assert (
+        evidence_status_rank("partial")
+        < evidence_status_rank("path_proven")
+        < evidence_status_rank("proven")
+    )
+
+
+def test_evidence_status_rank_case_insensitive():
+    assert evidence_status_rank("PROVEN") == evidence_status_rank("proven")
+    assert evidence_status_rank("  Path_Proven  ") == evidence_status_rank(
+        "path_proven"
+    )
+
+
+def test_evidence_status_rank_unknown_is_zero():
+    # Unknown / malformed / None statuses fall to the no-corroboration floor so
+    # a fold never silently upgrades on a value it does not understand.
+    assert evidence_status_rank("nonsense") == 0
+    assert evidence_status_rank("") == 0
+    assert evidence_status_rank(None) == 0
+    assert evidence_status_rank(object()) == 0
+
+
+def test_evidence_status_rank_covers_every_status():
+    # Every EvidenceStatus member must have an explicit rank (no member falls to
+    # the unknown-zero default by accident).
+    for status in get_args(EvidenceStatus):
+        assert status in EVIDENCE_STATUS_RANK
+        assert evidence_status_rank(status) == EVIDENCE_STATUS_RANK[status]
+
+
+def test_evidence_status_rank_matches_backing_path_tier():
+    # A backing_path-only proven set classifies to path_proven, which must rank
+    # above attestation-only (partial) and below machine-verified (proven).
+    path_proven = classify_evidence_tiered(
+        [{"kind": "backing_path", "proven": True}]
+    )
+    attested = classify_evidence_tiered(
+        [{"kind": "operator_attestation", "proven": True}]
+    )
+    machine = classify_evidence_tiered([{"kind": "named_test", "proven": True}])
+    assert (
+        evidence_status_rank(attested)
+        < evidence_status_rank(path_proven)
+        < evidence_status_rank(machine)
+    )

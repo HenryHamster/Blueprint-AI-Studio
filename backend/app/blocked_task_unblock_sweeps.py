@@ -371,19 +371,6 @@ async def _fetch_working_capability_names(session, project_id) -> set:
     return working_capability_names(getattr(project, "problem_model", None))
 
 
-# Rank of each tiered proof status, ascending in confidence. Used to fold the
-# durable ``capability_proof_records`` tier-2 signal into the evidence_refs-derived
-# tier-1 map WITHOUT ever downgrading a stronger tier-1 status.
-_PROOF_STATUS_RANK: dict[str, int] = {
-    "contradicted": 0,
-    "unverified": 0,
-    "unproven": 0,
-    "partial": 1,
-    "path_proven": 2,
-    "proven": 3,
-}
-
-
 def _fold_proof_records_tier2(
     status_by_name: dict, proof_records: object
 ) -> dict:
@@ -408,10 +395,14 @@ def _fold_proof_records_tier2(
     """
     if not isinstance(proof_records, dict) or not status_by_name:
         return status_by_name
-    from app.evidence_primitive import classify_evidence_tiered
+    from app.evidence_primitive import (
+        EVIDENCE_STATUS_RANK,
+        classify_evidence_tiered,
+        evidence_status_rank,
+    )
 
     for name, tier1 in list(status_by_name.items()):
-        if _PROOF_STATUS_RANK.get(tier1, 0) >= _PROOF_STATUS_RANK["proven"]:
+        if evidence_status_rank(tier1) >= EVIDENCE_STATUS_RANK["proven"]:
             continue
         entries = proof_records.get(name)
         if not isinstance(entries, list):
@@ -424,7 +415,7 @@ def _fold_proof_records_tier2(
         if not synthetic:
             continue
         tier2 = classify_evidence_tiered(synthetic)
-        if _PROOF_STATUS_RANK.get(tier2, 0) > _PROOF_STATUS_RANK.get(tier1, 0):
+        if evidence_status_rank(tier2) > evidence_status_rank(tier1):
             status_by_name[name] = tier2
     return status_by_name
 

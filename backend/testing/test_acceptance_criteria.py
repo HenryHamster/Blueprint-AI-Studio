@@ -3404,6 +3404,84 @@ def test_attestation_without_timestamps_not_perpetual():
     assert ac._compute_attestation_expires_at([ev_bad_ts]) is None
 
 
+def test_c1e3fafbf_evidence_tiering():
+    """A future-dated attested_at cannot extend or perpetuate the attestation window.
+
+    Named acceptance test for criterion c-1e3fafbf (attestation-vs-verified
+    evidence tiering). Before the fix a future ``attested_at`` made
+    ``now - attested_at`` negative — always inside the window — so the
+    attestation stayed 'valid' indefinitely and its computed expiry was pushed
+    arbitrarily far into the future, silently promoting a low-confidence
+    operator waiver to a perpetual one. The seam now rejects a meaningfully
+    future ``attested_at`` as the window anchor and falls back to
+    ``recorded_at`` (:func:`_attestation_reference_timestamp`), so the
+    lower-confidence 'attested' tier can never outrank machine-verified
+    evidence by living forever.
+    """
+    from datetime import datetime as _dt
+
+    far_future = (_utcnow() + timedelta(days=3650)).isoformat()
+
+    # (a) Future attested_at + STALE recorded_at → not attested (falls back to
+    #     the stale recorded_at, which is outside the window), coverage 'partial'.
+    ev_future_stale = _make_evidence(
+        "operator_attestation", detail={"attested_at": far_future}
+    )
+    ev_future_stale.recorded_at = _utcnow() - timedelta(
+        days=ac.ATTESTATION_WINDOW_DAYS + 1
+    )
+    assert ac._evidence_is_attested(ev_future_stale) is False, (
+        "a future attested_at must not keep a stale attestation valid"
+    )
+    assert ac.compute_criterion_coverage([ev_future_stale]) == "partial"
+    assert ac._compute_attestation_expires_at([ev_future_stale]) is None
+
+    # (b) Future attested_at + FRESH recorded_at → still attested via the fresh
+    #     recorded_at fallback, but the expiry is anchored to recorded_at (NOT
+    #     the far-future date), so the window is a normal ATTESTATION_WINDOW_DAYS.
+    fresh_recorded = _utcnow()
+    ev_future_fresh = _make_evidence(
+        "operator_attestation", detail={"attested_at": far_future}
+    )
+    ev_future_fresh.recorded_at = fresh_recorded
+    assert ac._evidence_is_attested(ev_future_fresh) is True
+    assert ac.compute_criterion_coverage([ev_future_fresh]) == "attested"
+    expires = ac._compute_attestation_expires_at([ev_future_fresh])
+    assert expires is not None
+    expires_dt = _dt.fromisoformat(expires)
+    expected = fresh_recorded + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expires_dt - expected).total_seconds()) < 2, (
+        "expiry must be anchored to recorded_at, not the far-future attested_at"
+    )
+    # The expiry must NOT be pushed near the far-future attested_at.
+    assert expires_dt < _utcnow() + timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+
+    # (c) Slightly-future attested_at within the clock-skew tolerance is still
+    #     honoured as the anchor (benign client/server skew).
+    skew_future = (
+        _utcnow() + timedelta(seconds=ac.ATTESTATION_FUTURE_SKEW_SECONDS // 2)
+    ).isoformat()
+    ev_skew = _make_evidence(
+        "operator_attestation", detail={"attested_at": skew_future}
+    )
+    assert ac._evidence_is_attested(ev_skew) is True
+    assert ac.compute_criterion_coverage([ev_skew]) == "attested"
+
+    # (d) A normal, past, in-window attested_at is unaffected by the guard.
+    recent_past = (_utcnow() - timedelta(days=1)).isoformat()
+    ev_recent = _make_evidence(
+        "operator_attestation", detail={"attested_at": recent_past}
+    )
+    assert ac._evidence_is_attested(ev_recent) is True
+    ref_expires = ac._compute_attestation_expires_at([ev_recent])
+    assert ref_expires is not None
+    ref_expires_dt = _dt.fromisoformat(ref_expires)
+    expected_recent = _dt.fromisoformat(recent_past) + timedelta(
+        days=ac.ATTESTATION_WINDOW_DAYS
+    )
+    assert abs((ref_expires_dt - expected_recent).total_seconds()) < 2
+
+
 @pytest.mark.asyncio
 async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
     """POST .../attest records timestamped operator_attestation evidence and coverage → 'attested'."""

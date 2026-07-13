@@ -3422,6 +3422,25 @@ async def _upsert_dimension_result(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                # Never downgrade a resolved fact (passed/failed/blocked) to a
+                # non-resolved status (e.g. "unavailable" from an infra failure
+                # in a different gate or a failed _load_prior_dimension_results).
+                # _record_infra_dimension_unavailable has a matching guard at its
+                # call site; this primitive-level guard is defense-in-depth.
+                if (
+                    existing.status in _LEDGER_RESOLVED_STATUSES
+                    and status not in _LEDGER_RESOLVED_STATUSES
+                ):
+                    logger.debug(
+                        "[RELEASE_QUALIFIER] skipping downgrade of resolved dimension "
+                        "'%s' on v%s/%s from '%s' to '%s'",
+                        dimension,
+                        getattr(version, "version_number", "?"),
+                        candidate_sha[:8] if candidate_sha else "?",
+                        existing.status,
+                        status,
+                    )
+                    return
                 existing.status = status
                 existing.sub_score = _sub_score
                 existing.blocker = blocker

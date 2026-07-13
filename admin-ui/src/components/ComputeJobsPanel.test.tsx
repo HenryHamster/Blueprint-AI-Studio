@@ -2200,10 +2200,31 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
       makeJob({ external_compute_id: 'compute-job-abc-123' }),
     ]));
-    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const subtitle = await findByText((t) => t.includes('compute-job-abc-123'));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const subtitle = await findByTestId('compute-job-provenance');
     expect(subtitle.textContent).toContain('gcp_compute_engine');
     expect(subtitle.textContent).toContain('compute-job-abc-123');
+  });
+
+  test('shows job provenance identity', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        backend: 'gcp_compute_engine',
+        machine_type: 'e2-standard-2',
+        external_compute_id: 'compute-job-vm-1',
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // The provenance line is the machine-testable seam that identifies WHERE a
+    // compute result was produced: backend, machine type, and the cloud VM identity.
+    const provenance = await findByTestId('compute-job-provenance');
+    expect(provenance.textContent).toContain('gcp_compute_engine');
+    expect(provenance.textContent).toContain('e2-standard-2');
+    // The cloud VM identity is explicitly labelled so provenance reads as an
+    // identity rather than an anonymous suffix.
+    const vmIdentity = await findByTestId('compute-job-vm-identity');
+    expect(vmIdentity.textContent).toBe('VM compute-job-vm-1');
+    expect(provenance.contains(vmIdentity)).toBe(true);
   });
 
   test('renders aggregate summary header when summary has jobs', async () => {
