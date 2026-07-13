@@ -70,14 +70,17 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
     let cancelled = false;
     fetchComputeJobs(projectId, undefined, undefined, 0, taskId)
       .then(result => {
-        if (!cancelled) setJobs(result.jobs);
+        // Defensive: compute jobs are OPTIONAL context for this drawer. A response
+        // without a `jobs` array must degrade to "no jobs", not set state to
+        // undefined and blow up the whole TaskDetailDrawer on `jobs.length`.
+        if (!cancelled) setJobs(Array.isArray(result?.jobs) ? result.jobs : []);
       })
       .catch(() => { /* compute jobs are optional context */ });
     return () => { cancelled = true; };
   }, [projectId, taskId]);
 
   if (!projectId) return null;
-  if (jobs.length === 0) return null;
+  if (!jobs || jobs.length === 0) return null;
 
   const isComputeExperiment = (task.task_type as string) === 'compute_experiment' ||
     (task.payloads?.[0] as Record<string, unknown> | undefined)?.type === 'compute_experiment';
