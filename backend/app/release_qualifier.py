@@ -2336,17 +2336,44 @@ async def run_qualification(
     # fresh-run path enforces.  Force a fresh audit+challenge re-measurement
     # instead — drop audit+test_erosion from the reuse set so BOTH the spawn
     # decision below AND the finalize composition route through the same gate.
+    #
+    # A stored audit fact with status "blocked" (sub_score None == the
+    # ``audit_missing`` hard-blocker sentinel) is the SECOND way a reused audit
+    # fact composes an un-re-measurable verdict, and it is strictly worse: the
+    # dimension carries NO usable report at all, so reusing it verbatim replays
+    # the identical ``audit_missing`` block on every permitted same-sha re-drive
+    # while ``_audit_needed`` stays False — the audit child is never re-spawned,
+    # so nothing can ever produce the report that would clear it.  That is a
+    # fail-closed wedge with no recovery valve short of new work landing (which
+    # moves the sha and abandons the ledger row).  A re-drive is only reached
+    # when some caller judged the candidate worth re-measuring, so the ONLY
+    # useful thing to do with a blocked audit fact is re-measure it.  Drop it
+    # from the reuse set for the same reason, and by the same mechanism, as the
+    # unconfirmed-deduction case above.
+    _reused_audit_status = resolved_dims.get("audit", {}).get("status")
+    _force_fresh_audit_reason: str | None = None
     if (
-        resolved_dims.get("audit", {}).get("status") == "failed"
+        _reused_audit_status == "failed"
         and resolved_dims.get("challenge", {}).get("status") != "passed"
     ):
+        _force_fresh_audit_reason = (
+            "reused a 'failed' audit whose challenge gate never resolved "
+            "'passed' — composing the unconfirmed deduction would silently drop "
+            "the challenge gate the fresh-run path enforces"
+        )
+    elif _reused_audit_status == "blocked":
+        _force_fresh_audit_reason = (
+            "reused a 'blocked' audit fact (no usable report) — replaying it "
+            "would re-block on audit_missing forever, since the audit child is "
+            "not re-spawned while the fact is reused"
+        )
+    if _force_fresh_audit_reason:
         logger.info(
-            "[RELEASE_QUALIFIER] v%d candidate %s reused a 'failed' audit whose "
-            "challenge gate never resolved 'passed' — forcing a fresh "
-            "audit+challenge re-measurement instead of composing the "
-            "unconfirmed deduction",
+            "[RELEASE_QUALIFIER] v%d candidate %s %s — forcing a fresh "
+            "audit+challenge re-measurement",
             version.version_number,
             candidate_sha[:8],
+            _force_fresh_audit_reason,
         )
         resolved_dims.pop("audit", None)
         resolved_dims.pop("test_erosion", None)
@@ -2571,12 +2598,12 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the merged diffs 'misses' the version goal per the blind merge-grade "
         "and the merge_grade_block_threshold is armed"
     ),
-    "uncorroborated_attestation": (
-        "all acceptance criteria rely solely on operator attestation — zero "
-        "machine-verified evidence; promotion is blocked until at least one "
-        "criterion carries machine-verified evidence (named_test, "
-        "reachability, or verified task_merge)"
-    ),
+    # NOTE: ``uncorroborated_attestation`` was retired with the attestation gate
+    # it labeled (replaced by the per-category goal-verification gate, whose
+    # block surfaces as ``criterion_coverage_incomplete``).  It has no emitter
+    # anywhere in the backend; a label for a blocker nothing can emit is dead
+    # operator-facing vocabulary, so it is intentionally absent here.  Do not
+    # re-add a label without an emitter — see test_blocker_labels_have_emitters.
 }
 
 

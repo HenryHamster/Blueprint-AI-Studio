@@ -622,6 +622,54 @@ class TestComputeCompositeSmoketestDisabled:
 
 
 # ===========================================================================
+# Blocker vocabulary — no operator-facing label without an emitter
+# ===========================================================================
+
+
+def test_blocker_labels_have_emitters():
+    """Every ``_BLOCKER_LABELS`` key must be a blocker some code path can emit.
+
+    A label for a blocker nothing emits is DEAD operator-facing vocabulary: it
+    reads to an operator (and to the strategic agent, which is handed these
+    labels) as a live gate that can fire, when in fact the gate behind it was
+    retired.  ``uncorroborated_attestation`` was exactly that — its gate was
+    replaced by the per-category goal-verification gate (which blocks as
+    ``criterion_coverage_incomplete``) but the label outlived the emitter.
+
+    The emitters are the ``blocker = "..."`` assignments in ``release_scoring``
+    (``compute_composite`` is the sole producer of the hard-blocker codes these
+    labels render).  This is the REVERSE direction of
+    ``test_every_compute_composite_blocker_code_is_classified`` in
+    test_release_scoring.py, which pins emitter → classification; together they
+    keep the vocabulary and the gates in lockstep in both directions.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(rs.__file__).read_text()
+    emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+    assert emitted, "expected to find blocker assignments in release_scoring"
+
+    dead = sorted(set(rq._BLOCKER_LABELS) - emitted)
+    assert not dead, (
+        f"_BLOCKER_LABELS has labels for blockers nothing emits: {dead}. "
+        "Either wire up the emitter or delete the dead vocabulary."
+    )
+
+
+def test_uncorroborated_attestation_is_fully_retired():
+    """The retired attestation gate leaves NO vocabulary behind.
+
+    Named regression for the dead-blocker-vocabulary finding: the code must be
+    absent from BOTH surfaces that described it — the operator-facing label map
+    and the execution-site map — and it must stay un-emitted.
+    """
+    assert "uncorroborated_attestation" not in rq._BLOCKER_LABELS
+    assert "uncorroborated_attestation" not in rs.BLOCKER_EXECUTION_SITE
+    assert rs.blocker_execution_site("uncorroborated_attestation") is None
+
+
+# ===========================================================================
 # compute_composite — debt-pressure signal (observe mode)
 # ===========================================================================
 
@@ -20936,6 +20984,112 @@ async def test_redrive_failed_audit_with_passed_challenge_is_reused(
     assert resolved.get("audit", {}).get("status") == "failed"
     assert "test_erosion" in resolved
     assert qual["audit_task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_redrive_blocked_audit_fact_re_measures_instead_of_reblocking(
+    db_session, mocker,
+):
+    """A reused 'blocked' audit fact must ALSO force a fresh audit — otherwise a
+    permitted same-sha re-drive can never recover (fail-closed wedge).
+
+    A 'blocked' audit fact is the ``audit_missing`` hard-blocker sentinel: the
+    dimension carries NO usable report (sub_score None).  Before the fix, only a
+    'failed' audit fact was dropped from the reuse set, so a 'blocked' one was
+    reused verbatim: ``_audit_needed`` stayed False (audit + test_erosion both
+    "resolved"), the audit child was never re-spawned, and finalize composed the
+    same None sub-score straight back into ``audit_missing``.  Every subsequent
+    re-drive at this sha replayed that block with nothing able to clear it.
+
+    The recovery valve: a 'blocked' audit is re-measured, so the audit child IS
+    re-spawned and the block can actually resolve.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "0bad0bad" * 5
+
+    # The exact ledger shape a prior finalize writes when the audit produced no
+    # usable report: audit blocked (sub_score None == audit_missing sentinel) and
+    # test_erosion blocked alongside it (_score_audit(None) -> (None, None)).
+    await _seed_dimension_row(
+        db_session, project, version, "audit",
+        status="blocked", sub_score=None, blocker="audit_missing",
+        candidate_sha=sha,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "test_erosion",
+        status="blocked", sub_score=None, candidate_sha=sha,
+    )
+    # Every OTHER gate resolved cleanly — so the audit fact is the only thing
+    # standing between this candidate and a verdict.
+    for dim in ("smoketest", "ci", "migration_identity", "migration_apply",
+                "merge_grade"):
+        await _seed_dimension_row(
+            db_session, project, version, dim, status="passed", candidate_sha=sha,
+        )
+    await db_session.commit()
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": sha,
+        "error": "audit_report_missing",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-07-10T00:00:00",
+        "finalized_at": "2026-07-10T00:01:00",
+    }
+    version.qualification_attempts = 1
+    version.goal = "A blocked audit fact must not wedge the same-sha re-drive"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    smoketest_spawn = mocker.patch(
+        "app.release_qualifier._spawn_qualifier_smoketest_task",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-0bad",
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert result is True
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["status"] == "pending"
+
+    # Core assertion: the 'blocked' audit was NOT reused — a fresh audit child is
+    # spawned, which is the ONLY thing that can produce the missing report.
+    audit_spawn.assert_awaited_once()
+    assert qual["audit_task_id"] is not None
+
+    # Both audit-child dimensions leave the reuse set, so the finalize
+    # composition re-reads the fresh report instead of replaying sub_score None
+    # (which compute_composite turns straight back into audit_missing).
+    resolved = qual.get("resolved_dimensions") or {}
+    assert "audit" not in resolved, (
+        "a blocked audit fact was reused — finalize will re-block on audit_missing "
+        "with no way to clear it"
+    )
+    assert "test_erosion" not in resolved
+
+    # Scoped: sibling gates that resolved on their own merits are still reused —
+    # the recovery valve must not turn into a full re-qualification.
+    smoketest_spawn.assert_not_called()
+    assert resolved.get("smoketest", {}).get("status") == "passed"
 
 
 @pytest.mark.asyncio

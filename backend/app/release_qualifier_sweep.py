@@ -1307,12 +1307,21 @@ async def _run_auto_qualification_trigger_for_version(
                     )
                 # Only check CI state when the SHA has actually advanced.
                 if automain_sha and automain_sha != candidate_sha:
+                    # ``_resolve_candidate_ci`` — the qualifier-scoped STRICT CI
+                    # resolver — is defined in ``release_qualifier``, NOT in
+                    # ``app.ci_resolution`` (which holds the shared merge-path
+                    # helpers).  Bind it from the injected module, and bind it
+                    # OUTSIDE the try below: a missing symbol is a WIRING BUG,
+                    # and swallowing it as a benign "CI fetch failed" warning is
+                    # exactly how the CI-red suppression underneath this call
+                    # stayed dead code (every sweep raised ImportError, left
+                    # automain_ci_state None, and the red candidate auto-fired).
+                    # Only genuine GitHub I/O failure may degrade to "unknown".
+                    _resolve_candidate_ci = release_qualifier._resolve_candidate_ci
                     try:
-                        from app.ci_resolution import _resolve_candidate_ci
                         ci_result = await _resolve_candidate_ci(
                             token, owner, repo, automain_sha
                         )
-                        automain_ci_state = ci_result.get("state")
                     except Exception:
                         logger.warning(
                             "[AUTO_QUAL_TRIGGER] CI state fetch failed for %s "
@@ -1320,6 +1329,8 @@ async def _run_auto_qualification_trigger_for_version(
                             automain_sha[:8] if automain_sha else "?",
                             version.id,
                         )
+                    else:
+                        automain_ci_state = ci_result.get("state")
 
     decision = resolve_qualification_trigger(
         phase=version.phase or "",

@@ -1040,6 +1040,13 @@ class TestBlockerExecutionSite:
     def test_candidate_side_blockers(self):
         # These all fire on candidate content — a fix on automain clears them on
         # the next qualification.
+        #
+        # ``uncorroborated_attestation`` is deliberately NOT in this list: the
+        # attestation gate it classified was retired (replaced by the
+        # per-category goal-verification gate, which blocks as
+        # ``criterion_coverage_incomplete``), so the code has no emitter and its
+        # map entry was dead vocabulary.  Its absence is pinned by
+        # test_execution_site_map_has_no_dead_entries below.
         for code in (
             "ci_not_green",
             "ci_unresolved",
@@ -1049,7 +1056,6 @@ class TestBlockerExecutionSite:
             "criterion_coverage_incomplete",
             "merge_grade_misses",
             "capability_proof_gate_blocked",
-            "uncorroborated_attestation",
         ):
             assert (
                 rs.blocker_execution_site(code) == rs.EXECUTION_SITE_CANDIDATE
@@ -1072,6 +1078,26 @@ class TestBlockerExecutionSite:
         assert emitted, "expected to find blocker assignments in release_scoring"
         for code in emitted:
             assert rs.blocker_execution_site(code) is not None, code
+
+    def test_execution_site_map_has_no_dead_entries(self):
+        # The REVERSE direction of the check above: every CLASSIFIED code must
+        # still be emitted by some gate.  A classification for a blocker nothing
+        # emits is dead vocabulary — it tells an operator "a fix on automain
+        # clears this on the next qualification" about a gate that cannot fire.
+        # ``uncorroborated_attestation`` was exactly that: the gate it described
+        # was replaced by the per-category goal-verification gate, but its map
+        # entry (and its operator-facing label) outlived the emitter.
+        import re
+
+        src = (Path(rs.__file__)).read_text()
+        emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+        assert emitted, "expected to find blocker assignments in release_scoring"
+
+        dead = sorted(set(rs.BLOCKER_EXECUTION_SITE) - emitted)
+        assert not dead, (
+            f"BLOCKER_EXECUTION_SITE classifies blockers nothing emits: {dead}. "
+            "Either wire up the emitter or delete the dead vocabulary."
+        )
 
     def test_labels_match_site_and_are_distinct(self):
         deployed_label = rs.blocker_execution_site_label(

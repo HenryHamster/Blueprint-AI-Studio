@@ -1028,7 +1028,11 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "criterion_coverage_incomplete": EXECUTION_SITE_CANDIDATE,
     "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
     "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
-    "uncorroborated_attestation": EXECUTION_SITE_CANDIDATE,
+    # NOTE: ``uncorroborated_attestation`` is deliberately absent — the
+    # attestation gate it classified was replaced by the per-category
+    # goal-verification gate (which blocks as ``criterion_coverage_incomplete``),
+    # and no code path emits the code any more.  Classifying a blocker nothing
+    # emits is dead vocabulary that reads as a live gate to operators.
 }
 
 # Short operator-facing phrase per execution-site, appended to blocker labels.
