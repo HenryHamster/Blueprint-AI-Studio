@@ -501,7 +501,8 @@ def decide_agent_backend(
       3. *(Compute only — not agent)*: image-native jobs that supply a
          ``container_image`` the experiment must run inside.
 
-    Backends, in preference order:
+    Backends, in decision order (the order is load-bearing — see the opt-in note
+    in the body: checking bwrap first silently neuters the opt-in):
 
       * ``BACKEND_DOCKER`` — ``agent_image`` supplied AND docker usable AND
         task type read-only-eligible (documented necessity #1 above).  This
@@ -521,18 +522,30 @@ def decide_agent_backend(
     CRITICAL invariant: when ``agent_image`` is falsy the result is byte-identical
     to the historical bwrap-or-decline table — the docker branch is inert.
     """
-    # Preferred: rootless bwrap when binary + sandbox are both available.
-    if agent_binary_present and caps.bwrap_ok:
-        return BACKEND_BWRAP
-    # Reserved docker fallback: bwrap unavailable, but prod image + usable docker.
+    # Documented necessity #1 — the prod-parity OPT-IN, and it must be checked
+    # BEFORE bwrap or it can never fire.
+    #
+    # `agent_image` is not incidental: blueprint_runner only resolves one when the
+    # operator explicitly asks (`--docker-agent`, BLUEPRINT_AGENT_BACKEND=docker,
+    # or `--pull`), and leaves it None otherwise. So a truthy agent_image IS the
+    # opt-in signal. Testing bwrap first made that flag a SILENT NO-OP on every
+    # host with bwrap — the operator asked for a prod-parity container run and
+    # quietly got bwrap instead, with nothing said. An opt-in that does nothing
+    # when you opt in is worse than no opt-in at all.
+    #
+    # Still gated by task type: the write/heavy slice never rides the container
+    # path, regardless of the flag.
     if (
         agent_image
         and caps.docker_usable
         and (task_type is None or task_type in AGENT_DOCKER_TYPES)
     ):
         return BACKEND_DOCKER
-    if not agent_binary_present:
-        return DECLINE
+    # Preferred default: rootless bwrap when binary + sandbox are both available.
+    # With no opt-in (agent_image falsy) the docker branch above cannot fire, so
+    # this preserves the historical bwrap-or-decline table byte for byte.
+    if agent_binary_present and caps.bwrap_ok:
+        return BACKEND_BWRAP
     return DECLINE
 
 
@@ -1557,20 +1570,132 @@ def plan_compute_execution(
     )
 
 
+# Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
+# the NGC / ``nvcr.io/nvidia/pytorch`` images) when the host GPU predates the
+# image's minimum CUDA compute capability — e.g. a Tesla V100 (Volta, CC 7.0)
+# under a container built for Turing+.
+#
+# These are the ONLY pre-run signal for an arch mismatch: ``nvidia-smi -L``
+# queries the DRIVER, which lists the V100 happily regardless of what the
+# image's CUDA runtime can actually use, and the entrypoint prints the banner
+# and still exits 0. Exit code and device visibility both look healthy.
+#
+# MUST stay byte-identical to ``_NO_USABLE_GPU_LOG_MARKERS`` in
+# ``backend/app/compute_jobs.py`` (the reactive post-run guard that reclassifies
+# a SUCCEEDED job on the same markers). ``scripts/`` is deployed standalone on
+# runner hosts with no ``backend`` package importable, so the tuple is
+# DUPLICATED rather than imported; parity is enforced by
+# ``backend/testing/test_runner_isolation_gpu_markers.py``, which fails CI if
+# either list is edited without the other.
+NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
+    "no supported gpu(s) detected to run this container",
+    "gpu, which is not supported by this container",
+)
+
+# Suffix distinguishing the probe container from the real run's container.
+PROBE_NAME_SUFFIX = "-probe"
+
+
+def no_usable_gpu_marker(text: str) -> str | None:
+    """The first :data:`NO_USABLE_GPU_LOG_MARKERS` entry present in ``text``."""
+    lowered = (text or "").lower()
+    for marker in NO_USABLE_GPU_LOG_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _force_remove_container(
+    runtime: str | None, name: str | None, env: dict[str, str] | None
+) -> None:
+    """Best-effort ``docker rm -f`` of a probe container orphaned by a timeout.
+
+    ``--rm`` does NOT save us here: on :exc:`subprocess.TimeoutExpired` Python
+    kills the docker CLI *client*, not the container. The container keeps
+    running, ``--rm`` never fires, and the name stays held. Swallows every
+    error — this is cleanup, never a failure path.
+    """
+    if not runtime or not name:
+        return
+    try:
+        subprocess.run(
+            [runtime, "rm", "-f", name],
+            env=env,
+            capture_output=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def pull_container_image(
+    plan: ExecutionPlan, image: str | None, timeout: int = 1800
+) -> tuple[bool, str]:
+    """Pull *image* explicitly, so the GPU probe does not have to wait on it.
+
+    Without this the probe's own ``docker run`` IS the pull — docker's default
+    pull policy is ``missing`` — and the probe's short timeout would be racing a
+    cold multi-GB download it cannot win. A 14-minute NGC pull against a 30s
+    probe times out, and the job dies reporting a probe timeout instead of the
+    arch mismatch the probe exists to name.
+
+    Best-effort by design: a failed pull is NOT fatal here. ``docker run`` will
+    re-attempt the pull anyway, so letting the probe (or the real run) surface
+    the error keeps ONE authoritative failure path instead of inventing a second
+    one. Returns ``(ok, detail)`` for logging only. Never raises.
+
+    A no-op for imageless/bwrap plans, which have nothing to pull.
+    """
+    if not image or plan.backend not in (BACKEND_DOCKER, BACKEND_PODMAN):
+        return True, "no image to pull"
+    runtime = plan.argv[0] if plan.argv else None
+    if not runtime:
+        return True, "no container runtime in plan"
+    try:
+        result = subprocess.run(
+            [runtime, "pull", image],
+            env=plan.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"image pull timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"image pull failed to launch: {exc}"
+    if result.returncode != 0:
+        detail = ((result.stderr or "") + (result.stdout or "")).strip()
+        return False, f"image pull exited {result.returncode}: {detail[:500]}"
+    return True, f"pulled {image}"
+
+
 def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, str]:
     """Run ``nvidia-smi -L`` inside the EXACT sandbox the real job will use.
 
     The probe reuses the plan's argv/env verbatim, substituting only the
-    terminal command argument so the sandbox construction is identical (same
-    bwrap bind mounts, same CUDA_VISIBLE_DEVICES, same /sys bind, same docker
-    flags). A GPU that can't be seen here will silently fall back to CPU in the
-    real job, which this gate is designed to prevent.
+    terminal command argument (and, on container backends, the ``--name``) so
+    the sandbox construction is identical (same bwrap bind mounts, same
+    CUDA_VISIBLE_DEVICES, same /sys bind, same docker flags).
 
-    Returns ``(True, output)`` when at least one GPU is listed; ``(False, reason)``
-    on any failure (non-zero exit, timeout, OSError, or empty GPU list). Never
-    raises.
+    Two independent failures are caught:
+
+      * **Device invisibility** — ``nvidia-smi -L`` fails or lists no GPU, so
+        the real job would silently fall back to CPU.
+      * **Arch incompatibility** — the GPU IS listed (``nvidia-smi`` reads the
+        driver, which is arch-agnostic) but the image's CUDA runtime cannot use
+        it. The entrypoint says so on stderr and still exits 0, so only a marker
+        scan of the COMBINED stdout+stderr can see it. Checking exit code and
+        stdout alone lets a V100/Turing+-image mismatch through the gate, burn
+        the image pull and the full run, and fail later as a confusing
+        "no metric produced".
+
+    Returns ``(True, output)`` when at least one GPU is listed and no
+    no-usable-GPU marker appears; ``(False, reason)`` on any failure (non-zero
+    exit, timeout, OSError, empty GPU list, or arch mismatch). Never raises.
     """
     probe_command = "nvidia-smi -L"
+    probe_container: str | None = None
+    runtime: str | None = None
 
     if plan.backend == BACKEND_BWRAP:
         # bwrap argv ends with: ... bash -lc <command>
@@ -1587,6 +1712,19 @@ def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, 
         except ValueError:
             return False, "unexpected docker argv shape — cannot build probe"
         probe_argv = list(plan.argv[:bash_idx]) + ["bash", "-lc", probe_command]
+        runtime = probe_argv[0] if probe_argv else None
+        # The probe MUST NOT reuse the real run's container name. A timed-out
+        # probe leaks a still-running container holding that name (see
+        # _force_remove_container), and the real run would then die with
+        # "name already in use". A distinct name makes the collision
+        # structurally impossible even if cleanup also fails.
+        try:
+            name_idx = probe_argv.index("--name")
+        except ValueError:
+            name_idx = -1
+        if 0 <= name_idx < len(probe_argv) - 1:
+            probe_container = probe_argv[name_idx + 1] + PROBE_NAME_SUFFIX
+            probe_argv[name_idx + 1] = probe_container
     elif plan.backend in (BACKEND_APPTAINER, BACKEND_ENROOT):
         # apptainer exec … image <command>  →  replace terminal command
         probe_argv = list(plan.argv[:-1]) + [probe_command]
@@ -1602,17 +1740,30 @@ def probe_gpu_in_sandbox(plan: ExecutionPlan, timeout: int = 30) -> tuple[bool, 
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        _force_remove_container(runtime, probe_container, plan.env)
         return False, f"GPU probe timed out after {timeout}s"
     except OSError as exc:
         return False, f"GPU probe failed to launch: {exc}"
 
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    combined = (stdout + "\n" + stderr).strip()
+
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        detail = (stdout + "\n" + stderr).strip() or f"exit {result.returncode}"
+        detail = combined or f"exit {result.returncode}"
         return False, f"nvidia-smi -L exited {result.returncode}: {detail}"
 
-    output = (result.stdout or "").strip()
-    if not output:
+    # Arch gate runs BEFORE the device-visibility check: on a mismatch the GPU
+    # list is populated and the exit code is 0, so the marker is the only
+    # authoritative signal and must not be short-circuited by a healthy-looking
+    # stdout.
+    marker = no_usable_gpu_marker(combined)
+    if marker:
+        return False, (
+            "container reported no usable GPU — host GPU/image compatibility "
+            f"mismatch (matched {marker!r}): {combined}"
+        )
+
+    if not stdout:
         return False, "nvidia-smi -L returned no output"
-    return True, output
+    return True, stdout

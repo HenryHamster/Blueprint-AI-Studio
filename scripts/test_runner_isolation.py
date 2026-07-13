@@ -76,19 +76,34 @@ class TestDecisionTable(unittest.TestCase):
             iso.BACKEND_BWRAP,
         )
 
-    def test_decide_agent_backend_prefers_bwrap_when_usable(self):
-        # bwrap_ok + binary + usable docker + eligible image → bwrap wins (preferred).
+    def test_decide_agent_backend_prefers_bwrap_when_not_opted_in(self):
+        """bwrap is the DEFAULT — but an explicit opt-in still beats it.
+
+        This test previously asserted that bwrap wins even WITH an agent_image,
+        which directly contradicted test_bwrap_first_policy_across_device_shapes
+        below (same inputs, opposite expectation). The repo carried both for as
+        long as this suite went unrun in CI. Resolved in favour of the opt-in:
+        blueprint_runner only resolves an agent_image when the operator explicitly
+        asks (--docker-agent / BLUEPRINT_AGENT_BACKEND=docker / --pull), so
+        letting bwrap win anyway made that flag build or pull a whole image and
+        then silently ignore it.
+
+        What "bwrap-first" actually means: docker is never auto-enabled merely
+        because docker is usable. It does NOT mean the opt-in is inert.
+        """
         both = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        # No opt-in → bwrap, even though docker is perfectly usable.
+        self.assertEqual(
+            iso.decide_agent_backend(both, True, task_type="research"),
+            iso.BACKEND_BWRAP,
+        )
+        self.assertEqual(iso.decide_agent_backend(both, True), iso.BACKEND_BWRAP)
+        # Opted in → docker actually happens (the flag is not a no-op).
         self.assertEqual(
             iso.decide_agent_backend(
                 both, True, task_type="research", agent_image="reg/agent:latest"
             ),
-            iso.BACKEND_BWRAP,
-        )
-        # Same for task_type=None (unclassified).
-        self.assertEqual(
-            iso.decide_agent_backend(both, True, agent_image="reg/agent:latest"),
-            iso.BACKEND_BWRAP,
+            iso.BACKEND_DOCKER,
         )
         # Docker reserved when bwrap unavailable (no binary either — image ships its own).
         docker_only = _caps(docker_usable=True)
@@ -1368,6 +1383,445 @@ class TestProbeGpuInSandbox(unittest.TestCase):
             ok, detail = iso.probe_gpu_in_sandbox(plan)
         self.assertFalse(ok)
         self.assertIn("no output", detail)
+
+
+# ── Arch gate: GPU listed by the driver, unusable by the image ───────────────
+
+# The real banner an NGC pytorch image prints on a Volta (sm_70) host when the
+# image dropped Volta support. Note it goes to STDERR, the GPU is still listed
+# on stdout by nvidia-smi (which reads the driver, not the image's CUDA
+# runtime), and the container exits 0.
+NGC_VOLTA_BANNER = (
+    "ERROR: Detected NVIDIA Tesla V100-SXM2-16GB GPU, which is not supported "
+    "by this container\n"
+    "ERROR: No supported GPU(s) detected to run this container\n"
+)
+
+
+class TestProbeGpuArchGate(unittest.TestCase):
+    """The probe must fail an image whose CUDA runtime cannot use the host GPU.
+
+    Regression: task 9b8093fd declared a T4, landed on a V100 (sm_70) DGX, and
+    requested nvcr.io/nvidia/pytorch:25.01-py3 — which dropped Volta. The probe
+    passed (exit 0, GPU listed), the job burned a ~14-min image pull plus a full
+    run, produced no metric, and failed the unmeasured-=-failure gate with a
+    confusing reason. The signal was on STDERR the whole time.
+    """
+
+    def _docker_plan(self, gpu_indices=(0,), container_name="bp-job1"):
+        caps = _caps(docker_usable=True, gpu_indices=tuple(gpu_indices))
+        return iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image="nvcr.io/nvidia/pytorch:25.01-py3",
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=list(gpu_indices),
+            container_name=container_name,
+            source_env={"PATH": "/usr/bin"},
+        )
+
+    def test_marker_on_stderr_fails_probe_despite_exit0_and_gpu_listed(self):
+        """THE regression: exit 0 + GPU on stdout + banner on stderr → FAIL.
+
+        Every signal the old probe looked at says healthy. Only stderr says the
+        image cannot use this GPU.
+        """
+        plan = self._docker_plan()
+        fake = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="GPU 0: Tesla V100-SXM2-16GB (UUID: GPU-abc123)\n",
+            stderr=NGC_VOLTA_BANNER,
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+
+        self.assertFalse(ok, "arch-incompatible image must not pass the GPU probe")
+        self.assertIn("no usable GPU", detail)
+        # The reason names the mismatch, not a generic "no metric" downstream.
+        self.assertIn("compatibility", detail)
+        self.assertIn("V100", detail)
+
+    def test_marker_on_stdout_also_fails_probe(self):
+        """Entrypoints that print the banner to stdout are caught identically."""
+        plan = self._docker_plan()
+        fake = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="GPU 0: Tesla V100\n" + NGC_VOLTA_BANNER,
+            stderr="",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("no usable GPU", detail)
+
+    def test_marker_match_is_case_insensitive(self):
+        """Markers are matched against a lowercased haystack, not verbatim."""
+        plan = self._docker_plan()
+        fake = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="GPU 0: Tesla V100\n",
+            stderr="NO SUPPORTED GPU(S) DETECTED TO RUN THIS CONTAINER",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, _ = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+
+    def test_clean_probe_with_benign_stderr_still_passes(self):
+        """A healthy GPU still PASSES — stderr noise alone must not fail the gate.
+
+        Guards against over-triggering: the gate keys on the markers, not on
+        stderr being non-empty.
+        """
+        plan = self._docker_plan()
+        fake = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-def456)\n",
+            stderr="WARNING: The NVIDIA Driver was not detected as up to date.\n",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertTrue(ok, "a compatible GPU must still pass the probe")
+        self.assertIn("A100", detail)
+
+    def test_nvidia_smi_device_visibility_check_is_retained(self):
+        """The original empty-GPU-list check still fails, marker or no marker."""
+        plan = self._docker_plan()
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=fake):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIn("no output", detail)
+
+    def test_no_usable_gpu_marker_helper(self):
+        """The helper returns the matched marker, or None on clean text."""
+        self.assertIsNotNone(iso.no_usable_gpu_marker(NGC_VOLTA_BANNER))
+        self.assertIsNone(
+            iso.no_usable_gpu_marker("GPU 0: NVIDIA A100-SXM4-40GB\n")
+        )
+        self.assertIsNone(iso.no_usable_gpu_marker(""))
+
+    def test_probe_detail_distinguishes_conclusive_from_inconclusive_failure(self):
+        """The caller's fatal/non-fatal split reads the DETAIL string — pin it.
+
+        local_runner decides whether a probe failure is fatal by re-scanning the
+        returned detail with no_usable_gpu_marker(). An arch mismatch is
+        conclusive (the container said it cannot use this GPU) and must always
+        be fatal; a timeout is INconclusive (the probe could not run) and must
+        not kill a job that never asked for a GPU. If the detail strings stopped
+        carrying that distinction, the split would silently invert.
+        """
+        plan = self._docker_plan()
+
+        arch = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="GPU 0: Tesla V100\n", stderr=NGC_VOLTA_BANNER,
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=arch):
+            ok, arch_detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIsNotNone(
+            iso.no_usable_gpu_marker(arch_detail),
+            "arch-mismatch detail must be recognisable as CONCLUSIVE — it is what "
+            "makes the failure fatal even for a job that declared no accelerator",
+        )
+
+        def timeout_run(argv, **kwargs):
+            if "rm" in argv:
+                return subprocess.CompletedProcess(args=[], returncode=0)
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=30)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=timeout_run):
+            ok, timeout_detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIsNone(
+            iso.no_usable_gpu_marker(timeout_detail),
+            "a timeout must NOT read as an arch mismatch — otherwise a cold pull "
+            "or a slow host would fatally fail a CPU-only containerized job",
+        )
+
+        missing = subprocess.CompletedProcess(
+            args=[], returncode=127,
+            stdout="", stderr="bash: nvidia-smi: command not found\n",
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=missing):
+            ok, missing_detail = iso.probe_gpu_in_sandbox(plan)
+        self.assertFalse(ok)
+        self.assertIsNone(
+            iso.no_usable_gpu_marker(missing_detail),
+            "a missing nvidia-smi is inconclusive, not an arch mismatch",
+        )
+
+
+class TestDockerAgentOptInIsNotASilentNoOp(unittest.TestCase):
+    """`--docker-agent` must actually select docker, not quietly fall to bwrap.
+
+    blueprint_runner only resolves an agent_image when the operator explicitly
+    opts in (--docker-agent / BLUEPRINT_AGENT_BACKEND=docker / --pull), so a
+    truthy agent_image IS the opt-in. Checking bwrap FIRST made the flag a no-op
+    on every host that has bwrap — the operator asked for a prod-parity container
+    and silently got bwrap. This class pins the decision ORDER, which is the only
+    thing standing between the opt-in and a silent no-op.
+    """
+
+    def test_optin_wins_over_bwrap_when_both_are_available(self):
+        both = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                both, True, agent_image="reg/agent:v1", task_type="research"
+            ),
+            iso.BACKEND_DOCKER,
+            "an explicit agent_image opt-in must beat bwrap — otherwise "
+            "--docker-agent does nothing at all on a bwrap-capable host",
+        )
+
+    def test_no_optin_is_byte_identical_to_the_historical_bwrap_table(self):
+        """The CRITICAL invariant: agent_image falsy → docker branch inert."""
+        both = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=True)
+        self.assertEqual(iso.decide_agent_backend(both, True), iso.BACKEND_BWRAP)
+        self.assertEqual(
+            iso.decide_agent_backend(both, True, task_type="research"),
+            iso.BACKEND_BWRAP,
+            "docker must NEVER win merely because docker is usable",
+        )
+        no_bwrap_no_docker = _caps(docker_usable=False)
+        self.assertEqual(iso.decide_agent_backend(no_bwrap_no_docker, True), iso.DECLINE)
+
+    def test_optin_still_gated_by_task_type(self):
+        """The write/heavy slice never rides the container path, flag or not."""
+        both = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                both, True, agent_image="reg/agent:v1", task_type="code_change"
+            ),
+            iso.BACKEND_BWRAP,
+            "an ineligible task type must fall back to bwrap even when opted in",
+        )
+
+    def test_optin_falls_back_to_bwrap_when_docker_is_unusable(self):
+        no_docker = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=False)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                no_docker, True, agent_image="reg/agent:v1", task_type="research"
+            ),
+            iso.BACKEND_BWRAP,
+        )
+
+
+class TestPullContainerImage(unittest.TestCase):
+    """The probe must not have to win a race against a cold image pull.
+
+    docker's default pull policy is `missing`, so the probe's own `docker run`
+    IS the pull. A 14-minute NGC pull against a 30s probe timeout means the job
+    dies reporting "GPU probe timed out" — never reaching the arch check the
+    probe exists to perform. Pulling explicitly first makes the probe's run warm.
+    """
+
+    def _docker_plan(self):
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        return iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image="nvcr.io/nvidia/pytorch:25.01-py3",
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=[0],
+            container_name="bp-job1",
+            source_env={"PATH": "/usr/bin"},
+        )
+
+    def test_pull_invokes_docker_pull_with_the_image(self):
+        plan = self._docker_plan()
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, detail = iso.pull_container_image(plan, "nvcr.io/nvidia/pytorch:25.01-py3")
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            calls[0], ["docker", "pull", "nvcr.io/nvidia/pytorch:25.01-py3"]
+        )
+
+    def test_pull_timeout_is_not_fatal(self):
+        """A failed pull is reported, never raised — the run surfaces the error."""
+        plan = self._docker_plan()
+
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=1800)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, detail = iso.pull_container_image(plan, "img:tag")
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
+    def test_pull_is_a_noop_without_an_image_or_on_bwrap(self):
+        plan = self._docker_plan()
+        ok, detail = iso.pull_container_image(plan, None)
+        self.assertTrue(ok)
+        self.assertIn("no image", detail)
+
+        caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, gpu_indices=(0,))
+        bwrap_plan = iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image=None,
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=[0],
+            container_name="bp-job1",
+            source_env={"PATH": "/usr/bin"},
+        )
+        with mock.patch.object(iso.subprocess, "run") as run_mock:
+            ok, _ = iso.pull_container_image(bwrap_plan, "img:tag")
+        self.assertTrue(ok)
+        run_mock.assert_not_called()
+
+
+class TestProbeContainerNameIsolation(unittest.TestCase):
+    """The probe container must never hold the real run's container name.
+
+    `--rm` does not protect us: on TimeoutExpired Python kills the docker CLI
+    *client*, not the container. The container keeps running, `--rm` never
+    fires, the name stays held, and the REAL run then dies with "name already
+    in use".
+    """
+
+    def _docker_plan(self, container_name="bp-job1"):
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        return iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image="nvcr.io/nvidia/pytorch:25.01-py3",
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=[0],
+            container_name=container_name,
+            source_env={"PATH": "/usr/bin"},
+        )
+
+    def test_probe_container_name_differs_from_real_run(self):
+        plan = self._docker_plan(container_name="bp-9b8093fd0000")
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="GPU 0: Tesla V100\n", stderr="",
+            )
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            iso.probe_gpu_in_sandbox(plan)
+
+        probe_argv = captured["argv"]
+        name_idx = probe_argv.index("--name")
+        probe_name = probe_argv[name_idx + 1]
+
+        # The real run's name is still what the plan carries...
+        self.assertEqual(plan.container_name, "bp-9b8093fd0000")
+        # ...and the probe must NOT reuse it.
+        self.assertNotEqual(probe_name, plan.container_name)
+        self.assertEqual(probe_name, "bp-9b8093fd0000" + iso.PROBE_NAME_SUFFIX)
+        # The rest of the sandbox is still identical (same image, same GPU flags).
+        self.assertIn("nvcr.io/nvidia/pytorch:25.01-py3", probe_argv)
+        self.assertIn("device=0", probe_argv)
+
+    def test_probe_timeout_force_removes_the_probe_container(self):
+        """A timed-out probe force-removes ITS OWN container, never the real name."""
+        plan = self._docker_plan(container_name="bp-job7")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if "rm" in argv:
+                return subprocess.CompletedProcess(args=[], returncode=0)
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=30)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+        rm_calls = [c for c in calls if "rm" in c]
+        self.assertEqual(len(rm_calls), 1, "timed-out probe must force-remove its container")
+        self.assertEqual(rm_calls[0], ["docker", "rm", "-f", "bp-job7" + iso.PROBE_NAME_SUFFIX])
+        # Never force-remove the real run's container.
+        self.assertNotIn("bp-job7", rm_calls[0])
+
+    def test_probe_cleanup_failure_is_swallowed(self):
+        """A failing `docker rm` must not turn into a raised exception."""
+        plan = self._docker_plan()
+
+        def fake_run(argv, **kwargs):
+            if "rm" in argv:
+                raise OSError("docker daemon gone")
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=30)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, detail = iso.probe_gpu_in_sandbox(plan)
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+
+    def test_bwrap_timeout_attempts_no_container_removal(self):
+        """bwrap has no container to remove — no stray `rm` subprocess."""
+        caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, gpu_indices=(0,))
+        plan = iso.plan_compute_execution(
+            caps=caps,
+            command="python train.py",
+            image=None,
+            registry_auth=None,
+            workspace_host="/tmp/bp_x",
+            result_file_host="/tmp/bp_x/result.json",
+            artifact_dir_host="/tmp/bp_x/artifacts",
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=[0],
+            container_name="bp-job1",
+            source_env={"PATH": "/usr/bin"},
+        )
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=30)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            ok, _ = iso.probe_gpu_in_sandbox(plan)
+
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1, "bwrap probe must not attempt a container rm")
 
 
 if __name__ == "__main__":

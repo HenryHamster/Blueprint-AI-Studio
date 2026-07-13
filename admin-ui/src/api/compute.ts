@@ -848,6 +848,10 @@ export interface ComputeJob {
   // Absent on legacy rows where the task payload predates this field.
   launch_params?: {
     command?: string | null;
+    // Multi-arm commands are stored base64-wrapped for escape safety. The
+    // backend decodes them on read; null for single-arm/operator commands,
+    // which are stored verbatim and need no decoding.
+    command_decoded?: string | null;
     arms?: Array<{ name: string; command: string }> | null;
     declared_metric?: string | null;
     metric?: string | null;

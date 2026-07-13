@@ -2957,32 +2957,81 @@ def _run_compute_job(
             )
             return
 
-        # GPU-used enforcement: when the job declares an accelerator requirement,
-        # run a lightweight nvidia-smi -L probe INSIDE the same sandbox before
-        # the real command so torch/TF cannot silently fall back to CPU if CUDA
-        # is not actually reachable inside the sandbox.
-        if accelerator_type and assigned_gpus:
+        # GPU-used enforcement: run a lightweight nvidia-smi -L probe INSIDE the
+        # same sandbox before the real command, so (a) torch/TF cannot silently
+        # fall back to CPU if CUDA is not actually reachable, and (b) an image
+        # whose CUDA runtime cannot use this GPU's arch (NGC images drop older
+        # compute capabilities) is caught before the FULL RUN is burned. It does
+        # NOT save the image pull — the pull happens first, by necessity.
+        #
+        # A container image alone arms the gate: the image/GPU arch mismatch
+        # exists whenever GPUs meet a container, even with no declared
+        # accelerator. An imageless (bwrap) GPU job still probes only when an
+        # accelerator was declared, exactly as before.
+        if assigned_gpus and (accelerator_type or container_image):
+            # Pull FIRST. The probe's own `docker run` would otherwise BE the
+            # pull (docker's default policy is `missing`), pitting the probe's
+            # 30s timeout against a cold multi-GB download it cannot win — the
+            # job would then die reporting a probe timeout instead of the real
+            # reason. Best-effort: a pull failure is left for the probe / real
+            # run to surface, so there is only one authoritative failure path.
+            pull_ok, pull_detail = iso.pull_container_image(plan, container_image)
+            if not pull_ok:
+                print(
+                    f"[compute] job {job_id}: pre-probe image pull did not "
+                    f"succeed ({pull_detail}) — continuing; the probe or the run "
+                    "will surface the real error",
+                    flush=True,
+                )
+
             probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
             if not probe_ok:
-                terminal_reason = (
-                    f"GPU declared (accelerator={accelerator_type}) but unusable "
-                    f"in sandbox: {probe_detail}"
+                # An arch mismatch is CONCLUSIVE: the container itself reported it
+                # cannot use this GPU, so the run can only end in "no metric".
+                # Fatal no matter what the job declared.
+                #
+                # Every OTHER probe failure (timeout, no nvidia-smi, empty device
+                # list) is INCONCLUSIVE — it says the PROBE could not run, not
+                # that the JOB cannot. Killing on those would be a false failure,
+                # and the blast radius is wide: `assigned_gpus` is populated from
+                # caps.has_gpu ALONE, so on a GPU host it covers every
+                # containerized job, CPU-only ones included. Keep the old contract
+                # — only a job that DECLARED an accelerator dies on an
+                # inconclusive probe; an image-only job warns and proceeds.
+                arch_mismatch = iso.no_usable_gpu_marker(probe_detail) is not None
+                if not arch_mismatch and not accelerator_type:
+                    print(
+                        f"[compute] job {job_id}: GPU probe inconclusive "
+                        f"({probe_detail}) — no accelerator was declared, so the "
+                        "job proceeds rather than fail on a probe it never needed",
+                        flush=True,
+                    )
+                else:
+                    declared = (
+                        f"accelerator={accelerator_type}"
+                        if accelerator_type
+                        else f"image={container_image}"
+                    )
+                    terminal_reason = (
+                        f"GPU assigned ({declared}) but unusable "
+                        f"in sandbox: {probe_detail}"
+                    )
+                    print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
+                    outcome = "failure"
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=1,
+                        command_log={
+                            "text": terminal_reason,
+                            "truncated": False,
+                        },
+                    )
+                    return
+            else:
+                print(
+                    f"[compute] GPU probe OK for job {job_id}: {probe_detail.splitlines()[0]}",
+                    flush=True,
                 )
-                print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
-                outcome = "failure"
-                _report_compute_job(
-                    orchestrator_url, token, job_id,
-                    exec_status="failed", exit_code=1,
-                    command_log={
-                        "text": terminal_reason,
-                        "truncated": False,
-                    },
-                )
-                return
-            print(
-                f"[compute] GPU probe OK for job {job_id}: {probe_detail.splitlines()[0]}",
-                flush=True,
-            )
 
         # Per-job image downgrade: the job asked for a container_image but this host
         # has no container runtime, so it runs image-LESS under bwrap on the host

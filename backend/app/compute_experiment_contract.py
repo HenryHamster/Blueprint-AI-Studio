@@ -41,6 +41,68 @@ COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY = (
 COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY = "advisory_success_criterion"
 
 
+# Multi-arm wrappers are stored as `echo <blob> | base64 -d | bash`.  The
+# encoding is deliberate and stays: the wrapper nests Python inside bash inside
+# a Python string literal, and compounding escape layers is the bug class
+# CLAUDE.md explicitly warns about.  What the encoding costs is legibility — an
+# operator reading the job sees an opaque blob — so we decode on READ rather
+# than give up the escape safety.
+_GENERATED_COMMAND_RE = re.compile(
+    r"^echo\s+(?P<blob>[A-Za-z0-9+/=]+)\s*\|\s*base64\s+-d\s*\|\s*bash$"
+)
+
+# Within the decoded wrapper the aggregator is itself a base64 blob of a static
+# file (compute_arm_aggregator.py), thousands of characters long.  Expanding it
+# would bury the per-arm commands, which are the part an operator actually reads.
+#
+# The blob is matched EXACTLY, not by shape: `echo <blob> | base64 -d > <dest>`
+# is the very pattern CLAUDE.md tells authors to use for embedding a script, so
+# an arm's own command may legitimately contain one.  Eliding by shape alone
+# would relabel that arm's blob as the aggregator and destroy its contents —
+# a legibility feature that lies about what ran is worse than no feature.
+_EMBEDDED_AGGREGATOR_RE = re.compile(
+    r"^echo\s+(?P<blob>[A-Za-z0-9+/=]{64,})\s*\|\s*base64\s+-d\s*>\s*(?P<dest>\S+)$",
+    re.MULTILINE,
+)
+
+
+def decode_generated_command(
+    command: str | None, *, elide_aggregator: bool = True
+) -> str | None:
+    """Return the readable bash behind a generated ``base64 -d | bash`` command.
+
+    ``None`` means *command* is not one of our generated wrappers — single-arm
+    experiments are never encoded, and an operator-authored command is passed
+    through verbatim.  Callers fall back to showing the raw command.
+
+    Never raises: a truncated or non-UTF-8 blob yields ``None`` rather than
+    turning a read of an old job into a 500.
+    """
+    if not isinstance(command, str):
+        return None
+    match = _GENERATED_COMMAND_RE.match(command.strip())
+    if match is None:
+        return None
+    try:
+        script = base64.b64decode(match.group("blob"), validate=True).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if elide_aggregator:
+
+        def _elide(m: re.Match[str]) -> str:
+            # Only OUR aggregator blob is elided. An arm that embeds its own
+            # base64 script is left byte-for-byte intact.
+            if m.group("blob") != _AGGREGATOR_B64:
+                return m.group(0)
+            return (
+                "echo <base64 blob: compute_arm_aggregator.py> "
+                f"| base64 -d > {m.group('dest')}"
+            )
+
+        script = _EMBEDDED_AGGREGATOR_RE.sub(_elide, script)
+    return script
+
+
 def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
     """Assemble a compute_experiment launch contract from a finding/subtask.
 

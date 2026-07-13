@@ -2339,6 +2339,106 @@ def test_arms_contract_validation_synthesizes_command():
     assert "python b.py" in decoded
 
 
+def test_decode_generated_command_round_trips_the_synthesized_wrapper():
+    """The decoder inverts the encoder: an operator can read what actually ran."""
+    from app.compute_experiment_contract import (
+        _AGGREGATOR_B64,
+        decode_generated_command,
+    )
+
+    contract = {
+        "arms": [
+            {"name": "baseline", "command": "python train.py --lr=0.1"},
+            {"name": "tuned", "command": "python train.py --lr='0.01'"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, _reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    decoded = decode_generated_command(contract["command"])
+    assert decoded is not None
+    # The arm commands — the part an operator actually wants to read — survive verbatim.
+    assert "python train.py --lr=0.1" in decoded
+    assert "python train.py --lr='0.01'" in decoded
+    # The static aggregator blob is elided, not expanded, so it cannot bury the arms.
+    assert "compute_arm_aggregator.py" in decoded
+    assert _AGGREGATOR_B64 not in decoded
+
+
+def test_decode_generated_command_never_elides_an_arms_own_base64_blob():
+    """An arm may legitimately embed its own base64 script — leave it INTACT.
+
+    `echo <blob> | base64 -d > <dest>` is the exact pattern CLAUDE.md tells
+    authors to use, so eliding by SHAPE would relabel an arm's blob as the
+    aggregator and destroy its contents. A legibility feature that lies about
+    what ran is worse than no feature.
+    """
+    import base64
+
+    from app.compute_experiment_contract import decode_generated_command
+
+    # Two things this test must get right or it silently proves nothing:
+    #  1. The blob must encode to >= 64 base64 chars, or _EMBEDDED_AGGREGATOR_RE
+    #     never matches it (an earlier draft used 60 and passed WITH the bug).
+    #  2. The `echo` must NOT be the arm's first line. The generator wraps line 1
+    #     as `(export BLUEPRINT_RESULT_FILE=...; <cmd>`, so a leading echo is not
+    #     at line-start and `^echo` cannot match it. A MIDDLE line is the
+    #     reachable case.
+    script_src = (
+        b"import json\n"
+        b"cfg = {'lr': 0.01, 'epochs': 30, 'arch': 'resnet50'}\n"
+        b"json.dump(cfg, open('cfg.json', 'w'))\n"
+    )
+    payload = base64.b64encode(script_src).decode()
+    assert len(payload) >= 64, "payload too short to reach the elision regex"
+    arm_cmd = (
+        "python prep.py\n"
+        f"echo {payload} | base64 -d > model_cfg.py\n"
+        "python train.py --cfg model_cfg.py"
+    )
+    contract = {
+        "arms": [{"name": "embedder", "command": arm_cmd}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, _reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    decoded = decode_generated_command(contract["command"])
+    assert decoded is not None
+    # The arm's OWN blob survives verbatim and is not mislabelled.
+    assert payload in decoded
+    assert "base64 blob: compute_arm_aggregator.py> | base64 -d > model_cfg.py" not in decoded
+    # ...while the real aggregator blob is still elided.
+    assert "echo <base64 blob: compute_arm_aggregator.py>" in decoded
+
+
+def test_decode_generated_command_passes_through_unencoded_commands():
+    """Single-arm/operator commands are stored verbatim — nothing to decode."""
+    from app.compute_experiment_contract import decode_generated_command
+
+    assert decode_generated_command("python train.py --epochs 3") is None
+    assert decode_generated_command(None) is None
+    assert decode_generated_command("") is None
+
+
+def test_decode_generated_command_never_raises_on_a_corrupt_blob():
+    """A truncated blob must not turn a read of an old job into a 500."""
+    import base64
+
+    from app.compute_experiment_contract import decode_generated_command
+
+    # Well-formed wrapper shape, invalid base64 payload.
+    assert decode_generated_command("echo !!!notb64!!! | base64 -d | bash") is None
+    # Valid base64 that is not UTF-8 text.
+    blob = base64.b64encode(b"\xff\xfe\x00\x01").decode()
+    assert decode_generated_command(f"echo {blob} | base64 -d | bash") is None
+
+
 def test_arms_contract_validation_single_quote_safe():
     """Arms with single quotes in commands produce a safe base64-encoded command."""
     import base64

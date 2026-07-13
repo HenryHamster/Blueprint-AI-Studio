@@ -1757,6 +1757,28 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
 
               {(() => {
+                const rawCommand = job.launch_params?.command;
+                if (!rawCommand) return null;
+                const decoded = job.launch_params?.command_decoded;
+                return (
+                  <details
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5"
+                    data-testid="compute-command-disclosure"
+                  >
+                    <summary className="cursor-pointer text-ui-sm font-mono text-neutral-500 hover:text-neutral-300">
+                      Command{decoded ? ' (decoded)' : ''}
+                    </summary>
+                    <pre
+                      className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words text-ui-sm font-mono text-neutral-300"
+                      data-testid="compute-command-text"
+                    >
+                      {decoded ?? rawCommand}
+                    </pre>
+                  </details>
+                );
+              })()}
+
+              {(() => {
                 if (!active) return null;
                 const burnRate = computeJobBurnRate(job, nowMs);
                 if (burnRate == null) return null;

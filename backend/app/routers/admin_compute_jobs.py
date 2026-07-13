@@ -26,6 +26,7 @@ from app.compute_jobs import (
     kill_compute_job,
     list_compute_jobs,
 )
+from app.compute_experiment_contract import decode_generated_command
 from app.compute_jobs_aggregation import (
     aggregate_all_compute_jobs_summary,
     aggregate_compute_jobs_summary,
@@ -309,8 +310,13 @@ async def _build_compute_job_payload(
             raw_provenance = fp.get("provenance")
             raw_spend = fp.get("spend_cap_usd")
             raw_deadline = fp.get("deadline_seconds")
+            raw_command = fp.get("command") or None
             launch_params = {
-                "command": fp.get("command") or None,
+                "command": raw_command,
+                # Multi-arm commands are stored base64-wrapped for escape safety;
+                # decode here so the operator can read what actually ran. None for
+                # single-arm/operator commands, which are stored verbatim.
+                "command_decoded": decode_generated_command(raw_command),
                 "arms": arms_val,
                 "declared_metric": fp.get("declared_metric") or None,
                 "metric": fp.get("metric") or None,

@@ -140,6 +140,7 @@
     "runner_health_monitors.py": 1001,
     "strategic_context_package.py": 1800,
     "routers/runner.py": 1650,
+    "capability_trial_verdict.py": 1750,
     "acceptance_gate.py": 1800
   },
   "agent": {
@@ -235,7 +236,7 @@
     "components/DirectionPortfolioSection.tsx": 1100,
     "components/HeaderBar.tsx": 1100,
     "components/ResearchBrowser.tsx": 1050,
-    "components/ComputeJobsPanel.tsx": 2850,
+    "components/ComputeJobsPanel.tsx": 2900,
     "hooks/useWorkbenchCommands.ts": 1800,
     "api/compute.ts": 2000,
     "api/projects.ts": 1750

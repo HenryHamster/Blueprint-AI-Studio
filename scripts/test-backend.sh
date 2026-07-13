@@ -463,6 +463,11 @@ if [ "${1:-}" = "--standalone" ]; then
   )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
   [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
+  # The runner-isolation suite covers the GPU probe's arch gate, probe/real
+  # container-name isolation, and the pre-probe image pull. It lives under
+  # scripts/ (which ships standalone to runner hosts), so the `pytest testing/`
+  # shards never collect it — without this line the whole gate is untested in CI.
+  [ -f /repo/scripts/test_runner_isolation.py ] && STANDALONE_ARGS+=(/repo/scripts/test_runner_isolation.py)
   _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest
   exit 0
 fi
