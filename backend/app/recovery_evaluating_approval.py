@@ -297,13 +297,46 @@ async def _handle_approval_gate_timeout(
                 "pr_number"
             )
             if _pr_num:
+                from app.review_loop_convergence import (
+                    _PreservabilityUnavailable,
+                    _pr_is_preservable_on_cap,
+                )
+
                 _is_preservable = False
                 try:
-                    from app.review_loop_convergence import _pr_is_preservable_on_cap
-
                     _is_preservable = await _pr_is_preservable_on_cap(
                         task, int(_pr_num), session
                     )
+                except _PreservabilityUnavailable as _unavail:
+                    # TRANSIENT (deadline breach / GitHub rate limit) — we do NOT
+                    # know this PR's state, so we must not abandon it. Without this
+                    # clause the generic ``except Exception`` below swallows it,
+                    # leaves _is_preservable=False, and the task lands FAILED with a
+                    # perfectly mergeable PR abandoned — in BULK during an
+                    # install-token-exhaustion window, which is exactly the incident
+                    # the raising code exists to prevent.
+                    #
+                    # PRESERVE instead. Be honest about what that means: the preserve
+                    # branch below persists ``approval_timeout_preserved_for_handmerge
+                    # =True``, and BOTH the guard above and the early-return below
+                    # then skip this task forever — so a transient blip LATCHES
+                    # preserve permanently. There is no "a later sweep re-decides once
+                    # GitHub is healthy"; this is a one-way door to human hand-merge.
+                    #
+                    # That is deliberate and it is the right trade here: the outcome
+                    # is non-destructive (the PR stays OPEN, nothing is closed, no
+                    # CODE_ERROR) and it is OBSERVABLE (the branch fires a hand-merge
+                    # alert), so a latched preserve surfaces to an operator instead of
+                    # silently destroying a mergeable PR. Latching a PR open for a
+                    # human beats closing it because our quota ran out.
+                    logger.warning(
+                        f"[EVAL TIMEOUT] Preservability UNAVAILABLE for "
+                        f"{str(task.id)[:8]} PR #{_pr_num} ({_unavail}) — PRESERVING "
+                        f"for hand-merge rather than abandoning a PR we could not "
+                        f"read. NOTE: this LATCHES (approval_timeout_preserved_for_"
+                        f"handmerge); it will not be re-decided automatically."
+                    )
+                    _is_preservable = True
                 except Exception:
                     logger.debug(
                         f"[EVAL TIMEOUT] Preservability check failed for "

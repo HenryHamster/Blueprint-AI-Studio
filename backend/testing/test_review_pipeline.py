@@ -18653,3 +18653,317 @@ async def test_noop_fix_skips_review_spawn_below_churn_limit(db_session, mocker)
     assert "No-op fix" in (noop_fix.latest_status_message or ""), (
         "Source task status message should indicate no-op fix closure"
     )
+
+
+# ── R3: stale-supersede must not blind-overwrite a live reviewer ─────────────
+#
+# The per-PR advisory lock serializes SPAWNERS only — it does NOT serialize
+# against a reviewer agent committing its OWN terminal status. The supersede
+# decision reads `active_pipeline` with a plain UNLOCKED SELECT and the cancel is
+# an ORM UPDATE-by-PK with no WHERE-status guard (and version_id_col was dropped
+# globally, so there is no optimistic-concurrency backstop). Two consequences,
+# both covered below:
+#   1. Task.last_heartbeat goes STALE on a LIVE agent whose row write was
+#      409-skipped under contention (routers/agent.py:4525-4545). VmContact is
+#      written off the contended row and cannot be starved — corroborate against
+#      it before declaring a task dead (mirrors reaper.py:481).
+#   2. A reviewer that reaches COMPLETED inside the supersede window is
+#      blind-overwritten to CANCELLED, and its context blob (carrying the fresh
+#      APPROVE verdict) is replaced from the stale snapshot — the verdict is
+#      ERASED, not merely superseded.
+
+
+async def _make_stale_review(db_session, project, original_task, *, pr_number, vm_id=None):
+    stale_started = _utcnow_for_test() - timedelta(
+        minutes=PIPELINE_TASK_STALE_MINUTES + 5
+    )
+    review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "feat/r3",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        started_at=stale_started,
+    )
+    review.last_heartbeat = stale_started
+    review.vm_instance_id = vm_id
+    db_session.add(review)
+    await db_session.commit()
+    await db_session.refresh(review)
+    return review
+
+
+def _make_r3_source(project, original_task, *, pr_number):
+    return make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": pr_number,
+                "branch": "feat/r3",
+                "base_branch": "main",
+                "prompt": "Build X",
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_starved_but_live_reviewer_is_not_superseded(db_session, mocker):
+    """R3: a LIVE reviewer whose on-row heartbeat is lock-starved (stale
+    last_heartbeat) but whose VmContact is FRESH must NOT be cancelled.
+
+    This is the false-stale premise the codebase already documents: the heartbeat
+    handler writes the Task row with_for_update(skip_locked=True) and is
+    409-skipped under contention, so last_heartbeat goes stale on an agent that
+    is very much alive. The reaper grew a VmContact override for exactly this
+    (reaper.py:481); the supersede path never did — so it cancelled the live
+    reviewer and deleted its VM.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
+
+    from app.models import VmContact
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    live_review = await _make_stale_review(
+        db_session, project, original_task, pr_number=920, vm_id="vm-live-1"
+    )
+    # The agent IS alive: it is still calling in, and every contact lands on its
+    # OWN uncontended VmContact row even when the Task-row write is skipped.
+    db_session.add(
+        VmContact(vm_instance_id="vm-live-1", last_contact_at=_utcnow_for_test())
+    )
+    source_task = _make_r3_source(project, original_task, pr_number=920)
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=920,
+        branch="feat/r3",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+    await db_session.refresh(live_review)
+
+    assert live_review.status == TaskStatus.IN_PROGRESS, (
+        "a LIVE reviewer (fresh VmContact, lock-starved heartbeat) was cancelled "
+        "as a corpse"
+    )
+    assert (live_review.context or {}).get("failure_detail") is None
+    delete_vm.assert_not_awaited()
+    # Same-type dedup: the live review is trusted to finish, no duplicate spawn.
+    assert created is False
+    assert result is not None and result.id == live_review.id
+
+
+@pytest.mark.asyncio
+async def test_genuinely_dead_reviewer_is_still_superseded(db_session, mocker):
+    """R3 negative control: no VmContact at all (crashed / preempted / OOM VM
+    sends no requests) → the stale reviewer IS still superseded. The fix must not
+    turn the supersede path off."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    dead_review = await _make_stale_review(
+        db_session, project, original_task, pr_number=921, vm_id="vm-dead-1"
+    )
+    # No VmContact row for vm-dead-1 — the VM is genuinely gone.
+    source_task = _make_r3_source(project, original_task, pr_number=921)
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    _result, created = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=921,
+        branch="feat/r3",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+    await db_session.refresh(dead_review)
+
+    assert dead_review.status == TaskStatus.CANCELLED
+    assert (dead_review.context or {}).get("failure_detail") == (
+        "superseded_by_review_pipeline"
+    )
+    assert created is True
+
+
+@pytest.mark.asyncio
+async def test_stale_vm_contact_does_not_rescue_a_dead_reviewer(db_session, mocker):
+    """R3 negative control 2: a VmContact that is ITSELF older than the cutoff is
+    not proof of life — the reviewer is still superseded."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    from app.models import VmContact
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    dead_review = await _make_stale_review(
+        db_session, project, original_task, pr_number=922, vm_id="vm-dead-2"
+    )
+    db_session.add(
+        VmContact(
+            vm_instance_id="vm-dead-2",
+            last_contact_at=_utcnow_for_test()
+            - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5),
+        )
+    )
+    source_task = _make_r3_source(project, original_task, pr_number=922)
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=922,
+        branch="feat/r3",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+    await db_session.refresh(dead_review)
+
+    assert dead_review.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_reviewer_that_completes_inside_supersede_window_keeps_its_verdict(
+    db_session, mocker
+):
+    """R3: a reviewer that commits COMPLETED + APPROVE *inside* the supersede
+    window must NOT be blind-overwritten to CANCELLED, and its verdict must
+    survive.
+
+    The window is simulated at its exact boundary: the candidate is selected and
+    judged stale from the unlocked snapshot, and the agent's own terminal write
+    lands before the destructive UPDATE. Without the FOR UPDATE re-select +
+    status re-assert, the ORM UPDATE-by-PK overwrites status AND rewrites the
+    whole context blob from the stale snapshot, ERASING the APPROVE verdict.
+    """
+    from app import review_pipeline
+    from sqlalchemy.orm.attributes import flag_modified
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    delete_vm = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    racing_review = await _make_stale_review(
+        db_session, project, original_task, pr_number=923, vm_id="vm-race-1"
+    )
+    source_task = _make_r3_source(project, original_task, pr_number=923)
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    review_id = racing_review.id
+    real_relock = review_pipeline._relock_pipeline_task_for_cancel
+
+    async def _agent_commits_then_relock(session, task_id):
+        # The agent's completion handler wins the race: it locks its own row and
+        # commits COMPLETED + APPROVE just before we try to cancel it.
+        if task_id == review_id:
+            t = await session.get(Task, task_id)
+            ctx = dict(t.context or {})
+            ctx["blueprint_review_verdict"] = "APPROVE"
+            t.context = ctx
+            t.status = TaskStatus.COMPLETED
+            flag_modified(t, "context")
+            session.add(t)
+            await session.commit()
+        return await real_relock(session, task_id)
+
+    mocker.patch.object(
+        review_pipeline,
+        "_relock_pipeline_task_for_cancel",
+        side_effect=_agent_commits_then_relock,
+    )
+
+    await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=923,
+        branch="feat/r3",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    db_session.expunge_all()
+    landed = await db_session.get(Task, review_id)
+    assert landed.status == TaskStatus.COMPLETED, (
+        "a reviewer that committed COMPLETED inside the supersede window was "
+        "blind-overwritten to CANCELLED by an unguarded UPDATE-by-PK"
+    )
+    assert (landed.context or {}).get("blueprint_review_verdict") == "APPROVE", (
+        "the APPROVE verdict was ERASED — the cancel rewrote the whole context "
+        "blob from the pre-race snapshot"
+    )
+    assert (landed.context or {}).get("failure_detail") is None
+    delete_vm.assert_not_awaited()

@@ -142,7 +142,8 @@
     "strategic_context_package.py": 1800,
     "routers/runner.py": 1650,
     "capability_trial_verdict.py": 1750,
-    "acceptance_gate.py": 1800
+    "acceptance_gate.py": 1800,
+    "review_loop_convergence.py": 1950
   },
   "agent": {
     "index.ts": 4600,

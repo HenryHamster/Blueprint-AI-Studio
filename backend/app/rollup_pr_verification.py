@@ -216,8 +216,11 @@ _pr_merge_negative_cache: dict[uuid.UUID, float] = {}
 
 class _TransientPRVerifyError(Exception):
     """Internal marker: this PR could not be verified because GitHub failed
-    transiently (5xx / network error / a rate-limit 403 that ``github_pulls``
-    re-maps to a 500).
+    transiently (5xx / network error / a GitHub RATE LIMIT, which
+    ``github_pulls.get_pull_request`` surfaces as a **503 + Retry-After** via the
+    canonical ``github_http.raise_rate_limited``; 503 is already in the retryable
+    status list below, so a drained quota bucket takes this clean transient path
+    rather than escaping as an unclassified raise).
 
     Raised instead of returning early so the transient path FALLS THROUGH to the
     negative-cache stamp at the bottom of :func:`_verify_pr_merged`. The early

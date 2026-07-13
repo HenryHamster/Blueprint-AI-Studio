@@ -562,3 +562,130 @@ async def test_reviews_checked_returns_raw_review_dicts_unwrapped(mocker):
     assert isinstance(reviews, list)
     assert reviews == [{"state": "APPROVED"}]
     assert status == github_pulls.REVIEWS_COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# get_pull_request rate-limit DISCRIMINATOR (N1).
+#
+# review_loop_convergence's cap-exhaustion path treats a preservability lookup
+# FAILURE as "this PR is not salvageable" and CLOSES the PR. So the question
+# "is this response a rate limit, or a real error?" is load-bearing: get it
+# wrong one way and a drained quota bucket destroys every cap-exhausted rollup
+# PR at once; get it wrong the other way and a permanently de-authorized repo
+# defers forever. These probe get_pull_request against REAL response shapes —
+# the classifier tests in test_review_loop_convergence mock the HTTPException
+# directly and so cannot catch a broken discriminator.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_pr_empty_bucket_403_is_retryable_503(mocker):
+    """Empty-bucket 403 (X-RateLimit-Remaining: 0) -> retryable 503 + Retry-After.
+
+    This is the shape the client SYNTHESISES with zero network when it already
+    knows the install-token bucket is drained (github.py ~:471-486), and the shape
+    a hard primary rate limit fast-fails with (~:536-540). It must NOT look like a
+    hard failure, or the cap path closes a perfectly good PR.
+    """
+    from app import github_http, github_pulls
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(return_value=_rate_limited_response(reset_in_s=90)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    exc = exc_info.value
+    assert exc.status_code == 503, (
+        "a drained quota bucket was reported as a hard failure — the cap-exhaustion "
+        "path reads that as 'PR not salvageable' and CLOSES the PR"
+    )
+    retry_after = int((exc.headers or {}).get("Retry-After"))
+    assert 0 < retry_after <= github_http.RATE_LIMIT_MAX_RETRY_AFTER_S
+
+
+@pytest.mark.asyncio
+async def test_get_pr_secondary_rate_limit_429_without_headers_is_retryable_503(
+    mocker,
+):
+    """A HEADER-LESS 429 (secondary limit) is still a rate limit.
+
+    A hand-rolled "429 AND rate-limit headers" test would miss this and fall
+    through to the destructive 500. ``is_rate_limited_response`` treats ANY 429 as
+    a rate limit, which is why the canonical helper is used rather than a second
+    discriminator.
+    """
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            return_value=MockResponse(
+                429,
+                {"message": "You have exceeded a secondary rate limit"},
+                text="secondary rate limit",
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_get_pr_permission_403_with_quota_headers_is_NOT_rate_limited(mocker):
+    """THE INVERSION GUARD. A PERMISSION 403 must NOT be mistaken for a rate limit.
+
+    GitHub DOES send X-RateLimit-* headers on a permission 403 — but with a
+    NONZERO remaining. The discriminator keys on the VALUE (== "0"), not on the
+    presence of the header, so this correctly falls through to the hard 500 and
+    the cap path keeps its fail-safe (terminal) semantics.
+
+    If this ever flips to 503, a de-authorized repo would DEFER FOREVER instead of
+    terminalizing — a permanent wedge.
+    """
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            return_value=MockResponse(
+                403,
+                {"message": "Resource not accessible by integration"},
+                text="Resource not accessible by integration",
+                headers={
+                    "X-RateLimit-Remaining": "4999",
+                    "X-RateLimit-Limit": "5000",
+                    "X-RateLimit-Reset": str(int(time.time()) + 3000),
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert exc_info.value.status_code == 500, (
+        "a PERMISSION 403 was classified as a rate limit — the cap-exhaustion path "
+        "would DEFER FOREVER on a condition that never clears"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_pr_404_still_raises_404(mocker):
+    """A genuinely-gone PR keeps its own status — never a rate limit."""
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(return_value=MockResponse(404, {}, text="Not Found")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert exc_info.value.status_code == 404

@@ -2121,6 +2121,79 @@ async def test_approval_gate_timeout_preserves_mergeable_rollup_pr(eval_db, mock
 
 
 @pytest.mark.asyncio
+async def test_approval_gate_timeout_rate_limited_lookup_preserves_not_fails(
+    eval_db, mocker
+):
+    """MINOR 3 (round 3): the 2nd consumer of ``_pr_is_preservable_on_cap`` must
+    honour ``_PreservabilityUnavailable`` instead of swallowing it into FAILED.
+
+    ``_PreservabilityUnavailable`` is an ``Exception``, so this sweep's generic
+    ``except Exception`` caught it, left ``_is_preservable = False``, and the task
+    landed **FAILED with a perfectly mergeable PR abandoned** — in bulk during a
+    GitHub rate-limit / install-token-exhaustion window. That falsified the very
+    invariant the exception exists to enforce ("a transient lookup failure must
+    never close a PR or fail a task") at the one call site nobody audited.
+
+    A rate-limited lookup here now PRESERVES for hand-merge; the sweep is
+    idempotent, so a later sweep re-decides once GitHub is healthy again.
+    """
+    from fastapi import HTTPException
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # The GitHub client's synthetic 403 for a known-empty install-token bucket.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(
+            status_code=403,
+            detail="GitHub rate limit exhausted fetching PR #475 (reset at 999)",
+        ),
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="Rollup RateLimit", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            "rollup_pr_number": 475,
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status != TaskStatus.FAILED, (
+        "a GitHub RATE LIMIT made the approval-gate sweep abandon a PR it could "
+        "not even read — _PreservabilityUnavailable was swallowed into FAILED"
+    )
+    assert (parent.context or {}).get(
+        "approval_timeout_preserved_for_handmerge"
+    ) is True
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
     """RC-2 GUARDRAIL: approval-gate timeout on a non-rollup task (no rollup PR
     to preserve) keeps today's FAILED path unchanged."""

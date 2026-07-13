@@ -454,6 +454,46 @@ async def get_pull_request(
             status_code=response.status_code,
             detail=f"PR #{pr_number} not found or repo gone",
         )
+    if is_rate_limited_response(response):
+        # RATE LIMIT — surface it AS a retryable rate limit, not as a generic 500.
+        #
+        # ``_github_request`` deliberately RETURNS the raw 403/429 for a HARD rate
+        # limit instead of sleeping through it: it fast-fails a reset more than
+        # RATE_LIMIT_FAST_FAIL_THRESHOLD_S (5s) out (github.py ~:536-540) and
+        # synthesises a 403 with ZERO network for a known-empty bucket (~:471-486).
+        # Collapsing that into a 500 told every caller "GitHub broke" when the truth
+        # is "we are out of budget until the reset" — the most recoverable condition
+        # there is, reported as the least recoverable.
+        #
+        # The mislabel is load-bearing: review_loop_convergence's cap-exhaustion
+        # preservability check reads a lookup FAILURE as "PR not salvageable" and
+        # CLOSES the PR, so during an install-token-budget exhaustion window that
+        # destroyed every cap-exhausted rollup at once.
+        #
+        # Use the CANONICAL helpers (github_http, added by #14546 for exactly this
+        # problem) rather than a second, divergent discriminator:
+        #   • ``is_rate_limited_response`` — any 429 (incl. a header-less SECONDARY
+        #     limit, which a hand-rolled "429 AND headers" test would miss), or a
+        #     403 carrying rate-limit headers. Byte-identical to _github_request's
+        #     own ``is_rate_limited``.
+        #   • ``raise_rate_limited`` — a 503 + ``Retry-After``, NOT a bare 403/429.
+        #     503-with-Retry-After is what keeps a caller's backoff loop engaged:
+        #     the agent (agent/src/index.ts ~:934-946) retries 503 and 403-with-
+        #     Retry-After but deliberately FAILS FAST on a bare 403 (so genuine
+        #     auth/permission 403s don't spin), and rollup_pr_verification.py ~:331
+        #     treats 503 as its clean transient path. A bare 403 would make the
+        #     agent hard-fail a short SECONDARY limit it would otherwise have won.
+        # ``create_pull_request`` and ``merge_pull_request`` already use these; one
+        # predicate, one surface, no drift.
+        #
+        # A genuine PERMISSION 403 carries X-RateLimit-Remaining NONZERO (GitHub
+        # does send the quota headers on it) and no Retry-After, so it does NOT
+        # match and still falls through to the 500 below — unchanged, fail-fast.
+        raise_rate_limited(
+            f"[GITHUB] get PR #{pr_number} rate limited",
+            f"GitHub rate limit exhausted fetching PR #{pr_number}",
+            retry_after_seconds_from_response(response),
+        )
     if response.status_code != 200:
         logger.error(f"Failed to get PR #{pr_number}: {response.text}")
         raise HTTPException(

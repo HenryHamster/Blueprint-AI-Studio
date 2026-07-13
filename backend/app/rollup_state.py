@@ -23,6 +23,26 @@ _MERGE_QUEUE_UPDATE_AT_KEY = "_merge_queue_update_at"
 # path proceeds unchanged so a genuine conflict is never wedged.
 _MERGE_QUEUE_UPDATE_FRESH_SECONDS = 300
 
+# Alembic auto-reconcile in-flight stake (MAJOR 4). Written under the rollup
+# parent's FOR UPDATE lock, in the same commit as the retry-counter stake, right
+# before that lock is released for the multi-request GitHub push. A peer sweep
+# that sees a FRESH one for the SAME PR defers instead of issuing a concurrent
+# second push to the staging branch. TTL-bounded so a sweep that dies mid-push
+# cannot wedge the reconcile forever.
+_ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY = "_alembic_autoreconcile_inflight_at"
+_ALEMBIC_AUTORECONCILE_PR_KEY = "_alembic_autoreconcile_pr"
+# Must comfortably exceed one reconcile (PR-file plan + file read + multi-request
+# push; measured at ~285s under rate-limit backoff).
+_ALEMBIC_AUTORECONCILE_INFLIGHT_TTL_S = 900  # 15 min
+
+# The rollup PR number whose security-scan report comment has already been
+# posted (NIT 8). K7 hoists ``create_pr_comment`` out of the parent's lock
+# window, which means the post can land and the subsequent ``_relock_parent``
+# can still be LOST — and a per-invocation local flag then lets the NEXT sweep
+# re-scan and post the same report AGAIN. Persisting the fact of the post,
+# keyed by PR, makes it exactly-once ACROSS sweeps, not just within one.
+_SCAN_REPORT_POSTED_PR_KEY = "_scan_report_posted_pr"
+
 # Ephemeral counters/flags written to parent.context during the rollup's merge
 # phase. They exist to ratchet retry budgets and de-duplicate alerts *within a
 # single EVALUATING → terminal cycle*, not across cycles. Any terminal
@@ -54,6 +74,16 @@ _ROLLUP_TRANSIENT_CTX_KEYS = frozenset(
         # it only triggers once per alerting cycle. Must be scrubbed on terminal
         # so a future deferral episode can re-escalate if needed.
         "_merge_escalation_attempted",
+        # Alembic auto-reconcile in-flight stake — same shape as
+        # ``rollup_pr_creating_at`` above: a per-cycle claim that a peer sweep is
+        # mid-push. It must never outlive the cycle, or a stale claim would block
+        # the next reconcile until its TTL expires.
+        _ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY,
+        # Scan-report exactly-once marker. Scoped to one rollup PR; a re-entry on
+        # a NEW PR must post its own report. (The marker is PR-keyed, so this is
+        # belt-and-braces — but leaving it would strand a dead PR number in the
+        # context of every re-used parent.)
+        _SCAN_REPORT_POSTED_PR_KEY,
     }
 )
 
@@ -101,6 +131,54 @@ def _merge_queue_update_in_flight(ctx: dict | None, now: datetime | None = None)
         now = _utcnow()
     age_seconds = (now - stamped).total_seconds()
     return 0 <= age_seconds < _MERGE_QUEUE_UPDATE_FRESH_SECONDS
+
+
+def _alembic_autoreconcile_in_flight(
+    ctx: dict | None, pr_number: int, now: datetime | None = None
+) -> bool:
+    """True if a peer sweep is mid-push on this PR's Alembic auto-reconcile.
+
+    MAJOR 4 (review round 2). K6 releases the rollup parent's FOR UPDATE lock
+    across the auto-reconcile push so the connection is not left
+    idle-in-transaction across multi-request GitHub I/O. The cost of that release
+    is that ``skip_locked`` no longer defers a second sweep — and
+    ``_check_and_trigger_rollup`` is driven from at least six call sites (github
+    webhook, agent_status, task_lifecycle, reaper_evaluating_sweeps,
+    reaper_post_orphan_sweep, recovery_evaluating) — so two sweeps could both
+    enter the alembic block and both push to ``staging_branch``.
+
+    The retry stake, written under the parent lock before the release, doubles as
+    a durable in-flight marker: a peer that sees a FRESH one for the SAME PR
+    defers to the next cycle instead of double-pushing. TTL-bounded so a sweep
+    that dies mid-push cannot wedge the reconcile forever — and the retry cap
+    still bounds total attempts either way.
+
+    Deliberately NOT a Postgres advisory lock: ``_release_parent_lock`` returns
+    the connection to the pool on commit (rollup_locking.py, H6), so a
+    session-scoped advisory lock would ride a pooled connection into an unrelated
+    caller and leak on crash. A malformed/missing marker, or one stamped for a
+    DIFFERENT PR, reads as "not in flight" — never wedging on bad data.
+    """
+    ctx = ctx or {}
+    if ctx.get(_ALEMBIC_AUTORECONCILE_PR_KEY) != pr_number:
+        return False
+    raw = ctx.get(_ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY)
+    if not raw or not isinstance(raw, str):
+        return False
+    try:
+        stamped = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return False
+    if stamped.tzinfo is not None:
+        from datetime import timezone
+
+        stamped = stamped.astimezone(timezone.utc).replace(tzinfo=None)
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+    age_seconds = (now - stamped).total_seconds()
+    return 0 <= age_seconds < _ALEMBIC_AUTORECONCILE_INFLIGHT_TTL_S
 
 
 def _is_rollup_parent_awaiting_merge(ctx: dict | None) -> bool:

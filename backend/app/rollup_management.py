@@ -37,6 +37,7 @@ from app.models import (
 from app.review_pipeline import (
     _spawn_pipeline_task,
     _is_pipeline_task_stale,
+    _load_pipeline_liveness_lookups,
     _task_is_actively_ci_waiting,
 )
 from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
@@ -64,8 +65,12 @@ from app.rollup_pr_verification import (  # noqa: F401 — re-exported for calle
     verify_rollup_merge_landed,
 )
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
+    _ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY,
+    _ALEMBIC_AUTORECONCILE_INFLIGHT_TTL_S,
     _MERGE_QUEUE_UPDATE_AT_KEY,
     _ROLLUP_TRANSIENT_CTX_KEYS,
+    _SCAN_REPORT_POSTED_PR_KEY,
+    _alembic_autoreconcile_in_flight,
     _clear_rollup_transient_state,
     _is_rollup_parent_awaiting_merge,
     _merge_queue_update_in_flight,
@@ -115,56 +120,66 @@ _SIZE_CAP_AUTOBUMP_CAP = 2
 
 
 async def _attempt_alembic_autoreconcile(
-    parent: Task,
-    session: AsyncSession,
     gh_token: str,
     owner: str,
     repo: str,
     rollup_pr_number: int,
-    rollup_pr_url: str,
     staging_branch: str,
     target_branch: str,
-    parent_ctx: dict,
-    current_count: int,
-) -> bool:
+    *,
+    promotion_target: str | None = None,
+    project_id: str | None = None,
+) -> dict | None:
     """Try to auto-renumber a rollup migration that collides with the target head.
 
-    Returns ``True`` when a reconciliation commit was pushed to *staging_branch*
-    (the caller defers one sweep so re-validation can pass and the rollup can
-    merge with no operator step). Returns ``False`` — leaving the parent
-    untouched — for every non-mechanical case, missing literal, or push failure,
-    so the caller falls through to the existing operator-alert / agent-fix path.
-    Conservative and fail-safe: only the unambiguous single-added-migration
-    collision / stale-anchor is auto-remediated.
+    Returns the reconciliation ``plan`` dict when a reconciliation commit was
+    PUSHED to *staging_branch* (the caller defers one sweep so re-validation can
+    pass and the rollup can merge with no operator step). Returns ``None`` — with
+    NO side effect on the repository — for every non-mechanical case, missing
+    literal, or push failure, so the caller falls through to the existing
+    operator-alert / agent-fix path. Conservative and fail-safe: only the
+    unambiguous single-added-migration collision / stale-anchor is auto-remediated.
+
+    K6 LOCK-WINDOW CONTRACT (2026-07-12 concurrency audit): this helper is PURE
+    GitHub I/O — it takes NO ``session`` and NO ``Task``, touches no ORM state,
+    and issues no DB query. That is load-bearing, not incidental. It performs a
+    plan (PR file fetches), a file read, and a multi-request PUSH (GET ref → GET
+    commit → POST blob xN → POST tree → POST commit → PATCH ref) that can run for
+    minutes under GitHub rate-limit backoff. It MUST therefore be called from an
+    UNLOCKED window: with the rollup parent's ``FOR UPDATE`` released AND no open
+    transaction. It previously ran with the parent row locked and the transaction
+    open, which (a) starved sibling-child heartbeats on the parent row and (b)
+    left the connection idle-in-transaction, racing Postgres'
+    ``idle_in_transaction_session_timeout`` (60s — database.py) with a call that
+    has been observed to take ~285s.
+
+    The caller owns ALL parent mutation, including STAKING the retry counter
+    BEFORE this call (see ``_check_and_trigger_rollup``): the push is a real,
+    irreversible side effect, so the attempt must be recorded durably before it
+    is made. Any DB access added here would silently re-open a transaction across
+    the push and reintroduce the defect — pass plain values instead.
     """
     from app.migration_chain import rewrite_expected_schema_revision
     from app.github import get_file_text_at_ref, commit_file_changes
 
     try:
-        parent_project = (
-            await session.get(Project, parent.project_id) if parent.project_id else None
-        )
         plan = await _plan_rollup_migration_reconciliation(
             gh_token,
             owner,
             repo,
             rollup_pr_number,
             target_branch,
-            promotion_target=(
-                _get_project_promotion_target(parent_project)
-                if parent_project is not None
-                else None
-            ),
-            project_id=str(parent.project_id),
+            promotion_target=promotion_target,
+            project_id=project_id,
         )
     except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile planning "
             f"failed ({type(e).__name__}: {e}); falling back to fix path"
         )
-        return False
+        return None
     if not plan:
-        return False
+        return None
 
     # The migration becomes the new head, so EXPECTED_SCHEMA_REVISION must bump
     # to match. Read main.py at the staging-branch tip and rewrite the literal;
@@ -176,16 +191,16 @@ async def _attempt_alembic_autoreconcile(
             owner=owner,
             repo=repo,
             ref=staging_branch,
-            project_id=str(parent.project_id),
+            project_id=project_id,
         )
     except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile could not "
             f"fetch main.py ({type(e).__name__}: {e}); falling back to fix path"
         )
-        return False
+        return None
     if not main_text:
-        return False
+        return None
     new_main_text, replaced = rewrite_expected_schema_revision(
         main_text, plan["expected_schema_revision"]
     )
@@ -194,7 +209,7 @@ async def _attempt_alembic_autoreconcile(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile: no "
             f"EXPECTED_SCHEMA_REVISION literal in main.py; falling back to fix path"
         )
-        return False
+        return None
 
     # The plan renumbers the colliding migration AND its entire linear
     # descendant tail (one entry per renamed file in ``upserts``/``deletes``);
@@ -216,34 +231,21 @@ async def _attempt_alembic_autoreconcile(
                 f"{plan['old_revision']}->{plan['new_revision']} and rechain onto "
                 f"{plan['new_down_revision']}"
             ),
-            project_id=str(parent.project_id),
+            project_id=project_id,
         )
     except Exception as e:
         logger.warning(
             f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile push failed "
             f"({type(e).__name__}: {e}); falling back to fix path"
         )
-        return False
+        return None
 
-    parent.context = {
-        **parent_ctx,
-        "rollup_pr_url": rollup_pr_url,
-        "rollup_pr_number": rollup_pr_number,
-        "_alembic_autoreconcile_pr": rollup_pr_number,
-        "_alembic_autoreconcile_count": current_count + 1,
-    }
-    parent.latest_status_message = (
-        f"Rollup PR #{rollup_pr_number} — auto-renumbered Alembic migration "
-        f"{plan['old_revision']}->{plan['new_revision']}; re-validating next cycle"
-    )[:500]
-    session.add(parent)
-    await session.commit()
     logger.info(
         f"[ROLLUP] PR #{rollup_pr_number} alembic collision auto-reconciled: "
         f"renumbered {plan['old_revision']}->{plan['new_revision']} on "
         f"{staging_branch}, bumped EXPECTED_SCHEMA_REVISION; deferring re-validation"
     )
-    return True
+    return plan
 
 
 async def attempt_pr_migration_finalization(
@@ -1274,6 +1276,70 @@ async def _record_completed_children_merge_evidence(
             )
 
 
+async def _mark_scan_report_posted(
+    session: "AsyncSession", parent_id, pr_number: int
+) -> None:
+    """Durably record that the scan-report comment for ``pr_number`` was posted.
+
+    NIT 8. K7 hoists ``create_pr_comment`` OUT of the parent's lock window, which
+    is correct (a Postgres row lock is released by transaction end, so the old
+    call site held the parent FOR UPDATE across a GitHub POST). The cost is that
+    the post can succeed and the following ``_relock_parent`` can still be lost —
+    leaving the comment on the PR with nothing recording it, so the next sweep
+    re-scans and posts a DUPLICATE. A per-invocation local flag cannot fix that;
+    only a durable, PR-keyed marker can.
+
+    Runs in its OWN bounded transaction, taken AFTER the GitHub call and released
+    immediately — no network I/O inside it, so this re-acquire can never become
+    the very idle-in-transaction window K7 removed.
+
+    Best-effort by design: on ``skip_locked`` contention or any error we log and
+    move on. Failing to stamp the marker costs at most one duplicate comment on a
+    later sweep (cosmetic); it can never block the rollup or lose the report.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    try:
+        row = (
+            await session.execute(
+                select(Task)
+                .where(Task.id == parent_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().first()
+        if row is None:
+            logger.info(
+                f"[ROLLUP] Scan-report marker for PR #{pr_number} not stamped — parent "
+                f"row held by a peer. Worst case: one duplicate comment next sweep."
+            )
+            await session.commit()
+            return
+        ctx = dict(row.context or {})
+        ctx[_SCAN_REPORT_POSTED_PR_KEY] = pr_number
+        row.context = ctx
+        flag_modified(row, "context")
+        session.add(row)
+        await session.commit()
+    except Exception as exc:
+        # Best-effort de-dup marker: never let a marker failure break the rollup.
+        #
+        # ROLLBACK-EXPIRY CONTRACT (the campaign's own bug class — see
+        # review_loop_convergence._handle_cap_exhaustion). This rollback is
+        # MANDATORY (a failed commit leaves the session in pending-rollback) and it
+        # expires EVERY loaded instance, including the caller's ``parent``. That is
+        # safe HERE only because of what the caller does next: the sole ORM object
+        # it touches after this returns is re-loaded by ``_relock_parent``, which
+        # expires the cached instance and re-SELECTs it with populate_existing
+        # anyway. Any future code added between this call and that re-lock MUST
+        # re-fetch what it touches, or it will lazy-load outside greenlet context
+        # and raise MissingGreenlet.
+        logger.warning(
+            f"[ROLLUP] Failed to persist scan-report marker for PR #{pr_number}: {exc}"
+        )
+        await session.rollback()
+
+
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
 ) -> bool:
@@ -1473,6 +1539,21 @@ async def _check_and_trigger_rollup(
     # while a review/fix cycle is in progress. Stale tasks (no heartbeat for
     # 15+ min) are excluded so a silently-dead pipeline task can't permanently
     # block rollup; the orchestrator's reaper will eventually cancel them.
+    #
+    # MAJOR 7: this is the 4th consumer of ``_is_pipeline_task_stale`` and it must
+    # be fed the SAME liveness evidence as the three supersede sites in
+    # review_pipeline. Left on the raw heartbeat signal, the two predicates
+    # DISAGREE about the same task: the rollup would declare a lock-starved-but-
+    # LIVE child "stale" and stop waiting on it, while ``_spawn_pipeline_task``
+    # (which has the VmContact override) refuses to supersede it — one task, two
+    # contradictory definitions of "stale". Thread both lookups through so
+    # "stale" means exactly one thing across the codebase.
+    _pipeline_children = [
+        c for c in all_children if (c.first_payload).get("type") in ("review", "fix")
+    ]
+    _vm_contact_lookup, _runner_report_lookup = await _load_pipeline_liveness_lookups(
+        session, _pipeline_children
+    )
     pipeline_active = False
     for c in all_children:
         if (c.first_payload).get("type") not in ("review", "fix"):
@@ -1510,7 +1591,11 @@ async def _check_and_trigger_rollup(
         if (
             c.status != TaskStatus.BLOCKED
             and not _task_is_actively_ci_waiting(c)
-            and _is_pipeline_task_stale(c)
+            and _is_pipeline_task_stale(
+                c,
+                vm_last_contact=_vm_contact_lookup.get(c.vm_instance_id or ""),
+                runner_report_lookup=_runner_report_lookup,
+            )
         ):
             logger.warning(
                 f"[ROLLUP] Ignoring stale pipeline task {str(c.id)[:8]} "
@@ -3196,6 +3281,65 @@ async def _check_and_trigger_rollup(
                         commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
                     )
 
+                    # ── K7: post the security-scan report HERE, while the parent
+                    # lock is still released (2026-07-12 concurrency audit).
+                    #
+                    # This used to live below, AFTER the re-acquire, behind the
+                    # comment "post comment outside lock window is fine; we don't
+                    # mutate the parent for this case". That comment was FALSE on
+                    # both paths that reach it: a Postgres row lock is released by
+                    # TRANSACTION END, not by the absence of a mutation. On the
+                    # findings-but-not-blocked path (findings is set independently
+                    # of blocked, so medium/low findings give findings != [] with
+                    # blocked=False) the last lock op was the `_relock_parent`
+                    # below and nothing had committed, so `create_pr_comment` ran
+                    # with the parent held FOR UPDATE and the connection
+                    # idle-in-transaction. On the blocked+gates-off path the
+                    # report was ALSO posted a SECOND time, under the re-taken
+                    # lock, duplicating the comment on the PR.
+                    #
+                    # Posting here touches no ORM state, so nothing needs the
+                    # lock. `_report_posted` makes the post exactly-once across
+                    # every downstream branch (the blocked paths below only
+                    # re-attempt if this attempt FAILED).
+                    #
+                    # NIT 8: a local flag is only exactly-once WITHIN one
+                    # invocation. Because the post now happens BEFORE the
+                    # `_relock_parent` below, a LOST re-lock returns early with the
+                    # comment already on the PR and nothing recording that — so the
+                    # next sweep re-scans and posts the SAME report again, trading
+                    # one double-post for a rarer cross-sweep double-post. The fact
+                    # of the post is therefore persisted, keyed by PR, in its own
+                    # short transaction (below) — exactly-once ACROSS sweeps.
+                    _report_posted = (
+                        parent_ctx.get(_SCAN_REPORT_POSTED_PR_KEY) == rollup_pr_number
+                    )
+                    if (
+                        rollup_scan is not None
+                        and rollup_scan.get("findings")
+                        and not _report_posted
+                    ):
+                        try:
+                            await create_pr_comment(
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                rollup_scan["report"],
+                            )
+                            _report_posted = True
+                        except Exception as e:
+                            logger.warning(
+                                f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}"
+                            )
+                        if _report_posted:
+                            # Durably record it BEFORE the re-lock that may be lost.
+                            # Its own bounded transaction — no GitHub I/O inside, so
+                            # this re-acquire cannot be held across the network.
+                            await _mark_scan_report_posted(
+                                session, parent_id_local, rollup_pr_number
+                            )
+
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
                         session,
@@ -3281,8 +3425,11 @@ async def _check_and_trigger_rollup(
                                 pr_number=rollup_pr_number,
                             )
                             await session.commit()
-                            # Comment after the lock is released — it's an external side-effect.
-                            if rollup_scan["findings"]:
+                            # The report was already posted in the unlocked window
+                            # above (K7). Only retry here if that attempt FAILED —
+                            # posting unconditionally is what double-posted the
+                            # report on the gates-off path.
+                            if rollup_scan["findings"] and not _report_posted:
                                 try:
                                     await create_pr_comment(
                                         gh_token,
@@ -3291,9 +3438,18 @@ async def _check_and_trigger_rollup(
                                         rollup_pr_number,
                                         rollup_scan["report"],
                                     )
+                                    _report_posted = True
                                 except Exception as e:
                                     logger.warning(
                                         f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}"
+                                    )
+                                if _report_posted:
+                                    # Persist it here too, not just the local flag:
+                                    # a failed first post + successful RETRY would
+                                    # otherwise leave no durable marker, and the next
+                                    # sweep would re-scan and post a duplicate.
+                                    await _mark_scan_report_posted(
+                                        session, parent_id_local, rollup_pr_number
                                     )
                             return
                         # Gates off: do NOT re-block every cycle. Fire a loud
@@ -3314,7 +3470,12 @@ async def _check_and_trigger_rollup(
                             pr_number=rollup_pr_number,
                         )
                         await session.commit()
-                        if rollup_scan["findings"]:
+                        # Already posted in the unlocked window above (K7) — only
+                        # retry on a failed first attempt. The unconditional post
+                        # that used to be here, PLUS the one below, meant this
+                        # path posted the SAME report TWICE on every gates-off
+                        # blocked rollup (the second time under the re-taken lock).
+                        if rollup_scan["findings"] and not _report_posted:
                             try:
                                 await create_pr_comment(
                                     gh_token,
@@ -3323,9 +3484,17 @@ async def _check_and_trigger_rollup(
                                     rollup_pr_number,
                                     rollup_scan["report"],
                                 )
+                                _report_posted = True
                             except Exception as e:
                                 logger.warning(
                                     f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}"
+                                )
+                            if _report_posted:
+                                # Durable marker on the RETRY path too (see above):
+                                # a failed first post + successful retry must not
+                                # leave the next sweep free to post a duplicate.
+                                await _mark_scan_report_posted(
+                                    session, parent_id_local, rollup_pr_number
                                 )
                         # Re-acquire the parent lock dropped by the alert dispatch
                         # path before falling through to the alembic guard + merge.
@@ -3340,21 +3509,10 @@ async def _check_and_trigger_rollup(
                         parent_ctx = parent.context or {}
                         if parent.status != TaskStatus.EVALUATING:
                             return
-                    if rollup_scan["findings"]:
-                        # Findings but not blocked — post comment outside lock window
-                        # is fine; we don't mutate the parent for this case.
-                        try:
-                            await create_pr_comment(
-                                gh_token,
-                                owner,
-                                repo,
-                                rollup_pr_number,
-                                rollup_scan["report"],
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}"
-                            )
+
+                    # (The findings-but-not-blocked scan comment that used to sit
+                    # here — under the parent's FOR UPDATE — is now posted in the
+                    # unlocked window above. See the K7 note there.)
 
                     # Alembic combined-chain guard (parent is locked here).
                     if alembic_status == "defer":
@@ -3378,28 +3536,227 @@ async def _check_and_trigger_rollup(
                         # parse failure, non-resolving renumber) yields no plan
                         # and falls through unchanged. The per-PR counter caps
                         # retries so a non-mechanical block never loops.
+                        #
+                        # K6 (2026-07-12 concurrency audit): the reconcile does a
+                        # PR-file plan, a file read and a MULTI-REQUEST GitHub push
+                        # (GET ref → GET commit → POST blob xN → POST tree → POST
+                        # commit → PATCH ref — none of it coalescable). It used to
+                        # run with the parent still held FOR UPDATE from the
+                        # re-acquire above — the code even said so ("parent is
+                        # locked here") — one continuous idle-in-transaction window
+                        # that starts at the re-lock and never resets, racing the
+                        # 60s idle_in_transaction_session_timeout (database.py)
+                        # against a call that has been measured at ~285s. Use the
+                        # SAME release/relock sandwich the (strictly lighter,
+                        # read-only) security scan above already uses.
                         _ar_pr = parent_ctx.get("_alembic_autoreconcile_pr")
                         _ar_count = (
                             int(parent_ctx.get("_alembic_autoreconcile_count", 0))
                             if _ar_pr == rollup_pr_number
                             else 0
                         )
+                        # MAJOR 4: a peer sweep is mid-push on this PR.
+                        # _check_and_trigger_rollup is invoked from at least six
+                        # places (github webhook, agent_status, task_lifecycle,
+                        # reaper_evaluating_sweeps, reaper_post_orphan_sweep,
+                        # recovery_evaluating), so two sweeps CAN both enter this
+                        # block. Releasing the parent lock across the push (the
+                        # whole point of K6) means the second one is no longer
+                        # deferred by ``skip_locked``, and both would push to
+                        # ``staging_branch``. ``commit_file_changes`` uses
+                        # ``force: False`` (github.py:1194) so the loser gets a 422
+                        # rather than clobbering — but it burns GitHub calls and
+                        # muddies the counter.
+                        #
+                        # The stake below doubles as a durable in-flight marker: a
+                        # peer that sees a FRESH one defers. It is TTL-bounded so a
+                        # sweep that dies mid-push (or loses its re-lock) cannot
+                        # wedge the reconcile forever — after the TTL the next sweep
+                        # proceeds, and the cap still bounds total attempts.
+                        # Deliberately NOT a pg advisory lock: the release-commit
+                        # returns the connection to the pool (rollup_locking.py H6),
+                        # so a session-scoped advisory lock would ride a pooled
+                        # connection into another caller and leak on crash.
+                        if _alembic_autoreconcile_in_flight(
+                            parent_ctx, rollup_pr_number
+                        ):
+                            logger.info(
+                                f"[ROLLUP] Alembic auto-reconcile already in flight for "
+                                f"PR #{rollup_pr_number} — deferring to next cycle "
+                                f"rather than issuing a concurrent second push to "
+                                f"{staging_branch}"
+                            )
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} — Alembic auto-reconcile "
+                                f"in flight on a peer sweep, retrying next cycle"
+                            )[:500]
+                            session.add(parent)
+                            await session.commit()
+                            return
                         if _ar_count < _ALEMBIC_AUTORECONCILE_CAP:
-                            _reconciled = await _attempt_alembic_autoreconcile(
-                                parent,
-                                session,
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            # STAKE THE CLAIM BEFORE RELEASING. The push is a REAL,
+                            # irreversible side effect, so the attempt must be
+                            # durably recorded before it is attempted. If we
+                            # incremented after the push (as the old code did), a
+                            # peer-mutation defer on re-lock would discard the
+                            # increment while the push had already landed — and the
+                            # retry cap could be bypassed indefinitely. Failing the
+                            # other way (counting an attempt that never pushed) is
+                            # safe and is corrected below.
+                            #
+                            # context_dirty=True is MANDATORY: _release_parent_lock
+                            # only calls flag_modified when told to, so without it
+                            # this JSONB write is silently DROPPED.
+                            _ar_staked = _ar_count + 1
+                            parent.context = {
+                                **parent_ctx,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                                "_alembic_autoreconcile_pr": rollup_pr_number,
+                                "_alembic_autoreconcile_count": _ar_staked,
+                                # Doubles as the in-flight marker a peer sweep
+                                # defers on (MAJOR 4) — same write, same lock,
+                                # same commit as the stake, so it is durable
+                                # before the push is attempted.
+                                _ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY: _utcnow().isoformat(),
+                            }
+                            _ar_snapshot = await _release_parent_lock(
+                                parent, session, context_dirty=True
+                            )
+
+                            # ── UNLOCKED: plan + read + multi-request push ──
+                            _ar_plan = await _attempt_alembic_autoreconcile(
                                 gh_token,
                                 owner,
                                 repo,
                                 rollup_pr_number,
-                                rollup_pr_url,
                                 staging_branch,
                                 target_branch,
-                                parent_ctx,
-                                _ar_count,
+                                promotion_target=promotion_target,
+                                project_id=(
+                                    str(project_id_local) if project_id_local else None
+                                ),
                             )
-                            if _reconciled:
+
+                            parent = await _relock_parent(
+                                session,
+                                parent_id_local,
+                                _ar_snapshot,
+                                parent_in_session=parent,
+                            )
+                            if parent is None:
+                                # Peer holds/mutated the parent. The staked counter
+                                # is already committed, so a push that DID land is
+                                # correctly accounted for; a push that did NOT land
+                                # costs at most one of the two attempts. Never a cap
+                                # bypass — that asymmetry is the point.
                                 return
+                            parent_ctx = parent.context or {}
+                            if parent.status != TaskStatus.EVALUATING:
+                                return
+
+                            if _ar_plan is not None:
+                                # The push LANDED. Keep the stake (a real side
+                                # effect must stay counted) but clear OUR in-flight
+                                # marker so the next cycle's re-validation is not
+                                # blocked by it. CAS: only clear it if it is still
+                                # ours — a peer that staked in our unlocked window
+                                # owns a fresher marker and must keep it.
+                                if (
+                                    int(
+                                        parent_ctx.get(
+                                            "_alembic_autoreconcile_count", 0
+                                        )
+                                    )
+                                    == _ar_staked
+                                    and parent_ctx.get("_alembic_autoreconcile_pr")
+                                    == rollup_pr_number
+                                ):
+                                    _ar_done_ctx = dict(parent_ctx)
+                                    _ar_done_ctx.pop(
+                                        _ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY, None
+                                    )
+                                    parent.context = _ar_done_ctx
+                                    flag_modified(parent, "context")
+                                    parent_ctx = parent.context
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} — auto-renumbered "
+                                    f"Alembic migration {_ar_plan['old_revision']}->"
+                                    f"{_ar_plan['new_revision']}; re-validating next cycle"
+                                )[:500]
+                                session.add(parent)
+                                await session.commit()
+                                return
+
+                            # No plan / fetch failure / push failure. We now KNOW,
+                            # under the lock, that no commit was pushed, so hand the
+                            # staked attempt back and fall through to the
+                            # operator-alert / re-chain-fix path unchanged. (Only
+                            # ever un-staked on this confirmed-no-side-effect path;
+                            # a lost re-lock keeps the stake.)
+                            #
+                            # MAJOR 3 — COMPARE-AND-SWAP, not an absolute write.
+                            # This used to write ``_ar_count`` (our PRE-stake
+                            # baseline) unconditionally, which is a stale absolute
+                            # write that can clobber a PEER's stake and RESET the
+                            # cap. The interleaving that breaks it:
+                            #   S1 reads 0 → stakes 1 → its push FAILS
+                            #   S2 reads 1 → stakes 2 → its push SUCCEEDS
+                            #   S1 re-locks (the counter is NOT in
+                            #     _capture_rollup_parent_snapshot, so S2's write does
+                            #     NOT trip the validator) → _ar_plan is None →
+                            #     writes count = 0
+                            # A LANDED push is now uncounted and the cap is reset —
+                            # so the headline invariant ("the cap can only get
+                            # stricter, never bypassed") was FALSE under concurrent
+                            # reconcilers.
+                            #
+                            # Hand the stake back ONLY if our own stake is still on
+                            # top: re-read the FRESH count under the re-taken lock
+                            # (parent_ctx was rebuilt from the fresh row above) and
+                            # decrement only when it is exactly what we left. If a
+                            # peer has staked since, its attempt — and any push it
+                            # landed — stays counted, and we simply forfeit our own
+                            # refund. Forfeiting a refund is always safe; erasing a
+                            # peer's landed attempt is not.
+                            _ar_fresh = (
+                                int(
+                                    parent_ctx.get("_alembic_autoreconcile_count", 0)
+                                )
+                                if parent_ctx.get("_alembic_autoreconcile_pr")
+                                == rollup_pr_number
+                                else 0
+                            )
+                            _ar_new_ctx = {
+                                **parent_ctx,
+                                "_alembic_autoreconcile_pr": rollup_pr_number,
+                            }
+                            if _ar_fresh == _ar_staked:
+                                # Our stake is still on top — no peer intervened, so
+                                # the refund is ours to take, and the in-flight
+                                # marker we wrote is ours to clear.
+                                _ar_new_ctx["_alembic_autoreconcile_count"] = _ar_count
+                                _ar_new_ctx.pop(
+                                    _ALEMBIC_AUTORECONCILE_INFLIGHT_AT_KEY, None
+                                )
+                            else:
+                                # A peer staked in our unlocked window. Keep ITS
+                                # count (a push it landed must stay accounted) and
+                                # leave ITS fresher in-flight marker alone — clearing
+                                # it would green-light a third concurrent push.
+                                logger.info(
+                                    f"[ROLLUP] Alembic auto-reconcile for PR "
+                                    f"#{rollup_pr_number}: not un-staking (staked "
+                                    f"{_ar_staked}, found {_ar_fresh}) — a peer sweep "
+                                    f"staked in our unlocked window; keeping its count "
+                                    f"so a push it landed stays accounted"
+                                )
+                            parent.context = _ar_new_ctx
+                            flag_modified(parent, "context")
+                            parent_ctx = parent.context
+                            session.add(parent)
                         # C5: gate the approval flag on require_approval_gates.
                         # A broken combined migration chain is deterministic and
                         # would break `alembic upgrade head` for the whole project,
@@ -3665,6 +4022,17 @@ async def _check_and_trigger_rollup(
 
                             _snap_proj = await session.get(Project, parent.project_id)
                             if _snap_proj is not None:
+                                # MAJOR 6: ``session.get`` above AUTOBEGINS a
+                                # transaction (the merge-success commit ended the
+                                # previous one), so without this commit the
+                                # ``get_pull_request_diff`` below — an unbounded
+                                # GitHub call — would run idle-in-transaction and
+                                # race the 60s idle_in_transaction_session_timeout.
+                                # Committing ends that read-only txn; it does NOT
+                                # expire ``parent``/``_snap_proj``
+                                # (expire_on_commit=False), and the snapshot helper
+                                # below opens its own txn as needed.
+                                await session.commit()
                                 _diff_text = await get_pull_request_diff(
                                     gh_token, owner, repo, rollup_pr_number
                                 )
