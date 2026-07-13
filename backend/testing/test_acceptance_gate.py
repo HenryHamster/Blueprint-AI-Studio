@@ -532,23 +532,26 @@ def test_named_test_frontend_stem_mismatch_fails_closed():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_named_test_github_verified_absent_fails_hard():
-    """When the changed-file list comes from GitHub's API (github_verified=True),
-    an absent declared test is an authoritative absence — no soft truncation
-    credit is granted even when the list was truncated.  This closes the agent
-    self-declaration trust gap: an agent can declare any test it likes, but the
-    webhook's GitHub-verified list is the ground truth.
+def test_named_test_github_verified_but_truncated_absent_is_inconclusive():
+    """A truncated (>50 files) changed-file list is INCONCLUSIVE about absence
+    even when the list came from GitHub's API (github_verified sentinel).
+
+    Our own ``stamp_changed_files_signal`` caps the stored list at 50 paths
+    regardless of source, so a >50-file PR drops every path beyond index 50. A
+    legitimately declared test lying beyond the stored prefix reads as absent from
+    the truncated window — hard-failing that truthful declaration is unsound. The
+    gate must credit soft (satisfied, unproven), not fail closed.
     """
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_acceptance_gate.py",
         },
-        changed_files=["backend/app/acceptance_gate.py"],  # test NOT in list
+        changed_files=["backend/app/acceptance_gate.py"],  # test beyond stored prefix
         unverified_reason=None,
     )
     # Simulate the webhook having stamped the GitHub-verified sentinel alongside
-    # a truncated list: without github_verified the gate would credit soft.
+    # a truncated list. Truncation makes absence inconclusive regardless of source.
     ctx = dict(task.context or {})
     ctx["_pr_changed_files_truncated"] = True
     ctx["_pr_changed_files_github_verified"] = True
@@ -556,10 +559,12 @@ def test_named_test_github_verified_absent_fails_hard():
 
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
-    assert verdict.satisfied is False, (
-        "GitHub-verified absent test must fail closed, not receive soft truncation credit"
+    assert verdict.satisfied is True, (
+        "truncated absent test must credit soft (inconclusive), not fail closed — "
+        "even when github-verified, only the first 50 paths are stored"
     )
-    assert "not among" in verdict.reason
+    assert verdict.proven is False
+    assert "truncated" in verdict.reason
 
 
 def test_named_test_github_verified_present_still_passes():
@@ -585,9 +590,14 @@ def test_named_test_github_verified_present_still_passes():
     assert verdict.proven is True
 
 
-def test_github_verified_sentinel_propagates_through_evaluate_code_acceptance():
-    """stamp_changed_files_signal with github_verified=True sets the sentinel,
-    and evaluate_code_acceptance reads it — confirming the end-to-end seam."""
+def test_github_verified_sentinel_does_not_override_truncation_credit():
+    """stamp_changed_files_signal with github_verified=True sets the sentinel, but
+    the sentinel does NOT flip a truncated-absent named_test to a hard fail.
+
+    Truncation drops paths beyond index 50 in our own storage regardless of
+    source, so absence stays inconclusive and the soft credit holds both with and
+    without the GitHub-verified sentinel.
+    """
     from app.acceptance_gate import stamp_changed_files_signal
 
     signal = stamp_changed_files_signal(
@@ -595,9 +605,6 @@ def test_github_verified_sentinel_propagates_through_evaluate_code_acceptance():
     )
     assert signal.get("_pr_changed_files_github_verified") is True
 
-    # Build a task that would receive soft truncation credit WITHOUT the sentinel
-    # (test absent, list truncated, not github_verified) — verify that adding the
-    # sentinel flips the verdict to hard fail.
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -609,17 +616,66 @@ def test_github_verified_sentinel_propagates_through_evaluate_code_acceptance():
     ctx = dict(task.context or {})
     ctx["_pr_changed_files_truncated"] = True
     task.context = ctx
-    # Without github_verified: soft credit
+    # Without github_verified: soft credit (truncated absence is inconclusive)
     without = evaluate_code_acceptance(task)
     assert without.satisfied is True, "baseline: truncated absent → soft credit"
 
-    # Apply the stamp (as the webhook would) and re-evaluate
+    # Apply the stamp (as the webhook would) and re-evaluate — still soft credit.
     ctx.update(signal)
     task.context = ctx
     with_sentinel = evaluate_code_acceptance(task)
-    assert with_sentinel.satisfied is False, (
-        "with github_verified sentinel: truncated absent → hard fail"
+    assert with_sentinel.satisfied is True, (
+        "github_verified sentinel must NOT flip truncated-absent to a hard fail — "
+        "only the first 50 paths are stored so absence is inconclusive"
     )
+    assert with_sentinel.proven is False
+
+
+def test_named_test_beyond_50_file_prefix_credits_soft_via_real_stamp():
+    """End-to-end regression for finding e8a5b79be22b056b: a >50-changed-files PR
+    (github-verified) whose declared test path lies BEYOND the stored 50-path
+    prefix must credit soft (inconclusive), not hard-fail on false absence.
+
+    Drives the real ``stamp_changed_files_signal`` truncation so the test exercises
+    exactly what the webhook stamps: the first 50 paths (none of which is the
+    declared test), ``_pr_changed_files_truncated=True``, and the github-verified
+    sentinel. Before the fix this hard-failed (``satisfied=False``) because the
+    github-verified sentinel suppressed the truncation credit even though the test
+    could not possibly be observed past index 50.
+    """
+    from app.acceptance_gate import stamp_changed_files_signal
+
+    declared_test = "backend/testing/test_acceptance_gate.py"
+    # 54 production files, then the declared test at index 54 — well beyond the
+    # 50-path stored prefix. The seam (acceptance_gate.py) sits inside the prefix so
+    # the only thing missing from the stored window is the declared test itself.
+    changed = ["backend/app/acceptance_gate.py"]
+    changed += [f"backend/app/module_{i:03d}.py" for i in range(53)]
+    changed.append(declared_test)
+    assert len(changed) > 50
+    assert declared_test not in changed[:50], "fixture: test must fall past the prefix"
+
+    signal = stamp_changed_files_signal(changed, github_verified=True)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_github_verified"] is True
+    assert declared_test not in signal["_pr_changed_files"]
+
+    task = _make_code_task(
+        acceptance_evidence={"kind": "named_test", "test_path": declared_test},
+        unverified_reason=None,
+    )
+    ctx = dict(task.context or {})
+    ctx.update(signal)
+    task.context = ctx
+
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, (
+        "declared test beyond the stored 50-path prefix must credit soft, not "
+        "hard-fail on false absence"
+    )
+    assert verdict.proven is False
+    assert "truncated" in verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -399,7 +399,6 @@ def _evaluate_named_test(
     changed: list[str],
     verified: bool,
     truncated: bool = False,
-    github_verified: bool = False,
     parent_derived: bool = False,
     targeted_green: bool = False,
 ) -> AcceptanceGateVerdict:
@@ -438,11 +437,17 @@ def _evaluate_named_test(
     is credited soft (``satisfied=True, proven=False``) — the specific test could
     not be machine-verified from the truncated input.
 
-    ``github_verified`` marks that the changed-file list was sourced directly from
-    GitHub's API rather than from the agent's self-report. When the list is
-    GitHub-verified, an absent declared test is an authoritative absence — the
-    soft truncation credit is suppressed even when ``truncated=True`` because
-    GitHub's API paginates fully and the absence is not a data artifact.
+    Absence on a truncated list is ALWAYS inconclusive, even when the file list
+    was sourced from GitHub's API rather than an agent self-report (the
+    ``_pr_changed_files_github_verified`` sentinel). Our own
+    :func:`stamp_changed_files_signal` caps the stored list at 50 paths
+    *regardless of source*, so a GitHub-verified PR with more than 50 changed
+    files still drops every path beyond index 50. A legitimately declared test
+    lying beyond that stored prefix would read as absent and unsoundly hard-fail a
+    truthful declaration. So truncation always yields the soft (inconclusive)
+    credit above; nothing overrides it. Where the list is complete
+    (``truncated=False``), the plain hard-fail below already applies and is
+    genuinely authoritative because every changed path is stored.
 
     ``parent_derived`` marks that the changed-file list was INHERITED from a
     rollup parent's combined diff (the union of all siblings' changes) rather than
@@ -454,14 +459,16 @@ def _evaluate_named_test(
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
     if not test_present:
-        if truncated and not github_verified:
+        if truncated:
             return AcceptanceGateVerdict(
                 True,
                 True,
                 evidence.kind,
                 f"declared named_test {declared_path!r} could not be confirmed "
                 "among the PR's changed files because the changed-file list was "
-                "truncated (>50 files) — crediting soft without machine proof",
+                "truncated (>50 files, only the first 50 paths are stored) — the "
+                "test may ship beyond the stored prefix, so absence is "
+                "inconclusive; crediting soft without machine proof",
             )
         return AcceptanceGateVerdict(
             True,
@@ -761,7 +768,6 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     changed = _changed_files(task)
     verified = _merge_was_test_verified(task)
     truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
-    github_verified_files = bool((task.context or {}).get("_pr_changed_files_github_verified"))
     parent_derived_files = bool(
         (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
     )
@@ -773,7 +779,6 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
             changed,
             verified,
             truncated,
-            github_verified=github_verified_files,
             parent_derived=parent_derived_files,
             targeted_green=targeted_green,
         )
