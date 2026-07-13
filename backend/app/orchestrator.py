@@ -2664,16 +2664,24 @@ async def orchestrator_worker():
                     ).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
-                # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown.
-                # The flag is computed from zone state ALONE — never from `queued_tasks`.
-                # It exists to stop the all-types-blocked detector below from
-                # misattributing a zone outage to the per-type failure gate, and that
-                # detector now also reasons over `_withheld_failing_types` (tasks the
-                # pre-cutoff gate removed from `queued_tasks`). If the gate withheld
-                # EVERY candidate, `queued_tasks` is empty while the withheld set is not
-                # — so gating the flag on `queued_tasks` would leave it False during a
-                # zone outage and fire exactly the misattributed alert it was added to
-                # prevent. any_zone_available() is a pure in-memory cooldown check.
+                # Zone pre-check: every GCP zone is in cooldown, so no COLD GCE
+                # provision can succeed this cycle. The flag is computed from zone
+                # state ALONE — never from `queued_tasks`. Two consumers:
+                #   * the all-types-blocked detector below, which must not
+                #     misattribute a zone outage to the per-type failure gate. That
+                #     detector also reasons over `_withheld_failing_types` (tasks the
+                #     pre-cutoff gate removed from `queued_tasks`); if the gate
+                #     withheld EVERY candidate, `queued_tasks` is empty while the
+                #     withheld set is not — so gating the flag on `queued_tasks`
+                #     would leave it False during a zone outage and fire exactly the
+                #     misattributed alert it was added to prevent.
+                #   * the per-task cold-provision hold in the dispatch loop below,
+                #     which is what ACTUALLY skips GCP dispatch. It is deliberately
+                #     NOT a whole-loop skip: fleet-runner pins, compute_experiment
+                #     jobs, warm-pin skip-provisions, warm-pool leases and Cloud Run
+                #     jobs consume no GCE zone capacity and must still dispatch while
+                #     the zones recover.
+                # any_zone_available() is a pure in-memory cooldown check.
                 _zones_exhausted_this_cycle = not any_zone_available()
                 if queued_tasks and _zones_exhausted_this_cycle:
                     global _last_zone_exhaustion_log
@@ -2688,13 +2696,22 @@ async def orchestrator_worker():
                     if _is_cadence_due(_last_zone_exhaustion_log, 60, now_check):
                         _last_zone_exhaustion_log = now_check
                         wait_sec = zone_recovery_wait_seconds()
+                        # WARNING, not INFO: this 60s-cadence line is now the only
+                        # sustained during-outage signal. Before the cold-provision
+                        # hold below existed, every held task instead burned a real
+                        # GCE insert and logged a PROVISION_FAILURE — a storm that
+                        # was the de-facto pager for "the fleet is zone-blocked".
+                        # The hold correctly silences that storm, so the ongoing
+                        # state has to carry its own weight. (Entry into the state
+                        # is separately loud: per-zone WARNINGs + a deduped operator
+                        # alert.)
                         if wait_sec is not None:
-                            logger.info(
-                                f"[ORCHESTRATOR] All zones in cooldown — skipping dispatch (recovery in {int(wait_sec)}s)"
+                            logger.warning(
+                                f"[ORCHESTRATOR] All zones in cooldown — holding cold GCE dispatch (recovery in {int(wait_sec)}s)"
                             )
                         else:
-                            logger.info(
-                                "[ORCHESTRATOR] All zones in cooldown — skipping dispatch"
+                            logger.warning(
+                                "[ORCHESTRATOR] All zones in cooldown — holding cold GCE dispatch"
                             )
                         try:
                             await ws_manager.broadcast_to_all(
@@ -2711,7 +2728,16 @@ async def orchestrator_worker():
                             logger.exception(
                                 "[ORCHESTRATOR] Failed to broadcast zone_exhaustion throttle"
                             )
-                    queued_tasks = []  # Clear so the loop below is skipped
+                    # NOTE: this does NOT skip the dispatch loop below — that loop
+                    # iterates the `_queued_task_gate_info` snapshot taken above,
+                    # not this list, so clearing it here has been a no-op for
+                    # dispatch for as long as the snapshot has existed (the comment
+                    # that used to sit on this line claimed otherwise). The real
+                    # dispatch skip is the per-task cold-provision hold below,
+                    # gated on `_zones_exhausted_this_cycle`. This clear is retained
+                    # only for the remaining reader of `queued_tasks` past this
+                    # point — the cycle's "tasks considered" metric.
+                    queued_tasks = []
 
                 # All-types-blocked detection: if every task that wanted to dispatch is of
                 # a failing type, the pipeline is silently stalled — create an operator
@@ -3491,6 +3517,72 @@ async def orchestrator_worker():
                             _iter_preclaimed_account_id = None
                             _iter_preclaimed_project_id = None
                             await session.rollback()
+                            continue
+
+                        # Zone-exhaustion hold — the ONLY thing left below this
+                        # point is a COLD GCE provision, and every GCP zone is in
+                        # cooldown, so it cannot succeed. Cold-dispatching anyway
+                        # burns a Secret Manager write, a GCS payload upload and a
+                        # GCE insert attempt (which blocks in-zone for up to
+                        # ZONE_RECOVERY_WAIT_CAP_SECONDS), then requeues the task
+                        # with a 10-30 min retry_after — i.e. it DELAYS the task
+                        # well past zone recovery and banks a wasted attempt. Hold
+                        # it QUEUED instead; the next cycle dispatches it as soon
+                        # as a zone recovers.
+                        #
+                        # Deliberately scoped to the cold-GCE path only, and placed
+                        # after every non-GCE route has already had its turn
+                        # (strategic/fleet runner pin, compute_experiment, warm-pin
+                        # skip-provision, warm-pool lease) and after the Cloud Run
+                        # classification: none of those consume GCE zone capacity,
+                        # so gating them on zone cooldown would strand
+                        # locally-routable work — a worse failure than the throttle
+                        # this gate exists to apply.
+                        if _zones_exhausted_this_cycle and not _is_cloud_run_dispatch:
+                            # DEBUG, not INFO: this fires per held task per cycle —
+                            # a full dispatch window every ~5s (the idle cadence a
+                            # zero-dispatch cycle selects) for the length of the
+                            # outage, i.e. hundreds of lines/minute. The WHY is
+                            # already emitted once per 60s at cycle level (the
+                            # zone-exhaustion WARNING above, with the recovery ETA);
+                            # this line only adds which task, for when someone is
+                            # actually tracing one.
+                            logger.debug(
+                                "[ORCHESTRATOR] All GCP zones in cooldown — holding "
+                                f"cold provision of task {task.id} (stays QUEUED)"
+                            )
+                            # Release the slot pre-reserved during runtime selection
+                            # (select_max_plan_account pre-increments active_tasks),
+                            # exactly as the backlog-reuse hold above does.
+                            if runtime_selection and runtime_selection.account:
+                                await release_max_plan_account(
+                                    runtime_selection.account["id"],
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
+                                )
+                            _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
+                            # COMMIT (not rollback) so a warm-pin clear this
+                            # iteration already decided is persisted. The pin is
+                            # genuinely dead; rolling the clear back would re-derive
+                            # it — and re-fire record_pool_claim_failure — on every
+                            # cycle of the outage, tripping the warm-pool breaker and
+                            # suppressing the pool leases this gate deliberately lets
+                            # through. On commit failure fall back to rollback: the
+                            # task simply stays QUEUED with its pin intact.
+                            try:
+                                await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to commit warm-pin clear while "
+                                    f"holding task {task.id} for zone recovery"
+                                )
+                                await session.rollback()
                             continue
 
                         # Ensure VM ID exists (cleared during stale PROVISIONING recovery

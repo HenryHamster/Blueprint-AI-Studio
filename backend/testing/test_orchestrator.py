@@ -12454,3 +12454,301 @@ async def test_held_forced_runner_compute_alerts_before_timeout(db_session, mock
         await db_session.execute(_select(Alert).where(Alert.task_id == task_id))
     ).scalars().all()
     assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Zone-exhaustion gate — the cold-GCE dispatch skip when every zone is in cooldown
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestZoneExhaustionColdProvisionGate:
+    """The orchestrator's "all GCP zones in cooldown" guard.
+
+    The guard used to clear ``queued_tasks`` with the comment "Clear so the loop
+    below is skipped" — but the dispatch loop iterates the ``_queued_task_gate_info``
+    SNAPSHOT built from ``queued_tasks`` a few lines earlier, so clearing the list
+    skipped nothing and every queued task still burned a full cold provision
+    (Secret Manager write + GCS upload + a GCE insert that blocks in-zone), then
+    got requeued with a 10-30 min retry_after — i.e. DELAYED past zone recovery.
+
+    The fix gates the COLD-GCE path only. Locally-routable work (fleet-runner
+    pins, compute_experiment, warm pins, warm-pool leases, Cloud Run jobs) uses no
+    GCE zone capacity and must still dispatch during a zone outage — blocking it
+    would be a worse regression than the dead guard.
+
+    Reuses the ``orch_warm_db`` / ``_run_one_cycle`` one-cycle harness from
+    ``TestWarmVMSkipProvision``.
+    """
+
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @staticmethod
+    def _patch_common(mocker, *, zones_available: bool):
+        """Mocks shared by every test in this class.
+
+        Returns the ``provision_agent_vm`` mock — the single observable that
+        answers "did the orchestrator attempt a GCP provision this cycle?".
+        """
+        import app.orchestrator as _orch_module
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Supply dummy credentials so the dispatch loop reaches the cold-provision
+        # step (no env LLM keys in CI). Without this the no-credentials branch
+        # short-circuits BEFORE provisioning and these tests would pass vacuously
+        # on the unfixed code.
+        mocker.patch(
+            "app.orchestrator._resolve_env_runtime_fallback",
+            return_value=(
+                "fake-api-key",
+                "anthropic",
+                "api_key",
+                "claude-opus-4-8",
+                None,
+                {},
+            ),
+        )
+        # The zone ring: patch the orchestrator's binding, which both the
+        # cycle-level pre-check and the per-task cold-provision gate read.
+        mocker.patch(
+            "app.orchestrator.any_zone_available", return_value=zones_available
+        )
+        _orch_module._last_zone_exhaustion_log = None
+        return prov_mock
+
+    @pytest.mark.asyncio
+    async def test_cold_provision_dispatches_when_a_zone_is_available(
+        self, orch_warm_db, mocker
+    ):
+        """NEGATIVE CONTROL. With a zone available, the very same task DOES cold
+        provision — so the exhaustion tests below cannot pass vacuously (i.e. the
+        harness really does drive a dispatch)."""
+        from sqlmodel import select as _select
+
+        prov_mock = self._patch_common(mocker, zones_available=True)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Available", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert prov_mock.called, (
+            "control: with a healthy zone the task must cold-provision — if this "
+            "fails the harness is not driving a dispatch and the exhaustion "
+            "assertions below prove nothing"
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_holds_cold_gcp_provision(
+        self, orch_warm_db, mocker
+    ):
+        """THE REGRESSION. All zones in cooldown => no GCP provisioning is
+        attempted, and the task is held QUEUED (not requeued with a retry_after
+        that would delay it past zone recovery).
+
+        Fails on the dead-guard code: clearing ``queued_tasks`` does not stop the
+        loop, which iterates the ``_queued_task_gate_info`` snapshot, so
+        provision_agent_vm is called anyway."""
+        from sqlmodel import select as _select
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Exhausted", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not prov_mock.called, (
+            "Zone-exhaustion guard is dead: provision_agent_vm was called with "
+            "every GCP zone in cooldown. The guard clears `queued_tasks`, but the "
+            "dispatch loop iterates the `_queued_task_gate_info` snapshot."
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"A task held for zone recovery must stay QUEUED, got {row.status}"
+            )
+            assert row.retry_after_until is None, (
+                "The hold must NOT bank a retry_after — that would delay the task "
+                "past zone recovery, the very harm the guard exists to prevent"
+            )
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_still_pins_task_to_local_runner(
+        self, orch_warm_db, mocker
+    ):
+        """BLAST RADIUS. A task routable to a registered fleet runner needs no GCE
+        zone, so a zone cooldown must NOT block it. Skipping the whole dispatch
+        loop (rather than only the cold-GCE step) would strand every local-runner
+        and DGX task for the duration of the outage."""
+        import hashlib
+        from sqlmodel import select as _select
+        from app.models import LocalRunner
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Zone Exhausted + Runner", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            runner = LocalRunner(
+                project_id=project.id,
+                token_hash=hashlib.sha256(b"zone-gate-runner").hexdigest(),
+                hostname="dgx-1",
+                status="active",
+                last_seen_at=_utcnow(),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+            session.add(runner)
+            await session.commit()
+            await session.refresh(runner)
+            runner_id = runner.id
+
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={},
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not prov_mock.called, (
+            "A runner-pinned task must never reach GCP provisioning"
+        )
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING, (
+                "A locally-routable task must still dispatch while GCP zones are "
+                f"in cooldown, got {row.status}"
+            )
+            assert row.vm_instance_id == f"runner:{runner_id}", (
+                f"Task must be pinned to the fleet runner, got {row.vm_instance_id}"
+            )
+            assert (row.context or {}).get("runner_target_id") == str(runner_id)
+
+    @pytest.mark.asyncio
+    async def test_zone_exhaustion_still_dispatches_cloud_run_job(
+        self, orch_warm_db, mocker
+    ):
+        """BLAST RADIUS. A Cloud Run Job runs in a managed container, not on a GCE
+        VM from the agent-VM zone ring — so an allowlisted read-only type must
+        still dispatch while every zone is in cooldown."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        prov_mock = self._patch_common(mocker, zones_available=False)
+        cr_mock = mocker.patch(
+            "app.orchestrator.launch_agent_cloud_run_job",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        _orch_module._runtime_config["cloud_run_task_type_allowlist"] = ["research"]
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Zone Exhausted + CR", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "research", "prompt": "Analyse the codebase"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+
+            assert cr_mock.called, (
+                "Cloud Run dispatch consumes no GCE zone capacity — a zone "
+                "cooldown must not block it"
+            )
+            assert not prov_mock.called, (
+                "A Cloud Run task must not fall through to GCE provisioning"
+            )
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                assert row is not None
+                assert row.status == TaskStatus.PROVISIONING
+        finally:
+            _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
