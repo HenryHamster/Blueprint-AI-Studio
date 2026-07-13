@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectFullViewportAt } from '../test/viewport';
 import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
-import type { StrategicContextPackageDescriptor } from '../strategicStateApi';
+import type { StrategicContextPackageDescriptor, StrategicContextArtifactViewablePreview } from '../strategicStateApi';
 
 function makePackage(overrides: Partial<StrategicContextPackageDescriptor> = {}): StrategicContextPackageDescriptor {
   return {
@@ -98,6 +98,48 @@ describe('StrategicContextArtifactSlot — viewport regression', () => {
         // All three images should be rendered in the gallery
         const imgs = host.querySelectorAll('img');
         expect(imgs.length).toBeGreaterThanOrEqual(3);
+      },
+      { waitMs: 40 },
+    );
+  });
+
+  test('renders video descriptor built from viewable_previews at 900px', async () => {
+    // Simulates the descriptor shape produced when strategic_context_package.py
+    // populates viewable_previews on an ArtifactEvidence item and the descriptor
+    // builder converts them into descriptor.videos entries.
+    const previews: StrategicContextArtifactViewablePreview[] = [
+      { url: 'https://storage.example.com/run.mp4?sig=v1', kind: 'video', filename: 'run.mp4' },
+    ];
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-video',
+          kind: 'video',
+          title: 'Training run video',
+          summary: 'Captured from compute job',
+          status: 'ready',
+          video: { url: previews[0].url, alt: previews[0].filename ?? undefined },
+          videos: previews.map(p => ({ url: p.url, alt: p.filename ?? undefined, filename: p.filename ?? undefined })),
+        },
+      ],
+    });
+    await expectFullViewportAt(
+      900,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '16px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<StrategicContextArtifactSlot contextPackage={pkg} />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
+        const text = host.textContent ?? '';
+        expect(text).toContain('Training run video');
+        const videos = host.querySelectorAll('video');
+        expect(videos.length).toBeGreaterThanOrEqual(1);
       },
       { waitMs: 40 },
     );

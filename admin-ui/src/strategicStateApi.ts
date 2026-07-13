@@ -180,11 +180,13 @@ export interface StrategicContextRenderableDescriptor {
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
+    storage_uri?: string | null;
   }> | null;
   videos?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
+    storage_uri?: string | null;
   }> | null;
   chart?: {
     kind?: 'bar' | 'line' | string;
@@ -234,6 +236,14 @@ export interface StrategicContextKnowledgeEvidence {
   updated_at?: string | null;
 }
 
+export interface StrategicContextArtifactViewablePreview {
+  url: string;
+  kind: 'image' | 'video' | string;
+  filename?: string | null;
+  /** Stable gs:// ref for lazy re-resolution when the baked signed URL expires. */
+  storage_uri?: string | null;
+}
+
 export interface StrategicContextArtifactEvidence {
   id: string;
   kind: string;
@@ -245,6 +255,9 @@ export interface StrategicContextArtifactEvidence {
   logical_key?: string | null;
   target?: StrategicContextPackageDrilldown['target'] | null;
   created_at?: string | null;
+  has_logs?: boolean | null;
+  storage_uri?: string | null;
+  viewable_previews?: StrategicContextArtifactViewablePreview[] | null;
 }
 
 export interface StrategicContextEvidenceCollection<T> {

@@ -668,10 +668,11 @@ async def _resolve_viewable_previews(
     target} and structurally drops image/video/preview payloads, and knowledge
     evidence rules (``knowledge_completion``) already reject bare http(s)
     citations — signed URLs stay transient helpers, never durable evidence.
-    The raw ``gs://`` object references deliberately do NOT ride along: the
-    workbench projection must never expose durable storage URIs (see
-    test_strategic_state.py — "storage_uri" not in items and no "gs://"
-    anywhere in the package).
+    The raw ``gs://`` object reference DOES ride along on each preview as
+    ``storage_uri`` so the frontend can lazily re-resolve a fresh signed URL
+    when a preview's short-lived signature expires; it is scrubbed from the
+    durable workbench projection at the snapshot seam
+    (``_sanitize_ref_descriptor``), so it never becomes persisted evidence.
 
     Fail-soft everywhere: an ownership violation or signing failure skips that
     one file, and any parse error degrades to the metadata-only stub — a
@@ -698,6 +699,7 @@ async def _resolve_viewable_previews(
             previews.append(
                 {
                     "url": url,
+                    "storage_uri": direct,
                     "kind": direct_kind,
                     "filename": direct.rsplit("/", 1)[-1],
                 }
@@ -742,6 +744,7 @@ async def _resolve_viewable_previews(
                 previews.append(
                     {
                         "url": signed_url,
+                        "storage_uri": vf_storage_uri,
                         "kind": vf_kind,
                         "filename": vf_filename,
                     }
@@ -951,8 +954,10 @@ async def load_strategic_context_evidence(
         # files (bounded: at most the 4 evidence rows above). The signed URLs
         # are minted at THIS async load boundary and live only in the
         # in-flight response — see _resolve_viewable_previews for the
-        # never-persist reasoning. The raw storage_uri deliberately does NOT
-        # ride on the item (no-leak contract, test_strategic_state.py).
+        # never-persist reasoning. Each preview also carries its raw
+        # storage_uri so the frontend can lazily re-resolve an expired signed
+        # URL; the snapshot seam scrubs it from the durable projection so it
+        # never leaks into persisted evidence (test_strategic_state.py).
         viewable_previews = await _resolve_viewable_previews(
             session, project_id, artifact
         )
@@ -1270,10 +1275,10 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     previews = [
         p
         for p in (raw_previews if isinstance(raw_previews, list) else [])
-        if isinstance(p, dict) and p.get("url")
+        if isinstance(p, dict) and (p.get("url") or p.get("storage_uri"))
     ]
-    image_url = next((p["url"] for p in previews if p.get("kind") == "image"), None)
-    video_url = next((p["url"] for p in previews if p.get("kind") == "video"), None)
+    image_url = next((p.get("url") for p in previews if p.get("kind") == "image"), None)
+    video_url = next((p.get("url") for p in previews if p.get("kind") == "video"), None)
     if image_url:
         kind = "image"
     elif video_url:
@@ -1319,13 +1324,19 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         # built from that filtered set — emits url/alt/filename only, never a
         # raw storage_uri.
         image_previews = [p for p in previews if p.get("kind") == "image"] or previews
-        url = image_url or (image_previews[0]["url"] if image_previews else None)
-        descriptor["image"] = {"url": url, "alt": title}
+        url = image_url or (image_previews[0].get("url") if image_previews else None)
+        primary_storage_uri = image_previews[0].get("storage_uri") if image_previews else None
+        descriptor["image"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
         descriptor["images"] = [
-            {"url": p.get("url"), "alt": p.get("filename") or title, "filename": p.get("filename")}
+            {
+                "url": p.get("url"),
+                "alt": p.get("filename") or title,
+                "filename": p.get("filename"),
+                "storage_uri": p.get("storage_uri"),
+            }
             for p in image_previews
         ]
-        if not url:
+        if not url and not primary_storage_uri:
             descriptor[
                 "unsupported_reason"
             ] = "Image artifact previews require a signed preview URL."
@@ -1333,13 +1344,19 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         # OUR filtered ``previews`` (signed-URL-only) + engine's multi-video
         # gallery list; url/alt/filename only, never a raw storage_uri.
         video_previews = [p for p in previews if p.get("kind") == "video"] or previews
-        url = video_url or (video_previews[0]["url"] if video_previews else None)
-        descriptor["video"] = {"url": url, "alt": title}
+        url = video_url or (video_previews[0].get("url") if video_previews else None)
+        primary_storage_uri = video_previews[0].get("storage_uri") if video_previews else None
+        descriptor["video"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
         descriptor["videos"] = [
-            {"url": p.get("url"), "alt": p.get("filename") or title, "filename": p.get("filename")}
+            {
+                "url": p.get("url"),
+                "alt": p.get("filename") or title,
+                "filename": p.get("filename"),
+                "storage_uri": p.get("storage_uri"),
+            }
             for p in video_previews
         ]
-        if not url:
+        if not url and not primary_storage_uri:
             descriptor[
                 "unsupported_reason"
             ] = "Video artifact previews require a signed preview URL."

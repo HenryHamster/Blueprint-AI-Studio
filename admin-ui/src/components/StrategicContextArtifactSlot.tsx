@@ -5,6 +5,7 @@ import type {
   StrategicContextPackageDrilldown,
   StrategicContextRenderableDescriptor,
 } from '../strategicStateApi';
+import { resolveArtifactDownloadUrl } from '../api';
 import { StrategicContextMap } from './StrategicContextMap';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
@@ -83,6 +84,78 @@ function safeImageUrl(value?: string | null): string | null {
   }
 }
 
+/**
+ * Resolve the freshest usable media URL. When `projectId` and `storageUri` are
+ * present, mint a fresh signed URL from the stable `gs://` ref on mount (and
+ * whenever they change) so the preview survives baked-URL expiry on a long-idle
+ * canvas. Until that resolves — or if resolution fails, or when no ref exists —
+ * fall back to the baked URL. Returns null when nothing is renderable.
+ */
+function useFreshMediaUrl(
+  projectId: string | null | undefined,
+  storageUri: string | null | undefined,
+  bakedUrl: string | null | undefined,
+): string | null {
+  // Key the resolved URL by the ref it was minted for, so a stale resolution
+  // from a previous storage_uri is ignored once the ref changes (rather than
+  // resetting state synchronously inside the effect, which cascades renders).
+  const [resolved, setResolved] = useState<{ uri: string; url: string } | null>(null);
+
+  useEffect(() => {
+    if (!projectId || !storageUri) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    resolveArtifactDownloadUrl(projectId, storageUri, controller.signal)
+      .then(url => { if (!cancelled) setResolved({ uri: storageUri, url }); })
+      .catch(() => { /* keep the baked-URL fallback below */ });
+    return () => { cancelled = true; controller.abort(); };
+  }, [projectId, storageUri]);
+
+  const fresh = resolved && storageUri && resolved.uri === storageUri ? resolved.url : null;
+  return safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
+}
+
+function ResolvedImage({
+  projectId,
+  storageUri,
+  bakedUrl,
+  alt,
+  className,
+}: {
+  projectId?: string | null;
+  storageUri?: string | null;
+  bakedUrl?: string | null;
+  alt: string;
+  className: string;
+}) {
+  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (!url) return null;
+  return <img src={url} alt={alt} className={className} />;
+}
+
+function ResolvedVideo({
+  projectId,
+  storageUri,
+  bakedUrl,
+  ariaLabel,
+  className,
+}: {
+  projectId?: string | null;
+  storageUri?: string | null;
+  bakedUrl?: string | null;
+  ariaLabel: string;
+  className: string;
+}) {
+  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (!url) return null;
+  return (
+    <video controls className={className} aria-label={ariaLabel}>
+      <source src={url} />
+      Your browser does not support the video element.
+    </video>
+  );
+}
+
 function MutedStatus({ children }: { children: ReactNode }) {
   return (
     <div className="mt-2 px-1 py-1.5 text-xs text-neutral-500">
@@ -128,27 +201,6 @@ function DescriptorCard({
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
   projectId?: string | null;
 }) {
-  const imageStorageUri = descriptor.image?.storage_uri ?? null;
-  const [resolvedImageUrl, setResolvedImageUrl] = useState<string | null>(null);
-  const [, setImageError] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (imageStorageUri && projectId && !descriptor.image?.url) {
-      (async () => {
-        try {
-          const { resolveArtifactDownloadUrl } = await import('../api');
-          const url = await resolveArtifactDownloadUrl(projectId, imageStorageUri);
-          if (!cancelled) setResolvedImageUrl(url);
-        } catch {
-          if (!cancelled) setImageError(true);
-        }
-      })();
-    }
-    return () => { cancelled = true; };
-  }, [imageStorageUri, projectId, descriptor.image?.url]);
-
-  const imageUrl = safeImageUrl(descriptor.image?.url) ?? safeImageUrl(resolvedImageUrl);
   const chartPoints = descriptor.chart?.points ?? [];
   const maxChartValue = Math.max(1, ...chartPoints.map(point => Math.abs(point.value)));
   const columns = descriptor.columns ?? [];
@@ -252,28 +304,38 @@ function DescriptorCard({
       )}
 
       {descriptor.kind === 'image' && (() => {
-        const allImages = descriptor.images?.filter(img => safeImageUrl(img.url)) ?? [];
-        const singleUrl = allImages.length === 1 ? safeImageUrl(allImages[0].url) : imageUrl;
+        // A preview is renderable if it has EITHER a baked URL or a stable
+        // storage_uri we can re-resolve — do not filter on url alone, or an
+        // expired baked URL would drop a still-resolvable image.
+        const listed = (descriptor.images ?? []).filter(img => img.url || img.storage_uri);
+        const fallback = descriptor.image;
+        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
+          listed.length > 0
+            ? listed
+            : fallback && (fallback.url || fallback.storage_uri)
+              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+              : [];
         return (
           <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-            {allImages.length > 1 ? (
+            {items.length > 1 ? (
               <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
-                {allImages.map((img, i) => {
-                  const url = safeImageUrl(img.url) ?? '';
-                  return (
-                    <img
-                      key={url}
-                      src={url}
-                      alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
-                      className="h-36 w-auto flex-shrink-0 object-contain"
-                    />
-                  );
-                })}
+                {items.map((img, i) => (
+                  <ResolvedImage
+                    key={img.storage_uri || img.url || i}
+                    projectId={projectId}
+                    storageUri={img.storage_uri}
+                    bakedUrl={img.url}
+                    alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
+                    className="h-36 w-auto flex-shrink-0 object-contain"
+                  />
+                ))}
               </div>
-            ) : singleUrl ? (
-              <img
-                src={singleUrl}
-                alt={descriptor.image?.alt || descriptor.title}
+            ) : items.length === 1 ? (
+              <ResolvedImage
+                projectId={projectId}
+                storageUri={items[0].storage_uri}
+                bakedUrl={items[0].url}
+                alt={descriptor.image?.alt || items[0].alt || descriptor.title}
                 className="max-h-48 w-full object-contain"
               />
             ) : (
@@ -286,36 +348,37 @@ function DescriptorCard({
       })()}
 
       {descriptor.kind === 'video' && (() => {
-        const allVideos = descriptor.videos?.filter(v => safeImageUrl(v.url)) ?? [];
-        const singleVideoUrl = allVideos.length === 1 ? safeImageUrl(allVideos[0].url) : safeImageUrl(descriptor.video?.url);
+        const listed = (descriptor.videos ?? []).filter(v => v.url || v.storage_uri);
+        const fallback = descriptor.video;
+        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
+          listed.length > 0
+            ? listed
+            : fallback && (fallback.url || fallback.storage_uri)
+              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+              : [];
         return (
           <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-            {allVideos.length > 1 ? (
+            {items.length > 1 ? (
               <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
-                {allVideos.map((v, i) => {
-                  const url = safeImageUrl(v.url) ?? '';
-                  return (
-                    <video
-                      key={url}
-                      controls
-                      className="h-36 w-auto flex-shrink-0"
-                      aria-label={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
-                    >
-                      <source src={url} />
-                      Your browser does not support the video element.
-                    </video>
-                  );
-                })}
+                {items.map((v, i) => (
+                  <ResolvedVideo
+                    key={v.storage_uri || v.url || i}
+                    projectId={projectId}
+                    storageUri={v.storage_uri}
+                    bakedUrl={v.url}
+                    ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
+                    className="h-36 w-auto flex-shrink-0"
+                  />
+                ))}
               </div>
-            ) : singleVideoUrl ? (
-              <video
-                controls
+            ) : items.length === 1 ? (
+              <ResolvedVideo
+                projectId={projectId}
+                storageUri={items[0].storage_uri}
+                bakedUrl={items[0].url}
+                ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
                 className="max-h-48 w-full"
-                aria-label={descriptor.video?.alt || descriptor.title}
-              >
-                <source src={singleVideoUrl} />
-                Your browser does not support the video element.
-              </video>
+              />
             ) : (
               <div className="px-2 py-2 text-xs text-neutral-500">
                 Video preview unavailable. Open the artifact for the source.

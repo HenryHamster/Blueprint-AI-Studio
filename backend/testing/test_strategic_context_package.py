@@ -287,6 +287,7 @@ async def test_artifact_image_preview_signed_at_load(db_session, monkeypatch):
     assert previews == [
         {
             "url": "https://signed.example/loss_curve.png",
+            "storage_uri": image_uri,
             "kind": "image",
             "filename": "loss_curve.png",
         }
@@ -296,7 +297,9 @@ async def test_artifact_image_preview_signed_at_load(db_session, monkeypatch):
     descriptor = _artifact_descriptor(item)
     assert descriptor["kind"] == "image"
     assert descriptor["image"]["url"] == "https://signed.example/loss_curve.png"
-    assert "storage_uri" not in descriptor["image"]
+    # storage_uri now rides on the descriptor sub-dict for lazy re-resolution;
+    # the no-leak contract is enforced at the item level (asserted above).
+    assert descriptor["image"]["storage_uri"] == image_uri
     assert "unsupported_reason" not in descriptor
 
 
@@ -355,6 +358,7 @@ async def test_bundle_artifact_resolves_manifest_viewable_video(
     assert previews == [
         {
             "url": "https://signed.example/rollout.mp4",
+            "storage_uri": own_video,
             "kind": "video",
             "filename": "rollout.mp4",
         }
@@ -365,7 +369,9 @@ async def test_bundle_artifact_resolves_manifest_viewable_video(
     descriptor = _artifact_descriptor(item)
     assert descriptor["kind"] == "video"
     assert descriptor["video"]["url"] == "https://signed.example/rollout.mp4"
-    assert "storage_uri" not in descriptor["video"]
+    # storage_uri now rides on the descriptor sub-dict for lazy re-resolution;
+    # the no-leak contract is enforced at the item level (asserted above).
+    assert descriptor["video"]["storage_uri"] == own_video
 
 
 @pytest.mark.asyncio
@@ -394,7 +400,11 @@ async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
 
     descriptor = _artifact_descriptor(item)
     assert descriptor["kind"] == "image"
-    assert descriptor["image"] == {"url": None, "alt": descriptor["title"]}
+    assert descriptor["image"] == {
+        "url": None,
+        "alt": descriptor["title"],
+        "storage_uri": None,
+    }
     assert "unsupported_reason" in descriptor
 
 
@@ -665,6 +675,76 @@ def test_artifact_descriptor_multi_video_populates_videos_list():
     assert desc["videos"][0]["filename"] == "clip0.mp4"
 
 
+def test_artifact_descriptor_image_carries_storage_uri_for_lazy_resolution():
+    """Image descriptors expose storage_uri so the frontend can re-resolve a
+    fresh signed URL when the baked (5-minute) URL expires on an idle canvas."""
+    item = {
+        "id": "art-lazy-img",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/plot.png?sig=abc",
+                "kind": "image",
+                "filename": "plot.png",
+                "storage_uri": "gs://bucket/plot.png",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["image"]["storage_uri"] == "gs://bucket/plot.png"
+    assert desc["images"][0]["storage_uri"] == "gs://bucket/plot.png"
+
+
+def test_artifact_descriptor_video_carries_storage_uri_for_lazy_resolution():
+    """Video descriptors expose storage_uri for the same lazy re-resolution path."""
+    item = {
+        "id": "art-lazy-vid",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/demo.mp4?sig=def",
+                "kind": "video",
+                "filename": "demo.mp4",
+                "storage_uri": "gs://bucket/demo.mp4",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["video"]["storage_uri"] == "gs://bucket/demo.mp4"
+    assert desc["videos"][0]["storage_uri"] == "gs://bucket/demo.mp4"
+
+
+def test_artifact_descriptor_image_ref_only_is_not_unsupported():
+    """A preview with only a storage_uri (no baked url) is still resolvable, so
+    the descriptor must NOT be stubbed with unsupported_reason."""
+    item = {
+        "id": "art-ref-only",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {"url": None, "kind": "image", "filename": "plot.png", "storage_uri": "gs://bucket/plot.png"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert "unsupported_reason" not in desc
+    assert desc["image"]["storage_uri"] == "gs://bucket/plot.png"
+
+
+
 
 @pytest.mark.asyncio
 async def test_load_strategic_context_evidence_artifact_viewable_files(db_session):
@@ -724,11 +804,13 @@ async def test_load_strategic_context_evidence_artifact_viewable_files(db_sessio
         "url": "https://signed-url/plot.png?token=abc",
         "kind": "image",
         "filename": "plot.png",
+        "storage_uri": "gs://bucket/obj1",
     }
     assert item["viewable_previews"][1] == {
         "url": "https://signed-url/video.mp4?token=def",
         "kind": "video",
         "filename": "video.mp4",
+        "storage_uri": "gs://bucket/obj2",
     }
     assert mock_verify.call_count == 2
     assert mock_sign.call_count == 2
