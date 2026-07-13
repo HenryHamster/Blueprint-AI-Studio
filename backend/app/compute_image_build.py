@@ -42,15 +42,33 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+# ── Layer-scan memory bounds ─────────────────────────────────────────────────
+#
+# The credential layer-scan runs against real compute images — a CUDA base plus
+# a torch wheel is comfortably multi-GB. Every read it performs is bounded by
+# one of these two caps, so peak RSS is O(cap), NOT O(image size).
+
+# Largest single file the scanner will read out of a layer. Anything bigger is
+# not a plausible credential store (it is a wheel, a model, a CUDA blob) and is
+# skipped without being read.
+_MAX_SCANNED_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+# Largest control document (OCI ``index.json`` / manifest blob) the scanner will
+# parse. These are kilobytes in practice; the cap stops a malformed or hostile
+# archive from passing off a multi-GB blob as JSON and reintroducing an
+# unbounded read through the back door.
+_MAX_CONTROL_DOC_BYTES = 4 * 1024 * 1024  # 4 MiB
 
 
 # ── Content hashing ──────────────────────────────────────────────────────────
@@ -230,7 +248,7 @@ def scan_inputs_for_credentials(
     return findings
 
 
-def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, bytes]]:
+def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, str]]:
     """Resolve the credential-scannable layer tarballs from a ``docker save``
     archive.
 
@@ -245,35 +263,50 @@ def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, bytes]]:
       images nest an OCI index that references per-arch manifests, so index
       references are walked recursively.
 
-    Returns a list of ``(label, raw_layer_bytes)`` tuples. An **empty list**
-    means NO recognizable layers were found — the caller MUST treat that as a
-    fail-closed error (the scan would otherwise silently pass unexamined
-    layers).
+    Returns a list of ``(label, member_name)`` tuples — layer *references*, NOT
+    layer bytes. Resolving to names keeps the whole scan streaming: a realistic
+    CUDA image has multi-GB layers, and materializing even one of them (let
+    alone all of them) in memory is what OOM'd the API process. The caller opens
+    each layer lazily through :meth:`tarfile.TarFile.extractfile`, which reads
+    through the underlying file handle without buffering the member.
+
+    Only the small JSON control documents (``index.json``, manifest blobs) are
+    read into memory — they are kilobytes, and the OCI walk needs them parsed.
+
+    An **empty list** means NO recognizable layers were found — the caller MUST
+    treat that as a fail-closed error (the scan would otherwise silently pass
+    unexamined layers).
     """
     members = {m.name: m for m in outer.getmembers()}
 
-    def _read(name: str) -> Optional[bytes]:
+    def _read_control(name: str) -> bytes | None:
+        """Read a small control document (index/manifest JSON) into memory.
+
+        Guarded by a size cap so a hostile archive cannot pass off a multi-GB
+        blob as ``index.json`` and reintroduce the unbounded read this function
+        exists to avoid.
+        """
         m = members.get(name)
         if m is None or not m.isfile():
+            return None
+        if m.size > _MAX_CONTROL_DOC_BYTES:
             return None
         fh = outer.extractfile(m)
         if fh is None:
             return None
-        return fh.read()
+        return fh.read(_MAX_CONTROL_DOC_BYTES)
 
-    layers: List[Tuple[str, bytes]] = []
+    layers: List[Tuple[str, str]] = []
 
     # ── Classic docker-save layout: <hash>/layer.tar ─────────────────────────
     for name, m in members.items():
         if m.isfile() and name.endswith("layer.tar"):
-            data = _read(name)
-            if data is not None:
-                layers.append((name, data))
+            layers.append((name, name))
     if layers:
         return layers
 
     # ── OCI image layout: index.json → manifest blob → layer blobs ───────────
-    index_bytes = _read("index.json")
+    index_bytes = _read_control("index.json")
     if index_bytes is None:
         return layers  # neither classic nor OCI — caller fails closed
 
@@ -295,7 +328,7 @@ def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, bytes]]:
         path = _blob_path(digest)
         if path is None:
             return
-        raw = _read(path)
+        raw = _read_control(path)
         if raw is None:
             return
         try:
@@ -308,16 +341,16 @@ def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, bytes]]:
         for sub in doc.get("manifests", []) or []:
             if isinstance(sub, dict) and isinstance(sub.get("digest"), str):
                 _walk_manifest(sub["digest"])
-        # Image manifest → collect the layer blobs it references.
+        # Image manifest → collect the layer blobs it references (by NAME).
         for layer in doc.get("layers", []) or []:
             if not isinstance(layer, dict):
                 continue
             lpath = _blob_path(layer.get("digest"))
             if lpath is None:
                 continue
-            ldata = _read(lpath)
-            if ldata is not None:
-                layers.append((f"blob:{lpath}", ldata))
+            m = members.get(lpath)
+            if m is not None and m.isfile():
+                layers.append((f"blob:{lpath}", lpath))
 
     try:
         index_doc = json.loads(index_bytes)
@@ -342,6 +375,15 @@ def scan_image_layers_for_credentials(
     ``RUN curl http://secrets-server/token > /root/.creds`` or a pip package
     that installs a credential helper) that are invisible in the source inputs.
 
+    **Streaming, never buffered.** ``docker save`` writes STRAIGHT TO A TEMP FILE
+    (``-o``) instead of a pipe the parent drains into memory, and layers are read
+    lazily through :meth:`tarfile.TarFile.extractfile` rather than materialized
+    as ``bytes``. A realistic CUDA compute image is multiple GB; the previous
+    ``capture_output=True`` + ``io.BytesIO(proc.stdout)`` + per-layer ``bytes``
+    shape held the archive in RAM two or three times over and OOM'd the API
+    process that called this. Peak memory is now bounded by the largest single
+    scanned FILE (hard-capped at 10 MiB below), not by the image size.
+
     Both archive layouts ``docker save`` can produce are handled — the classic
     ``<hash>/layer.tar`` layout and the OCI ``index.json`` + ``blobs/`` store
     (see :func:`_resolve_image_layers`). When the archive yields NO recognizable
@@ -352,56 +394,95 @@ def scan_image_layers_for_credentials(
     errors in ``docker save`` are propagated as ``RuntimeError`` so callers
     can treat infrastructure failures distinctly from credential findings.
     """
-    try:
-        proc = _run(
-            ["docker", "save", image_ref],
-            capture_output=True,
-            timeout=600,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"docker save failed: {exc}") from exc
+    with tempfile.TemporaryDirectory(prefix="compute-image-scan-") as tmpdir:
+        archive_path = os.path.join(tmpdir, "image.tar")
+        try:
+            # `-o` streams the archive to disk inside the daemon/CLI. Nothing is
+            # piped back through this process, so a multi-GB image costs disk,
+            # not RAM. stdout/stderr stay captured for error reporting only —
+            # with `-o` they carry progress/error text, not the archive.
+            proc = _run(
+                ["docker", "save", "-o", archive_path, image_ref],
+                capture_output=True,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"docker save failed: {exc}") from exc
 
-    if proc.returncode != 0:
-        stderr = (proc.stderr or b"").decode("utf-8", errors="replace")[-1000:]
-        raise RuntimeError(f"docker save failed (exit {proc.returncode}): {stderr}")
+        if proc.returncode != 0:
+            raw_err = proc.stderr or b""
+            if isinstance(raw_err, str):
+                stderr = raw_err[-1000:]
+            else:
+                stderr = raw_err.decode("utf-8", errors="replace")[-1000:]
+            raise RuntimeError(f"docker save failed (exit {proc.returncode}): {stderr}")
 
-    findings: List[str] = []
-    try:
-        with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:*") as outer:
-            layers = _resolve_image_layers(outer)
-            if not layers:
-                # Fail CLOSED: an archive with no classic layer.tar members and
-                # no resolvable OCI blob layers is unscannable, not clean. A
-                # silent empty-findings pass here would let an OCI-layout image
-                # (or a malformed/unexpected archive) skip the credential gate.
-                raise RuntimeError(
-                    "credential layer-scan found no recognizable layers in the "
-                    f"docker save archive for {image_ref!r} (neither classic "
-                    "layer.tar members nor a resolvable OCI index.json/blobs "
-                    "layout) — failing closed"
-                )
-            for label, layer_data in layers:
-                try:
-                    with tarfile.open(fileobj=io.BytesIO(layer_data), mode="r:*") as layer:
-                        for fmember in layer.getmembers():
-                            if not fmember.isfile():
-                                continue
-                            # Skip files that are almost certainly not text/credential stores.
-                            if fmember.size == 0 or fmember.size > 10 * 1024 * 1024:
-                                continue
-                            ffh = layer.extractfile(fmember)
-                            if ffh is None:
-                                continue
-                            content = ffh.read()
-                            flabel = f"layer:{label}!{fmember.name}"
-                            findings.extend(_scan_content_patterns(flabel, content))
-                except tarfile.TarError:
-                    # Corrupted layer — skip rather than crashing.
-                    pass
-    except tarfile.TarError as exc:
-        raise RuntimeError(f"failed to parse docker save output: {exc}") from exc
+        if not os.path.isfile(archive_path):
+            # Fail CLOSED: `docker save` reported success but produced no
+            # archive. Returning "clean" here would skip the credential gate.
+            raise RuntimeError(
+                f"docker save produced no archive for {image_ref!r} — failing closed"
+            )
 
-    return findings
+        findings: List[str] = []
+        try:
+            # Opened from a PATH: the file handle is seekable, so extractfile()
+            # returns a seekable stream and oversized members can be skipped by
+            # seeking past them rather than reading them.
+            with tarfile.open(archive_path, mode="r:*") as outer:
+                layers = _resolve_image_layers(outer)
+                if not layers:
+                    # Fail CLOSED: an archive with no classic layer.tar members
+                    # and no resolvable OCI blob layers is unscannable, not
+                    # clean. A silent empty-findings pass here would let an
+                    # OCI-layout image (or a malformed/unexpected archive) skip
+                    # the credential gate.
+                    raise RuntimeError(
+                        "credential layer-scan found no recognizable layers in the "
+                        f"docker save archive for {image_ref!r} (neither classic "
+                        "layer.tar members nor a resolvable OCI index.json/blobs "
+                        "layout) — failing closed"
+                    )
+                for label, member_name in layers:
+                    member = outer.getmember(member_name)
+                    layer_stream = outer.extractfile(member)
+                    if layer_stream is None:
+                        continue
+                    try:
+                        # Nested tar read THROUGH the outer archive's handle —
+                        # the layer is never materialized as a bytes object.
+                        with tarfile.open(
+                            fileobj=layer_stream, mode="r:*"
+                        ) as layer:
+                            for fmember in layer:
+                                if not fmember.isfile():
+                                    continue
+                                # Skip files that are almost certainly not
+                                # text/credential stores. The upper bound also
+                                # caps this scan's peak memory: no single read
+                                # below can exceed it.
+                                if (
+                                    fmember.size == 0
+                                    or fmember.size > _MAX_SCANNED_FILE_BYTES
+                                ):
+                                    continue
+                                ffh = layer.extractfile(fmember)
+                                if ffh is None:
+                                    continue
+                                content = ffh.read(_MAX_SCANNED_FILE_BYTES)
+                                flabel = f"layer:{label}!{fmember.name}"
+                                findings.extend(
+                                    _scan_content_patterns(flabel, content)
+                                )
+                    except tarfile.TarError:
+                        # Corrupted layer — skip rather than crashing.
+                        pass
+                    finally:
+                        layer_stream.close()
+        except tarfile.TarError as exc:
+            raise RuntimeError(f"failed to parse docker save output: {exc}") from exc
+
+        return findings
 
 
 # ── Registry lookup + build/push orchestration ───────────────────────────────

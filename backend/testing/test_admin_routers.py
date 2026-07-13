@@ -30141,3 +30141,132 @@ class TestRunnerStatsClaimLatency:
         assert body["claim_latency_ms_p95"] is None
         assert body["claim_latency_ms_p99"] is None
         assert body["claim_latency_ms_max"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_project_tools.py — compute-image build trigger
+#
+# The build runs `docker build` + `docker push` of a REAL project image (a CUDA
+# base plus a torch wheel is multi-GB, and the build can run the better part of
+# an hour) as a subprocess ON THE ORCHESTRATOR HOST. It used to be reachable by
+# any project MEMBER, with no concurrency limit, straight inside one HTTP
+# request — an unbounded docker fan-out on the API process itself.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestComputeImageBuildTrigger:
+    """Blast-radius bounds on the member-triggerable docker build."""
+
+    @staticmethod
+    def _patch_pipeline(monkeypatch, *, build_fn=None):
+        """Stub manifest discovery + the build pipeline (no docker, no network)."""
+        from app.routers import admin_project_tools as apt
+
+        async def fake_manifest(_project):
+            return {
+                "tools": [],
+                "skills": [],
+                "compute": {
+                    "image": {
+                        "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                        "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+                    }
+                },
+                "error": None,
+            }
+
+        monkeypatch.setattr(apt, "_discover_manifest_tools", fake_manifest)
+        monkeypatch.setattr(
+            apt._cb, "resolve_compute_image_registry_repo",
+            lambda: "us-docker.pkg.dev/p/compute-images",
+        )
+
+        async def default_build(*a, **k):
+            from app.compute_image_build import BuildResult
+
+            return BuildResult(
+                pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:" + "a" * 64,
+                tag="deadbeef",
+                dep_hash="deadbeef",
+                already_present=False,
+                built=True,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", build_fn or default_build
+        )
+        return apt
+
+    @pytest.mark.asyncio
+    async def test_build_succeeds_and_records_the_row(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Happy path still works end-to-end (owner, no build in flight)."""
+        self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild OK")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["digest"] == "sha256:" + "a" * 64
+        assert body["built"] is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_build_is_rejected_with_429(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A second build while one is in flight sheds load — it does not queue.
+
+        Queuing would park an API worker (and its DB connection) behind an
+        hour-long docker build; fanning out would run N multi-GB docker builds on
+        the orchestrator host at once. Neither is acceptable, so the request is
+        refused with a Retry-After.
+        """
+        apt = self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild Busy")
+
+        # Simulate a build already occupying the only slot.
+        await apt._compute_image_build_semaphore.acquire()
+        try:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/compute-image/build"
+            )
+        finally:
+            apt._compute_image_build_semaphore.release()
+
+        assert resp.status_code == 429, resp.text
+        assert resp.headers.get("Retry-After")
+        # The app wraps HTTPException detail; assert on the rendered body.
+        assert "already running" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_build_slot_is_released_after_a_failed_build(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A build that raises must not leak its concurrency slot."""
+
+        async def boom(*a, **k):
+            raise RuntimeError("docker build failed (exit 1)")
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=boom)
+        project = await _make_project(db_session, name="ImgBuild Boom")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+        assert resp.status_code == 422, resp.text
+
+        # Slot is free again — a later build is not permanently 429'd.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_trigger_a_build(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Building is OWNER-grade: it runs docker on the host and pushes to the
+        shared registry, like the other state-changing tool endpoints."""
+        self._patch_pipeline(monkeypatch)
+        project = await _make_project(db_session, name="ImgBuild Member", role="member")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+
+        assert resp.status_code == 403, resp.text

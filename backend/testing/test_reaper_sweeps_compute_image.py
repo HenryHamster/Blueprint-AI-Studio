@@ -21,8 +21,11 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
-from app.models import Project, ProjectComputeImage
-from app.reaper_sweeps import sweep_protect_referenced_compute_image_digests
+from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
+from app.reaper_sweeps import (
+    _split_pinned_ref,
+    sweep_protect_referenced_compute_image_digests,
+)
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -512,3 +515,182 @@ async def test_no_images_returns_zero_counts(db):
         )
 
     assert result == {"applied": 0, "pruned": 0, "skipped_cadence": 0}
+
+
+# ── Job-referenced digests with NO ProjectComputeImage row ────────────────────
+#
+# The sweep's docstring promises protection for any digest "referenced" by a
+# live or recent compute job. Protection used to be applied by iterating
+# ProjectComputeImage rows ONLY, so a digest a running job depends on but which
+# has no build row — e.g. an image baked through the documented CI path,
+# scripts/build_compute_image.py, which writes no DB row — was silently left
+# unprotected and GC'd out from under the job still pulling it.
+
+
+async def _add_job(
+    db: AsyncSession,
+    project_id: uuid.UUID,
+    container_image: str,
+    *,
+    status: ComputeJobStatus = ComputeJobStatus.RUNNING,
+    completed_at: datetime | None = None,
+) -> ComputeJob:
+    job = ComputeJob(
+        project_id=project_id,
+        backend="gcp",
+        status=status,
+        polling_metadata={"container_image": container_image},
+    )
+    if completed_at is not None:
+        job.completed_at = completed_at
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_live_job_digest_without_image_row_is_protected(db):
+    """A RUNNING job's digest is protected even with NO ProjectComputeImage row.
+
+    This is the CI-built-image case: scripts/build_compute_image.py pushes the
+    image and the job pins it by digest, but nothing writes a ProjectComputeImage
+    row. The digest must still be stamped — in the repo the job's container_image
+    names — or registry GC reclaims the image the job is still pulling.
+    """
+    project = await _make_project(db)
+    ci_repo = "us-docker.pkg.dev/myproj/compute-images/ci-baked"
+    await _add_job(db, project.id, f"{ci_repo}@{_DIGEST_A}")
+
+    stamped: list[tuple[str, str]] = []
+
+    def tracking_apply_tag(repo, digest):
+        stamped.append((repo, digest))
+        return "inuse-tag"
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=tracking_apply_tag,
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    assert (ci_repo, _DIGEST_A) in stamped, (
+        "A live job's image digest was NOT protected because it has no "
+        f"ProjectComputeImage row. apply_tag calls: {stamped}"
+    )
+    assert result["applied"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_completed_job_digest_without_image_row_is_protected(db):
+    """A digest referenced only by a RECENTLY-COMPLETED job is protected too.
+
+    The result's provenance/reproducibility depends on the image staying
+    pullable for the protection window, exactly as the docstring promises.
+    """
+    project = await _make_project(db)
+    ci_repo = "us-docker.pkg.dev/myproj/compute-images/ci-baked"
+    await _add_job(
+        db,
+        project.id,
+        f"{ci_repo}@{_DIGEST_B}",
+        status=ComputeJobStatus.SUCCEEDED,
+        completed_at=_NOW - timedelta(hours=1),
+    )
+
+    stamped: list[tuple[str, str]] = []
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: stamped.append((repo, digest)) or "t",
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    assert (ci_repo, _DIGEST_B) in stamped, (
+        f"A recent job's digest was not protected. apply_tag calls: {stamped}"
+    )
+    assert result["applied"] == 1
+
+
+@pytest.mark.asyncio
+async def test_job_referenced_repo_has_its_stale_tags_pruned(db):
+    """A repo learned only from a job's container_image is also pruned.
+
+    Protection and pruning must cover the same repo set: if the sweep can stamp
+    an `inuse-` tag in a job-only repo, it must also be able to reclaim a stale
+    one there, or protection tags accumulate forever in that repo.
+    """
+    project = await _make_project(db)
+    ci_repo = "us-docker.pkg.dev/myproj/compute-images/ci-baked"
+    await _add_job(db, project.id, f"{ci_repo}@{_DIGEST_A}")
+
+    deleted: list[tuple[str, str]] = []
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: "inuse-tag",
+            # A stale protection tag for a digest nothing references any more.
+            _list_tags=lambda repo: ["inuse-deadbeef"],
+            _delete_tag=lambda repo, tag: deleted.append((repo, tag)) or True,
+        )
+
+    assert (ci_repo, "inuse-deadbeef") in deleted, (
+        f"Stale tag in the job-referenced repo was not pruned. deletes: {deleted}"
+    )
+    assert result["pruned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tag_only_job_image_contributes_no_protection(db):
+    """A job pinned to a mutable tag (no @sha256:) has no digest to protect."""
+    project = await _make_project(db)
+    await _add_job(db, project.id, f"{_FULL_REPO}:latest")
+
+    stamped: list[tuple[str, str]] = []
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: stamped.append((repo, digest)) or "t",
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    assert stamped == []
+    assert result["applied"] == 0
+
+
+def test_split_pinned_ref_parses_repo_and_digest():
+    """The repo/digest parser handles ports, tags, and malformed refs."""
+    assert _split_pinned_ref(f"{_FULL_REPO}@{_DIGEST_A}") == (_FULL_REPO, _DIGEST_A)
+    # A tag alongside the digest — the repo must drop the tag, not the port.
+    assert _split_pinned_ref(f"{_FULL_REPO}:v2@{_DIGEST_A}") == (_FULL_REPO, _DIGEST_A)
+    assert _split_pinned_ref(f"localhost:5000/img:v2@{_DIGEST_A}") == (
+        "localhost:5000/img",
+        _DIGEST_A,
+    )
+    # Tag-only / malformed refs carry no stable digest.
+    assert _split_pinned_ref(f"{_FULL_REPO}:latest") is None
+    assert _split_pinned_ref("") is None
+    assert _split_pinned_ref(f"{_FULL_REPO}@notadigest") is None

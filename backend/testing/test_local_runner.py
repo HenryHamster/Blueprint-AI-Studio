@@ -4792,6 +4792,161 @@ class TestArtifactUploadEndpoint:
         )
         assert resp.status_code == 404
 
+    # ── Terminal-status guard ────────────────────────────────────────────────
+    #
+    # _COMPUTE_JOB_TERMINAL_STATUSES promises that runner reports/uploads can no
+    # longer mutate a finalized job's evidence. /report enforced it; the artifact
+    # upload did not — so a pinned runner could POST to a SUCCEEDED/FAILED job and
+    # overwrite the durable GCS bundle a verdict had already been drawn from
+    # (store_runner_artifact writes a FIXED per-job object path).
+
+    @pytest.mark.parametrize(
+        "terminal_status",
+        [
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_upload_cannot_overwrite_finalized_job_artifact(
+        self, client: AsyncClient, db_session, monkeypatch, terminal_status
+    ):
+        """A second upload to a FINALIZED job is refused — evidence is immutable."""
+        project, runner, token, job = await self._make_runner_job(db_session)
+
+        # The job is finalized AND already carries its durable evidence.
+        original = {
+            "kind": "runner_artifact",
+            "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+            "file_count": 7,
+            "total_bytes": 999,
+            "stored": True,
+        }
+        job.status = terminal_status
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "runner_artifact": original,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(*a, **k):
+            raise AssertionError(
+                "store_runner_artifact must NOT run for a finalized job — "
+                "it would overwrite the durable GCS object"
+            )
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08OVERWRITE", 1, 42)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 409, resp.text
+
+        # The stamped evidence is untouched.
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == original
+
+    @pytest.mark.asyncio
+    async def test_first_upload_after_finalize_is_still_accepted(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A terminal job with NO artifact yet still accepts its FIRST upload.
+
+        This is the normal race, not an attack: the runner sends its terminal
+        /report FIRST and uploads the artifact afterwards (local_runner.py does it
+        in a `finally:` block), while the monitor finalizes the job as soon as it
+        sees runner_exec_status=succeeded. Rejecting this would silently destroy
+        the artifacts of every job whose upload lost that race — so the guard must
+        bite on OVERWRITE, not on "terminal".
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        job.status = ComputeJobStatus.SUCCEEDED  # finalized, no artifact stamped
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 3, 77)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"]["file_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_upload_to_running_job_can_still_be_replaced(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A NON-terminal job's artifact is still replaceable (retry after a blip).
+
+        The runner retries a dropped upload; the job is still RUNNING server-side,
+        so re-stamping must remain allowed. The guard is scoped to finalized jobs.
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "runner_artifact": {"kind": "runner_artifact", "file_count": 1},
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/x/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 5, 88)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"]["file_count"] == 5
+
 
 # ── Orchestrator routing helpers ─────────────────────────────────────────────
 

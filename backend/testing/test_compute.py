@@ -11,12 +11,14 @@ import base64
 import io
 import json
 import tarfile
+import tracemalloc
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 import os
 import re
 import shlex
+import shutil
 import signal
 import uuid
 
@@ -46,6 +48,7 @@ from app.compute_backends import (
     OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
 )
 from app.database import resolve_async_engine
+from testing.conftest import TestingSessionLocal, USE_POSTGRES
 from app.models import (
     Alert,
     AlertSeverity,
@@ -16249,9 +16252,25 @@ def _tar_bytes(entries: dict) -> bytes:
 
 
 def _fake_docker_save(stdout_bytes: bytes):
-    """Return a _run callable that emulates a successful `docker save`."""
+    """Return a _run callable that emulates a successful `docker save`.
+
+    The real command is now ``docker save -o <path> <ref>`` — the archive is
+    streamed to a FILE rather than piped back through the parent's memory (a
+    multi-GB CUDA image OOM'd the API process when it was buffered). The fake
+    therefore writes the archive to the ``-o`` destination.
+
+    It ALSO still returns the bytes on ``stdout``, which the streaming
+    implementation never reads. That is deliberate: it keeps this fake honest for
+    the memory test below, which asserts the scanner does not materialize the
+    archive even when a pipe-shaped payload is right there for the taking.
+    """
 
     def _run(cmd, **kw):
+        if "-o" in cmd:
+            out_path = cmd[cmd.index("-o") + 1]
+            with open(out_path, "wb") as fh:
+                fh.write(stdout_bytes)
+
         class P:
             returncode = 0
             stdout = stdout_bytes
@@ -16367,6 +16386,115 @@ def test_scan_image_layers_oci_unresolvable_blobs_fails_closed():
         _bci.scan_image_layers_for_credentials(
             "img:tag", _run=_fake_docker_save(bogus)
         )
+
+
+def test_scan_image_layers_streams_to_disk_never_buffers_the_archive():
+    """`docker save` must write to a FILE, not be drained into memory.
+
+    The credential layer-scan runs on real compute images — a CUDA base plus a
+    torch wheel is comfortably multi-GB. Buffering the `docker save` archive
+    (`capture_output=True` → `io.BytesIO(proc.stdout)` → per-layer `bytes`) held
+    the whole image in RAM two or three times over and OOM'd the API process that
+    a project MEMBER could trigger over HTTP.
+    """
+    seen_cmds = []
+
+    def _run(cmd, **kw):
+        seen_cmds.append(cmd)
+        out_path = cmd[cmd.index("-o") + 1]
+        with open(out_path, "wb") as fh:
+            fh.write(_classic_save_archive(b"clean\n"))
+
+        class P:
+            returncode = 0
+            stdout = b""  # nothing is piped back
+            stderr = b""
+
+        return P()
+
+    findings = _bci.scan_image_layers_for_credentials("img:tag", _run=_run)
+
+    assert findings == []
+    cmd = seen_cmds[0]
+    assert "-o" in cmd, f"docker save must stream to a file, got: {cmd}"
+    # The archive path is a real temp file the scanner owns, not a pipe.
+    assert cmd[cmd.index("-o") + 1].endswith(".tar")
+    assert cmd[-1] == "img:tag"
+
+
+def test_scan_image_layers_peak_memory_is_bounded_by_file_cap_not_image_size(tmp_path):
+    """Peak memory during the scan must NOT scale with the image size.
+
+    This is the OOM, as a measurement. The archive holds a 48 MiB blob (standing
+    in for the CUDA/torch payload that makes a real compute image multi-GB) plus a
+    small file carrying a leaked credential.
+
+    The fake `docker save` models the two transports HONESTLY, which is what makes
+    the assertion mean something:
+
+    * ``-o <path>`` (what the streaming scanner asks for) — the archive is copied
+      to the destination on disk, never through Python memory, and stdout is
+      empty.
+    * no ``-o`` (what a `capture_output=True` implementation asks for) — the
+      archive has to be pulled into a bytes object to be handed back on stdout,
+      exactly as a real pipe would. That allocation lands inside the measurement
+      window, so a buffering implementation is caught paying for it.
+
+    A streaming scan seeks past the oversized member without ever reading it and
+    stays near the 10 MiB per-file cap; a buffering one holds the image.
+    """
+    big_blob = b"\0" * (48 * 1024 * 1024)  # skipped: over the 10 MiB per-file cap
+    layer_tar = _tar_bytes({"opt/cuda/payload.bin": big_blob, "root/.creds": _LEAKED_CRED})
+    archive = _tar_bytes(
+        {
+            "0a1b2c/layer.tar": layer_tar,
+            "manifest.json": b'[{"Layers":["0a1b2c/layer.tar"]}]',
+        }
+    )
+    archive_size = len(archive)
+    assert archive_size > 48 * 1024 * 1024
+
+    # Stage the archive on disk, then drop every in-memory reference to it, so
+    # ONLY the scanner's own allocations land in the tracemalloc window.
+    src = tmp_path / "image-src.tar"
+    src.write_bytes(archive)
+    del big_blob, layer_tar, archive
+
+    def _run(cmd, **kw):
+        if "-o" in cmd:
+            # Streams to disk — no Python-level buffer of the archive.
+            shutil.copyfile(src, cmd[cmd.index("-o") + 1])
+            stdout = b""
+        else:
+            # A real pipe: the parent must materialize the whole archive.
+            stdout = src.read_bytes()
+
+        class P:
+            returncode = 0
+            stderr = b""
+
+        P.stdout = stdout
+        return P()
+
+    tracemalloc.start()
+    try:
+        findings = _bci.scan_image_layers_for_credentials("img:tag", _run=_run)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # The scan still WORKS: the small credential file inside the huge layer is found.
+    assert any("github_app_token" in f for f in findings), findings
+
+    # And it did not pay for the image's size in RAM. The ceiling is generous
+    # (well under half the archive) so this asserts the SHAPE — bounded, not
+    # proportional — rather than a brittle exact number.
+    ceiling = 20 * 1024 * 1024
+    assert peak < ceiling, (
+        f"layer-scan peaked at {peak / 1024 / 1024:.1f} MiB on a "
+        f"{archive_size / 1024 / 1024:.1f} MiB archive — it is buffering the "
+        "image instead of streaming it (this is the OOM)"
+    )
 
 
 def test_build_and_push_missing_dockerfile_raises(tmp_path):
@@ -16899,6 +17027,254 @@ async def test_record_project_compute_image_build_parses_digest(db_session):
 
 
 # ---------------------------------------------------------------------------
+# record_project_compute_image_build is a REAL upsert (ON CONFLICT DO UPDATE).
+#
+# It used to be a select-then-insert with no lock: two concurrent build triggers
+# for the same (project_id, dep_hash) BOTH missed the existence check, both
+# INSERTed, and the loser died on uq_projectcomputeimage_project_dep_hash — a
+# 500 out of the build endpoint.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="ON CONFLICT + a real unique-violation race need PostgreSQL",
+)
+async def test_record_project_compute_image_build_concurrent_same_dep_hash(db_session):
+    """Two CONCURRENT builds for the same (project_id, dep_hash) must not 500.
+
+    Both callers run in their own session, so neither can see the other's
+    uncommitted INSERT — exactly the interleaving that made the select-then-insert
+    version raise IntegrityError on the unique constraint.
+    """
+    from app import compute_backends as cb
+    from app.models import ProjectComputeImage
+
+    project = await _make_project(db_session)
+    project_id = project.id
+
+    async def _record(digest_char: str, tag: str):
+        async with TestingSessionLocal() as session:
+            row = await cb.record_project_compute_image_build(
+                session,
+                project_id,
+                registry_repo="ghcr.io/org/repo",
+                image_name="compute-proj",
+                result=_build_result(
+                    pinned_ref=f"ghcr.io/org/repo@sha256:{digest_char * 64}",
+                    tag=tag,
+                    dep_hash="raced-hash",
+                    built=True,
+                ),
+            )
+            await session.commit()
+            return row.id
+
+    # Concurrent, independent transactions — no IntegrityError may escape.
+    ids = await asyncio.gather(_record("e", "v1"), _record("f", "v2"))
+
+    # Exactly ONE row survives, and both callers converged on it.
+    rows = (
+        await db_session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.dep_hash == "raced-hash",
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1, f"concurrent upsert duplicated the row: {rows}"
+    assert ids[0] == ids[1] == rows[0].id
+
+
+# ---------------------------------------------------------------------------
+# resolve_digest_pinned_default_image matches on the image's FULL identity.
+#
+# Matching on the SHORT image name alone silently resolved a manifest ref to a
+# build record that does not describe it: a tag rollback (:v2 -> :v1) kept
+# running the rolled-back digest, and an external prebuilt image sharing the
+# trailing name hijacked this project's own build record.
+# ---------------------------------------------------------------------------
+async def _add_build_row(
+    db_session,
+    project_id,
+    *,
+    registry_repo,
+    image_name,
+    tag,
+    dep_hash,
+    digest,
+    updated_at,
+):
+    from app.models import ProjectComputeImage
+
+    row = ProjectComputeImage(
+        project_id=project_id,
+        image_name=image_name,
+        registry_repo=registry_repo,
+        dep_hash=dep_hash,
+        tag=tag,
+        pinned_ref=f"{registry_repo}/{image_name}@{digest}",
+        digest=digest,
+        built=True,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    await db_session.refresh(row)
+    # updated_at has an onupdate=; set it explicitly AFTER the insert so the
+    # "most recently built" ordering under test is deterministic.
+    row.updated_at = updated_at
+    db_session.add(row)
+    await db_session.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_tag_rollback_uses_the_rolled_back_build(db_session):
+    """Rolling the manifest back :v2 -> :v1 must resolve to the :v1 DIGEST.
+
+    Both builds share registry+image_name, so keying on image_name alone returned
+    the most-recently-updated row — the :v2 build the project had just rolled back
+    — behind a digest-pinned ref that looked authoritative.
+    """
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+    registry = "us-docker.pkg.dev/proj/compute-images"
+    v1_digest = "sha256:" + "1" * 64
+    v2_digest = "sha256:" + "2" * 64
+
+    await _add_build_row(
+        db_session,
+        project.id,
+        registry_repo=registry,
+        image_name="my-project",
+        tag="v1",
+        dep_hash="hash-v1",
+        digest=v1_digest,
+        updated_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    # The NEWER build — this is the one the buggy lookup returned.
+    await _add_build_row(
+        db_session,
+        project.id,
+        registry_repo=registry,
+        image_name="my-project",
+        tag="v2",
+        dep_hash="hash-v2",
+        digest=v2_digest,
+        updated_at=datetime(2026, 6, 1, 0, 0, 0),
+    )
+
+    resolved = await cb.resolve_digest_pinned_default_image(
+        db_session, project.id, f"{registry}/my-project:v1"
+    )
+
+    assert resolved == f"{registry}/my-project@{v1_digest}", (
+        "Rolling back to :v1 resolved to the :v2 digest — the project silently "
+        f"runs the image it rolled back. got={resolved!r}"
+    )
+    assert v2_digest not in (resolved or "")
+
+    # And :v2 still resolves to :v2 (no over-correction).
+    assert await cb.resolve_digest_pinned_default_image(
+        db_session, project.id, f"{registry}/my-project:v2"
+    ) == f"{registry}/my-project@{v2_digest}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_ignores_foreign_registry_with_same_name(db_session):
+    """An EXTERNAL image sharing the trailing name must not match a local build.
+
+    Switching to a prebuilt ghcr.io/vendor/my-project used to match this project's
+    own …/compute-images/my-project build record and run THAT digest. The foreign
+    ref must pass through untouched.
+    """
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+    registry = "us-docker.pkg.dev/proj/compute-images"
+    local_digest = "sha256:" + "9" * 64
+
+    await _add_build_row(
+        db_session,
+        project.id,
+        registry_repo=registry,
+        image_name="my-project",
+        tag="latest",
+        dep_hash="hash-local",
+        digest=local_digest,
+        updated_at=datetime(2026, 6, 1, 0, 0, 0),
+    )
+
+    foreign = "ghcr.io/vendor/my-project:latest"
+    resolved = await cb.resolve_digest_pinned_default_image(
+        db_session, project.id, foreign
+    )
+
+    assert resolved == foreign, (
+        "An external image sharing the trailing name resolved to THIS project's "
+        f"build digest. got={resolved!r}"
+    )
+    assert local_digest not in (resolved or "")
+
+
+@pytest.mark.asyncio
+async def test_resolve_digest_pin_floating_tag_still_pins_latest_build(db_session):
+    """A floating tag (:latest) still pins to the latest build for that image.
+
+    The build pipeline pushes content-hash tags, never `latest`, so no per-tag row
+    exists for a floating tag by construction — the latest build IS the right
+    answer, and this is the primary use case the feature exists for.
+    """
+    from app import compute_backends as cb
+
+    project = await _make_project(db_session)
+    registry = "us-docker.pkg.dev/proj/compute-images"
+    old_digest = "sha256:" + "a" * 64
+    new_digest = "sha256:" + "b" * 64
+
+    await _add_build_row(
+        db_session,
+        project.id,
+        registry_repo=registry,
+        image_name="my-project",
+        tag="deadbeefcafe0001",  # a dep-hash tag, as the pipeline pushes
+        dep_hash="deadbeefcafe0001",
+        digest=old_digest,
+        updated_at=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    await _add_build_row(
+        db_session,
+        project.id,
+        registry_repo=registry,
+        image_name="my-project",
+        tag="deadbeefcafe0002",
+        dep_hash="deadbeefcafe0002",
+        digest=new_digest,
+        updated_at=datetime(2026, 6, 1, 0, 0, 0),
+    )
+
+    resolved = await cb.resolve_digest_pinned_default_image(
+        db_session, project.id, f"{registry}/my-project:latest"
+    )
+    assert resolved == f"{registry}/my-project@{new_digest}"
+
+
+def test_split_image_ref_decomposes_registry_name_and_tag():
+    from app import compute_backends as cb
+
+    assert cb._split_image_ref("us-docker.pkg.dev/p/ci/my-project:v2") == (
+        "us-docker.pkg.dev/p/ci",
+        "my-project",
+        "v2",
+    )
+    # A registry :port must survive; only the FINAL segment carries the tag.
+    assert cb._split_image_ref("localhost:5000/img:v2") == ("localhost:5000", "img", "v2")
+    assert cb._split_image_ref("ghcr.io/org/base") == ("ghcr.io/org", "base", "")
+    assert cb._split_image_ref("bare-image") == ("", "bare-image", "")
+    assert cb._split_image_ref("") == ("", "", "")
+
+
+# ---------------------------------------------------------------------------
 # resolve_compute_image_registry_repo — pure env/config function.
 # ---------------------------------------------------------------------------
 
@@ -16944,14 +17320,22 @@ def test_resolve_compute_image_registry_repo_custom_region(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def _make_member_project(db_session, name="Build-Trigger-Test"):
+async def _make_build_trigger_project(db_session, name="Build-Trigger-Test", role="owner"):
+    """Project + membership for the compute-image build trigger.
+
+    The trigger is OWNER-grade: it runs `docker build`/`docker push` on the
+    ORCHESTRATOR HOST and pushes to the shared compute-image registry. It used to
+    accept any project MEMBER, which is the privilege half of the OOM finding —
+    a member could fan out unbounded multi-GB docker builds on the API process.
+    ``role`` is parameterised so the denial path is covered too.
+    """
     from app.models import Project, ProjectMember
 
     project = Project(name=name, user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="member"))
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role=role))
     await db_session.commit()
     return project
 
@@ -16971,7 +17355,7 @@ async def test_project_compute_image_build_trigger_persists_digest(
     from app.models import ProjectComputeImage
     from app.routers import admin_project_tools as pt
 
-    project = await _make_member_project(db_session)
+    project = await _make_build_trigger_project(db_session)
     digest = "sha256:" + "b" * 64
     pinned_ref = f"us-docker.pkg.dev/test-project/compute-images/compute-proj@{digest}"
 
@@ -17043,7 +17427,7 @@ async def test_project_compute_image_build_no_build_config_returns_422(
     from app.models import ProjectComputeImage
     from app.routers import admin_project_tools as pt
 
-    project = await _make_member_project(db_session, name="NoBuild-Test")
+    project = await _make_build_trigger_project(db_session, name="NoBuild-Test")
 
     # Manifest has image.name but no build section — resolve returns None.
     async def _fake_discover_no_build(proj):
@@ -17085,6 +17469,33 @@ async def test_project_compute_image_build_no_build_config_returns_422(
     ).scalars().all()
     assert rows == []
     assert build_called == []  # build was never invoked
+
+
+@pytest.mark.asyncio
+async def test_project_compute_image_build_trigger_denies_member(
+    client, db_session, monkeypatch
+):
+    """A project MEMBER cannot trigger the build — it is owner-grade.
+
+    The trigger shells out to `docker build`/`docker push` ON THE ORCHESTRATOR
+    HOST and publishes to the shared registry. Leaving that member-reachable let
+    any member fan out unbounded multi-GB builds against the API process.
+    """
+    from app import compute_backends as cb
+    from app.routers import admin_project_tools as pt
+
+    project = await _make_build_trigger_project(
+        db_session, name="Member-Denied", role="member"
+    )
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("build must not be reachable by a member")
+
+    monkeypatch.setattr(cb, "build_project_compute_image", _fail_if_called)
+    monkeypatch.setattr(pt, "_discover_manifest_tools", _fail_if_called)
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/compute-image/build")
+    assert resp.status_code == 403, resp.text
 
 
 # ---------------------------------------------------------------------------

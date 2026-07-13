@@ -3261,6 +3261,33 @@ def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
     return pinned_ref.rsplit("@", 1)[1] or None
 
 
+def _split_image_ref(ref: str) -> tuple[str, str, str]:
+    """Split an image reference into ``(registry_repo, image_name, tag)``.
+
+    ``us-docker.pkg.dev/proj/compute-images/my-project:v2``
+        -> ``("us-docker.pkg.dev/proj/compute-images", "my-project", "v2")``
+
+    The tag is split off the FINAL path segment only, so a registry host that
+    carries a ``:port`` (``localhost:5000/my-project:v2``) keeps its port and
+    still yields ``tag="v2"``. A ref with no registry prefix yields an empty
+    registry; a ref with no tag yields an empty tag. Any ``@digest`` suffix is
+    stripped first — callers handle already-pinned refs before this point, but
+    the parse stays total rather than depending on that.
+
+    Mirrors how :func:`build_project_compute_image` derives ``image_name`` and
+    how :func:`resolve_compute_image_registry_repo` derives the registry, so a
+    manifest ref decomposes into exactly the fields persisted on
+    :class:`ProjectComputeImage`.
+    """
+    if not ref:
+        return "", "", ""
+    base = ref.split("@", 1)[0]
+    head, sep, last = base.rpartition("/")
+    registry_repo = head if sep else ""
+    name, _, tag = last.partition(":")
+    return registry_repo, name, tag
+
+
 async def record_project_compute_image_build(
     session: Any,
     project_id: uuid.UUID,
@@ -3276,47 +3303,70 @@ async def record_project_compute_image_build(
     ``sha256:...`` digest is parsed out of ``result.pinned_ref`` (the substring
     after ``@``) and stored in ``digest`` — ``None`` when the ref is tag-pinned.
 
+    A REAL upsert — ``INSERT … ON CONFLICT (project_id, dep_hash) DO UPDATE``,
+    not a select-then-insert. Two concurrent build triggers for the same
+    ``(project_id, dep_hash)`` (the common case: the same dependency set built
+    from two clicks, or a click racing a CI trigger) both used to miss the
+    existence check and race to INSERT; the loser died on
+    ``uq_projectcomputeimage_project_dep_hash`` and surfaced as a 500. The
+    conflict is now resolved by the database, so the second writer updates the
+    row the first one inserted.
+
     Callers are responsible for committing the session.
     """
     from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
     pinned_ref = getattr(result, "pinned_ref", None) or ""
     tag = getattr(result, "tag", None) or ""
     dep_hash = getattr(result, "dep_hash", None) or ""
     built = bool(getattr(result, "built", False))
     digest = _parse_digest_from_pinned_ref(pinned_ref)
+    now = _utcnow()
 
-    existing = (
+    values = {
+        "id": uuid.uuid4(),
+        "project_id": project_id,
+        "registry_repo": registry_repo,
+        "image_name": image_name,
+        "dep_hash": dep_hash,
+        "tag": tag,
+        "pinned_ref": pinned_ref,
+        "digest": digest,
+        "built": built,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stmt = _pg_insert(ProjectComputeImage).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        # The unique constraint the concurrent INSERT used to die on.
+        index_elements=[
+            ProjectComputeImage.project_id,
+            ProjectComputeImage.dep_hash,
+        ],
+        set_={
+            "registry_repo": stmt.excluded.registry_repo,
+            "image_name": stmt.excluded.image_name,
+            "tag": stmt.excluded.tag,
+            "pinned_ref": stmt.excluded.pinned_ref,
+            "digest": stmt.excluded.digest,
+            "built": stmt.excluded.built,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    ).returning(ProjectComputeImage.id)
+
+    row_id = (await session.execute(stmt)).scalar_one()
+
+    # Re-read through the ORM so the caller gets a managed instance with the
+    # post-upsert values (the same contract the select-then-insert had).
+    row = (
         await session.execute(
-            select(ProjectComputeImage).where(
-                ProjectComputeImage.project_id == project_id,
-                ProjectComputeImage.dep_hash == dep_hash,
-            )
+            select(ProjectComputeImage)
+            .where(ProjectComputeImage.id == row_id)
+            .execution_options(populate_existing=True)
         )
-    ).scalar_one_or_none()
-
-    if existing is not None:
-        existing.registry_repo = registry_repo
-        existing.image_name = image_name
-        existing.pinned_ref = pinned_ref
-        existing.digest = digest
-        existing.tag = tag
-        existing.built = built
-        existing.updated_at = _utcnow()
-        session.add(existing)
-        return existing
-
-    row = ProjectComputeImage(
-        project_id=project_id,
-        registry_repo=registry_repo,
-        image_name=image_name,
-        dep_hash=dep_hash,
-        tag=tag,
-        pinned_ref=pinned_ref,
-        digest=digest,
-        built=built,
-    )
-    session.add(row)
+    ).scalar_one()
     return row
 
 
@@ -3356,6 +3406,34 @@ async def resolve_digest_pinned_default_image(
       ``pinned_ref``.
     * no such row -> the raw ``manifest_name`` unchanged (logs a debug note);
       this preserves today's behavior rather than introducing a new failure.
+
+    **Matching is on the image's FULL identity — registry AND name — and an
+    explicitly-tagged ref resolves to THAT tag's build.** A manifest ref
+    ``registry/repo/name:tag`` names one specific image; its trailing ``name``
+    does not. Keying the lookup on ``image_name`` alone (as this did) silently
+    resolved to the wrong digest in two ordinary situations:
+
+    * **Tag rollback.** A project pins ``:v2``, hits a regression, and rolls its
+      manifest back to ``:v1``. Both builds carry the same ``image_name``, so the
+      most-recently-updated row — the ``:v2`` build — still won, and the project
+      kept running the image it had just rolled back, behind a digest-pinned ref
+      that looked authoritative. An explicit tag now resolves to the build record
+      pushed under that tag.
+    * **A foreign image with the same trailing name.** Switching to an external
+      prebuilt ``ghcr.io/vendor/my-project:latest`` matched this project's own
+      ``…/compute-images/my-project`` build record and ran THAT digest. The
+      registry is now part of the key, so a foreign image never matches a local
+      build record; it fails open to the ref the manifest actually asked for.
+
+    Resolution order for a ``registry``/``name``-matched row set:
+
+    1. A row whose ``tag`` equals the ref's tag — an explicitly-pinned tag must
+       resolve to its own build, never to a newer one.
+    2. Otherwise the most recent build for that registry+name. A FLOATING tag
+       (``:latest``, or no tag at all) is exactly the mutable-tag case this
+       function exists to pin, and the pipeline pushes content-hash tags rather
+       than ``latest``, so no per-tag row exists for it by construction — the
+       latest build IS the right answer, and the pre-existing behavior.
     """
     if not manifest_name:
         return None
@@ -3363,27 +3441,48 @@ async def resolve_digest_pinned_default_image(
         # Already content-addressed; nothing to pin.
         return manifest_name
 
-    # Short image name within the registry repo, derived identically to the
-    # build pipeline (see build_project_compute_image) so it matches the
-    # persisted ProjectComputeImage.image_name.
-    image_name = manifest_name.rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+    # Decompose the manifest ref into the same coordinates the build pipeline
+    # persists on ProjectComputeImage (see build_project_compute_image /
+    # record_project_compute_image_build), so the lookup keys on the image's full
+    # identity rather than on its trailing name.
+    registry_repo, image_name, ref_tag = _split_image_ref(manifest_name)
 
     try:
         from sqlalchemy import select
 
-        row = (
-            await session.execute(
-                select(ProjectComputeImage)
-                .where(
-                    ProjectComputeImage.project_id == project_id,
-                    ProjectComputeImage.image_name == image_name,
-                    ProjectComputeImage.built.is_(True),
-                    ProjectComputeImage.digest.is_not(None),
+        conditions = [
+            ProjectComputeImage.project_id == project_id,
+            ProjectComputeImage.image_name == image_name,
+            ProjectComputeImage.built.is_(True),
+            ProjectComputeImage.digest.is_not(None),
+        ]
+        # A bare ``name`` with no registry prefix cannot be attributed to a
+        # registry, so only the name is pinned down in that (unusual) case.
+        if registry_repo:
+            conditions.append(ProjectComputeImage.registry_repo == registry_repo)
+
+        row = None
+        if ref_tag:
+            # (1) Explicit tag → the build pushed under exactly that tag.
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions, ProjectComputeImage.tag == ref_tag)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
                 )
-                .order_by(ProjectComputeImage.updated_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
+
+        if row is None:
+            # (2) Floating/unknown tag → the latest build for this exact image.
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
     except Exception:  # noqa: BLE001 — fail-open to the raw tag on any DB error.
         logger.debug(
             "[COMPUTE] digest-pin lookup failed for project=%s image=%s; "

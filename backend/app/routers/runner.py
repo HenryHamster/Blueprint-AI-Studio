@@ -1980,6 +1980,39 @@ async def upload_compute_job_artifact(
     if job is None:
         raise HTTPException(status_code=404, detail="compute job not found")
 
+    # TERMINAL-STATUS GUARD — the promise _COMPUTE_JOB_TERMINAL_STATUSES makes at
+    # the top of this module ("runner reports/uploads must no longer mutate the
+    # job's evidence") was enforced on /report but NOT here, so a pinned runner
+    # could POST to a SUCCEEDED/FAILED job and silently REPLACE its durable
+    # evidence: store_runner_artifact writes to the fixed per-job object
+    # `compute-jobs/<job_id>/artifacts/bundle.tar.gz`, so a late upload
+    # overwrites the bundle a verdict may already have been drawn from.
+    #
+    # The guard is scoped precisely to that overwrite, and NOT to "any upload to
+    # a terminal job", because a terminal-but-unstamped job is the NORMAL race:
+    # the runner sends its terminal /report FIRST and uploads the artifact
+    # afterwards (local_runner.py finalizes in a `finally:` block), while the
+    # monitor finalizes the job the moment it sees runner_exec_status=succeeded.
+    # A first artifact landing just after that flip is the common case, adds
+    # evidence rather than mutating it, and must still be accepted — rejecting it
+    # would silently destroy the artifacts of every job whose upload lost that
+    # race. What must never happen is a SECOND upload replacing evidence that is
+    # already stamped on a finalized job.
+    existing_artifact = (job.polling_metadata or {}).get("runner_artifact")
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES and existing_artifact is not None:
+        logger.warning(
+            "[RUNNERS] Rejected artifact overwrite for FINALIZED compute job %s "
+            "(status=%s) from runner %s — durable evidence is immutable once the "
+            "job is terminal",
+            job_id,
+            job.status,
+            runner.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="compute job is finalized — its artifact evidence is immutable",
+        )
+
     # store_runner_artifact is implemented in parallel in app.compute_backends
     # (pinned contract). Imported locally — same pattern as the repo-token import
     # in /next-compute-job — so module import / app boot never depends on its
@@ -2005,6 +2038,30 @@ async def upload_compute_job_artifact(
         raise HTTPException(status_code=404, detail="compute job not found")
 
     meta = dict(job.polling_metadata or {})
+
+    # Re-check the guard under the lock. The plain read above happened BEFORE a
+    # storage upload that can take seconds; in that window the job can finalize
+    # AND a concurrent uploader can stamp its own artifact. Re-pointing a
+    # finalized job's evidence at ours here would be exactly the mutation the
+    # pre-check refuses, just through a narrower door — so refuse it too rather
+    # than clobbering the stamp a verdict may already have read.
+    if (
+        job.status in _COMPUTE_JOB_TERMINAL_STATUSES
+        and meta.get("runner_artifact") is not None
+        and existing_artifact is None
+    ):
+        logger.warning(
+            "[RUNNERS] Compute job %s finalized and was stamped by a concurrent "
+            "uploader while runner %s's artifact was in flight — keeping the "
+            "stamped evidence, discarding the late pointer",
+            job_id,
+            runner.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="compute job is finalized — its artifact evidence is immutable",
+        )
+
     meta["runner_artifact"] = artifact_info
     job.polling_metadata = meta
     job.updated_at = _utcnow()

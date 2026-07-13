@@ -1691,6 +1691,85 @@ _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
 _last_compute_image_gc_guard_sweep: datetime | None = None
 
 
+def _split_pinned_ref(ref: str) -> tuple[str, str] | None:
+    """Split a digest-pinned image ref into ``(full_repo, digest)``.
+
+    ``us-docker.pkg.dev/proj/compute-images/my-project:v2@sha256:abc``
+        -> ``("us-docker.pkg.dev/proj/compute-images/my-project", "sha256:abc")``
+
+    The digest is everything after the last ``@``; the repo is what precedes it,
+    minus an optional ``:tag`` on the FINAL path segment (a registry host may
+    legitimately carry a ``:port``, which must survive). A tag-only or malformed
+    ref yields ``None`` — it has no stable digest to protect.
+    """
+    if not ref or "@" not in ref:
+        return None
+    base, _, digest = ref.rpartition("@")
+    if not base or not digest.startswith("sha256:"):
+        return None
+    head, sep, last = base.rpartition("/")
+    if ":" in last:
+        last = last.split(":", 1)[0]
+    full_repo = f"{head}{sep}{last}" if sep else last
+    if not full_repo or not last:
+        return None
+    return full_repo, digest
+
+
+async def _referenced_compute_image_repo_digests(
+    session, *, since: datetime
+) -> set[tuple[str, str]]:
+    """``(full_repo, digest)`` pairs a live/recent compute job still depends on.
+
+    The digest-only sibling of this query lives in
+    ``compute_jobs.referenced_compute_image_digests`` and answers "which digests
+    matter". That is enough to decide what NOT to prune, but not enough to
+    PROTECT: a registry protection tag can only be applied to the repo that
+    actually holds the digest, and a job's ``container_image`` is the only place
+    that repo is recorded when the image has no ``ProjectComputeImage`` row (the
+    documented CI build path, ``scripts/build_compute_image.py``, writes none).
+
+    Reuses the same live/recent status predicate as the digest query — the status
+    constants are imported from ``compute_jobs`` so the two cannot drift — and
+    differs only in projecting the FULL ref instead of just its digest.
+    """
+    from sqlalchemy import and_, or_
+
+    from app.compute_jobs import (
+        _COMPUTE_JOB_ACTIVE_STATUSES,
+        _COMPUTE_JOB_TERMINAL_STATUSES,
+    )
+    from app.models import ComputeJob
+
+    conditions = [ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES)]
+    if since is not None:
+        conditions.append(
+            and_(
+                ComputeJob.status.in_(list(_COMPUTE_JOB_TERMINAL_STATUSES)),
+                ComputeJob.completed_at.is_not(None),
+                ComputeJob.completed_at >= since,
+            )
+        )
+
+    rows = (
+        await session.execute(
+            select(ComputeJob.polling_metadata).where(or_(*conditions))
+        )
+    ).scalars().all()
+
+    pairs: set[tuple[str, str]] = set()
+    for meta in rows:
+        if not isinstance(meta, dict):
+            continue
+        ref = meta.get("container_image")
+        if not isinstance(ref, str):
+            continue
+        parsed = _split_pinned_ref(ref)
+        if parsed is not None:
+            pairs.add(parsed)
+    return pairs
+
+
 async def sweep_protect_referenced_compute_image_digests(
     session,
     now=None,
@@ -1768,18 +1847,45 @@ async def sweep_protect_referenced_compute_image_digests(
 
     protected_tags = {protection_tag_for_digest(d) for d in referenced}
 
+    # (repo, digest) pairs to stamp. A digest can only be tagged in the repo that
+    # actually holds it, so protection needs the REPO, not just the digest.
+    #
+    # Two independent sources — and the second one is why this sweep used to lie:
+    #
+    #   * ProjectComputeImage rows — the repo comes from the row's own
+    #     registry_repo/image_name columns.
+    #   * LIVE/RECENT COMPUTE JOBS — the repo is parsed out of the job's
+    #     container_image ref. Protection used to be applied by iterating
+    #     ProjectComputeImage rows ONLY, so a digest referenced by a running job
+    #     but with NO ProjectComputeImage row (e.g. an image baked through the
+    #     documented CI path, scripts/build_compute_image.py, which writes no DB
+    #     row) was collected into `referenced`, counted as protected when pruning
+    #     — and then never actually stamped. It was GC-able out from under the
+    #     very job that was still pulling it, which is precisely the failure this
+    #     sweep's docstring promises to prevent.
+    targets: set[tuple[str, str]] = set()
+
+    for img in images:
+        if img.digest and img.digest in referenced:
+            targets.add((f"{img.registry_repo}/{img.image_name}", img.digest))
+
+    job_refs = await _referenced_compute_image_repo_digests(session, since=cutoff)
+    for full_repo, digest in job_refs:
+        if digest in referenced:
+            targets.add((full_repo, digest))
+
     applied = 0
     pruned = 0
-    # Group images by their full registry repo so pruning lists each repo once.
-    repos: set[str] = set()
-    for img in images:
-        full_repo = f"{img.registry_repo}/{img.image_name}"
-        repos.add(full_repo)
-        if img.digest and img.digest in referenced:
-            # Run blocking subprocess call off the event-loop thread so the
-            # sweep cannot stall API responsiveness or heartbeat processing.
-            if await asyncio.to_thread(apply_tag, full_repo, img.digest):
-                applied += 1
+    # Every repo we know about gets its stale protection tags pruned — including
+    # repos we only learned about from a job's container_image.
+    repos: set[str] = {f"{img.registry_repo}/{img.image_name}" for img in images}
+    repos.update(repo for repo, _digest in job_refs)
+
+    for full_repo, digest in sorted(targets):
+        # Run blocking subprocess call off the event-loop thread so the
+        # sweep cannot stall API responsiveness or heartbeat processing.
+        if await asyncio.to_thread(apply_tag, full_repo, digest):
+            applied += 1
 
     for full_repo in repos:
         try:

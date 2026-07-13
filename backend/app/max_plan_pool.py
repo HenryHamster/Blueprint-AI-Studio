@@ -15,10 +15,11 @@ import random
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Set
 
 from app.database import AsyncSessionLocal
 from app.field_encryption import decrypt_field
+from app.max_plan_project_state import reconcile_project_state
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
 from app.providers.registry import get_provider
@@ -1006,11 +1007,18 @@ async def load_max_plan_pool():
     """Load Max plan accounts from database into per-user pools on startup.
     Reconciles active_tasks from DB by counting tasks currently PROVISIONING/IN_PROGRESS."""
     from sqlmodel import select as sql_select
-    from app.models import MaxPlanAccount, Task, TaskStatus
+    from app.models import MaxPlanAccount, Project, Task, TaskStatus
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(sql_select(MaxPlanAccount))
         accounts = result.scalars().all()
+
+        # Projects that still exist — lets the prune evict a DELETED project's
+        # entry at once instead of waiting a daily window to zero its counters.
+        live_project_ids: Set[str] = {
+            str(p)
+            for p in (await session.execute(sql_select(Project.id))).scalars().all()
+        }
 
         # Count actually active tasks per account to reconcile after restarts
         active_tasks = (
@@ -1073,27 +1081,16 @@ async def load_max_plan_pool():
                 and auth_mode == LLMAuthMode.OAUTH
                 else None
             )
-            # Build reconciled per-project state from DB-persisted state + active task reconciliation.
-            # Mirrors the project_state JSONB column shape:
-            #   {project_id: {active_tasks: int, daily_task_count: int}}.
-            reconciled_project_state: Dict[str, Dict[str, int]] = {}
-            db_project_state = getattr(acct, "project_state", None) or {}
-            for pid, pstate in db_project_state.items():
-                if isinstance(pstate, dict):
-                    # Copy persisted per-project state, but zero out active_tasks:
-                    # the DB tasks table is the single source of truth for the
-                    # live active count at startup. A project whose persisted
-                    # active_tasks is a stale nonzero value but which has ZERO
-                    # currently-active tasks would otherwise keep the stale count
-                    # forever (no override below), permanently starving that
-                    # (account, project) pair once per-project concurrency caps
-                    # are configured. Other keys (daily_task_count, ...) survive.
-                    copied = dict(pstate)
-                    copied["active_tasks"] = 0
-                    reconciled_project_state[pid] = copied
-            # Override active_tasks with reconciled counts from current DB (tasks table).
-            for pid, count in active_per_account_project.get(acct_id, {}).items():
-                reconciled_project_state.setdefault(pid, {})["active_tasks"] = count
+            # Per-project state: persisted JSONB reconciled against the live task
+            # counts, then BOUNDED (see app/max_plan_project_state.py — without
+            # the prune, one entry per project ever dispatched on this account
+            # survives forever, recopied on every rebuild and re-persisted on
+            # every cap flush).
+            reconciled_project_state = reconcile_project_state(
+                getattr(acct, "project_state", None),
+                active_per_account_project.get(acct_id, {}),
+                live_project_ids=live_project_ids,
+            )
             entry = {
                 "id": acct_id,
                 "user_id": acct.user_id,
@@ -1267,6 +1264,9 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
             for proj_entry in pstate.values():
                 if isinstance(proj_entry, dict) and "daily_task_count" in proj_entry:
                     proj_entry["daily_task_count"] = 0
+        # Zeroed entries are COLLECTED on the next ~300s pool rebuild (which is
+        # the growth vector: it copies the map forward and re-persists it), not
+        # here on the hot dispatch path. See max_plan_project_state.
         return True
     return False
 

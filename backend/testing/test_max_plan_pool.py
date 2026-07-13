@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.time_utils import _utcnow
+from app.max_plan_project_state import prune_project_state, reconcile_project_state
 from app.providers.base import UsageSnapshot
 from app.max_plan_pool import (
     _CREDENTIAL_SWEEP_INTERVAL_SECONDS,
@@ -389,6 +390,113 @@ class TestDailyResetIfElapsed:
         )
         assert _daily_reset_if_elapsed(acct, now) is True
         assert acct["daily_task_count"] == 0
+
+
+# ── project_state bounding (app/max_plan_project_state.py) ──────────────────
+#
+# project_state gained one entry per DISTINCT PROJECT ever dispatched on an
+# account and never dropped one — copied forward on every ~300s pool rebuild and
+# re-persisted to the project_state JSONB column on every cap flush. Unbounded.
+
+
+class TestReconcileProjectState:
+    """The pool-rebuild path: copy persisted state, override live counts, bound."""
+
+    def test_stale_active_tasks_are_zeroed_and_overridden_from_live_counts(self):
+        """Pre-existing contract: the tasks table is the SSOT for active_tasks."""
+        reconciled = reconcile_project_state(
+            {
+                "p1": {"active_tasks": 99, "daily_task_count": 4},  # stale 99
+                "p2": {"active_tasks": 7, "daily_task_count": 2},
+            },
+            {"p1": 3},  # p1 really has 3 active; p2 has none
+        )
+        assert reconciled["p1"] == {"active_tasks": 3, "daily_task_count": 4}
+        # p2's stale active count is zeroed, and its daily count survives.
+        assert reconciled["p2"] == {"active_tasks": 0, "daily_task_count": 2}
+
+    def test_a_project_with_live_tasks_is_never_pruned(self):
+        """The prune runs AFTER the override, so live projects always survive."""
+        reconciled = reconcile_project_state(
+            {},  # nothing persisted at all
+            {"running-now": 2},
+        )
+        assert reconciled == {"running-now": {"active_tasks": 2}}
+
+    def test_idle_and_deleted_project_entries_are_collected(self):
+        """The unbounded-growth case: entries with nothing left to say are dropped."""
+        reconciled = reconcile_project_state(
+            {
+                "idle": {"active_tasks": 5, "daily_task_count": 0},  # stale, gone quiet
+                "deleted": {"active_tasks": 0, "daily_task_count": 3},
+                "busy": {"active_tasks": 0, "daily_task_count": 1},
+            },
+            {},  # no live tasks anywhere
+            live_project_ids={"idle", "busy"},
+        )
+        # "idle": active zeroed by reconciliation + no daily count => no information.
+        # "deleted": project no longer exists => evicted despite a daily count.
+        assert set(reconciled) == {"busy"}
+
+
+class TestPruneProjectState:
+    def test_zero_counter_entries_are_dropped(self):
+        """An all-zero entry is indistinguishable from an absent one."""
+        pruned = prune_project_state(
+            {
+                "idle": {"active_tasks": 0, "daily_task_count": 0},
+                "never-ran": {},
+            }
+        )
+        assert pruned == {}
+
+    def test_live_and_recently_active_projects_are_kept(self):
+        """Behaviour-preserving for anything carrying real state."""
+        state = {
+            "running": {"active_tasks": 2, "daily_task_count": 0},
+            "dispatched-today": {"active_tasks": 0, "daily_task_count": 7},
+            "both": {"active_tasks": 1, "daily_task_count": 3},
+            "idle": {"active_tasks": 0, "daily_task_count": 0},
+        }
+        pruned = prune_project_state(state)
+        assert set(pruned) == {"running", "dispatched-today", "both"}
+        # Kept entries are untouched, counters and all.
+        assert pruned["both"] == {"active_tasks": 1, "daily_task_count": 3}
+
+    def test_deleted_project_is_evicted_even_with_a_daily_count(self):
+        """A project that no longer exists is dropped without waiting a day."""
+        state = {
+            "alive": {"active_tasks": 0, "daily_task_count": 4},
+            "deleted": {"active_tasks": 0, "daily_task_count": 4},
+        }
+        pruned = prune_project_state(state, live_project_ids={"alive"})
+        assert set(pruned) == {"alive"}
+
+    def test_deleted_project_with_live_tasks_is_kept(self):
+        """Never evict an entry a release path still has to decrement."""
+        state = {"racing": {"active_tasks": 1, "daily_task_count": 0}}
+        pruned = prune_project_state(state, live_project_ids=set())
+        assert set(pruned) == {"racing"}
+
+    def test_malformed_entries_and_none_are_tolerated(self):
+        assert prune_project_state(None) == {}
+        assert prune_project_state({"bogus": "not-a-dict"}) == {}
+
+    def test_prune_is_idempotent_and_bounds_growth(self):
+        """The steady state: N projects run once, go idle, and fall out.
+
+        This is the unbounded-growth scenario from the finding — a long-lived
+        account that has touched many projects over time.
+        """
+        state = {
+            f"proj-{i}": {"active_tasks": 0, "daily_task_count": 0} for i in range(500)
+        }
+        state["still-running"] = {"active_tasks": 1, "daily_task_count": 1}
+
+        once = prune_project_state(state)
+        assert set(once) == {"still-running"}
+        # Idempotent: pruning the pruned dict changes nothing.
+        assert prune_project_state(once) == once
 
 
 # ── _account_at_cap ─────────────────────────────────────────────────────────

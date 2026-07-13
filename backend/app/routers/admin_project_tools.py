@@ -27,9 +27,11 @@ dependency — it validates a short-lived capability JWT from the query string
 so opaque-origin (``null``) iframes can load tool assets without cookies.
 """
 
+import asyncio
 import json as _json
 import logging
 import mimetypes
+import os
 import re
 import time as _time
 import uuid
@@ -1202,6 +1204,41 @@ async def serve_tool_asset(
 
 
 # ── Compute-image build trigger endpoint ─────────────────────────────────────
+#
+# A compute-image build is a `docker build` + `docker push` of a REAL project
+# image — a CUDA base plus a torch wheel is comfortably multi-GB and can run for
+# the better part of an hour. It executes as a subprocess ON THE ORCHESTRATOR
+# HOST, so an unbounded fan-out of these (one per member per click) is a
+# self-inflicted DoS on the whole API process, not just on the caller's request.
+#
+# Two bounds, mirroring the semaphore pattern compute.py already uses to cap
+# concurrent GCP provisions (`_gcp_provision_semaphore`):
+#
+#   1. CONCURRENCY — at most `_MAX_CONCURRENT_IMAGE_BUILDS` builds in flight
+#      process-wide. The slot is taken NON-BLOCKING: a request that would have
+#      to queue is rejected with 429 + Retry-After instead of parking an API
+#      worker (and its DB connection) behind an hour-long docker build.
+#   2. WALL CLOCK — a single build can never pin a worker indefinitely. The
+#      inner subprocess timeouts (3600s build / 1800s push) can stack, so an
+#      outer deadline bounds the whole pipeline and returns 504.
+#
+# Note the layer-scan inside the pipeline no longer buffers the `docker save`
+# archive in memory (see compute_image_build.scan_image_layers_for_credentials);
+# that was the OOM. These bounds cap the remaining blast radius: CPU, disk, and
+# API workers.
+_MAX_CONCURRENT_IMAGE_BUILDS = max(
+    1, int(os.getenv("MAX_CONCURRENT_COMPUTE_IMAGE_BUILDS", "1"))
+)
+_compute_image_build_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_IMAGE_BUILDS)
+
+# Outer deadline for the whole clone → hash → scan → build → push pipeline.
+_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS = int(
+    os.getenv("COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS", "5400")  # 90 min
+)
+
+# Advertised to a rejected caller so it retries on a sane cadence rather than
+# hot-looping against a saturated builder.
+_COMPUTE_IMAGE_BUILD_RETRY_AFTER_SECONDS = 120
 
 
 @router.post("/projects/{project_id}/compute-image/build")
@@ -1220,10 +1257,21 @@ async def trigger_project_compute_image_build(
     Returns the persisted row fields: ``pinned_ref``, ``digest``, ``dep_hash``,
     ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
     RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
-    Requires member role on the project.
+
+    **Requires OWNER role.** A build runs docker on the orchestrator host and
+    pushes to the shared compute-image registry — a privileged, expensive,
+    host-affecting operation, not the member-grade read/save that the rest of
+    this router exposes. It is gated with the same role the other
+    state-changing tool endpoints (register/seed/delete) already require.
+
+    Concurrency-bounded: returns **429** (with ``Retry-After``) when a build is
+    already in flight, and **504** when the pipeline exceeds its outer deadline.
+    A ``dry_run`` request performs no docker work but still takes a slot — it
+    clones the repo and hashes the deps, which is the cheap part of the same
+    pipeline.
     """
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "owner"
     )
 
     manifest = await _discover_manifest_tools(project)
@@ -1240,15 +1288,62 @@ async def trigger_project_compute_image_build(
     registry_repo = _cb.resolve_compute_image_registry_repo()
     image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
 
-    try:
-        result = await _cb.build_project_compute_image(
-            project,
-            registry_repo=registry_repo,
-            build_config=build_config,
-            dry_run=dry_run,
+    # NON-BLOCKING slot acquisition: shed load rather than queue behind a build.
+    if _compute_image_build_semaphore.locked():
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "a compute-image build is already running on the orchestrator "
+                "(concurrency limit "
+                f"{_MAX_CONCURRENT_IMAGE_BUILDS}) — retry shortly"
+            ),
+            headers={"Retry-After": str(_COMPUTE_IMAGE_BUILD_RETRY_AFTER_SECONDS)},
         )
+
+    try:
+        await asyncio.wait_for(
+            _compute_image_build_semaphore.acquire(),
+            timeout=1.0,
+        )
+    except asyncio.TimeoutError:
+        # Lost the race between the `.locked()` check and acquire — same answer.
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "a compute-image build is already running on the orchestrator "
+                "(concurrency limit "
+                f"{_MAX_CONCURRENT_IMAGE_BUILDS}) — retry shortly"
+            ),
+            headers={"Retry-After": str(_COMPUTE_IMAGE_BUILD_RETRY_AFTER_SECONDS)},
+        ) from None
+
+    try:
+        result = await asyncio.wait_for(
+            _cb.build_project_compute_image(
+                project,
+                registry_repo=registry_repo,
+                build_config=build_config,
+                dry_run=dry_run,
+            ),
+            timeout=_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.exception(
+            "[COMPUTE-IMAGE] build for project=%s exceeded %ss deadline",
+            project_id,
+            _COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "compute-image build exceeded the "
+                f"{_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS}s deadline"
+            ),
+        ) from None
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        _compute_image_build_semaphore.release()
 
     row = await _cb.record_project_compute_image_build(
         session,
