@@ -36,8 +36,9 @@ def test_evidence_status_literal_members():
 
 
 def test_proof_kind_is_union_of_existing_kinds():
-    # The union of every proof kind already in use across the self-model — no
-    # new kinds minted here.
+    # The union of every proof kind in use across the self-model.
+    # ``named_test_present`` is the structural-only tier: a convention-named test
+    # file exists at HEAD and imports the backing module, but was never executed.
     assert set(get_args(ProofKind)) == {
         "named_test",
         "downstream_artifact",
@@ -47,19 +48,25 @@ def test_proof_kind_is_union_of_existing_kinds():
         "operator_attestation",
         "trial_adoption",
         "backing_path",
+        "named_test_present",
     }
 
 
 def test_path_backed_kinds_are_file_pathish():
-    assert set(PATH_BACKED_KINDS) == {"named_test", "backing_path"}
+    assert set(PATH_BACKED_KINDS) == {
+        "named_test",
+        "backing_path",
+        "named_test_present",
+    }
     # Every path-backed kind is a real ProofKind.
     assert set(get_args(ProofKind)) >= PATH_BACKED_KINDS
 
 
 def test_backing_only_kinds_is_backing_path():
-    # Only structural-only (file-existence) kinds belong here; a backing_path
-    # proof alone is not machine-verified corroboration.
-    assert set(BACKING_ONLY_KINDS) == {"backing_path"}
+    # Only structural-only (file-existence) kinds belong here; neither a
+    # backing_path proof nor a never-executed named_test_present proof is
+    # machine-verified corroboration.
+    assert set(BACKING_ONLY_KINDS) == {"backing_path", "named_test_present"}
     # Every backing-only kind is a real ProofKind.
     assert set(get_args(ProofKind)) >= BACKING_ONLY_KINDS
 
@@ -176,6 +183,37 @@ def test_tiered_mixed_backing_and_named_test_returns_proven():
 def test_tiered_named_test_only_returns_proven():
     # A lone machine-verified named_test is proven, exactly like the plain path.
     refs = [{"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True}]
+    assert classify_evidence_tiered(refs) == "proven"
+
+
+def test_tiered_named_test_present_only_returns_path_proven():
+    # A ``named_test_present`` proof — a convention test file exists at HEAD and
+    # imports the module, but was NEVER executed — is structural-only and must
+    # NOT be laundered into the executed ``proven`` tier. Both classifiers demote
+    # it to ``path_proven`` so it cannot clear the enforce gate.
+    refs = [
+        {"kind": "named_test_present", "ref": "test_foo.py", "proven": True}
+    ]
+    assert classify_evidence_tiered(refs) == "path_proven"
+    assert classify_evidence(refs) == "path_proven"
+
+
+def test_tiered_named_test_present_with_backing_path_returns_path_proven():
+    # Two structural-only kinds together are still structural-only → path_proven.
+    refs = [
+        {"kind": "named_test_present", "ref": "test_foo.py", "proven": True},
+        {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": True},
+    ]
+    assert classify_evidence_tiered(refs) == "path_proven"
+
+
+def test_tiered_named_test_present_plus_executed_named_test_returns_proven():
+    # A never-executed named_test_present corroborated by an executed named_test
+    # reads proven — the mixed case keeps the machine-verified floor.
+    refs = [
+        {"kind": "named_test_present", "ref": "test_foo.py", "proven": True},
+        {"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True},
+    ]
     assert classify_evidence_tiered(refs) == "proven"
 
 
@@ -331,6 +369,84 @@ def test_none_claim_never_contradicts():
 
 def test_claim_status_is_case_insensitive():
     assert claim_contradicts_evidence("CLOSED", "UNPROVEN") is True
+
+
+# --- Freshness / expiry (opt-in) ---------------------------------------------
+
+
+def _fresh_now():
+    from datetime import datetime
+
+    return datetime(2026, 7, 12, 0, 0, 0)
+
+
+def test_expired_proven_ref_demotes_to_partial():
+    """A proven ref older than PROOF_FRESHNESS_TTL drops out when now is supplied."""
+    from datetime import timedelta
+
+    from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+    now = _fresh_now()
+    stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+    ref = {"kind": "named_test", "ref": "t", "proven": True, "recorded_at": stale}
+    # Both classifiers agree the stale-only set is no longer proven.
+    assert classify_evidence([ref], now=now) == "partial"
+    assert classify_evidence_tiered([ref], now=now) == "partial"
+
+
+def test_fresh_proven_ref_still_proven():
+    from datetime import timedelta
+
+    now = _fresh_now()
+    fresh = (now - timedelta(days=1)).isoformat()
+    ref = {"kind": "named_test", "ref": "t", "proven": True, "recorded_at": fresh}
+    assert classify_evidence([ref], now=now) == "proven"
+    assert classify_evidence_tiered([ref], now=now) == "proven"
+
+
+def test_freshness_boundary_z_suffix_parsed():
+    """A 'Z'-suffixed recorded_at is parsed and compared correctly."""
+    from datetime import timedelta
+
+    from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+    now = _fresh_now()
+    stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat() + "Z"
+    ref = {"kind": "named_test", "ref": "t", "proven": True, "recorded_at": stale}
+    assert classify_evidence_tiered([ref], now=now) == "partial"
+
+
+def test_now_none_never_expires():
+    """Default (now=None) evaluates no freshness — ancient proofs stay proven."""
+    ref = {
+        "kind": "named_test",
+        "ref": "t",
+        "proven": True,
+        "recorded_at": "2000-01-01T00:00:00",
+    }
+    assert classify_evidence(ref if isinstance(ref, list) else [ref]) == "proven"
+    assert classify_evidence_tiered([ref]) == "proven"
+
+
+def test_malformed_recorded_at_never_expires():
+    now = _fresh_now()
+    bad = {"kind": "named_test", "ref": "t", "proven": True, "recorded_at": "xx"}
+    missing = {"kind": "named_test", "ref": "t", "proven": True}
+    assert classify_evidence_tiered([bad], now=now) == "proven"
+    assert classify_evidence_tiered([missing], now=now) == "proven"
+
+
+def test_expired_backing_path_only_falls_to_partial():
+    """An expired backing_path-only set collapses to partial (no proven left)."""
+    from datetime import timedelta
+
+    from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+    now = _fresh_now()
+    stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+    ref = {"kind": "backing_path", "ref": "f.py", "proven": True, "recorded_at": stale}
+    # Fresh would be path_proven; expired drops the only proven ref → partial.
+    assert classify_evidence_tiered([ref], now=now) == "partial"
 
 
 # --- Tier total-order (evidence_status_rank / EVIDENCE_STATUS_RANK) -----------

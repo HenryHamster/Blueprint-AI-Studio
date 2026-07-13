@@ -51,6 +51,13 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _PROOF_KIND_NAMED_TEST = "named_test"
+#: Structural-only tier minted by the earn loop / fleet sweep from static
+#: discovery (a convention-named test file exists at HEAD and imports the backing
+#: module) WITHOUT ever executing the test. ``classify_evidence_tiered`` grades
+#: this ``path_proven`` — NOT ``proven`` — so it never clears the enforce gate.
+#: The genuine ``named_test`` tier is reserved for :func:`record_capability_proof`,
+#: which stamps it only from a real green merge-test acceptance verdict.
+_PROOF_KIND_NAMED_TEST_PRESENT = "named_test_present"
 _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
 _PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
 _PROOF_KIND_BACKING_PATH = "backing_path"
@@ -168,7 +175,7 @@ def _append_evidence_refs_to_capabilities(
 
 
 def enrich_problem_model_capability_proofs(
-    problem_model: Any, proof_records: Any
+    problem_model: Any, proof_records: Any, now: Any = None
 ) -> Any:
     """Return a shallow-copied problem_model with capability proof evidence.
 
@@ -185,6 +192,14 @@ def enrich_problem_model_capability_proofs(
        are backing_path, ``"unproven"`` otherwise.
 
     Missing / empty / malformed records fail open to claimed-only.
+
+    **Freshness (opt-in).** When ``now`` is supplied it is threaded into the
+    tiered classifier so a ``proven=True`` ref (or a proof-record, whose
+    ``proved_at`` is carried through as the synthetic ref's ``recorded_at``) older
+    than :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` demotes below
+    ``proven`` — keeping the strategist-facing badge honest and consistent with
+    the enforce gate. ``now`` defaults to ``None`` (no freshness evaluation) so
+    this display path stays deterministic for callers that do not opt in.
     """
     if not isinstance(problem_model, dict):
         return problem_model
@@ -211,15 +226,22 @@ def enrich_problem_model_capability_proofs(
         # Empty list means no refs captured yet — fall through to proof_records
         # rather than treating as affirmatively cleared.
         if isinstance(evidence_refs, list) and evidence_refs:
-            entry2["proof_status"] = classify_evidence_tiered(evidence_refs)
+            entry2["proof_status"] = classify_evidence_tiered(evidence_refs, now=now)
         elif entries:
             # Map proof records to EvidenceRef shape for tiered classification.
             # All stored proof records represent proven evidence (only recorded
             # when acceptance evidence is verified), so proven=True is correct.
+            # Carry proved_at through as recorded_at so an opt-in freshness caller
+            # (now != None) can expire a stale write-once proof-record.
             synthetic_refs = [
-                {"kind": e.get("proof_kind"), "proven": True} for e in entries
+                {
+                    "kind": e.get("proof_kind"),
+                    "proven": True,
+                    "recorded_at": e.get("proved_at"),
+                }
+                for e in entries
             ]
-            entry2["proof_status"] = classify_evidence_tiered(synthetic_refs)
+            entry2["proof_status"] = classify_evidence_tiered(synthetic_refs, now=now)
         else:
             entry2["proof_status"] = "unproven"
         if entries:
@@ -482,30 +504,20 @@ def record_capability_backing_path_proof(project: Any, cap_name: str) -> bool:
 
 
 def record_capability_named_test_proof(
-    project: Any,
-    cap_name: str,
-    test_refs: list[str],
-    *,
-    execution_verified: bool = False,
+    project: Any, cap_name: str, test_refs: list[str]
 ) -> bool:
-    """Record a bounded ``named_test``-tier proof for a capability.
+    """Record a bounded ``named_test_present``-tier proof for a capability.
 
-    The ``named_test`` tier is the ONLY one :func:`classify_evidence_tiered`
-    grades as ``proven`` (clearing the enforce gate), so it must reflect a test
-    that actually **ran green**, not merely a test file that exists. Per audit
-    finding #2 ("named_test earn path mints proofs without execution"), this
-    recorder now REQUIRES ``execution_verified=True`` — a caller's attestation
-    that it holds real execution evidence (a recorded green run for the declared
-    test) — before it will write anything. Called without it, the recorder logs
-    and returns ``False`` (records nothing), so static file-existence /
-    import-substring discovery can never mint a machine-verified proof.
-
-    The genuine execution-verified path is the acceptance-verdict recorder
-    (:func:`record_capability_proof`), whose ``named_test`` verdicts already
-    passed :func:`app.acceptance_gate._evaluate_named_test` (test present in the
-    diff AND ran green under a real merge-test verdict). The structural
-    static-analysis earn loop instead earns at most the ``backing_path`` tier
-    (:func:`record_capability_backing_path_proof`, graded ``path_proven``).
+    Called from :func:`commission_proof_earn_loop` when a working capability's
+    declared ``backing_paths`` are not merely present at HEAD but a
+    convention-named test file for them *exists at HEAD and imports the backing
+    module* (identified by :func:`_named_tests_covering_paths`). Crucially, that
+    discovery is purely STATIC — file existence plus an import regex — the test
+    is never executed. This therefore records the structural-only
+    ``named_test_present`` kind, which :func:`classify_evidence_tiered` grades
+    ``path_proven`` (like ``backing_path``), NOT ``proven`` — so it does NOT
+    clear the enforce gate. Only :func:`record_capability_proof`, driven by a real
+    green merge-test acceptance verdict, mints the ``proven`` ``named_test`` tier.
 
     This is NOT a parallel recording mechanism: it writes to the same durable
     ``project.capability_proof_records`` store and appends the same
@@ -513,7 +525,7 @@ def record_capability_named_test_proof(
     every other recorder in this module — only the ``proof_kind`` and dedup
     prefix differ.
 
-    Uses dedup key ``named_test:<normalized_cap_name>`` — the same stable
+    Uses dedup key ``named_test_present:<normalized_cap_name>`` — the same stable
     prefix-based pattern as the trial and backing-path recorders — so a standing
     verification does not produce duplicate proof entries on re-evaluation.
 
@@ -521,22 +533,10 @@ def record_capability_named_test_proof(
     the caller (typically a reaper sweep).
 
     Returns ``True`` when a new entry was recorded, ``False`` when already
-    present (dedup), when the capability name cannot be normalized, when
-    ``test_refs`` is empty, or when ``execution_verified`` is not ``True``.
+    present (dedup), when the capability name cannot be normalized, or when
+    ``test_refs`` is empty.
     """
     from app.time_utils import _utcnow
-
-    if execution_verified is not True:
-        # No green-run evidence — refuse to mint the proven-tier proof. This is
-        # the hard bar that closes the "unexecuted named_test proof" hole: a
-        # test file existing at HEAD is not evidence it passed.
-        logger.warning(
-            "[CAPABILITY_PROOF] refusing named-test proof for cap=%r — no "
-            "execution evidence (execution_verified is not True); a named_test "
-            "proof requires a recorded green run, not just a present test file",
-            cap_name,
-        )
-        return False
 
     norm = normalize_capability_name(cap_name)
     if not norm:
@@ -556,15 +556,16 @@ def record_capability_named_test_proof(
         )
         return False
 
-    # Stable dedup key: one named-test proof record per capability verification.
-    dedup_task_id = f"named_test:{norm}"
+    # Stable dedup key: one named-test-present proof record per capability
+    # verification.
+    dedup_task_id = f"named_test_present:{norm}"
     proved_at = _utcnow().isoformat()
     proof_ref = ",".join(refs)
 
     proof_entry: dict[str, Any] = {
         "task_id": dedup_task_id,
         "proved_at": proved_at,
-        "proof_kind": _PROOF_KIND_NAMED_TEST,
+        "proof_kind": _PROOF_KIND_NAMED_TEST_PRESENT,
         "proof_ref": proof_ref,
         "test_refs": refs,
         "commit_sha": "",
@@ -598,7 +599,8 @@ def record_capability_named_test_proof(
         return False
 
     logger.info(
-        "[CAPABILITY_PROOF] recorded named-test proof for cap=%s refs=%s",
+        "[CAPABILITY_PROOF] recorded named-test-present (path_proven tier) "
+        "proof for cap=%s refs=%s",
         norm,
         refs,
     )
@@ -607,7 +609,7 @@ def record_capability_named_test_proof(
         project,
         [norm],
         {
-            "kind": _PROOF_KIND_NAMED_TEST,
+            "kind": _PROOF_KIND_NAMED_TEST_PRESENT,
             "ref": proof_ref,
             "proven": True,
             "source_id": dedup_task_id,
@@ -774,9 +776,10 @@ def carry_proof_records_for_consolidation(
 # file(s) that would exercise it, plus a reference check confirming the test
 # actually imports the backing module. This is the "identify the test file(s)
 # that exercise a capability's backing paths, and reference them" step that lets
-# the earn loop mint a machine-verified ``named_test`` proof (which
-# ``classify_evidence_tiered`` grades ``proven``) instead of only the
-# structural-only ``backing_path`` proof (graded ``path_proven``).
+# the earn loop mint a ``named_test_present`` proof. This discovery is STATIC
+# (file exists + import regex; the test is never executed), so
+# ``classify_evidence_tiered`` grades it ``path_proven`` — the same tier as a
+# ``backing_path`` proof, NOT the executed ``proven`` ``named_test`` tier.
 
 _TS_JS_EXTS: frozenset[str] = frozenset({"ts", "tsx", "js", "jsx"})
 
@@ -1112,16 +1115,19 @@ async def commission_proof_earn_loop(
     2. For each demanded unproven capability that declares ``backing_paths``:
        verifies each path at HEAD via ``verify_path`` (defaults to
        :func:`app.source_ref_validation._path_exists_at_head`).  When ALL
-       paths are definitely present, it records the structural-only
-       ``backing_path`` proof (:func:`record_capability_backing_path_proof`,
-       graded ``path_proven``).  It deliberately does NOT mint the
-       machine-verified ``named_test`` tier: static file-existence /
-       import-substring discovery is not execution evidence (audit finding #2),
-       so it cannot prove a test ran green and must not clear the enforce gate.
-       A capability reaches the ``proven`` tier only through the
-       acceptance-verdict path (:func:`record_capability_proof`), whose verdict
-       already passed the green-run gate in
-       :func:`app.acceptance_gate._evaluate_named_test`.
+       paths are definitely present, it then attempts the *higher* tier:
+       :func:`_named_tests_covering_paths` looks for real test files that
+       exercise (import) every backing path.  When every path has a
+       convention-named test file present at HEAD that imports it, a
+       ``named_test_present`` proof is recorded via
+       :func:`record_capability_named_test_proof`.  That discovery is STATIC —
+       the test is never executed — so :func:`classify_evidence_tiered` grades it
+       ``path_proven`` (the SAME tier as the ``backing_path`` fallback), NOT
+       ``proven``: it does NOT clear the enforce gate.  Only a real green
+       merge-test acceptance verdict (:func:`record_capability_proof`) mints the
+       ``proven`` ``named_test`` tier.  The fallback when no covering test is
+       discoverable is the ``backing_path`` proof
+       (:func:`record_capability_backing_path_proof`, also ``path_proven``).
 
     3. For each demanded unproven capability that has NO ``backing_paths``:
        no automated verification is possible — the gap is reported in the
@@ -1146,9 +1152,9 @@ async def commission_proof_earn_loop(
         for testability (an ``AsyncMock`` or ``lambda`` can be substituted).
     read_head:
         Callable ``(path: str) -> str | None`` — async, returns the HEAD
-        contents of a test file (or ``None`` when indeterminate).  Retained for
-        back-compat with injecting callers; INTENTIONALLY UNUSED since the loop no
-        longer credits a ``named_test`` proof from static coverage (finding #2).
+        contents of a test file (or ``None`` when indeterminate).  Defaults to
+        :func:`_read_file_at_head`.  Injected for testability so the
+        named_test-present branch can be exercised without a git checkout.
 
     Returns
     -------
@@ -1156,11 +1162,14 @@ async def commission_proof_earn_loop(
     ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
       "still_unproven": list[str], "path_proven_stuck": list[str],
       "named_test_earned": list[str]}``.
-    Total entries found, count of newly-earned proofs (all ``backing_path`` tier),
-    capability names with no backing_paths, remaining unproven names (failed path
-    check), and already-recorded (stuck) names that were not newly recorded.
-    ``named_test_earned`` is retained in the shape for back-compat but is now
-    ALWAYS empty — the static earn loop never reaches the ``proven`` tier.
+    Total entries found, count of newly-recorded proofs (named_test_present +
+    backing_path), capability names with no backing_paths, remaining unproven
+    names (failed path check), already-recorded (stuck) names that were not newly
+    recorded, and the subset of newly-recorded names that got a
+    ``named_test_present`` proof (a convention test file is present at HEAD).
+    NOTE: both recorded tiers are graded ``path_proven`` — neither clears the
+    enforce gate; a capability reaches ``proven`` only via a real green
+    merge-test acceptance verdict (:func:`record_capability_proof`).
     """
     from app.capability_demand import compute_unproven_demanded_capabilities
     from app.source_ref_validation import (
@@ -1169,11 +1178,7 @@ async def commission_proof_earn_loop(
     )
 
     _verify = verify_path or _path_exists_at_head
-    # ``read_head`` is retained in the signature for back-compat with callers that
-    # inject a test-content reader, but the loop no longer credits a ``named_test``
-    # proof from static coverage (audit finding #2), so it is intentionally unused
-    # here — structural presence earns only the ``backing_path`` tier.
-    _ = read_head
+    _read_head = read_head or _read_file_at_head
 
     # Step 1: compute the intersection.
     demanded_unproven = compute_unproven_demanded_capabilities(
@@ -1267,16 +1272,30 @@ async def commission_proof_earn_loop(
                 break
 
         if all_present:
-            # The declared backing paths exist at HEAD — but that is a STRUCTURAL
-            # fact, not execution evidence. Per audit finding #2, static coverage
-            # discovery (a conventionally-named test file that imports the module)
-            # does NOT prove the test ran green, so the earn loop earns at most the
-            # structural-only ``backing_path`` tier (graded ``path_proven``), which
-            # does NOT clear the enforce gate on its own. The machine-verified
-            # ``named_test`` tier (graded ``proven``) is minted only by the
-            # acceptance-verdict path (:func:`record_capability_proof`), whose
-            # verdict already passed the green-run gate in
-            # :func:`app.acceptance_gate._evaluate_named_test`.
+            # If a convention-named test file for every backing path exists at
+            # HEAD and imports the module, record a ``named_test_present`` proof.
+            # This is a STATIC signal (no test is executed), so it is graded
+            # ``path_proven`` — richer metadata than a bare ``backing_path`` proof
+            # but the SAME tier: it does NOT clear the enforce gate. Only a real
+            # green merge-test verdict (record_capability_proof) reaches ``proven``.
+            test_refs = await _named_tests_covering_paths(
+                file_paths, verify_path=_verify, read_head=_read_head
+            )
+            if test_refs:
+                recorded = record_capability_named_test_proof(
+                    project, raw_name or canonical, test_refs
+                )
+                if recorded:
+                    earned_names.append(canonical)
+                    named_test_earned.append(canonical)
+                else:
+                    # Dedup hit: a named_test_present proof was already stamped
+                    # in a prior sweep. Not newly recorded.
+                    path_proven_stuck.append(canonical)
+                continue
+
+            # Fallback: paths present but no discoverable test coverage — record
+            # the structural-only ``backing_path`` proof (graded ``path_proven``).
             recorded = record_capability_backing_path_proof(project, raw_name or canonical)
             if recorded:
                 earned_names.append(canonical)

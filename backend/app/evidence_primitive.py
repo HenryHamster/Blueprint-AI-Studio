@@ -19,8 +19,10 @@ already proved out:
   ``named_test`` / ``downstream_artifact`` / ``visual`` /
   ``observable_behavior`` (acceptance_gate), ``reachability`` /
   ``operator_attestation`` (CriterionEvidence.source_kind), ``trial_adoption``
-  (capability_proof), and ``backing_path`` (capability backing-path
-  verification). No new kinds are minted here.
+  (capability_proof), ``backing_path`` (capability backing-path verification),
+  and ``named_test_present`` (a conventionally-named test file exists at HEAD
+  and imports the backing module, but was NEVER executed — a structural-only
+  signal distinct from a ``named_test`` that actually ran green).
 
 Nothing in this module performs IO or re-verification: ``classify_evidence``
 looks only at the stored ``proven`` flags. A caller that re-checks a ref
@@ -31,6 +33,7 @@ stored classification — this module never guesses.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 # Pydantic (< py3.12) requires typing_extensions.TypedDict for a TypedDict used
@@ -68,21 +71,30 @@ ProofKind = Literal[
     "operator_attestation", # CriterionEvidence.source_kind — human attestation
     "trial_adoption",       # capability_proof — a capability adopted on trial
     "backing_path",         # capability verification — a file backing the claim
+    "named_test_present",   # capability verification — a convention-named test
+                            # file exists at HEAD and imports the backing module,
+                            # but was NEVER executed (structural-only, path-tier)
 ]
 
 #: The kinds whose ``ref`` names a repo file/test path and can therefore be
 #: re-verified against HEAD (file exists / was removed). Other kinds point at
 #: logical ids (criterion keys, artifact ids) that a path check cannot resolve.
-PATH_BACKED_KINDS: frozenset[str] = frozenset({"named_test", "backing_path"})
+PATH_BACKED_KINDS: frozenset[str] = frozenset(
+    {"named_test", "backing_path", "named_test_present"}
+)
 
 #: Proof kinds that are *structural-only* — they prove the declared files exist
 #: at HEAD but NOT that anything was machine-verified to work. A ``backing_path``
-#: proof only asserts "the code that backs this claim is in the repo"; it is not
-#: the same corroboration bar as a ``named_test`` that actually ran green. When a
-#: proven-evidence set consists SOLELY of these kinds, the classifiers demote it
-#: from ``proven`` to ``path_proven`` so an enforce-mode gate is not cleared by a
-#: self-reported file-existence proof.
-BACKING_ONLY_KINDS: frozenset[str] = frozenset({"backing_path"})
+#: proof only asserts "the code that backs this claim is in the repo";
+#: ``named_test_present`` asserts a bit more — a convention-named test file exists
+#: at HEAD and imports the backing module — but STILL never executed the test, so
+#: it is not the same corroboration bar as a ``named_test`` that actually ran
+#: green. When a proven-evidence set consists SOLELY of these kinds, the
+#: classifiers demote it from ``proven`` to ``path_proven`` so an enforce-mode gate
+#: is not cleared by a self-reported file-existence proof.
+BACKING_ONLY_KINDS: frozenset[str] = frozenset(
+    {"backing_path", "named_test_present"}
+)
 
 #: Proof kinds that carry NO structural machine-check at all — a human simply
 #: asserted the claim. ``operator_attestation`` is a person's word that a
@@ -174,6 +186,79 @@ class EvidenceRef(TypedDict, total=False):
     recorded_at: str | None
 
 
+#: How long a machine-checked proof stays trusted before a caller that opts into
+#: freshness re-verification treats it as stale. A ``named_test`` / ``backing_path``
+#: proof records the ``recorded_at`` (and ``commit_sha``) of the moment it was
+#: earned, but nothing re-runs it afterwards — the backing file or test may have
+#: been deleted or materially changed at HEAD since. A proof older than this
+#: window is therefore no longer trusted to clear the enforce gate on its own; it
+#: is demoted to a non-``proven`` tier (an honest "must re-verify", never
+#: laundered into ``contradicted``) so the standing earn loop re-verifies it
+#: against HEAD and re-stamps a fresh proof. Chosen well above the hourly earn
+#: cadence so a live capability is continuously re-proven long before it expires,
+#: while a genuinely abandoned proof does eventually go stale.
+PROOF_FRESHNESS_TTL: timedelta = timedelta(days=30)
+
+
+def _parse_recorded_at(value: Any) -> datetime | None:
+    """Parse a stored ISO-8601 ``recorded_at`` into a naive-UTC datetime.
+
+    Returns ``None`` for anything unparseable (missing, non-string, malformed, or
+    a bare date with no time) — the caller treats an unreadable timestamp as
+    *indeterminate*, never as expired, mirroring the tri-state honesty rule the
+    rest of this module follows. Tz-aware inputs (including a ``Z`` suffix) are
+    normalized to naive UTC so the comparison never mixes aware/naive datetimes.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _ref_is_expired(ref: dict[str, Any], now: datetime, ttl: timedelta) -> bool:
+    """Whether a proof ref's ``recorded_at`` is older than ``ttl`` relative to ``now``.
+
+    A ref whose ``recorded_at`` is missing or malformed is NEVER expired — an
+    indeterminate age must not be laundered into staleness, exactly as an
+    indeterminate re-verification is never laundered into ``contradicted``. This
+    keeps every legacy ref that predates timestamped proofs classifying as it
+    always did.
+    """
+    recorded = _parse_recorded_at(ref.get("recorded_at"))
+    if recorded is None:
+        return False
+    now_naive = now
+    if now_naive.tzinfo is not None:
+        now_naive = now_naive.astimezone(timezone.utc).replace(tzinfo=None)
+    return (now_naive - recorded) > ttl
+
+
+def _active_proven(
+    checkable: list[dict[str, Any]],
+    now: datetime | None,
+    ttl: timedelta | None,
+) -> list[dict[str, Any]]:
+    """The ``proven=True`` refs that are still fresh (or all of them if opted out).
+
+    When ``now is None`` freshness is not evaluated at all — every ``proven=True``
+    ref is returned, preserving the legacy stored-flag-only behaviour for callers
+    that do not opt in. When ``now`` is supplied, refs whose ``recorded_at`` is
+    older than ``ttl`` (defaulting to :data:`PROOF_FRESHNESS_TTL`) are dropped, so
+    a proven set consisting solely of expired proofs collapses to empty and the
+    classifiers fall to ``partial`` — the honest "must re-verify" state.
+    """
+    proven = [r for r in checkable if r.get("proven") is True]
+    if now is None:
+        return proven
+    effective_ttl = ttl if ttl is not None else PROOF_FRESHNESS_TTL
+    return [r for r in proven if not _ref_is_expired(r, now, effective_ttl)]
+
+
 def _proven_tier(proven: list[dict[str, Any]]) -> EvidenceStatus:
     """Tier a NON-EMPTY list of ``proven=True`` refs below full ``proven``.
 
@@ -197,7 +282,12 @@ def _proven_tier(proven: list[dict[str, Any]]) -> EvidenceStatus:
     return "proven"
 
 
-def classify_evidence(refs: Any) -> EvidenceStatus:
+def classify_evidence(
+    refs: Any,
+    *,
+    now: datetime | None = None,
+    ttl: timedelta | None = None,
+) -> EvidenceStatus:
     """Classify a list of evidence refs into an :data:`EvidenceStatus`.
 
     Pure and stored-flag-only — it never performs IO or re-verification:
@@ -216,6 +306,15 @@ def classify_evidence(refs: Any) -> EvidenceStatus:
 
     ``contradicted`` is never returned here — it can only come from a caller
     that re-verified a proven ref against ground truth and disproved it.
+
+    **Freshness (opt-in).** When ``now`` is supplied, ``proven=True`` refs whose
+    ``recorded_at`` is older than ``ttl`` (defaulting to
+    :data:`PROOF_FRESHNESS_TTL`) are dropped before tiering, so a write-once proof
+    that has gone stale no longer reads ``proven``/``path_proven`` and falls to
+    ``partial`` — an honest "must re-verify". A ref with a missing/malformed
+    ``recorded_at`` is treated as indeterminate and never expires. When ``now`` is
+    ``None`` (the default) freshness is not evaluated at all and behaviour is
+    unchanged from the stored-flag-only classifier.
     """
     if not isinstance(refs, list):
         return "unverified"
@@ -224,13 +323,18 @@ def classify_evidence(refs: Any) -> EvidenceStatus:
     checkable = [r for r in refs if isinstance(r, dict)]
     if not checkable:
         return "unverified"
-    proven = [r for r in checkable if r.get("proven") is True]
+    proven = _active_proven(checkable, now, ttl)
     if proven:
         return _proven_tier(proven)
     return "partial"
 
 
-def classify_evidence_tiered(refs: Any) -> EvidenceStatus:
+def classify_evidence_tiered(
+    refs: Any,
+    *,
+    now: datetime | None = None,
+    ttl: timedelta | None = None,
+) -> EvidenceStatus:
     """Classify evidence refs, tiering non-machine-verified proofs below ``proven``.
 
     Shares the exact proven-tiering rule with :func:`classify_evidence` (both
@@ -259,6 +363,13 @@ def classify_evidence_tiered(refs: Any) -> EvidenceStatus:
 
     ``partial`` / ``unproven`` / ``unverified`` are returned identically to
     :func:`classify_evidence`; ``contradicted`` is never returned here.
+
+    **Freshness (opt-in).** Identical to :func:`classify_evidence`: when ``now``
+    is supplied, ``proven=True`` refs older than ``ttl`` (default
+    :data:`PROOF_FRESHNESS_TTL`) are dropped before tiering, so a stale write-once
+    proof demotes to ``partial`` and no longer clears an enforce-mode gate. A
+    ref with a missing/malformed ``recorded_at`` never expires; ``now=None``
+    (the default) evaluates no freshness and preserves legacy behaviour.
     """
     if not isinstance(refs, list):
         return "unverified"
@@ -267,7 +378,7 @@ def classify_evidence_tiered(refs: Any) -> EvidenceStatus:
     checkable = [r for r in refs if isinstance(r, dict)]
     if not checkable:
         return "unverified"
-    proven = [r for r in checkable if r.get("proven") is True]
+    proven = _active_proven(checkable, now, ttl)
     if not proven:
         return "partial"
     return _proven_tier(proven)

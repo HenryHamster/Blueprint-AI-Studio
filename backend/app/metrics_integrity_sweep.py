@@ -3584,23 +3584,30 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
     This check auto-resolves gaps where possible:
     - If an unproven working capability declares ``backing_paths`` and ALL resolve
-      at HEAD via :func:`_path_exists_at_head`, a structural ``backing_path`` proof
-      (:func:`record_capability_backing_path_proof`, graded ``path_proven``) is
-      recorded. Per audit finding #2 this self-heal does NOT mint the
-      machine-verified ``named_test`` tier from static coverage: a
-      conventionally-named test file existing at HEAD is not evidence it ran green,
-      so it cannot clear the enforce gate. The ``proven`` tier is reachable only
-      via the acceptance-verdict path (already green-run verified); a
-      ``path_proven`` cap therefore stays in the delta until real
-      execution-verified evidence lands.
+      at HEAD via :func:`_path_exists_at_head`, proof is recorded and the
+      capability moves from the gap to ``ground_truth``. Two recorded tiers, both
+      structural-only: when a convention-named test file for EVERY backing path is
+      present at HEAD and imports it (:func:`_named_tests_covering_paths`, a STATIC
+      check — the test is never executed), a ``named_test_present`` proof is
+      recorded via :func:`record_capability_named_test_proof`; otherwise a
+      ``backing_path`` proof (:func:`record_capability_backing_path_proof`) is the
+      fallback. :func:`classify_evidence_tiered` grades BOTH ``path_proven`` — NOT
+      ``proven`` — so neither raises auto-graduation coverage nor clears the
+      enforce gate (auto-graduation reads proof status through
+      :func:`working_capability_proof_status`, which grades these ``path_proven``).
+      A capability reaches ``proven`` only via a real green merge-test acceptance
+      verdict (:func:`app.capability_proof.record_capability_proof`).
     - Caps with no file-like backing_paths trigger automated backing-path
       DISCOVERY (:func:`_discover_candidate_backing_paths`): search tokens derived
-      from the capability name locate candidate files at HEAD. Auto-discovered
-      candidates are unverified, so they NEVER record a proof — they are surfaced
-      as concrete SUGGESTIONS folded into the enrolled research obligation
-      (enforce mode) and the cap stays in the gap. Discovery never mutates the
-      strategist-curated backing_paths and never records a proof from unverified
-      candidates.
+      from the capability name locate candidate files at HEAD. Discovered
+      candidates are held to the SAME confidence bar as declared backing_paths —
+      only a fully test-covered candidate set (:func:`_named_tests_covering_paths`)
+      auto-records a ``named_test_present`` proof and moves the cap to
+      ``ground_truth`` (still ``path_proven`` tier — see above).
+      Otherwise the candidates are surfaced as concrete SUGGESTIONS folded into
+      the enrolled research obligation (enforce mode) and the cap stays in the
+      gap — discovery never mutates the strategist-curated backing_paths and
+      never records a proof from unverified candidates.
     - Caps with no file-like backing_paths and no usable discovery are surfaced
       with ``needs_backing_paths`` in the detail for strategist/research discovery.
     - Caps whose backing_paths fail verification remain in ``delta``.
@@ -3609,7 +3616,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     commit for one project is logged and rolled back without aborting the check.
 
     * ``self_reported`` = total ``working`` capabilities in the project.
-    * ``ground_truth``  = proven caps (including newly auto-resolved).
+    * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
+      newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
+      evidence, not enforce-gate-clearing ``proven`` status specifically.
     * ``delta``         = unresolved gap: needs_backing_paths + failed verification.
 
     Bounded to ``ctx.max_projects`` projects.
@@ -3618,7 +3627,10 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
     from app.capability_proof import (
         _discover_candidate_backing_paths,
+        _named_tests_covering_paths,
+        _read_file_at_head,
         record_capability_backing_path_proof,
+        record_capability_named_test_proof,
     )
     from app.capability_registry import (
         exempt_capability_names,
@@ -3728,6 +3740,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # named_test minting from static coverage), so all auto-resolutions are
         # backing_path-tier.
         auto_resolved: list[str] = []
+        named_test_present_resolved: list[str] = []
         needs_backing_paths: list[str] = []
         still_unproven: list[str] = []
 
@@ -3754,26 +3767,51 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     break
 
             if all_present:
-                # The declared backing paths all exist at HEAD — a STRUCTURAL
-                # fact, recorded as a ``backing_path`` proof (graded ``path_proven``).
-                # Per audit finding #2, this fleet-wide self-heal must NOT mint the
-                # machine-verified ``named_test`` tier from static coverage: a
-                # conventionally-named test file existing at HEAD is not evidence it
-                # ran green, so it cannot clear the enforce gate. The ``proven`` tier
-                # is reachable only via the acceptance-verdict path
-                # (record_capability_proof), already green-run verified. A
-                # ``path_proven`` cap remains in the delta until it earns real
-                # execution-verified evidence.
+                # When a convention-named test file for EVERY backing path is
+                # present at HEAD and imports it, record a ``named_test_present``
+                # proof. This discovery is STATIC (file exists + import regex; the
+                # test is never executed), so classify_evidence_tiered grades it
+                # ``path_proven`` — the SAME tier as the ``backing_path`` fallback,
+                # NOT ``proven``: it does NOT raise auto-graduation coverage nor
+                # clear the enforce gate. Only a real green merge-test verdict
+                # (record_capability_proof) reaches the ``proven`` named_test tier.
                 try:
-                    recorded = record_capability_backing_path_proof(
-                        project, raw_name or cap_name
+                    test_refs = await _named_tests_covering_paths(
+                        file_paths,
+                        verify_path=_path_exists_at_head,
+                        read_head=_read_file_at_head,
                     )
-                    if recorded:
-                        auto_resolved.append(cap_name)
+                except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "named-test discovery failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    test_refs = []
+
+                try:
+                    if test_refs:
+                        recorded = record_capability_named_test_proof(
+                            project, raw_name or cap_name, test_refs
+                        )
+                        if recorded:
+                            auto_resolved.append(cap_name)
+                            named_test_present_resolved.append(cap_name)
+                        else:
+                            # Dedup: named_test_present proof already present.
+                            still_unproven.append(cap_name)
                     else:
-                        # Dedup: proof already present (path_proven tier, not
-                        # fully proven).
-                        still_unproven.append(cap_name)
+                        recorded = record_capability_backing_path_proof(
+                            project, raw_name or cap_name
+                        )
+                        if recorded:
+                            auto_resolved.append(cap_name)
+                        else:
+                            # Dedup: proof already present (path_proven tier, not
+                            # fully proven).
+                            still_unproven.append(cap_name)
                 except Exception:  # noqa: BLE001 — proof recording is non-fatal
                     logger.warning(
                         "[METRICS_INTEGRITY] capability_proof_gate_gap: "
@@ -3787,17 +3825,19 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 still_unproven.append(cap_name)
 
         # DISCOVERY pass: for caps with no declared file-like backing_paths, try
-        # to discover candidate backing paths at HEAD by name. Auto-DISCOVERED
-        # candidates are unverified and never green-run tested, so — per audit
-        # finding #2 and the long-standing invariant that discovery "never records
-        # a proof from unverified candidates" — they NEVER mint any proof (not even
-        # backing_path). They become concrete SUGGESTIONS folded into the enrolled
-        # research obligation (enforce mode) and the cap stays in the gap. This
-        # NEVER mutates the strategist-curated backing_paths.
+        # to discover candidate backing paths at HEAD by name. Apply the SAME
+        # confidence bar as the declared-backing_paths self-heal above: a fully
+        # test-covered candidate set records a ``named_test`` proof (auto-resolve,
+        # moving the cap to ground_truth); otherwise the candidates become
+        # concrete suggestions folded into the enrolled research obligation and
+        # the cap stays in the gap. This NEVER mutates the strategist-curated
+        # backing_paths and NEVER records a proof from unverified candidates.
+        # Runs before the commit below so newly-minted proofs are persisted.
         discovery_suggestions: dict[str, list[str]] = {}
         if needs_backing_paths:
             remaining_needs: list[str] = []
             for cap_name in needs_backing_paths:
+                raw_name = cap_backing.get(cap_name, (cap_name, []))[0]
                 try:
                     candidates = await _discover_candidate_backing_paths(cap_name)
                 except Exception:  # noqa: BLE001 — discovery must not abort the check
@@ -3813,9 +3853,47 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     remaining_needs.append(cap_name)
                     continue
 
-                # Candidates found but unverified/never-executed: keep the cap in
-                # the gap and surface the suggestions so the enrolled research
-                # obligation starts from a real candidate list.
+                # Same named_test_present confidence bar as declared backing_paths.
+                try:
+                    test_refs = await _named_tests_covering_paths(
+                        candidates,
+                        verify_path=_path_exists_at_head,
+                        read_head=_read_file_at_head,
+                    )
+                except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: named-test "
+                        "discovery failed for discovered cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    test_refs = []
+
+                if test_refs:
+                    try:
+                        recorded = record_capability_named_test_proof(
+                            project, raw_name or cap_name, test_refs
+                        )
+                    except Exception:  # noqa: BLE001 — proof recording is non-fatal
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: proof "
+                            "recording failed for discovered cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        recorded = False
+                    if recorded:
+                        auto_resolved.append(cap_name)
+                        named_test_present_resolved.append(cap_name)
+                        continue
+                    # Dedup/failure: fall through and keep the cap as a gap, but
+                    # still surface the candidates as research suggestions.
+
+                # Candidates found but not test-covered (or record was a no-op):
+                # keep the cap in the gap and remember the suggestions so the
+                # enrolled research obligation starts from a real candidate list.
                 discovery_suggestions[cap_name] = candidates
                 remaining_needs.append(cap_name)
             needs_backing_paths = remaining_needs
@@ -3892,8 +3970,14 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 preview_ar = ", ".join(sorted(auto_resolved)[:3])
                 if len(auto_resolved) > 3:
                     preview_ar += f" (+{len(auto_resolved) - 3} more)"
+                _tier_note = (
+                    f" ({len(named_test_present_resolved)} via named_test_present, "
+                    f"{len(auto_resolved) - len(named_test_present_resolved)} via backing_paths)"
+                    if named_test_present_resolved
+                    else " via backing_paths"
+                )
                 detail_parts.append(
-                    f"{len(auto_resolved)} auto-resolved via backing_paths: {preview_ar}"
+                    f"{len(auto_resolved)} auto-resolved{_tier_note}: {preview_ar}"
                 )
             if needs_backing_paths:
                 preview_nb = ", ".join(sorted(needs_backing_paths)[:3])
@@ -3944,9 +4028,17 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 f"all {total_working} working capability(ies) carry proven evidence"
             )
             if auto_resolved:
-                _ok_detail += (
-                    f" ({len(auto_resolved)} auto-resolved via backing_paths)"
-                )
+                if named_test_present_resolved:
+                    _ok_detail += (
+                        f" ({len(auto_resolved)} auto-resolved: "
+                        f"{len(named_test_present_resolved)} via named_test_present, "
+                        f"{len(auto_resolved) - len(named_test_present_resolved)} "
+                        "via backing_paths)"
+                    )
+                else:
+                    _ok_detail += (
+                        f" ({len(auto_resolved)} auto-resolved via backing_paths)"
+                    )
             if exempt_count:
                 _ok_detail += (
                     f" ({exempt_count} exempt: "

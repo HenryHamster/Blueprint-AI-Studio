@@ -2120,6 +2120,114 @@ async def _run_full_cycle_db_sweep() -> None:
                 "release-qualifier and badge seams"
             )
             assert gpu_blocked.status == TaskStatus.QUEUED
+
+            # ── Phase E: proof minted through the REAL landing seam ───────────
+            # The prior phases stamp the proof by calling record_capability_proof
+            # directly. That simulates the "provider lands with acceptance
+            # evidence" wiring instead of exercising it. Here we drive a provider
+            # through the production integration-landing seam,
+            # ``mark_landed_on_integration(provider, project)`` — the canonical
+            # write for a real integration-branch merge — and assert it mints the
+            # capability proof itself, then that the enforce gate resumes the
+            # dependent. Without the project-aware proof recording now wired into
+            # mark_landed_on_integration, the landing path would stamp only the
+            # acceptance verdict and NEVER the proof, so ``requeued4`` would stay
+            # 0 and the dependent would remain BLOCKED — this asserts the seam.
+            from app.landed_signal import mark_landed_on_integration
+
+            pm2 = project.problem_model
+            pm2["capabilities"].append(
+                {"name": "Data pipeline", "status": "working"}
+            )
+            flag_modified(project, "problem_model")
+            s.add(project)
+            await s.commit()
+
+            pipe_need = {"kind": "capability", "ref": "data-pipeline"}
+            now3 = _utcnow()
+            pipe_blocked = Task(
+                project_id=project.id,
+                title="pipe-dependent",
+                description="x",
+                status=TaskStatus.BLOCKED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                depends_on=[],
+                blocker_kind="precondition",
+                blocked_reason="BLOCKER: needs capability data-pipeline",
+                blocked_at=now3,
+                recheck_after=now3 - timedelta(minutes=1),  # due
+                context={
+                    "blocker": {
+                        "source": "agent",
+                        "waiting_on": "capability",
+                        "needs": [pipe_need],
+                        "need": pipe_need,
+                    }
+                },
+            )
+            s.add(pipe_blocked)
+            await s.commit()
+            await s.refresh(pipe_blocked)
+
+            # Enforce still holds the dependent BLOCKED before the provider lands.
+            requeued_hold = await sweep_unblock_blocked_tasks(
+                s, _utcnow(), verify_pr_merged=_stub_verify
+            )
+            await s.refresh(pipe_blocked)
+            assert requeued_hold == 0
+            assert pipe_blocked.status == TaskStatus.BLOCKED
+
+            # The provider lands on the integration branch. mark_landed_on_
+            # integration must mint the capability proof from its proven verdict —
+            # NOT a direct record_capability_proof call.
+            pipe_provider = Task(
+                id=uuid.uuid4(),
+                project_id=project.id,
+                title="pipe-provider",
+                description="x",
+                status=TaskStatus.COMPLETED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                context={
+                    "provides_capability": "data-pipeline",
+                    "code_acceptance_verdict": {
+                        "proven": True,
+                        "kind": "named_test",
+                        "proof_ref": (
+                            "testing/test_blocked_need_resolution.py::"
+                            "test_capability_proof_gate_full_cycle"
+                        ),
+                    },
+                },
+            )
+            mark_landed_on_integration(pipe_provider, project)
+            assert "data-pipeline" in (project.capability_proof_records or {}), (
+                "the integration-landing seam must mint the capability proof "
+                "itself when a project is supplied — the proof recording is no "
+                "longer confined to apply_merged_landed_signal"
+            )
+            s.add(project)
+            await s.commit()
+
+            # The now-proven capability resumes the dependent on the next sweep.
+            pipe_blocked.recheck_after = _utcnow() - timedelta(minutes=1)  # due
+            s.add(pipe_blocked)
+            await s.commit()
+            requeued4 = await sweep_unblock_blocked_tasks(
+                s, _utcnow(), verify_pr_merged=_stub_verify
+            )
+            await s.refresh(pipe_blocked)
+            assert requeued4 == 1, (
+                "a proof minted by the integration-landing seam must let the "
+                "enforce gate resume the dependent — the landing path, not a "
+                "direct record_capability_proof call, closed the cycle"
+            )
+            assert pipe_blocked.status == TaskStatus.QUEUED
     finally:
         if saved_mode is None:
             _rc.pop("capability_proof_gate_mode", None)
@@ -2505,11 +2613,14 @@ async def test_auto_graduation_excludes_exempt_capabilities(_grad_db):
         _grad_db,
         [
             {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
-            # Exempt working cap — excluded from coverage calc.
+            # Exempt working cap — excluded from coverage calc. Carries
+            # operator provenance so the exemption is honored (a bare
+            # proof_exempt flag is no longer sufficient).
             {
                 "name": "Cap B (exempt)",
                 "status": "working",
                 "proof_exempt": True,
+                "source": {"type": "user_message", "excerpt": "operator exempt"},
             },
         ],
     )
@@ -2608,6 +2719,7 @@ async def test_auto_graduation_skips_when_all_exempt(_grad_db):
                 "name": "Exempt only",
                 "status": "working",
                 "proof_exempt": True,
+                "source": {"type": "user_message", "excerpt": "operator exempt"},
             },
         ],
     )

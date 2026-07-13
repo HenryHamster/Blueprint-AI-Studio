@@ -386,8 +386,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 )
                 if record_pr_merged:
                     # Update in-memory first so caller sees the change even if DB write
-                    # fails.
-                    mark_landed_on_integration(task)
+                    # fails. Pass ``project`` so the PR-verification landing path also
+                    # mints the capability proof (not just the acceptance verdict).
+                    mark_landed_on_integration(task, project)
                     # Persist to DB in separate session (best-effort — may fail if
                     # caller holds FOR UPDATE lock on this row, but in-memory update is
                     # sufficient for the current rollup cycle).
@@ -459,7 +460,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     )
                     task.context = dict(_ctx)
                     if record_pr_merged:
-                        mark_landed_on_integration(task)
+                        mark_landed_on_integration(task, project)
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:

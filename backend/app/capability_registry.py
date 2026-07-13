@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from app.evidence_primitive import classify_evidence, classify_evidence_tiered
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from typing import Literal
 
     from app.evidence_primitive import EvidenceStatus
@@ -156,7 +157,7 @@ def registry_capability_evidence_refs_map(problem_model: object) -> dict[str, li
     IO-free — reads only from the in-memory model.
     """
     refs_map: dict[str, list] = {}
-    for raw_name, _status, _absorbs, evidence_refs, _backing_paths, _proof_exempt in _iter_capability_evidence_entries(
+    for raw_name, _status, _absorbs, evidence_refs, _backing_paths, _proof_exempt, _source in _iter_capability_evidence_entries(
         problem_model
     ):
         normalized = normalize_capability_name(raw_name)
@@ -266,20 +267,65 @@ def registry_satisfies_capability_need(
     return normalized is not None and normalized in set(working_names)
 
 
+#: Source ``type`` values that represent a deliberate operator or
+#: strategic-agent authoring decision — the provenance a ``proof_exempt``
+#: exemption requires to be honored. A bare ``proof_exempt=True`` with no cited
+#: ``source`` (or a source whose ``type`` is unrecognized) is NOT authorized:
+#: the exemption docstring assumes operator/strategic authorship and this is
+#: what enforces it, closing the "silent self-report escape hatch" where any
+#: writer could clear the enforce gate with an unattributed boolean flag.
+_EXEMPTION_PROVENANCE_TYPES: frozenset[str] = frozenset(
+    {
+        "user_message",       # operator explicitly authored the exemption
+        "self_reflection",    # strategic agent authored it during reflection
+        "direction_outcome",  # established by a strategic direction's outcome
+        "agent_observation",  # strategic agent observation
+    }
+)
+
+
+def _exemption_source_type(source: object) -> str | None:
+    """Return the non-empty string ``type`` of a capability ``source``, else ``None``.
+
+    Tolerates the pydantic ``Source`` instance, a dict-like payload, and any
+    missing / junk value (all fall through to ``None``).
+    """
+    if isinstance(source, Mapping):
+        raw = source.get("type")
+    else:
+        raw = getattr(source, "type", None)
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def _exemption_is_authorized(source: object) -> bool:
+    """True iff ``source`` carries provenance that authorizes a ``proof_exempt``.
+
+    An exemption is honored ONLY when the capability cites a ``source`` whose
+    ``type`` names a deliberate operator or strategic-agent authoring channel
+    (:data:`_EXEMPTION_PROVENANCE_TYPES`). A bare ``proof_exempt=True`` with no
+    source — the silent self-report vector this gate exists to close — is NOT
+    authorized, so the capability falls back to evidence-based classification
+    and cannot clear the enforce gate without real machine-verified proof.
+    """
+    return _exemption_source_type(source) in _EXEMPTION_PROVENANCE_TYPES
+
+
 def _iter_capability_evidence_entries(problem_model: object):
-    """Yield ``(raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt)`` sextuples.
+    """Yield ``(raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt, source)`` septuples.
 
     The evidence-aware sibling of :func:`_iter_capability_entries`: it draws from
     the exact same ``capabilities`` source (accepting either the pydantic
     ``ProblemModel`` instance or a dict-like payload) but additionally surfaces
-    each capability's ``evidence_refs``, ``backing_paths``, and ``proof_exempt``
-    so the proof-aware resolvers can classify the backing evidence and apply
-    exemption semantics WITHOUT widening the shared 3-tuple contract three other
-    call sites unpack. ``evidence_refs`` / ``backing_paths`` are whatever the
-    payload carries (a list, ``None`` on older/dict payloads that omit it, or
+    each capability's ``evidence_refs``, ``backing_paths``, ``proof_exempt``, and
+    ``source`` so the proof-aware resolvers can classify the backing evidence and
+    apply exemption semantics WITHOUT widening the shared 3-tuple contract three
+    other call sites unpack. ``evidence_refs`` / ``backing_paths`` are whatever
+    the payload carries (a list, ``None`` on older/dict payloads that omit it, or
     junk) — callers coerce them before handing them to
-    :func:`classify_evidence`. ``proof_exempt`` defaults to ``False`` for
-    backward-compatibility with payloads that omit the field.
+    :func:`classify_evidence`. ``proof_exempt`` defaults to ``False`` and
+    ``source`` to ``None`` for backward-compatibility with payloads that omit
+    those fields. ``source`` is the provenance :func:`_exemption_is_authorized`
+    checks before honoring an exemption.
     """
     if isinstance(problem_model, Mapping):
         raw_caps = problem_model.get("capabilities")
@@ -296,6 +342,7 @@ def _iter_capability_evidence_entries(problem_model: object):
                 cap.get("evidence_refs"),
                 cap.get("backing_paths"),
                 cap.get("proof_exempt", False),
+                cap.get("source"),
             )
         else:
             yield (
@@ -305,11 +352,13 @@ def _iter_capability_evidence_entries(problem_model: object):
                 getattr(cap, "evidence_refs", None),
                 getattr(cap, "backing_paths", None),
                 getattr(cap, "proof_exempt", False),
+                getattr(cap, "source", None),
             )
 
 
 def working_capability_proof_status(
     problem_model: object,
+    now: "datetime | None" = None,
 ) -> dict[str, EvidenceStatus]:
     """Map every ``working`` capability's canonical name to its evidence status.
 
@@ -342,12 +391,34 @@ def working_capability_proof_status(
     through the earning loop.
 
     **Exemption**: a ``working`` capability with ``proof_exempt=True`` is
-    classified as ``"proven"`` unconditionally — it satisfies the proof gate
-    without machine-verified evidence, is excluded from the unproven count in
-    the release qualifier, and does not inflate the metrics-sweep delta.
-    Exemption is for capabilities that genuinely cannot have machine-verifiable
-    proof (e.g. purely human processes, external integrations without test
-    hooks) and must be explicitly set by an operator or strategic agent.
+    classified as ``"proven"`` ONLY when its exemption carries operator or
+    strategic-agent provenance — a ``source`` whose ``type`` is in
+    :data:`_EXEMPTION_PROVENANCE_TYPES` (checked by
+    :func:`_exemption_is_authorized`). A provenance-backed exemption satisfies
+    the proof gate without machine-verified evidence, is excluded from the
+    unproven count in the release qualifier, and does not inflate the
+    metrics-sweep delta. A bare ``proof_exempt=True`` with NO cited ``source``
+    is NOT honored — it is the silent self-report escape hatch this gate exists
+    to close, so it falls through to evidence-based classification (and thus
+    reads ``unproven`` / ``partial`` when it has no real proof, blocking the
+    enforce gate exactly as an un-exempt claim would). Exemption is for
+    capabilities that genuinely cannot have machine-verifiable proof (e.g.
+    purely human processes, external integrations without test hooks) and must
+    be explicitly set — with provenance — by an operator or strategic agent.
+
+    **Freshness re-verification**: capability proofs are written once (each
+    ``evidence_ref`` stamps a ``recorded_at``) but nothing re-runs them, so a
+    proof whose backing test/file was since deleted or materially changed still
+    lingers as ``proven``. Because this map feeds the ENFORCE gate, it evaluates
+    proof freshness: a ``proven=True`` ref older than
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` is dropped before tiering,
+    so a stale proof demotes to a non-``proven`` tier and no longer clears the
+    gate on its own — the standing earn loop then re-verifies it against HEAD and
+    re-stamps a fresh proof. ``now`` defaults to the current UTC time (evaluated
+    lazily so the module stays import-time side-effect-free); a caller may pass an
+    explicit ``now`` for deterministic evaluation. A ref with a missing/malformed
+    ``recorded_at`` is treated as indeterminate and never expires, so every legacy
+    proof that predates timestamped evidence classifies exactly as before.
 
     IO-free and additive — the observe-mode wiring in both the spawn-time
     resolver and the blocked-resume sweep builds this map once per project
@@ -355,15 +426,22 @@ def working_capability_proof_status(
     against it via :func:`capability_need_proof_status`. First-seen wins when two
     entries normalize to the same name, matching the name reader's dedupe order.
     """
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     out: dict[str, EvidenceStatus] = {}
-    for raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt in _iter_capability_evidence_entries(
+    for raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt, source in _iter_capability_evidence_entries(
         problem_model
     ):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        # Exempt working capabilities are unconditionally "proven" — they
-        # satisfy the proof gate without machine-verified evidence.
-        if proof_exempt:
+        # An exempt working capability grades "proven" ONLY when its exemption
+        # carries operator/strategic provenance (:func:`_exemption_is_authorized`).
+        # A bare ``proof_exempt=True`` with no cited ``source`` is the silent
+        # self-report vector this gate exists to close, so it falls through to
+        # evidence-based classification and cannot clear the enforce gate.
+        if proof_exempt and _exemption_is_authorized(source):
             proof_status: EvidenceStatus = "proven"
         else:
             # Coerce a missing/None evidence_refs to the empty list so a capability
@@ -375,7 +453,7 @@ def working_capability_proof_status(
             # machine-verified) is demoted to ``partial`` so it does NOT clear the
             # gate as strongly as a machine-verified ``named_test``. The badge/display
             # path (annotate_capability_proof_status) keeps the plain classifier.
-            proof_status = classify_evidence_tiered(refs)
+            proof_status = classify_evidence_tiered(refs, now=now)
             # When evidence_refs is empty/missing but the capability declares
             # backing_paths, upgrade to ``partial`` — the claim has structural
             # evidence (it declares where its code lives) even if no formal
@@ -395,11 +473,17 @@ def working_capability_proof_status(
 
 
 def exempt_capability_names(problem_model: object) -> set[str]:
-    """Return the canonical names of ``working`` capabilities marked ``proof_exempt``.
+    """Return the canonical names of ``working`` capabilities with a *provenance-backed* ``proof_exempt``.
 
     These are capabilities the operator or strategic agent has declared genuinely
     cannot have machine-verifiable proof. They are excluded from the proof-gate
     delta, the release-qualifier unproven count, and the earn-loop targets.
+
+    Only exemptions carrying operator/strategic provenance (a ``source`` accepted
+    by :func:`_exemption_is_authorized`) are returned — a bare, unattributed
+    ``proof_exempt=True`` is not a real exemption and is omitted here, matching
+    its evidence-based (non-``proven``) classification in
+    :func:`working_capability_proof_status`.
 
     Alias-aware: same as :func:`working_capability_names`, an exempt entry
     contributes its own canonical name AND every name in its ``absorbs`` list so
@@ -413,8 +497,15 @@ def exempt_capability_names(problem_model: object) -> set[str]:
         _evidence_refs,
         _backing_paths,
         proof_exempt,
+        source,
     ) in _iter_capability_evidence_entries(problem_model):
         if not proof_exempt:
+            continue
+        # Only provenance-backed exemptions are honored — an unattributed
+        # ``proof_exempt=True`` is not a real exemption (see
+        # :func:`_exemption_is_authorized`), so it never enters the audit set
+        # and its capability classifies by evidence in the proof map.
+        if not _exemption_is_authorized(source):
             continue
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue

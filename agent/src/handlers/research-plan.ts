@@ -903,9 +903,10 @@ ${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <k
       localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
       // Bounded per-device summary (when the backend advertises it) so authored
       // experiments are sized to the hardware that will actually run them.
-      const devices = Array.isArray(localRunnerStatus.devices) ? localRunnerStatus.devices : [];
-      const deviceBits = devices.slice(0, 8).map((d) => {
-        if (!d || typeof d !== 'object') return '';
+      const devices: unknown[] = Array.isArray(localRunnerStatus.devices) ? localRunnerStatus.devices : [];
+      const deviceBits = devices.slice(0, 8).map((entry) => {
+        if (!entry || typeof entry !== 'object') return '';
+        const d = entry as Record<string, unknown>;
         const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
         const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
         const models = Array.isArray(d.gpu_models) ? (d.gpu_models as unknown[]).filter((m) => typeof m === 'string').join('/') : '';

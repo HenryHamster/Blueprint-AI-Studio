@@ -20,7 +20,7 @@ integration branch" signal used by analytics.
 """
 
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import and_, cast, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
@@ -239,7 +239,7 @@ def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
     )
 
 
-def mark_landed_on_integration(task: Task) -> None:
+def mark_landed_on_integration(task: Task, project: Any = None) -> None:
     """Stamp the landed signal for a PR that merged onto the integration branch.
 
     This is the canonical write for a *real* integration-branch merge. Callers
@@ -253,6 +253,18 @@ def mark_landed_on_integration(task: Task) -> None:
     is logged and swallowed so it can never undo a real merge landing. Lazy
     import avoids the module-load cycle (``acceptance_gate`` imports this module
     for its constants).
+
+    When ``project`` is supplied, also mints the capability proof for any
+    capability the task advertises with a proven acceptance verdict, so the SAME
+    "every integration-landing path" guarantee that already covers the verdict
+    now covers the capability proof too. Previously the proof was recorded only
+    on the ``apply_merged_landed_signal`` path, so direct landing paths (rollup
+    child propagation, PR verification, recovery strands) stamped the verdict but
+    never minted the proof — leaving the provider's dependents blocked under the
+    enforce gate until an out-of-band sweep re-recorded it. Fail-safe: a
+    proof-recording failure is logged and swallowed so it can never undo a real
+    merge landing. ``project`` defaults to ``None`` (proof skipped) so legacy
+    task-only callers keep their exact current behavior.
     """
     had_non_merge_unblock = NON_MERGE_UNBLOCK_REASON_KEY in (task.context or {})
     ctx = {
@@ -283,6 +295,17 @@ def mark_landed_on_integration(task: Task) -> None:
             getattr(task, "id", None),
             exc_info=True,
         )
+    if project is not None:
+        try:
+            from app.capability_proof import record_capability_proof
+
+            record_capability_proof(task, project)
+        except Exception:  # noqa: BLE001 — proof recording must never undo a real merge
+            logger.warning(
+                "[LANDED] capability proof recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
 
 
 def mark_unblocked_non_merge(task: Task, *, reason: str) -> None:
@@ -386,19 +409,10 @@ def apply_merged_landed_signal(
             ),
         )
     if landed_on_integration:
-        mark_landed_on_integration(task)
-        # Note: record_code_acceptance_verdict is now called inside
-        # mark_landed_on_integration so every landing path records the verdict.
-        try:
-            from app.capability_proof import record_capability_proof
-
-            record_capability_proof(task, project)
-        except Exception:  # noqa: BLE001 — proof recording must never undo a real merge
-            logger.warning(
-                "[LANDED] capability proof recording failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+        # record_code_acceptance_verdict AND record_capability_proof are both
+        # called inside mark_landed_on_integration (project supplied here), so
+        # every landing path records the verdict and mints the capability proof.
+        mark_landed_on_integration(task, project)
         try:
             from app.capability_proof import record_gap_evidence
 

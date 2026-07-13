@@ -18,7 +18,7 @@ import pytest
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     _PROOF_KIND_BACKING_PATH,
-    _PROOF_KIND_NAMED_TEST,
+    _PROOF_KIND_NAMED_TEST_PRESENT,
     _PROOF_KIND_TRIAL_ADOPTION,
     _candidate_test_paths,
     _capability_search_tokens,
@@ -1707,13 +1707,25 @@ def _proven_ref() -> dict:
     return {"kind": "named_test", "ref": "test_foo.py::test_bar", "proven": True}
 
 
+def _exemption_source() -> dict:
+    """Provenance that authorizes a ``proof_exempt`` exemption.
+
+    An operator (``user_message``) source is one of the deliberate
+    operator/strategic authoring channels
+    (``capability_registry._EXEMPTION_PROVENANCE_TYPES``) that make an exemption
+    real, rather than a bare, unattributed ``proof_exempt=True`` flag.
+    """
+    return {"type": "user_message", "excerpt": "operator declared this exempt"}
+
+
 def test_exempt_capability_not_blocked_by_gate():
-    """An exempt working capability is NOT blocked by the proof gate in enforce mode.
+    """A provenance-backed exempt working capability is NOT blocked by the proof gate.
 
     This is the load-bearing acceptance test for the proof_exempt feature:
-    a capability marked ``proof_exempt=True`` classifies as ``"proven"`` in
-    ``working_capability_proof_status()``, so the enforce-mode gate predicate
-    sees it as proven and returns ``False`` (not blocked).
+    a capability marked ``proof_exempt=True`` AND carrying operator/strategic
+    provenance classifies as ``"proven"`` in ``working_capability_proof_status()``,
+    so the enforce-mode gate predicate sees it as proven and returns ``False``
+    (not blocked).
 
     Without proof_exempt=True, the same capability with no evidence_refs
     classifies as ``"unproven"`` and the gate WOULD block it.
@@ -1723,7 +1735,7 @@ def test_exempt_capability_not_blocked_by_gate():
         working_capability_proof_status,
     )
 
-    # Exempt working capability with zero evidence.
+    # Exempt working capability with zero evidence but explicit provenance.
     model = {
         "capabilities": [
             {
@@ -1731,6 +1743,7 @@ def test_exempt_capability_not_blocked_by_gate():
                 "status": "working",
                 "evidence_refs": [],
                 "proof_exempt": True,
+                "source": _exemption_source(),
             }
         ]
     }
@@ -1766,6 +1779,83 @@ def test_exempt_capability_not_blocked_by_gate():
     ), "non-exempt unproven cap must be blocked in enforce mode"
 
 
+def test_exempt_without_provenance_not_honored():
+    """A bare ``proof_exempt=True`` with NO cited source does NOT clear the gate.
+
+    This is the load-bearing regression for the "silent self-report escape
+    hatch" fix: an exemption must carry operator/strategic provenance to be
+    honored. Without a ``source``, the flag is ignored — the capability falls
+    through to evidence-based classification (``unproven`` here, since it has no
+    evidence), is counted among the unproven, is NOT in the exempt audit set,
+    and IS blocked by the enforce-mode gate exactly as an un-exempt claim would
+    be. This closes the vector where any writer could set a bare boolean and
+    clear the exact gate this direction exists to make real.
+    """
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_proof_gate_release_status,
+        exempt_capability_names,
+        working_capability_proof_status,
+    )
+
+    # proof_exempt=True but NO source → not a real exemption.
+    model = {
+        "capabilities": [
+            {
+                "name": "human-code-review",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+            }
+        ]
+    }
+    proof = working_capability_proof_status(model)
+
+    # The bare exemption is ignored — the cap classifies by its (absent) evidence.
+    assert proof.get("human-code-review") == "unproven", (
+        "a proof_exempt cap with no provenance must fall back to 'unproven', "
+        "not be laundered into 'proven'"
+    )
+
+    # It is NOT in the exempt audit set.
+    assert exempt_capability_names(model) == set(), (
+        "an unattributed exemption must not appear in the exempt set"
+    )
+
+    # It IS blocked by the enforce-mode gate.
+    need = {"kind": "capability", "ref": "human-code-review"}
+    assert capability_need_blocked_by_proof_gate(
+        need, proof, mode="enforce"
+    ), "an unprovenanced exempt cap with no proof must be blocked in enforce mode"
+
+    # And it blocks release qualification in enforce mode.
+    blocked, detail = capability_proof_gate_release_status(model, "enforce")
+    assert blocked is True, (
+        "release qualifier must block when an unprovenanced exemption leaves an "
+        "unproven working capability"
+    )
+    assert "human-code-review" in detail["unproven"]
+    assert detail["exempt_count"] == 0
+
+    # A source of an UNRECOGNIZED type is likewise not sufficient provenance.
+    model_bad_type = {
+        "capabilities": [
+            {
+                "name": "human-code-review",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+                "source": {"type": "shipped_change", "pr_number": 42},
+            }
+        ]
+    }
+    proof_bad = working_capability_proof_status(model_bad_type)
+    assert proof_bad.get("human-code-review") == "unproven", (
+        "a source whose type is not an operator/strategic authoring channel "
+        "must not authorize the exemption"
+    )
+
+
 def test_exempt_capability_not_in_unproven_count():
     """Exempt working caps classify as 'proven' and do NOT appear in the unproven set."""
     from app.capability_registry import working_capability_proof_status
@@ -1775,7 +1865,8 @@ def test_exempt_capability_not_in_unproven_count():
             {"name": "real-proven", "status": "working",
              "evidence_refs": [_proven_ref()]},
             {"name": "exempt-cap", "status": "working",
-             "evidence_refs": [], "proof_exempt": True},
+             "evidence_refs": [], "proof_exempt": True,
+             "source": _exemption_source()},
             {"name": "unproven-cap", "status": "working",
              "evidence_refs": []},
         ]
@@ -1801,15 +1892,19 @@ def test_exempt_capability_names_returns_correct_set():
 
     model = {
         "capabilities": [
-            {"name": "exempt-working", "status": "working", "proof_exempt": True},
+            {"name": "exempt-working", "status": "working", "proof_exempt": True,
+             "source": _exemption_source()},
             {"name": "non-exempt-working", "status": "working", "proof_exempt": False},
-            {"name": "exempt-planned", "status": "planned", "proof_exempt": True},
+            {"name": "exempt-planned", "status": "planned", "proof_exempt": True,
+             "source": _exemption_source()},
             {"name": "no-exempt-field", "status": "working"},
+            # Exempt but with NO provenance — not a real exemption, excluded.
+            {"name": "exempt-no-provenance", "status": "working", "proof_exempt": True},
         ]
     }
     exempt = exempt_capability_names(model)
     assert exempt == {"exempt-working"}, (
-        "only working+exempt caps should be returned; got: " + str(exempt)
+        "only working+exempt+provenance caps should be returned; got: " + str(exempt)
     )
 
     # Empty model returns empty set.
@@ -1838,7 +1933,8 @@ def test_exempt_capability_skipped_in_earn_loop():
     project.problem_model = {
         "capabilities": [
             {"name": "exempt-no-proof", "status": "working",
-             "proof_exempt": True, "backing_paths": ["backend/app/main.py"]},
+             "proof_exempt": True, "backing_paths": ["backend/app/main.py"],
+             "source": _exemption_source()},
         ]
     }
     project.capability_proof_records = {}
@@ -1877,7 +1973,7 @@ def test_exempt_capability_skipped_in_earn_loop():
     project2.problem_model = {
         "capabilities": [
             {"name": "exempt-no-proof", "status": "working",
-             "proof_exempt": True},
+             "proof_exempt": True, "source": _exemption_source()},
             {"name": "real-unproven", "status": "working",
              "backing_paths": ["backend/app/main.py"]},
         ]
@@ -1918,7 +2014,8 @@ def test_release_qualifier_exempt_not_blocked():
     model = {
         "capabilities": [
             {"name": "exempt-unproven", "status": "working",
-             "proof_exempt": True, "evidence_refs": []},
+             "proof_exempt": True, "evidence_refs": [],
+             "source": _exemption_source()},
             {"name": "real-unproven", "status": "working",
              "evidence_refs": []},
         ]
@@ -1937,7 +2034,8 @@ def test_release_qualifier_exempt_not_blocked():
     model2 = {
         "capabilities": [
             {"name": "exempt-only", "status": "working",
-             "proof_exempt": True, "evidence_refs": []},
+             "proof_exempt": True, "evidence_refs": [],
+             "source": _exemption_source()},
             {"name": "existent-proven", "status": "working",
              "evidence_refs": [_proven_ref()]},
         ]
@@ -2414,12 +2512,15 @@ class TestProofEarnLoopDedup:
         )
 
 
-# ── named_test-tier automated proof earning (c-e9ef1da6 / d-2b95bef1) ──────────
+# ── named_test_present-tier automated proof earning (c-e9ef1da6 / d-2b95bef1) ──
 #
-# The earn loop's higher tier: when a capability's backing_paths are not merely
-# present at HEAD but are exercised by real test files, mint a machine-verified
-# ``named_test`` proof (graded ``proven`` by classify_evidence_tiered) so
-# auto-graduation coverage can move off 0 and enforce mode can graduate.
+# The earn loop's discovery tier: when a capability's backing_paths are not
+# merely present at HEAD but a convention-named test file for them also exists at
+# HEAD and imports the module, mint a ``named_test_present`` proof. That check is
+# STATIC — the test is never executed — so classify_evidence_tiered grades it
+# ``path_proven`` (the same tier as ``backing_path``), NOT ``proven``: it does
+# NOT clear the enforce gate. Only a real green merge-test acceptance verdict
+# (record_capability_proof) mints the executed ``proven`` ``named_test`` tier.
 
 
 class TestNamedTestCoverageHelpers:
@@ -2766,38 +2867,24 @@ class TestListHeadFiles:
 
 
 class TestRecordCapabilityNamedTestProof:
-    """record_capability_named_test_proof: named_test-tier durable recording."""
+    """record_capability_named_test_proof: named_test_present-tier recording."""
 
-    def test_requires_execution_evidence(self):
-        """Finding #2: without execution_verified=True the recorder writes
-        NOTHING and returns False — a present test file is not proof it ran green.
-
-        Fails before the fix (the recorder credited a proven-tier named_test from
-        a bare test-path list); passes after (execution evidence is mandatory)."""
-        project = _make_project()
-        with patch("app.capability_proof.flag_modified"):
-            # No execution evidence supplied → refused.
-            ok = record_capability_named_test_proof(
-                project, "my-cap", ["backend/testing/test_capability_proof.py"]
-            )
-        assert ok is False
-        assert project.capability_proof_records == {}
-
-    def test_records_named_test_entry_with_correct_shape(self):
+    def test_records_named_test_present_entry_with_correct_shape(self):
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
             ok = record_capability_named_test_proof(
                 project,
                 "my-cap",
                 ["backend/testing/test_capability_proof.py"],
-                execution_verified=True,
             )
         assert ok is True
         entries = project.capability_proof_records["my-cap"]
         assert len(entries) == 1
         e = entries[0]
-        assert e["proof_kind"] == _PROOF_KIND_NAMED_TEST
-        assert e["task_id"] == "named_test:my-cap"
+        # STATIC discovery (file exists + import regex) — never executed — so it
+        # is stamped named_test_present, NOT the executed named_test tier.
+        assert e["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+        assert e["task_id"] == "named_test_present:my-cap"
         assert e["proof_ref"] == "backend/testing/test_capability_proof.py"
         assert e["test_refs"] == ["backend/testing/test_capability_proof.py"]
 
@@ -2808,13 +2895,11 @@ class TestRecordCapabilityNamedTestProof:
                 project,
                 "my-cap",
                 ["backend/testing/test_capability_proof.py"],
-                execution_verified=True,
             )
             second = record_capability_named_test_proof(
                 project,
                 "my-cap",
                 ["backend/testing/test_capability_proof.py"],
-                execution_verified=True,
             )
         assert first is True
         assert second is False
@@ -2824,15 +2909,11 @@ class TestRecordCapabilityNamedTestProof:
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
             assert (
-                record_capability_named_test_proof(
-                    project, "my-cap", [], execution_verified=True
-                )
+                record_capability_named_test_proof(project, "my-cap", [])
                 is False
             )
             assert (
-                record_capability_named_test_proof(
-                    project, "my-cap", ["  "], execution_verified=True
-                )
+                record_capability_named_test_proof(project, "my-cap", ["  "])
                 is False
             )
         assert project.capability_proof_records == {}
@@ -2841,9 +2922,7 @@ class TestRecordCapabilityNamedTestProof:
         project = _make_project()
         with patch("app.capability_proof.flag_modified"):
             assert (
-                record_capability_named_test_proof(
-                    project, "", ["t.py"], execution_verified=True
-                )
+                record_capability_named_test_proof(project, "", ["t.py"])
                 is False
             )
 
@@ -2857,28 +2936,23 @@ class TestRecordCapabilityNamedTestProof:
                 project,
                 "my-cap",
                 ["backend/testing/test_capability_proof.py"],
-                execution_verified=True,
             )
         refs = project.problem_model["capabilities"][0]["evidence_refs"]
         assert len(refs) == 1
-        assert refs[0]["kind"] == _PROOF_KIND_NAMED_TEST
+        assert refs[0]["kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
         assert refs[0]["proven"] is True
 
-    def test_named_test_proof_reads_proven(self):
-        """The synthetic ref from a named_test proof classifies as 'proven'."""
-        synthetic = [{"kind": _PROOF_KIND_NAMED_TEST, "proven": True}]
-        assert classify_evidence_tiered(synthetic) == "proven"
+    def test_named_test_present_proof_reads_path_proven(self):
+        """The synthetic ref from a named_test_present proof classifies as
+        'path_proven' — NOT 'proven'. The test file exists but was never run, so
+        it must not clear the enforce gate."""
+        synthetic = [{"kind": _PROOF_KIND_NAMED_TEST_PRESENT, "proven": True}]
+        assert classify_evidence_tiered(synthetic) == "path_proven"
 
 
 class TestEarnLoopNamedTestTier:
-    """commission_proof_earn_loop earns only the structural ``backing_path`` tier.
-
-    Finding #2 correction: static coverage discovery (a conventionally-named test
-    file that imports the module, present at HEAD) is NOT execution evidence, so
-    the earn loop must NOT mint the machine-verified ``named_test`` tier (graded
-    ``proven``). It records at most ``backing_path`` (graded ``path_proven``),
-    which does not clear the enforce gate. The ``named_test`` tier is reachable
-    only via the acceptance-verdict path (already green-run verified)."""
+    """commission_proof_earn_loop mints named_test_present proofs → path_proven
+    (NEVER 'proven'): a never-executed test file cannot clear the enforce gate."""
 
     @staticmethod
     def _project_and_demand(cap_name, backing_paths):
@@ -2896,15 +2970,12 @@ class TestEarnLoopNamedTestTier:
         return project, demand
 
     @pytest.mark.asyncio
-    async def test_static_coverage_does_not_mint_named_test_proof(self):
-        """Finding #2: even when a conventionally-named, module-importing test
-        file exists at HEAD, the loop records only a ``backing_path`` proof
-        (``path_proven``) — NOT a ``named_test`` proof (``proven``). Static
-        presence is not execution evidence, so the capability stays below the
-        enforce-clearing tier.
-
-        Fails before the fix (the loop minted a named_test proof → ``proven``);
-        passes after (backing_path only → ``path_proven``)."""
+    async def test_test_backed_capability_earns_named_test_present_stays_path_proven(self):
+        """ACCEPTANCE EVIDENCE (c-e9ef1da6): a working capability whose backing
+        path has a convention-named test file present at HEAD earns a
+        named_test_present proof. Because that discovery is STATIC (the test is
+        never executed), working_capability_proof_status returns 'path_proven',
+        NOT 'proven' — and the enforce gate is NOT cleared."""
         project, demand = self._project_and_demand(
             "capability-proof-gate", ["backend/app/capability_proof.py"]
         )
@@ -2928,14 +2999,19 @@ class TestEarnLoopNamedTestTier:
             )
 
         assert result["earned"] == 1
-        # No named_test tier is ever earned from static coverage.
-        assert result["named_test_earned"] == []
-        # The recorded proof is the structural backing_path tier.
+        assert result["named_test_earned"] == ["capability-proof-gate"]
+        # The recorded proof is the STATIC named_test_present tier — never run.
         entry = project.capability_proof_records["capability-proof-gate"][0]
-        assert entry["proof_kind"] == _PROOF_KIND_BACKING_PATH
-        # And the capability reads 'path_proven' — below the enforce-clearing tier.
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+        # The capability reads 'path_proven' — NOT the enforce-clearing 'proven'.
         status = working_capability_proof_status(project.problem_model)
         assert status["capability-proof-gate"] == "path_proven"
+        # And under enforce mode a dependent need on it stays BLOCKED: a
+        # never-executed test file cannot graduate the gate.
+        need = {"kind": "capability", "ref": "capability-proof-gate"}
+        assert capability_need_blocked_by_proof_gate(
+            need, status, mode="enforce"
+        ) is True
 
     @pytest.mark.asyncio
     async def test_no_test_coverage_falls_back_to_backing_path(self):
@@ -2968,11 +3044,11 @@ class TestEarnLoopNamedTestTier:
         assert status["no-test-cap"] == "path_proven"
 
     @pytest.mark.asyncio
-    async def test_second_sweep_dedups_backing_path_and_stays_path_proven(self):
-        """A backing_path proof reads 'path_proven' (below proven), so the
-        capability stays in the demanded-unproven intersection on the next sweep,
-        but the recorder dedups — no duplicate entry and it is not re-counted as
-        newly earned."""
+    async def test_second_sweep_dedups_path_proven_capability(self):
+        """A named_test_present proof only reaches 'path_proven', so the cap stays
+        in the demanded-unproven set. The second sweep finds it again but the
+        recorder dedups — it earns nothing new and reports the cap in
+        path_proven_stuck, writing no duplicate proof entry."""
         project, demand = self._project_and_demand(
             "dedup-nt", ["backend/app/capability_proof.py"]
         )
@@ -2996,14 +3072,16 @@ class TestEarnLoopNamedTestTier:
                 verify_path=_verify, read_head=_read,
             )
 
-        assert first["earned"] == 1
-        assert first["named_test_earned"] == []
-        # path_proven is still below 'proven' → the cap remains demanded-unproven.
+        assert first["named_test_earned"] == ["dedup-nt"]
+        # Still only path_proven → remains in the demanded-unproven intersection.
         assert second["total_demanded_unproven"] == 1
-        # Dedup: no new proof recorded on the second sweep.
         assert second["earned"] == 0
-        assert "dedup-nt" in second["path_proven_stuck"]
+        assert second["named_test_earned"] == []
+        assert second["path_proven_stuck"] == ["dedup-nt"]
+        # No duplicate proof entry was written.
         assert len(project.capability_proof_records["dedup-nt"]) == 1
+        status = working_capability_proof_status(project.problem_model)
+        assert status["dedup-nt"] == "path_proven"
 
     @pytest.mark.asyncio
     async def test_named_test_earned_key_present_on_empty_return(self):
@@ -3016,6 +3094,206 @@ class TestEarnLoopNamedTestTier:
             problem_model={"capabilities": [{"name": "c", "status": "working"}]},
         )
         assert result["named_test_earned"] == []
+
+
+class TestCapabilityProofFreshnessExpiry:
+    """Capability proofs expire and force re-verification once stale.
+
+    A capability proof (named_test / backing_path) is written once with a
+    ``recorded_at`` timestamp but nothing re-runs it. A proof whose backing test
+    or file was since deleted or materially changed must not clear the enforce
+    gate forever. These tests pin the freshness contract: a ``proven=True`` ref
+    older than ``PROOF_FRESHNESS_TTL`` demotes below ``proven`` at the enforce
+    gate, a fresh one still clears it, a missing/malformed timestamp never
+    expires, and the legacy ``now=None`` path is unchanged.
+    """
+
+    @staticmethod
+    def _now():
+        from datetime import datetime
+
+        return datetime(2026, 7, 12, 0, 0, 0)
+
+    @staticmethod
+    def _ref(recorded_at, *, kind="named_test", proven=True) -> dict:
+        return {
+            "kind": kind,
+            "ref": "testing/test_foo.py::test_bar",
+            "proven": proven,
+            "recorded_at": recorded_at,
+        }
+
+    def test_expired_named_test_ref_demotes_to_partial(self):
+        """A stale proven named_test ref no longer classifies as 'proven'."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import (
+            PROOF_FRESHNESS_TTL,
+            classify_evidence_tiered,
+        )
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        fresh = (now - timedelta(days=1)).isoformat()
+
+        # Stale proof drops out → no proven refs remain → honest "must re-verify".
+        assert classify_evidence_tiered([self._ref(stale)], now=now) == "partial"
+        # A proof exactly one day inside the window is still proven.
+        assert classify_evidence_tiered([self._ref(fresh)], now=now) == "proven"
+
+    def test_now_none_preserves_legacy_behavior(self):
+        """Without opting into freshness, an ancient proof still reads 'proven'."""
+        from app.evidence_primitive import classify_evidence_tiered
+
+        ancient = self._ref("2000-01-01T00:00:00")
+        # now=None (default) → freshness not evaluated at all.
+        assert classify_evidence_tiered([ancient]) == "proven"
+        assert classify_evidence_tiered([ancient], now=None) == "proven"
+
+    def test_missing_or_malformed_recorded_at_never_expires(self):
+        """An indeterminate timestamp is never laundered into staleness."""
+        from app.evidence_primitive import classify_evidence_tiered
+
+        now = self._now()
+        # No recorded_at key at all.
+        no_ts = {"kind": "named_test", "ref": "t", "proven": True}
+        assert classify_evidence_tiered([no_ts], now=now) == "proven"
+        # Malformed / unparseable recorded_at.
+        bad_ts = self._ref("not-a-timestamp")
+        assert classify_evidence_tiered([bad_ts], now=now) == "proven"
+        # Explicit None recorded_at.
+        none_ts = self._ref(None)
+        assert classify_evidence_tiered([none_ts], now=now) == "proven"
+
+    def test_working_capability_proof_status_expires_stale_ref(self):
+        """The ENFORCE gate re-blocks a working capability whose proof went stale."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        fresh = (now - timedelta(days=1)).isoformat()
+
+        model_stale = {
+            "capabilities": [
+                {
+                    "name": "container-runtime",
+                    "status": "working",
+                    "evidence_refs": [self._ref(stale)],
+                }
+            ]
+        }
+        model_fresh = {
+            "capabilities": [
+                {
+                    "name": "container-runtime",
+                    "status": "working",
+                    "evidence_refs": [self._ref(fresh)],
+                }
+            ]
+        }
+
+        # Stale proof: capability is no longer 'proven', so the enforce gate blocks.
+        status_stale = working_capability_proof_status(model_stale, now=now)
+        assert status_stale["container-runtime"] != "proven"
+        need = {"kind": "capability", "ref": "container-runtime"}
+        assert capability_need_blocked_by_proof_gate(
+            need, status_stale, mode="enforce"
+        ), "a stale capability proof must re-block the enforce gate"
+
+        # Fresh proof: still proven, still clears the gate.
+        status_fresh = working_capability_proof_status(model_fresh, now=now)
+        assert status_fresh["container-runtime"] == "proven"
+        assert not capability_need_blocked_by_proof_gate(
+            need, status_fresh, mode="enforce"
+        ), "a fresh capability proof must still clear the enforce gate"
+
+    def test_enrich_opt_in_freshness_demotes_stale_proof_record(self):
+        """enrich carries proved_at through and expires a stale tier-2 record when opted in."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        fresh = (now - timedelta(days=1)).isoformat()
+
+        problem_model = {
+            "capabilities": [{"name": "cap-a", "status": "working"}]
+        }
+        stale_records = {
+            "cap-a": [
+                {
+                    "task_id": "t1",
+                    "proved_at": stale,
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_cap.py::test_cap",
+                    "commit_sha": "abc",
+                }
+            ]
+        }
+        fresh_records = {
+            "cap-a": [
+                {
+                    "task_id": "t1",
+                    "proved_at": fresh,
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_cap.py::test_cap",
+                    "commit_sha": "abc",
+                }
+            ]
+        }
+
+        # Opted in (now supplied): stale record demotes below 'proven'.
+        enriched_stale = enrich_problem_model_capability_proofs(
+            problem_model, stale_records, now
+        )
+        assert enriched_stale["capabilities"][0]["proof_status"] != "proven"
+
+        # Opted in, fresh: still proven.
+        enriched_fresh = enrich_problem_model_capability_proofs(
+            problem_model, fresh_records, now
+        )
+        assert enriched_fresh["capabilities"][0]["proof_status"] == "proven"
+
+        # Default (now=None): display path stays deterministic — no expiry.
+        enriched_legacy = enrich_problem_model_capability_proofs(
+            problem_model, stale_records
+        )
+        assert enriched_legacy["capabilities"][0]["proof_status"] == "proven"
+
+    def test_fold_proof_records_tier2_expires_stale_record(self):
+        """The blocked-resume tier-2 fallback no longer resurrects a stale proof-record."""
+        from datetime import timedelta
+
+        from app.blocked_task_unblock_sweeps import _fold_proof_records_tier2
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        fresh = (now - timedelta(days=1)).isoformat()
+
+        # Tier-1 map says the capability is unproven (evidence_refs append failed).
+        status_by_name = {"cap-a": "unproven"}
+
+        stale_records = {
+            "cap-a": [{"proof_kind": "named_test", "proved_at": stale}]
+        }
+        folded_stale = _fold_proof_records_tier2(
+            dict(status_by_name), stale_records, now=now
+        )
+        # A stale tier-2 proof must NOT upgrade the capability to proven.
+        assert folded_stale["cap-a"] != "proven"
+
+        fresh_records = {
+            "cap-a": [{"proof_kind": "named_test", "proved_at": fresh}]
+        }
+        folded_fresh = _fold_proof_records_tier2(
+            dict(status_by_name), fresh_records, now=now
+        )
+        # A fresh tier-2 proof still upgrades to proven (fail-open recovery intact).
+        assert folded_fresh["cap-a"] == "proven"
 
 
 class TestReleaseGateLedgerCorroboration:

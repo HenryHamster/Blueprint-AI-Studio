@@ -372,7 +372,7 @@ async def _fetch_working_capability_names(session, project_id) -> set:
 
 
 def _fold_proof_records_tier2(
-    status_by_name: dict, proof_records: object
+    status_by_name: dict, proof_records: object, now: object = None
 ) -> dict:
     """Upgrade an evidence_refs-derived proof map with durable proof_records.
 
@@ -392,6 +392,13 @@ def _fold_proof_records_tier2(
     are working), and a tier-2 status is applied only when it is strictly stronger
     than the tier-1 status — so a landed proof never regresses a capability the
     evidence_refs already classify more highly.
+
+    Freshness parity with the tier-1 gate: each proof record's ``proved_at`` is
+    carried into the synthetic ref as ``recorded_at`` and ``now`` is threaded into
+    the tiered classifier, so a stale tier-2 proof-record (older than
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL`) can no longer resurrect an
+    expired capability at the enforce gate after the fail-open evidence_refs append
+    is missing. ``now`` defaults to the current UTC time when not supplied.
     """
     if not isinstance(proof_records, dict) or not status_by_name:
         return status_by_name
@@ -401,6 +408,11 @@ def _fold_proof_records_tier2(
         evidence_status_rank,
     )
 
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+
     for name, tier1 in list(status_by_name.items()):
         if evidence_status_rank(tier1) >= EVIDENCE_STATUS_RANK["proven"]:
             continue
@@ -408,13 +420,17 @@ def _fold_proof_records_tier2(
         if not isinstance(entries, list):
             continue
         synthetic = [
-            {"kind": e.get("proof_kind"), "proven": True}
+            {
+                "kind": e.get("proof_kind"),
+                "proven": True,
+                "recorded_at": e.get("proved_at"),
+            }
             for e in entries
             if isinstance(e, dict)
         ]
         if not synthetic:
             continue
-        tier2 = classify_evidence_tiered(synthetic)
+        tier2 = classify_evidence_tiered(synthetic, now=now)
         if evidence_status_rank(tier2) > evidence_status_rank(tier1):
             status_by_name[name] = tier2
     return status_by_name
@@ -437,13 +453,18 @@ async def _fetch_working_capability_proof_status(session, project_id) -> dict:
     """
     from app.capability_registry import working_capability_proof_status
     from app.models import Project
+    from app.time_utils import _utcnow
 
+    # One clock for both tiers so a proof on the freshness boundary is graded
+    # identically whether it lands in evidence_refs (tier-1) or the durable
+    # capability_proof_records column (tier-2).
+    now = _utcnow()
     project = await session.get(Project, project_id)
     status_by_name = working_capability_proof_status(
-        getattr(project, "problem_model", None)
+        getattr(project, "problem_model", None), now=now
     )
     return _fold_proof_records_tier2(
-        status_by_name, getattr(project, "capability_proof_records", None)
+        status_by_name, getattr(project, "capability_proof_records", None), now=now
     )
 
 

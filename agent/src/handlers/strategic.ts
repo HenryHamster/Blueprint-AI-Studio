@@ -179,11 +179,12 @@ export function buildLocalRunnerSection(status: unknown): string {
   // Per-device hardware detail (backend-bounded per-runner AND in total under
   // the experiment-authoring shared budget) so the strategist can reason about
   // VRAM fit, device counts, and container capability when sizing experiments.
-  const devices = Array.isArray(s.devices) ? (s.devices as Array<Record<string, unknown>>) : [];
+  const devices: unknown[] = Array.isArray(s.devices) ? s.devices : [];
   if (devices.length > 0) {
     lines.push('- Devices (live runners — size experiments to fit this hardware):');
-    for (const d of devices.slice(0, 8)) {
-      if (!d || typeof d !== 'object') continue;
+    for (const entry of devices.slice(0, 8)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const d = entry as Record<string, unknown>;
       const name = typeof d.runner_name === 'string' && d.runner_name ? d.runner_name : 'runner';
       const gpuCount = typeof d.gpu_count === 'number' ? d.gpu_count : 0;
       const models = Array.isArray(d.gpu_models) ? d.gpu_models.filter((m) => typeof m === 'string').join(', ') : '';
