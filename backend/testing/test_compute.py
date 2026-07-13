@@ -17212,6 +17212,7 @@ async def test_extract_viewable_files_from_bundle_roundtrips(
             "./screen.jpeg": jpg_data,
             "./anim.webp": b"RIFF" + b"\x00" * 100,
             "./icon.gif": b"GIF89a" + b"\x00" * 50,
+            # SVG is EXCLUDED fail-closed (script execution via signed URL).
             "./diagram.svg": b"<svg></svg>",
             "./output.mp4": mp4_data,
             "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
@@ -17244,9 +17245,9 @@ async def test_extract_viewable_files_from_bundle_roundtrips(
     )
     await db_session.commit()
 
-    # 8 viewable files extracted.
-    assert count == 8
-    assert len(uploaded) == 8
+    # 7 viewable files extracted (SVG is excluded fail-closed).
+    assert count == 7
+    assert len(uploaded) == 7
 
     # Verify DB rows.
     rows = (
@@ -17254,7 +17255,7 @@ async def test_extract_viewable_files_from_bundle_roundtrips(
         .scalars()
         .all()
     )
-    assert len(rows) == 8
+    assert len(rows) == 7
 
     # Verify specific files by safe_relpath.
     by_name = {r.safe_relpath: r for r in rows}
@@ -17263,8 +17264,9 @@ async def test_extract_viewable_files_from_bundle_roundtrips(
     assert by_name["plot.png"].content_type == "image/png"
     assert by_name["output.mp4"].media_type == "video"
     assert by_name["output.mp4"].content_type == "video/mp4"
-    assert "diagram.svg" in by_name
-    assert by_name["diagram.svg"].content_type == "image/svg+xml"
+    # SVG must NOT be persisted as a signable/viewable ComputeJobFile — it is
+    # excluded fail-closed on BOTH surfaces (script-execution risk).
+    assert "diagram.svg" not in by_name
 
     # Non-viewable files must NOT appear.
     assert "terminal.json" not in by_name

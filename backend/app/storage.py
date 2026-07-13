@@ -741,16 +741,36 @@ async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
 
 # Mapping of file extensions (lowercase, with leading dot) to MIME types for
 # viewable compute-job artifacts extracted from the durable bundle.
+#
+# Deliberately NO ``.svg``: an SVG served from a signed URL / the viewable
+# canvas can execute script in the viewer's browsing context, so SVG is
+# excluded fail-closed. This MUST stay in agreement with
+# ``_VIEWABLE_CONTENT_TYPES`` above — both surfaces exclude SVG so no path
+# ever renders untrusted SVG executably (see :func:`svg_is_viewable`).
 VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
-    ".svg": "image/svg+xml",
     ".mp4": "video/mp4",
     ".webm": "video/webm",
 }
+
+
+def svg_is_viewable() -> bool:
+    """Whether SVG is treated as a signable/viewable artifact.
+
+    SVG is excluded fail-closed from BOTH viewable-artifact surfaces
+    (``_VIEWABLE_CONTENT_TYPES`` and ``VIEWABLE_COMPUTE_JOB_EXTENSIONS``)
+    because an SVG served from a signed URL can execute script in the
+    viewer's browsing context. This helper exists so the two surfaces can be
+    asserted to agree on SVG handling; it returns ``True`` only if BOTH
+    surfaces would accept an ``.svg`` file.
+    """
+    substrate_accepts_svg = "svg" in _VIEWABLE_CONTENT_TYPES
+    bundle_accepts_svg = ".svg" in VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    return substrate_accepts_svg and bundle_accepts_svg
 
 
 def _media_kind_for_mime(mime_type: str) -> str:

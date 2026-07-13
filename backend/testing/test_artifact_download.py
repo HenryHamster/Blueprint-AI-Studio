@@ -473,6 +473,20 @@ def test_viewable_content_type_classifies_images_and_videos():
     assert storage.viewable_content_type_for_filename("noext") is None
 
 
+def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
+    """Finding 63ee179fc66a7b97: the per-file viewable substrate and the
+    bundle-extraction surface MUST agree on SVG, and the agreed policy is
+    fail-closed exclusion (an SVG served from a signed URL can execute script
+    in the viewer's browsing context)."""
+    # Surface 1: the individually-addressable viewable substrate.
+    assert storage.viewable_content_type_for_filename("chart.svg") is None
+    assert "svg" not in storage._VIEWABLE_CONTENT_TYPES
+    # Surface 2: the durable-bundle extraction allowlist.
+    assert ".svg" not in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    # Both surfaces agree, and they agree on exclusion.
+    assert storage.svg_is_viewable() is False
+
+
 def test_sanitize_viewable_basename_strips_traversal():
     assert storage.sanitize_viewable_basename("../../etc/passwd.png") == "passwd.png"
     assert storage.sanitize_viewable_basename("sub/dir/fig 1.png") == "fig_1.png"
