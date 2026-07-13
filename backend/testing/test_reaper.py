@@ -9402,6 +9402,26 @@ async def test_unblock_sweep_holds_dependent_when_recut_conflicts(reaper_db, moc
     assert t.recheck_after is not None and t.recheck_after > now
 
 
+async def _elapse_recut_backoff(session, task):
+    """Simulate the cross-base re-cut's backed-off recheck window having ELAPSED.
+
+    ``ensure_dependent_base_recut`` now short-circuits (issuing NO GitHub merge
+    call) while ``_recut_recheck_after`` is still in the future, for EVERY failing
+    outcome — that is the amplifier fix: the merge POST used to be re-issued on
+    every dispatch/reaper cycle for the transient class. These sweeps simulate the
+    passage of time by advancing the ``now`` they are called with, but the re-cut
+    backoff reads wall-clock, so a test that wants the NEXT cycle to make a real
+    attempt must lapse the window explicitly.
+    """
+    ctx = dict(task.context or {})
+    if not ctx.get("_recut_recheck_after"):
+        return
+    ctx["_recut_recheck_after"] = (_utcnow() - timedelta(hours=1)).isoformat()
+    task.context = ctx
+    session.add(task)
+    await session.commit()
+
+
 @pytest.mark.asyncio
 async def test_unblock_sweep_persistent_recut_conflict_accumulates_and_escalates(
     reaper_db, mocker
@@ -9438,6 +9458,9 @@ async def test_unblock_sweep_persistent_recut_conflict_accumulates_and_escalates
     for i in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
         await reaper_db.refresh(t)
         cycle_now = (t.recheck_after or base_now) + timedelta(minutes=1)
+        # The re-cut's own backed-off window reads wall-clock, so lapse it to match
+        # the simulated cycle_now — otherwise the re-cut is (correctly) suppressed.
+        await _elapse_recut_backoff(reaper_db, t)
         await sweep_unblock_blocked_tasks(reaper_db, cycle_now)
         await reaper_db.refresh(t)
         # The consecutive-conflict counter ACCUMULATES across cycles (it is not
@@ -9540,6 +9563,8 @@ async def test_unblock_sweep_base_safe_sibling_need_does_not_wipe_conflict_accou
     for i in range(1, _RECUT_CONFLICT_ESCALATION_THRESHOLD):
         await reaper_db.refresh(t)
         cycle_now = (t.recheck_after or base_now) + timedelta(minutes=1)
+        # Lapse the wall-clock re-cut backoff to match the simulated cycle_now.
+        await _elapse_recut_backoff(reaper_db, t)
         await sweep_unblock_blocked_tasks(reaper_db, cycle_now)
         await reaper_db.refresh(t)
         assert t.context.get("_recut_conflict_attempts") == i + 1

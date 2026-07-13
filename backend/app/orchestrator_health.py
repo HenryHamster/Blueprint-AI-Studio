@@ -529,13 +529,15 @@ def _has_landed_cross_base_code_dep(dependent: Task, dep_tasks: list) -> bool:
 
 
 def _recut_backoff_active(ctx: dict) -> bool:
-    """True while an escalated dependent is inside its backed-off recheck window.
+    """True while a failed dependent re-cut is inside its backed-off recheck window.
 
-    Once a dependent has been escalated, we stop re-issuing the GitHub merge call
-    every dispatch/reaper cycle and only re-attempt the re-cut after the
-    backed-off ``_recut_recheck_after`` window elapses — so a genuinely stuck
-    dependent is not hammering the merge API, yet can still recover if the
-    conflict is later resolved (a successful re-cut clears the accounting)."""
+    Once a re-cut has failed for ANY reason (transient ``"error"``, permanent
+    ``"missing"``, or a genuine ``"conflict"``), we stop re-issuing the GitHub
+    merge call every dispatch/reaper cycle and only re-attempt the re-cut after the
+    backed-off ``_recut_recheck_after`` window elapses — so a held dependent is not
+    hammering the (non-idempotent, uncoalescable) merge API ~720x/hour against a
+    shared 5000/hr token budget, yet can still recover if the condition later
+    clears (a successful re-cut clears the accounting)."""
     raw = ctx.get("_recut_recheck_after")
     if not raw:
         return False
@@ -711,7 +713,8 @@ async def ensure_dependent_base_recut(
                          stale escalation alert, and return True.
       * ``"error"``    — a TRANSIENT GitHub/credential error: record a backed-off
                          recheck, reset the consecutive-conflict streak, NEVER
-                         escalate, and return False (retry next cycle).
+                         escalate, and return False (re-attempt only after the
+                         backed-off recheck window — NOT on the next cycle).
       * ``"missing"``  — a PERMANENT deleted/absent base or head branch (404):
                          escalate IMMEDIATELY (first occurrence, no retry bound)
                          under the missing-base blocker_kind with an observable
@@ -724,6 +727,19 @@ async def ensure_dependent_base_recut(
                          observable status message + context marker, and stop
                          hammering the merge API every cycle (re-attempt only
                          after the backed-off recheck window). Returns False.
+
+    EVERY failing outcome arms the backed-off recheck window, and the merge call
+    is gated on that window ALONE (see the gate below). The schedule is
+    ``_next_recheck_delay(_recut_recheck_attempts)`` =
+    ``_BLOCKED_RECHECK_BASE`` (5 min) x 2**attempts, capped at
+    ``_BLOCKED_RECHECK_MAX`` (1 h) — so the FIRST failure (attempts=1) holds for
+    10 min, the second for 20 min, and so on. No failing outcome re-issues the
+    merge POST on the next ~5s dispatch cycle. A ``"conflict"`` therefore reaches
+    its 3-attempt escalation bound in ~30 min of wall-clock (10 min + 20 min)
+    rather than ~10 s. This is intentional: the dependent is HELD either way, and
+    the independent permanent-blocked escalation (``_BLOCKED_ESCALATE_AFTER``,
+    6 h, measured on wall-clock from ``blocked_at``) still fires regardless, so a
+    stuck dependent is never starved of an operator signal.
 
     Single source of truth for the re-cut, shared by the dispatch driver
     (:func:`recut_landed_cross_base_dependents`), the completion-side warm-claim
@@ -739,12 +755,30 @@ async def ensure_dependent_base_recut(
     if project is None:
         # Cannot resolve the integration branch — hold to be safe.
         return False
-    # Once escalated, do not re-issue the GitHub merge call every cycle: only
-    # re-attempt after the backed-off recheck window so a stuck dependent stops
+    # Once a re-cut has FAILED, do not re-issue the GitHub merge call every cycle:
+    # only re-attempt after the backed-off recheck window so a held dependent stops
     # hammering the merge API, while still allowing eventual recovery.
-    if (dependent.context or {}).get("_recut_escalated") and _recut_backoff_active(
-        dependent.context or {}
-    ):
+    #
+    # The gate is the backoff window ALONE. It used to additionally require
+    # ``_recut_escalated``, which made the backoff DEAD CODE for the entire
+    # transient ``"error"`` class: ``_recut_escalated`` is only ever set by the
+    # missing/conflict escalation branches in ``_record_recut_failure``, and
+    # ``"error"`` NEVER escalates by design. A transiently-failing dependent
+    # therefore re-issued a real (uncoalesced, non-idempotent) POST
+    # /repos/{o}/{r}/merges on EVERY dispatch cycle — ~720/hr per held dependent,
+    # forever — draining the shared 5000/hr installation-token budget, in direct
+    # contradiction of this function's own contract ("a transient error keeps
+    # retrying with backoff"). ``_recut_recheck_after`` is already written
+    # unconditionally by ``_record_recut_failure`` for every failing outcome, so
+    # reading it alone is what makes the documented backoff real.
+    #
+    # Escalation semantics are unaffected: the window is only ever written AFTER an
+    # attempt was made and classified, so "missing" still escalates on its FIRST
+    # occurrence and consecutive conflicts still accrue toward (and trip) the
+    # one-shot conflict escalation — merely spaced by the backoff instead of
+    # hammered every ~5s. An "ok" outcome still clears the window via
+    # ``_clear_recut_accounting``, so recovery is never delayed.
+    if _recut_backoff_active(dependent.context or {}):
         return False
     from app.branch_resolution import recut_dependent_base_from_integration
 

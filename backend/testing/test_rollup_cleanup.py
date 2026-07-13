@@ -20,8 +20,12 @@ Covers _verify_pr_merged:
   - GitHub API confirms merged → returns True, updates task.context
   - GitHub API 401 → invalidates token cache and retries with fresh token
   - Transient GitHub errors (500, 502, 503) → returns False without failing task
+  - Transient failures (5xx, network error, rate-limit 403 remapped to 500) STAMP
+    the negative cache → the next cycle inside the TTL issues zero GitHub calls
   - Closed-but-not-merged → marks task FAILED, creates alert, returns True
 """
+
+import time
 
 import pytest
 import pytest_asyncio
@@ -33,6 +37,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 from app.rollup_management import _cleanup_branches, _verify_pr_merged
+from app.rollup_pr_verification import _PR_MERGE_NEGATIVE_TTL_S
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1259,12 +1264,50 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
 
 
 @pytest.mark.asyncio
-async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
-    cleanup_db, mocker
-):
-    """When a 401 prompts a fresh-token retry and the retry encounters a transient
-    error (503), return False without poisoning the negative cache. This ensures
-    transient GitHub instability during auth-retry doesn't block rollup convergence."""
+async def test_verify_pr_merged_401_retry_transient_negative_caches(cleanup_db, mocker):
+    """When a 401 prompts a fresh-token retry and the retry hits a transient error
+    (503), the negative cache IS stamped so the next dispatch cycle within the TTL
+    issues NO further GitHub call.
+
+    DELIBERATELY REVERSES TWO PRIOR MERGED FIXES — READ THIS BEFORE "RE-FIXING" IT.
+    This test previously asserted the OPPOSITE ("must not poison negative cache").
+    That was not an oversight: the no-cache-on-transient behavior was introduced on
+    purpose, twice, on 2026-06-29:
+
+      * PR #12281 "fix: explicit GitHub failure-path handling for rollup ancestry
+        credit" — added the ``except Exception`` early return for non-HTTP (network)
+        errors that skips the stamp. Its stated rationale was ONLY that stamping was
+        "inconsistent with the HTTP 5xx path which already returned early without
+        cache poisoning". That is an appeal to consistency with a path that was
+        itself never justified — it argued from symmetry, not from behavior.
+      * PR #12303 "fix: do not cache transient PR refresh failures" — wrapped the
+        401 fresh-token retry so a transient failure there also skips the stamp.
+        Its stated rationale was that stamping would "poison the negative cache,
+        PREVENTING RETRIES and delaying rollup convergence".
+
+    #12303's rationale is FACTUALLY FALSE, and that is why it is being reversed:
+    ``_PR_MERGE_NEGATIVE_TTL_S = 30``. The stamp does not prevent retries — it
+    delays exactly ONE retry by at most 30 seconds. (#12281's own body even calls it
+    "the 30-second negative cache", so the TTL was known.) Neither PR cited an
+    incident, a latency requirement, or considered call VOLUME.
+
+    The cost of that mistaken belief: ``_check_candidate_task_deps`` re-verifies
+    every same-base COMPLETED ``create`` dep of every candidate on every ~5s
+    dispatch cycle, and the 30s negative cache is the ONLY throttle. Skipping the
+    stamp on the transient class restored full 5s cadence — at up to 3 HTTP calls
+    per verify (``_github_request_uncoalesced`` retries 5xx) — draining the shared
+    5000/hr installation-token budget precisely when GitHub was already unhealthy.
+    Worse, ``github_pulls.get_pull_request`` maps ANY non-200/401/404/410 to
+    ``HTTPException(500)``, so a RATE-LIMIT 403 was classified transient and
+    therefore NOT cached: the system's response to "you are out of quota" was to
+    re-ask every 5 seconds.
+
+    So the trade the first two passes made is real but tiny in one direction and
+    unbounded in the other: caching costs AT MOST ~30s of extra merge-detection
+    latency on a transient blip; not caching costs an unbounded call amplification
+    against a shared budget whose exhaustion has twice stalled production. This is
+    the third pass over this behavior; the first two walked it the wrong way.
+    """
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/77")
@@ -1285,16 +1328,23 @@ async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
             HTTPException(status_code=503, detail="Service Unavailable"),
         ],
     )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
     assert result is False
-    # Crucially: no negative cache entry for this transient-on-retry case
-    from app.rollup_pr_verification import _pr_merge_negative_cache
-    assert task.id not in _pr_merge_negative_cache, (
-        "Transient error on fresh-token retry must not poison negative cache"
+    assert task.id in _pr_merge_negative_cache, (
+        "A transient error on the fresh-token retry must stamp the negative cache "
+        "— otherwise the dep is re-verified every dispatch cycle"
     )
     mock_invalidate.assert_called_once_with(str(task.project_id))
+    assert mock_get_pr.call_count == 2
+
+    # Next dispatch cycle, inside the TTL: served from the negative cache, ZERO
+    # additional GitHub calls (the whole point of the fix).
+    assert await _verify_pr_merged(task, cleanup_db) is False
     assert mock_get_pr.call_count == 2
 
 
@@ -1323,6 +1373,130 @@ async def test_verify_pr_merged_transient_errors_return_false(
 
     assert result is False
     assert task.status != TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 502, 503])
+async def test_verify_pr_merged_transient_error_negative_caches_next_cycle(
+    cleanup_db, mocker, status_code
+):
+    """A transient GitHub 5xx STAMPS the negative cache: the next verification
+    inside the 30s TTL issues NO GitHub call at all.
+
+    Call-count assertion is the point — the pre-fix code returned False early
+    WITHOUT stamping, so every ~5s dispatch cycle re-issued the lookup (each up
+    to 3 HTTP calls, since ``_github_request_uncoalesced`` retries 5xx up to
+    ``max_retries=3``) for every candidate's every same-base COMPLETED create dep.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/98")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=status_code, detail="Error"),
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+    assert task.id in _pr_merge_negative_cache
+
+    # Cycles 2 and 3, both inside the TTL → still exactly ONE GitHub call total.
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+
+    # Once the TTL lapses the lookup resumes (recovery is not delayed beyond it).
+    _pr_merge_negative_cache[task.id] = time.time() - _PR_MERGE_NEGATIVE_TTL_S - 1
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_network_error_negative_caches_next_cycle(
+    cleanup_db, mocker
+):
+    """A non-HTTPException fetch error (network/DNS/timeout) is transient too, and
+    must likewise stamp the negative cache instead of re-fetching every cycle."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/97")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=ConnectionError("connection reset by peer"),
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert task.id in _pr_merge_negative_cache
+    assert mock_get_pr.call_count == 1
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_get_pr.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_rate_limit_403_negative_caches_next_cycle(
+    cleanup_db, mocker
+):
+    """A GitHub rate-limit **403** is mapped by ``github_pulls.get_pull_request`` to
+    an HTTPException(500) (any non-200/401/404 becomes a 500), so the transient
+    classifier treats it as transient — meaning the un-cached class was BROADER
+    than 5xx/network. Verify end-to-end (through the real ``get_pull_request``)
+    that a 403 stamps the negative cache and the next cycle inside the TTL issues
+    ZERO HTTP requests. Otherwise budget exhaustion self-amplifies: the response to
+    "you are out of quota" was to ask again 720x/hr.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/96")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    rate_limited = MagicMock()
+    rate_limited.status_code = 403
+    rate_limited.text = "API rate limit exceeded"
+    rate_limited.json = MagicMock(return_value={"message": "API rate limit exceeded"})
+    # Patch the transport, NOT get_pull_request — the 403 → 500 remap under test
+    # lives inside the real github_pulls.get_pull_request.
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=rate_limited,
+    )
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+
+    _pr_merge_negative_cache.pop(task.id, None)
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_request.call_count == 1
+    assert task.id in _pr_merge_negative_cache, (
+        "A rate-limit 403 (remapped to 500) must stamp the negative cache"
+    )
+
+    assert await _verify_pr_merged(task, cleanup_db) is False
+    assert mock_request.call_count == 1
 
 
 @pytest.mark.asyncio

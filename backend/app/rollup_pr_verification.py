@@ -214,6 +214,24 @@ _PR_MERGE_NEGATIVE_TTL_S = 30
 _pr_merge_negative_cache: dict[uuid.UUID, float] = {}
 
 
+class _TransientPRVerifyError(Exception):
+    """Internal marker: this PR could not be verified because GitHub failed
+    transiently (5xx / network error / a rate-limit 403 that ``github_pulls``
+    re-maps to a 500).
+
+    Raised instead of returning early so the transient path FALLS THROUGH to the
+    negative-cache stamp at the bottom of :func:`_verify_pr_merged`. The early
+    returns it replaces bypassed that stamp, which meant the ONLY throttle on the
+    per-candidate, per-cycle verification (`_check_candidate_task_deps` calls it
+    for every same-base COMPLETED ``create`` dep of every candidate, on every ~5s
+    dispatch cycle) disappeared exactly when GitHub was already unhealthy — and
+    each un-cached verify is up to 3 HTTP calls, since ``_github_request``
+    retries 5xx. A partial GitHub outage was thereby converted into full
+    shared-token-bucket exhaustion. The 30s TTL still bounds the staleness: a
+    merge is detected within one cycle of the window elapsing.
+    """
+
+
 def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
     """Mirror agent_status's terminal-failure bookkeeping for rollup-side FAILEDs.
 
@@ -313,11 +331,14 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 if api_err.status_code not in (401, 500, 502, 503):
                     raise
                 if api_err.status_code != 401:
-                    # Transient GitHub API failure — can't verify now, will retry next cycle
-                    logger.warning(
-                        f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping"
-                    )
-                    return False
+                    # Transient GitHub API failure — can't verify now. Raise the
+                    # marker (rather than returning) so the negative cache IS
+                    # stamped: without it this dep is re-verified on every ~5s
+                    # dispatch cycle, at up to 3 HTTP calls apiece.
+                    raise _TransientPRVerifyError(
+                        f"GitHub API error ({api_err.status_code}) checking PR "
+                        f"#{pr_number} for task {task.id}"
+                    ) from api_err
                 # Token expired — invalidate cache and retry once with a fresh token
                 from app.routers.agent import invalidate_github_token_cache
 
@@ -332,22 +353,22 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
                 except HTTPException as retry_err:
                     if retry_err.status_code in (500, 502, 503):
-                        # Transient GitHub error on retry — don't poison cache
-                        logger.warning(
-                            f"[PR_VERIFY] GitHub API error ({retry_err.status_code}) on fresh-token retry for PR #{pr_number} task {task.id} — skipping"
-                        )
-                        return False
+                        # Transient GitHub error on the fresh-token retry.
+                        raise _TransientPRVerifyError(
+                            f"GitHub API error ({retry_err.status_code}) on "
+                            f"fresh-token retry for PR #{pr_number} task {task.id}"
+                        ) from retry_err
                     raise
                 except Exception as retry_exc:
-                    logger.warning(
-                        f"[PR_VERIFY] GitHub fetch error on fresh-token retry for PR #{pr_number} task {task.id}: {retry_exc} — skipping (transient)"
-                    )
-                    return False
+                    raise _TransientPRVerifyError(
+                        f"GitHub fetch error on fresh-token retry for PR "
+                        f"#{pr_number} task {task.id}: {retry_exc}"
+                    ) from retry_exc
             except Exception as fetch_exc:
-                logger.warning(
-                    f"[PR_VERIFY] GitHub fetch error for PR #{pr_number} task {task.id}: {fetch_exc} — skipping (transient)"
-                )
-                return False
+                raise _TransientPRVerifyError(
+                    f"GitHub fetch error for PR #{pr_number} task {task.id}: "
+                    f"{fetch_exc}"
+                ) from fetch_exc
             if pr_data.get("merged"):
                 project = (
                     await session.get(Project, task.project_id)
@@ -581,6 +602,16 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         f"[PR_VERIFY] Failed to persist pr_closed_unmerged for task {task.id}: {write_err}"
                     )
                 return True  # Return True so callers don't block — task is now FAILED which they handle
+        except _TransientPRVerifyError as transient_err:
+            # A transient GitHub failure falls through to the negative-cache stamp
+            # below (see _TransientPRVerifyError): the un-verified dep must be
+            # throttled for the TTL like any other not-yet-merged result, or the
+            # dispatch loop re-hammers GitHub every ~5s while it is already
+            # degraded. No traceback — this class is expected and self-healing.
+            logger.warning(
+                f"[PR_VERIFY] {transient_err} — skipping (transient, "
+                f"negative-cached for {_PR_MERGE_NEGATIVE_TTL_S}s)"
+            )
         except Exception as e:
             logger.warning(
                 f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}",

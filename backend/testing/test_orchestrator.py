@@ -9168,6 +9168,28 @@ class TestCrossBaseRecutBounding:
             .all()
         )
 
+    @staticmethod
+    async def _elapse_recut_backoff(db_session, dependent):
+        """Simulate the backed-off recheck window having ELAPSED.
+
+        Every failing re-cut outcome now arms ``_recut_recheck_after`` and
+        ``ensure_dependent_base_recut`` short-circuits (issuing NO GitHub merge
+        call) while that window is open — that IS the fix: the merge POST used to
+        be re-issued on every ~5s dispatch cycle for the whole transient-"error"
+        class, ~720/hr per held dependent against a shared 5000/hr token budget.
+        A test that wants to observe the NEXT real attempt must therefore let the
+        window lapse, exactly as wall-clock does in production.
+        """
+        from app.orchestrator_health import _utcnow
+
+        ctx = dict(dependent.context or {})
+        if not ctx.get("_recut_recheck_after"):
+            return
+        ctx["_recut_recheck_after"] = (_utcnow() - timedelta(hours=1)).isoformat()
+        dependent.context = ctx
+        db_session.add(dependent)
+        await db_session.commit()
+
     @pytest.mark.asyncio
     async def test_single_conflict_increments_attempts_and_holds(
         self, db_session, mocker
@@ -9221,7 +9243,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "conflict": True},
@@ -9236,21 +9258,27 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # Drive consecutive conflicts up to (and past) the escalation bound.
+        # Drive consecutive conflicts up to (and past) the escalation bound. The
+        # backoff window is elapsed between cycles (as wall-clock does), so each
+        # iteration is a REAL attempt — one merge call apiece, not one per ~5s
+        # dispatch cycle.
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await self._elapse_recut_backoff(db_session, dependent)
             assert (
                 await ensure_dependent_base_recut(dependent, [dep], db_session) is False
             )
 
+        assert merge_mock.await_count == _RECUT_CONFLICT_ESCALATION_THRESHOLD
         assert dependent.context.get("_recut_escalated") is True
         assert "persistent merge conflict" in (dependent.latest_status_message or "")
         alerts = await self._open_escalation_alerts(db_session, dependent)
         assert len(alerts) == 1
         assert alerts[0].severity == AlertSeverity.ERROR
 
-        # Running again must NOT create a second alert (deduped + post-escalation
-        # backoff short-circuits the merge call).
+        # Running again must NOT create a second alert, and — inside the still-open
+        # backoff window — must issue NO further merge call.
         assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == _RECUT_CONFLICT_ESCALATION_THRESHOLD
         alerts_again = await self._open_escalation_alerts(db_session, dependent)
         assert len(alerts_again) == 1
 
@@ -9272,7 +9300,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "conflict": False},
@@ -9288,20 +9316,89 @@ class TestCrossBaseRecutBounding:
         await db_session.commit()
 
         # Far more attempts than the conflict bound — a transient class must never
-        # escalate.
-        for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD + 2):
+        # escalate. Each iteration lets the backed-off window lapse first, so it is
+        # a genuine retry (one merge call each), which is what "retries with
+        # backoff" means.
+        attempts = _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
+        for _ in range(attempts):
+            await self._elapse_recut_backoff(db_session, dependent)
             assert (
                 await ensure_dependent_base_recut(dependent, [dep], db_session) is False
             )
 
+        assert merge_mock.await_count == attempts
         assert dependent.context.get("_recut_conflict_attempts") == 0
         assert dependent.context.get("_recut_last_outcome") == "error"
         assert dependent.context.get("_recut_escalated") is None
-        assert dependent.context.get("_recut_recheck_attempts") == (
-            _RECUT_CONFLICT_ESCALATION_THRESHOLD + 2
-        )
+        assert dependent.context.get("_recut_recheck_attempts") == attempts
         assert dependent.recheck_after is not None
         assert await self._open_escalation_alerts(db_session, dependent) == []
+
+    @pytest.mark.asyncio
+    async def test_transient_error_backoff_suppresses_merge_call_next_cycle(
+        self, db_session, mocker
+    ):
+        """REGRESSION (GitHub-call amplifier): a transient ``"error"`` outcome must
+        HONOR the backed-off recheck window — the next dispatch cycle inside it
+        issues NO ``POST /repos/{o}/{r}/merges`` at all.
+
+        The backoff gate used to read
+        ``ctx.get("_recut_escalated") and _recut_backoff_active(ctx)``. But
+        ``_recut_escalated`` is only ever set by the missing/conflict escalation
+        branches, and the transient ``"error"`` class NEVER escalates by design —
+        so the whole gate was dead code for that class and the (uncoalesced,
+        non-idempotent POST) merge call was re-issued on EVERY ~5s dispatch cycle:
+        ~720/hr per held dependent, forever, against a shared 5000/hr installation
+        token budget whose exhaustion has stalled production. Assert CALL COUNTS.
+        """
+        from app.orchestrator_health import ensure_dependent_base_recut
+
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": False},  # → "error"
+        )
+        project = make_project(
+            name="RecutBackoff1", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        dep, dependent = self._landed_cross_base_pair(project)
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Cycle 1: a real attempt → exactly one merge POST, window armed.
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == 1
+        assert dependent.context.get("_recut_last_outcome") == "error"
+        assert dependent.context.get("_recut_recheck_after")
+        # Never escalates — so the OLD gate could never have fired here.
+        assert dependent.context.get("_recut_escalated") is None
+
+        # Cycles 2..6, all inside the backoff window: the dependent is still HELD
+        # (False), but ZERO further GitHub merge calls are issued.
+        for _ in range(5):
+            assert (
+                await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+            )
+        assert merge_mock.await_count == 1
+        # The suppressed cycles are not counted as failed attempts either.
+        assert dependent.context.get("_recut_recheck_attempts") == 1
+
+        # Once the window lapses the retry resumes (backoff, not abandonment) —
+        # and a recovered GitHub immediately unblocks the dependent.
+        await self._elapse_recut_backoff(db_session, dependent)
+        merge_mock.return_value = {"merged": True, "already": False}
+        assert await ensure_dependent_base_recut(dependent, [dep], db_session) is True
+        assert merge_mock.await_count == 2
+        assert not any(str(k).startswith("_recut_") for k in (dependent.context or {}))
 
     @pytest.mark.asyncio
     async def test_successful_recut_clears_accounting_and_resolves_alert(
@@ -9336,8 +9433,10 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # Escalate via persistent conflicts.
+        # Escalate via persistent conflicts (elapsing the backed-off window between
+        # cycles so each iteration is a real attempt).
         for _ in range(_RECUT_CONFLICT_ESCALATION_THRESHOLD):
+            await self._elapse_recut_backoff(db_session, dependent)
             await ensure_dependent_base_recut(dependent, [dep], db_session)
         assert dependent.context.get("_recut_escalated") is True
         assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
@@ -9376,7 +9475,7 @@ class TestCrossBaseRecutBounding:
             new_callable=AsyncMock,
             return_value=("tok", "owner", "repo"),
         )
-        mocker.patch(
+        merge_mock = mocker.patch(
             "app.github.merge_branch",
             new_callable=AsyncMock,
             return_value={"merged": False, "missing": True},
@@ -9391,9 +9490,12 @@ class TestCrossBaseRecutBounding:
         db_session.add_all([dep, dependent])
         await db_session.commit()
 
-        # A SINGLE missing-branch outcome must already escalate (no bound).
+        # A SINGLE missing-branch outcome must already escalate (no bound) — the
+        # backoff gate is armed only AFTER an attempt was made and classified, so
+        # first-occurrence escalation is unaffected by the backoff fix.
         ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
         assert ok is False
+        assert merge_mock.await_count == 1
         assert dependent.context.get("_recut_last_outcome") == "missing"
         assert dependent.context.get("_recut_base_missing") is True
         assert dependent.context.get("_recut_escalated") is True
@@ -9404,9 +9506,10 @@ class TestCrossBaseRecutBounding:
         assert len(alerts) == 1
         assert alerts[0].severity == AlertSeverity.ERROR
 
-        # Re-running does not create a second alert (deduped + post-escalation
-        # backoff short-circuits the merge call).
+        # Re-running does not create a second alert and issues no further merge
+        # call (deduped + post-failure backoff short-circuits the merge API).
         assert await ensure_dependent_base_recut(dependent, [dep], db_session) is False
+        assert merge_mock.await_count == 1
         assert len(await self._open_escalation_alerts(db_session, dependent)) == 1
 
     @pytest.mark.asyncio
