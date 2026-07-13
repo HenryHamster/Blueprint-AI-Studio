@@ -1676,9 +1676,19 @@ def test_combined_chain_guard_catches_readded_0458_collision():
 
 def test_on_disk_0458b_0459_reconciliation_state():
     """The reconciled files on disk: 0459 restored to down_revision="0458", no
-    0458b file remains, and the new head 0526 re-adds the ix_task_vm_dispatched_at
-    index idempotently (CREATE INDEX IF NOT EXISTS on Postgres) chained onto the
-    reordered head 0525 (…0503<-0521<-0525<-0526)."""
+    0458b file remains, and the head re-adds the ix_task_vm_dispatched_at index
+    idempotently (CREATE INDEX CONCURRENTLY IF NOT EXISTS on Postgres), chained
+    onto a monotonic tail (…0503 <- 0525 <- 0526 <- 0527).
+
+    NOTE on the numbering: this reconciliation was originally PLANNED as
+    "keep 0521, rechain it under 0525, re-land the index as a new head 0526".
+    The non-monotonic 0521/0525 inversion was instead repaired by RENUMBERING
+    the structural head 0521 -> 0526 (``0526_project_compute_image.py``), so
+    0526 is taken and the re-landed index becomes 0527. The INVARIANTS this
+    test guards are unchanged — 0459 immutable, 0458b withdrawn, chain
+    monotonic, index re-landed idempotently at the head — only the revision
+    numbers differ from the original plan.
+    """
     import os
 
     from app.migration_chain import parse_revision_identifiers
@@ -1687,7 +1697,9 @@ def test_on_disk_0458b_0459_reconciliation_state():
         os.path.dirname(__file__), "..", "alembic", "versions"
     )
 
-    # 0459 restored to its deployed identity.
+    # 0459 restored to its deployed identity — byte-identical to `main`.  An
+    # in-place body edit of an already-applied revision is silently skipped by
+    # Alembic and corrupts a live DB; that edit is what hard-blocked promotion.
     with open(os.path.join(versions_dir, "0459_add_alert_project_created_index.py")) as f:
         rev_0459, down_0459 = parse_revision_identifiers(f.read())
     assert rev_0459 == "0459"
@@ -1695,29 +1707,36 @@ def test_on_disk_0458b_0459_reconciliation_state():
         "0459 must chain onto the deployed 0458, matching applied history"
     )
 
-    # 0458b withdrawn.
+    # 0458b withdrawn — a NEW revision may never be spliced in below the
+    # deployed head; its DDL is re-landed at the head instead.
     assert not os.path.exists(
         os.path.join(versions_dir, "0458b_task_updated_at_vm_dispatched_at_indexes.py")
     ), "the 0458b linearisation revision must be removed"
 
-    # 0521/0525 reordered so the topological chain is monotonic: 0503<-0521<-0525.
-    with open(os.path.join(versions_dir, "0521_project_compute_image.py")) as f:
-        rev_0521, down_0521 = parse_revision_identifiers(f.read())
-    assert rev_0521 == "0521"
-    assert down_0521 == "0503", "0521 must chain onto 0503 after the reorder"
+    # The 0521/0525 inversion was repaired by renumbering the head 0521 -> 0526,
+    # so the old 0521 filename must be gone and the tail must be monotonic.
+    assert not os.path.exists(
+        os.path.join(versions_dir, "0521_project_compute_image.py")
+    ), "0521 must have been renumbered to 0526 (it was numerically below its own parent 0525)"
     with open(os.path.join(versions_dir, "0525_task_evaluating_updated_at_index.py")) as f:
         rev_0525, down_0525 = parse_revision_identifiers(f.read())
     assert rev_0525 == "0525"
-    assert down_0525 == "0521", "0525 must chain onto 0521 after the reorder"
+    assert down_0525 == "0503"
+    with open(os.path.join(versions_dir, "0526_project_compute_image.py")) as f:
+        rev_0526, down_0526 = parse_revision_identifiers(f.read())
+    assert rev_0526 == "0526"
+    assert down_0526 == "0525", "0526 must chain onto 0525 (monotonic)"
 
-    # New head re-adds the index idempotently, chained onto the reordered head 0525.
-    head_path = os.path.join(versions_dir, "0526_readd_task_vm_dispatched_at_index.py")
-    assert os.path.exists(head_path), "the new head migration 0526 must exist"
+    # New head re-adds the index idempotently, chained onto 0526.
+    head_path = os.path.join(
+        versions_dir, "0527_task_updated_at_vm_dispatched_at_indexes.py"
+    )
+    assert os.path.exists(head_path), "the new head migration 0527 must exist"
     with open(head_path) as f:
         head_src = f.read()
     rev_head, down_head = parse_revision_identifiers(head_src)
-    assert rev_head == "0526"
-    assert down_head == "0525"
+    assert rev_head == "0527"
+    assert down_head == "0526"
     assert "ix_task_vm_dispatched_at" in head_src
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in head_src, (
         "the re-land must be idempotent so it is a no-op on dev DBs that already "
@@ -1726,7 +1745,7 @@ def test_on_disk_0458b_0459_reconciliation_state():
 
 
 def test_expected_schema_revision_tracks_new_head():
-    """EXPECTED_SCHEMA_REVISION must be bumped to the new structural head 0526."""
+    """EXPECTED_SCHEMA_REVISION must track the new structural head (0527)."""
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0526"
+    assert EXPECTED_SCHEMA_REVISION == "0527"
