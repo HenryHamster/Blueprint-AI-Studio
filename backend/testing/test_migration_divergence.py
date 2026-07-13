@@ -1553,3 +1553,180 @@ async def test_defect_class_2_mixed_restore_and_real_edit_blocks(mocker):
     assert edited in reason
     # The byte-identical restore must NOT be named as a tamper.
     assert restored not in reason
+
+
+# ===========================================================================
+# 0458b/0459 reconciliation regression tests (v25 migration-identity repair).
+#
+# Deployed main applied 0459_add_alert_project_created_index with
+# down_revision="0458". A local dedup hotfix (022cbf750) renamed a duplicate
+# task-index migration to 0458b and rechained 0459 in place to
+# down_revision="0458b" — an in-place body edit of an already-applied migration
+# PLUS a new revision (0458b) inserted below the deployed head. The release
+# qualifier's body-immutability guard correctly hard-blocked. The fix restores
+# 0459's deployed identity, removes 0458b, and re-lands its index DDL as a new
+# head (0526). To make the whole chain monotonic (single head == numeric max,
+# no test grandfathering) the independent, unapplied 0521/0525 pair is also
+# reordered so the topological chain is ...0503<-0521<-0525<-0526. These tests
+# lock (a) that the guard caught the pre-fix hazard, (b) that the reconciled
+# state passes clean, and (c) that the merge-time duplicate-revision guard
+# catches a re-introduced 0458 collision.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_blocks_prefix_0459_rechain_body_edit(mocker):
+    """PRE-FIX hazard: 0459 rechained in place (down_revision 0458 -> 0458b) is an
+    in-place body edit of a migration already applied on deployed main; the
+    body-immutability guard must BLOCK it. This is the exact state the v25
+    qualification finalized not_promoted on."""
+    deployed_0459 = _migration_source("0459", "0458")
+    candidate_0459 = _migration_source("0459", "0458b")  # rechained in place
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=[
+                "0458_add_perf_indexes.py",
+                "0459_add_alert_project_created_index.py",
+            ],
+            candidate_list=[
+                "0458_add_perf_indexes.py",
+                "0458b_task_updated_at_vm_dispatched_at_indexes.py",
+                "0459_add_alert_project_created_index.py",
+            ],
+            # The rechained down_revision changes 0459's body -> distinct blob sha
+            # -> the gate fetches and compares its body.
+            changed={"0459_add_alert_project_created_index.py"},
+        ),
+    )
+
+    async def _body(path, *, token, owner, repo, ref, project_id=None):
+        return deployed_0459 if ref == "main" else candidate_0459
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_body))
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "block"
+    assert "0459_add_alert_project_created_index" in detail
+    assert "immutable" in detail or "in-place" in detail or "body" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_ok_after_0458b_0459_reconciliation(mocker):
+    """POST-FIX: 0459 restored to down_revision="0458" (body byte-identical to
+    deployed), 0458b removed, and the index DDL re-landed as a NEW head (0526)
+    that exists only on the candidate ABOVE the deployed head. No shared revision
+    id or description diverges and no shared body changed → ('ok', None)."""
+    shared_0459 = _migration_source("0459", "0458")
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=_versions_by_ref(
+            main_list=[
+                "0458_add_perf_indexes.py",
+                "0459_add_alert_project_created_index.py",
+                "0521_project_compute_image.py",
+            ],
+            candidate_list=[
+                "0458_add_perf_indexes.py",
+                "0459_add_alert_project_created_index.py",
+                "0521_project_compute_image.py",
+                # New head, candidate-only, above the deployed head — normal
+                # ahead-ness, not a divergence. Note the fresh description that
+                # does NOT reuse "task_updated_at_vm_dispatched_at_indexes", so it
+                # can never trip the renumbered-identity detector.
+                "0526_readd_task_vm_dispatched_at_index.py",
+            ],
+        ),
+    )
+    body = mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=shared_0459),
+    )
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "ok"
+    assert detail is None
+    # All shared migrations are byte-identical (same blob sha) → no body fetch.
+    assert body.await_count == 0
+
+
+def test_combined_chain_guard_catches_readded_0458_collision():
+    """The merge-time duplicate-revision guard must catch a SECOND migration
+    claiming revision id 0458 (the exact class that produced the original
+    duplicate) before it reaches automain."""
+    from app.migration_chain import validate_combined_migration_chain
+
+    existing_filenames = [
+        "0457_encrypt_github_pat.py",
+        "0458_add_perf_indexes.py",
+        "0459_add_alert_project_created_index.py",
+    ]
+    added_sources = {
+        "backend/alembic/versions/0458_task_updated_at_vm_dispatched_at_indexes.py": (
+            _migration_source("0458", "0457")
+        ),
+    }
+    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    assert reason is not None
+    assert "0458" in reason
+    assert "already exists" in reason.lower() or "renumber" in reason.lower()
+
+
+def test_on_disk_0458b_0459_reconciliation_state():
+    """The reconciled files on disk: 0459 restored to down_revision="0458", no
+    0458b file remains, and the new head 0526 re-adds the ix_task_vm_dispatched_at
+    index idempotently (CREATE INDEX IF NOT EXISTS on Postgres) chained onto the
+    reordered head 0525 (…0503<-0521<-0525<-0526)."""
+    import os
+
+    from app.migration_chain import parse_revision_identifiers
+
+    versions_dir = os.path.join(
+        os.path.dirname(__file__), "..", "alembic", "versions"
+    )
+
+    # 0459 restored to its deployed identity.
+    with open(os.path.join(versions_dir, "0459_add_alert_project_created_index.py")) as f:
+        rev_0459, down_0459 = parse_revision_identifiers(f.read())
+    assert rev_0459 == "0459"
+    assert down_0459 == "0458", (
+        "0459 must chain onto the deployed 0458, matching applied history"
+    )
+
+    # 0458b withdrawn.
+    assert not os.path.exists(
+        os.path.join(versions_dir, "0458b_task_updated_at_vm_dispatched_at_indexes.py")
+    ), "the 0458b linearisation revision must be removed"
+
+    # 0521/0525 reordered so the topological chain is monotonic: 0503<-0521<-0525.
+    with open(os.path.join(versions_dir, "0521_project_compute_image.py")) as f:
+        rev_0521, down_0521 = parse_revision_identifiers(f.read())
+    assert rev_0521 == "0521"
+    assert down_0521 == "0503", "0521 must chain onto 0503 after the reorder"
+    with open(os.path.join(versions_dir, "0525_task_evaluating_updated_at_index.py")) as f:
+        rev_0525, down_0525 = parse_revision_identifiers(f.read())
+    assert rev_0525 == "0525"
+    assert down_0525 == "0521", "0525 must chain onto 0521 after the reorder"
+
+    # New head re-adds the index idempotently, chained onto the reordered head 0525.
+    head_path = os.path.join(versions_dir, "0526_readd_task_vm_dispatched_at_index.py")
+    assert os.path.exists(head_path), "the new head migration 0526 must exist"
+    with open(head_path) as f:
+        head_src = f.read()
+    rev_head, down_head = parse_revision_identifiers(head_src)
+    assert rev_head == "0526"
+    assert down_head == "0525"
+    assert "ix_task_vm_dispatched_at" in head_src
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in head_src, (
+        "the re-land must be idempotent so it is a no-op on dev DBs that already "
+        "applied the withdrawn 0458b index"
+    )
+
+
+def test_expected_schema_revision_tracks_new_head():
+    """EXPECTED_SCHEMA_REVISION must be bumped to the new structural head 0526."""
+    from app.main import EXPECTED_SCHEMA_REVISION
+
+    assert EXPECTED_SCHEMA_REVISION == "0526"
