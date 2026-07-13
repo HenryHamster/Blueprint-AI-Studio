@@ -185,9 +185,11 @@ def annotate_capability_proof_status(
 
     2. **Legacy proof records** (``proof_records``): when ``evidence_refs_map``
        has no entry for a capability, falls back to the durable proof-record
-       existence check — ``"proven"`` when at least one record exists, else
-       ``"unproven"``.  Backward-compatible: callers that omit
-       ``evidence_refs_map`` see unchanged behaviour.
+       store, grading its entries with the SAME classifier (so a
+       ``backing_path``-only ledger reads ``"path_proven"``, not ``"proven"``);
+       a capability with no records at all reads ``"unproven"``.
+       Backward-compatible: callers that omit ``evidence_refs_map`` see unchanged
+       behaviour.
 
     Input ``vocab`` is not mutated — a shallow copy of each entry is returned.
     Fail-open: unexpected shapes pass through unchanged. Shared by every spawn
@@ -209,8 +211,10 @@ def annotate_capability_proof_status(
         if isinstance(ev_refs, list) and ev_refs:
             entry2["proof_status"] = classify_evidence(ev_refs)
         elif isinstance(cap_name, str) and records.get(cap_name):
-            # Use tier-aware classification so backing_path-only proof_records
-            # return "path_proven" (not "proven"), matching enrich_problem_model_capability_proofs.
+            # backing_path-only proof_records return "path_proven" (not "proven"),
+            # matching enrich_problem_model_capability_proofs. (The classifier is
+            # the same one used on the ev_refs branch above — classify_evidence
+            # and classify_evidence_tiered are one function; see finding #8.)
             synthetic_refs = [
                 {"kind": e.get("proof_kind"), "proven": True}
                 for e in records[cap_name]
@@ -372,15 +376,19 @@ def working_capability_proof_status(
     to surface); one carrying a machine-verified ``proven=True`` ref classifies as
     ``proven``.
 
-    Because this map feeds the enforce-gate path, it uses the *tier-aware*
-    classifier: a capability whose ONLY ``proven=True`` ref is a
-    ``backing_path`` (declared files merely exist at HEAD — the same self-report
-    vector the gate exists to close) classifies as ``partial``, not ``proven``,
-    and therefore does NOT clear the enforce gate on its own. A ``backing_path``
-    proof corroborated by a machine-verified ``named_test`` still reads
-    ``proven``. The badge/display path
-    (:func:`annotate_capability_proof_status`) deliberately keeps the plain
-    :func:`classify_evidence` so existing evidence still surfaces on the UI.
+    This map feeds the enforce-gate path, so the tiering matters here: a
+    capability whose ONLY ``proven=True`` ref is a ``backing_path`` (declared
+    files merely exist at HEAD — the same self-report vector the gate exists to
+    close) classifies as ``path_proven``, not ``proven``, and therefore does NOT
+    clear the enforce gate on its own. A ``backing_path`` proof corroborated by a
+    machine-verified ``named_test`` still reads ``proven``.
+
+    NOTE: there is only ONE classifier — :func:`classify_evidence_tiered` is an
+    alias of :func:`classify_evidence` (audit finding #8). The tiering above is
+    not a property of *which* function is called; every surface, badge/display
+    included, grades a given ref set identically. The gate's extra strictness
+    comes from what it does with the tier (only ``proven`` clears), not from a
+    second classifier.
 
     When ``evidence_refs`` is empty or missing but the capability declares a
     non-empty ``backing_paths`` list, the status is upgraded to ``partial`` —
@@ -671,16 +679,31 @@ def capability_proof_gate_release_status(
     additionally requires that every capability the base map treats as cleared be
     CORROBORATED by a machine-verified entry in that ledger
     (:func:`_ledger_proof_status` grades ``"proven"``). A capability that reads
-    ``proven`` from a self-reported ``evidence_ref`` — or ``proof_exempt`` — but
-    carries no corroborating platform proof is NOT cleared: it is added to
-    ``unproven`` (and surfaced under ``uncorroborated``) so promotion blocks. When
-    ``proof_records`` is ``None`` (callers that do not supply the ledger), the
-    legacy problem_model-only derivation is used unchanged.
+    ``proven`` from a self-reported ``evidence_ref`` but carries no corroborating
+    platform proof is NOT cleared: it is added to ``unproven`` (and surfaced under
+    ``uncorroborated``) so promotion blocks. When ``proof_records`` is ``None``
+    (callers that do not supply the ledger), the legacy problem_model-only
+    derivation is used unchanged.
+
+    **Authorized exemptions bypass the ledger (audit finding #2).** A
+    *provenance-authorized* ``proof_exempt`` capability (one whose ``source``
+    :func:`_exemption_is_authorized` accepts — operator or strategic-agent
+    attribution) is cleared BY THAT AUTHORIZATION, not by machine proof. The earn
+    loop never mints a ledger entry for an exempt capability BY DESIGN, so
+    demanding ledger corroboration from it demoted every authorized exemption to
+    unproven and blocked promotion — nullifying the exemption. Those capabilities
+    are therefore EXCLUDED from the corroboration requirement and reported under
+    ``exempt_cleared``. This does not widen the self-report hole: a bare,
+    unattributed ``proof_exempt=True`` is not an exemption at all
+    (:func:`exempt_capability_names` drops it and
+    :func:`working_capability_proof_status` never grades it ``proven``), so it
+    still lands in ``unproven`` and still blocks.
 
     ``detail`` always carries ``mode`` and, when the enforce branch runs against
     a problem model, the ``total_working`` / ``unproven_count`` / ``unproven`` /
     ``exempt_count`` / ``exempt_names`` audit fields, plus (when the ledger is
-    supplied) ``corroborated`` and ``uncorroborated`` for audit visibility.
+    supplied) ``corroborated`` / ``uncorroborated`` / ``exempt_cleared`` for audit
+    visibility.
     """
     mode_norm = str(mode or "off").strip().lower()
     detail: dict = {"mode": mode_norm}
@@ -700,22 +723,51 @@ def capability_proof_gate_release_status(
         # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
         # entry — not just a self-reported evidence_ref / proof_exempt flag on the
         # problem_model. Uncorroborated "proven" caps are demoted to blocked.
+        #
+        # EXCEPT a provenance-authorized exemption (finding #2): an operator- or
+        # strategic-attributed ``proof_exempt`` capability is cleared BY ITS
+        # AUTHORIZATION, not by machine proof, and the earn loop deliberately never
+        # mints a ledger entry for it (exempt capabilities are excluded from the
+        # earn targets BY DESIGN). Requiring a ledger entry from it therefore
+        # demoted every authorized exemption to unproven and blocked promotion —
+        # nullifying the exemption the operator explicitly granted. Such a
+        # capability is skipped here (neither corroborated nor uncorroborated; it
+        # is already audited under ``exempt_names``).
+        #
+        # The security property is unchanged: ``exempt_set`` holds ONLY
+        # provenance-backed exemptions (:func:`exempt_capability_names` drops any
+        # bare ``proof_exempt=True``), and an unauthorized exemption never grades
+        # ``proven`` in the base map to begin with, so it stays in ``unproven``. A
+        # self-reported ``evidence_ref`` still requires ledger corroboration.
         already_unproven = set(unproven)
         uncorroborated: list[str] = []
         for name, status in proof_map.items():
             if status != "proven" or name in already_unproven:
                 continue
+            if name in exempt_set:
+                continue
             if _ledger_proof_status(proof_records, name) != "proven":
                 uncorroborated.append(name)
         if uncorroborated:
             unproven = sorted(set(unproven) | set(uncorroborated))
+        uncorroborated_set = set(uncorroborated)
         corroborated = [
             name
             for name, status in proof_map.items()
-            if status == "proven" and name not in set(uncorroborated)
+            if status == "proven"
+            and name not in uncorroborated_set
+            and name not in exempt_set
         ]
         detail["corroborated"] = sorted(corroborated)
         detail["uncorroborated"] = sorted(uncorroborated)
+        # Cleared by authorization rather than by ledger proof — surfaced
+        # separately so an auditor can see exactly which capabilities bypassed the
+        # machine-proof requirement and on whose authority.
+        detail["exempt_cleared"] = sorted(
+            name
+            for name, status in proof_map.items()
+            if status == "proven" and name in exempt_set
+        )
 
     detail["total_working"] = len(proof_map)
     detail["unproven_count"] = len(unproven)

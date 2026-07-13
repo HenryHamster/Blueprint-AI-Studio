@@ -8153,6 +8153,156 @@ async def test_reattempt_after_failed_backfill_restores_backfilled(db_session):
 
 
 # ---------------------------------------------------------------------------
+# Finding #9: get_failed_corroboration_keys pushes the corroboration_of filter
+# into SQL (it ran on the qualifier finalize path pulling the FULL context JSONB
+# of every FAILED/CANCELLED task in the project, filtering only in Python).
+# The selection must be UNCHANGED by the push-down.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_keys_sql_filter_selects_same_keys(db_session):
+    """The SQL-side ``corroboration_of`` filter selects EXACTLY the keys the old
+    Python-side filter did — no more, no less.
+
+    Exercises every discriminating row shape in one project:
+      * FAILED with corroboration_of            → selected
+      * CANCELLED with corroboration_of         → selected
+      * FAILED with NO corroboration_of         → ignored (the rows the old query
+                                                  dragged the whole context JSONB
+                                                  across the wire for)
+      * FAILED with a NULL / non-string value   → ignored (never laundered into a
+                                                  key by the ``->>`` text cast)
+      * COMPLETED / IN_PROGRESS corroboration   → ignored (not a terminal failure)
+      * a FAILED corroboration in ANOTHER project → ignored (project-scoped)
+    """
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, "Corroboration-SQL-Filter")
+    other_project = await _make_project(db_session, "Corroboration-SQL-Other")
+
+    def _task(proj_id, status, context, title="Verify: x"):
+        return _Task(
+            project_id=proj_id,
+            title=title,
+            context=context,
+            payloads=[{"type": "research", "prompt": "verify"}],
+            created_by="SYSTEM_AUTO_REVIEW",
+            status=status,
+        )
+
+    db_session.add_all(
+        [
+            # --- selected -----------------------------------------------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": "crit-failed", "spawned_by": "operator_attestation"},
+                title="Verify: crit-failed",
+            ),
+            _task(
+                project.id,
+                TaskStatus.CANCELLED,
+                {"corroboration_of": "crit-cancelled"},
+                title="Verify: crit-cancelled",
+            ),
+            # --- ignored: terminal, but not a corroboration task ---------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"some_other_key": "noise", "big_blob": "x" * 512},
+                title="Unrelated failed task",
+            ),
+            _task(project.id, TaskStatus.FAILED, {}, title="Empty-context failed task"),
+            # --- ignored: malformed corroboration_of values --------------------
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": None},
+                title="Verify: null-key",
+            ),
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": 42},
+                title="Verify: numeric-key",
+            ),
+            _task(
+                project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": {"nested": "obj"}},
+                title="Verify: object-key",
+            ),
+            # --- ignored: non-terminal / completed corroborations --------------
+            _task(
+                project.id,
+                TaskStatus.COMPLETED,
+                {"corroboration_of": "crit-completed"},
+                title="Verify: crit-completed",
+            ),
+            _task(
+                project.id,
+                TaskStatus.IN_PROGRESS,
+                {"corroboration_of": "crit-in-progress"},
+                title="Verify: crit-in-progress",
+            ),
+            # --- ignored: another project's failure ---------------------------
+            _task(
+                other_project.id,
+                TaskStatus.FAILED,
+                {"corroboration_of": "crit-other-project"},
+                title="Verify: crit-other-project",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+
+    assert failed_keys == {"crit-failed", "crit-cancelled"}, (
+        f"SQL-pushed filter must select exactly the FAILED/CANCELLED corroboration "
+        f"keys of THIS project, got {failed_keys}"
+    )
+    # The malformed values must not be coerced into keys by the SQL text cast.
+    assert "42" not in failed_keys and 42 not in failed_keys
+
+
+@pytest.mark.asyncio
+async def test_failed_corroboration_keys_newer_non_terminal_still_excluded(db_session):
+    """The stale-failure exclusion still works after the push-down: a key with a
+    newer non-terminal ``Verify:`` task is dropped, while a key whose only
+    corroboration attempt FAILED is still reported."""
+    from app.models import Task as _Task
+
+    project = await _make_project(db_session, "Corroboration-SQL-Stale")
+
+    def _task(status, key):
+        return _Task(
+            project_id=project.id,
+            title=f"Verify: {key}",
+            context={"corroboration_of": key},
+            payloads=[{"type": "research", "prompt": "verify"}],
+            created_by="SYSTEM_AUTO_REVIEW",
+            status=status,
+        )
+
+    db_session.add_all(
+        [
+            _task(TaskStatus.FAILED, "crit-retried"),
+            _task(TaskStatus.QUEUED, "crit-retried"),  # newer attempt in flight
+            _task(TaskStatus.FAILED, "crit-abandoned"),  # no newer attempt
+        ]
+    )
+    await db_session.commit()
+
+    failed_keys = await ac.get_failed_corroboration_keys(db_session, project.id)
+    assert failed_keys == {"crit-abandoned"}, (
+        "a key with a newer non-terminal Verify task must be excluded; a key whose "
+        f"only attempt failed must be reported. Got {failed_keys}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # MissingGreenlet fidelity: attest / re-attest with real ORM expiry
 # ---------------------------------------------------------------------------
 

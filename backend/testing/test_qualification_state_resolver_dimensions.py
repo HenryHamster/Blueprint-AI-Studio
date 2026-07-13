@@ -248,6 +248,104 @@ def test_goal_alignment_passed_when_present():
     assert d["goal_alignment"]["status"] == "passed"
 
 
+def _goal_alignment_qual(goal_alignment):
+    """A clean, fully-passing qualification blob with ``goal_alignment`` injected.
+
+    Nothing else in the blob can fail, so the goal_alignment dimension's status is
+    attributable solely to the injected value.
+    """
+    return {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "goal_alignment": goal_alignment,
+    }
+
+
+def test_goal_alignment_unrecognized_dict_status_is_not_passed():
+    """Finding #7: an unrecognized dict status must NOT fail open to 'passed'.
+
+    v25's principle is "earned, not claimed" — a dimension may only read passed
+    from a verdict it actually recognizes. This used to default to 'passed',
+    claiming an alignment pass the audit never gave.
+    """
+    result = resolve_dimension_states(
+        _goal_alignment_qual({"status": "who_knows", "grade": "?"})
+    )
+    d = _by_key(result)
+    assert d["goal_alignment"]["status"] != "passed", (
+        "an unrecognized goal_alignment verdict must never display as passed"
+    )
+    assert d["goal_alignment"]["status"] == "unavailable"
+    assert d["goal_alignment"]["reason"] == "goal_alignment_unrecognized:who_knows"
+
+
+def test_goal_alignment_empty_dict_is_not_passed():
+    """A goal_alignment dict carrying no verdict key at all is unknown, not passed."""
+    result = resolve_dimension_states(_goal_alignment_qual({"biggest_gap": "auth"}))
+    d = _by_key(result)
+    assert d["goal_alignment"]["status"] == "unavailable"
+    assert d["goal_alignment"]["reason"] == "goal_alignment_unrecognized"
+
+
+def test_goal_alignment_non_dict_truthy_is_not_passed():
+    """Finding #7: a non-dict truthy value (a bare string / number the audit never
+    promised) carries no readable verdict, so it must not claim a pass."""
+    for junk in ("aligned-ish", 1, ["aligned"]):
+        result = resolve_dimension_states(_goal_alignment_qual(junk))
+        d = _by_key(result)
+        assert d["goal_alignment"]["status"] != "passed", (
+            f"non-dict goal_alignment {junk!r} must not fail open to passed"
+        )
+        assert d["goal_alignment"]["status"] == "unavailable"
+        assert d["goal_alignment"]["reason"] == "goal_alignment_unrecognized"
+
+
+def test_goal_alignment_real_audit_shape_shortfall_is_failed():
+    """The REAL payload the release-audit agent emits is keyed on ``state``
+    ({"state": "aligned"|"shortfall"|"not_applicable", "assessed_grade": ...}) —
+    it carries neither ``status`` nor ``verdict``.
+
+    Before the fix, every real verdict — a "shortfall" included — fell into the
+    fail-open else branch and displayed as 'passed'. A shortfall must read failed.
+    """
+    result = resolve_dimension_states(
+        _goal_alignment_qual(
+            {
+                "state": "shortfall",
+                "assessed_grade": 0.4,
+                "biggest_gap": "Auth not addressed",
+            }
+        )
+    )
+    d = _by_key(result)
+    assert d["goal_alignment"]["status"] == "failed"
+    assert d["goal_alignment"]["reason"] == "shortfall"
+
+
+def test_goal_alignment_real_audit_shape_aligned_is_passed():
+    """The earned pass: the audit's ``state="aligned"`` verdict reads passed."""
+    result = resolve_dimension_states(
+        _goal_alignment_qual({"state": "aligned", "assessed_grade": 0.95})
+    )
+    d = _by_key(result)
+    assert d["goal_alignment"]["status"] == "passed"
+
+
+def test_goal_alignment_real_audit_shape_not_applicable():
+    """``state="not_applicable"`` (the goal cannot be assessed from this diff) is
+    neither a pass nor a failure."""
+    result = resolve_dimension_states(
+        _goal_alignment_qual({"state": "not_applicable"})
+    )
+    d = _by_key(result)
+    assert d["goal_alignment"]["status"] == "not_applicable"
+
+
 def test_criterion_coverage_incomplete():
     qual = {
         "status": "not_promoted",

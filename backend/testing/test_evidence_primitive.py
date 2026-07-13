@@ -153,6 +153,24 @@ def test_classify_treats_only_true_as_proven():
 # --- classify_evidence_tiered ------------------------------------------------
 
 
+def test_tiered_is_an_alias_of_classify_evidence_single_implementation():
+    """Finding #8: the two classifiers had drifted into byte-for-byte duplicates
+    while consumers still documented a tiered-vs-plain distinction. They are now
+    ONE implementation, with ``classify_evidence_tiered`` kept as a pure alias.
+
+    Asserting object identity (not merely equal outputs) is the point: it makes it
+    structurally impossible for the two names to diverge again — reintroducing a
+    second implementation, even one that behaves identically today, fails here.
+    """
+    from app import evidence_primitive as ep
+
+    assert ep.classify_evidence_tiered is ep.classify_evidence, (
+        "classify_evidence_tiered must remain an alias of classify_evidence — "
+        "a second implementation invites the duplicated-function drift finding #8 "
+        "closed"
+    )
+
+
 def test_tiered_backing_path_only_returns_path_proven():
     # A proven set whose ONLY proof is backing_path returns path_proven in both
     # classifiers — files exist at HEAD but nothing was machine-verified.

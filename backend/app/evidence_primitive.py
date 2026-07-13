@@ -290,16 +290,28 @@ def classify_evidence(
 ) -> EvidenceStatus:
     """Classify a list of evidence refs into an :data:`EvidenceStatus`.
 
+    THE single classifier for this vocabulary — :func:`classify_evidence_tiered`
+    is an alias of this function, not a second implementation (see the alias note
+    below). Every surface therefore grades a given ref set identically.
+
     Pure and stored-flag-only — it never performs IO or re-verification:
 
     * ``proven``      — at least one ref is a machine-verified (or unlabeled)
-      ``proven=True`` proof.
+      ``proven=True`` proof. The mixed case counts: one machine-verified proof
+      alongside a structural or attestation one still reads ``proven``. A
+      ``proven=True`` ref whose ``kind`` is missing/blank is treated as
+      NON-backing (so it still reads ``proven``) — an unlabeled proof is never
+      silently demoted.
     * ``path_proven`` — the only proven refs are structural-only
-      (:data:`BACKING_ONLY_KINDS`, e.g. ``backing_path``): files exist at HEAD
-      but nothing was machine-verified.
+      (:data:`BACKING_ONLY_KINDS`, e.g. ``backing_path`` /
+      ``named_test_present``): the declared files exist at HEAD but nothing was
+      machine-verified, so an enforce-mode gate is NOT cleared by them.
     * ``partial``     — refs exist but none backs the claim: none is proven, OR
-      the only proven refs are bare attestation (:data:`ATTESTATION_ONLY_KINDS`)
-      with no structural backing at all.
+      the only proven refs are bare attestation (:data:`ATTESTATION_ONLY_KINDS`,
+      i.e. ``operator_attestation``) with no structural backing at all. A human's
+      word is never laundered into ``proven`` parity with a ``named_test`` that
+      ran green — mirroring the acceptance layer, which already tiers an
+      attestation to a lower ``attested`` state rather than full ``covered``.
     * ``unproven``    — the list is present but empty (a claim with zero refs).
     * ``unverified``  — structurally uncheckable: ``refs`` is not a list, or it
       contains only non-dict entries we cannot read a ``proven`` flag from.
@@ -329,59 +341,21 @@ def classify_evidence(
     return "partial"
 
 
-def classify_evidence_tiered(
-    refs: Any,
-    *,
-    now: datetime | None = None,
-    ttl: timedelta | None = None,
-) -> EvidenceStatus:
-    """Classify evidence refs, tiering non-machine-verified proofs below ``proven``.
-
-    Shares the exact proven-tiering rule with :func:`classify_evidence` (both
-    delegate to :func:`_proven_tier`), so a proven set is graded identically
-    everywhere the shared contract is adopted:
-
-    * When the ONLY ``proven=True`` refs are structural-only
-      (:data:`BACKING_ONLY_KINDS`, e.g. ``backing_path``) → ``"path_proven"``.
-      A ``backing_path`` proof only asserts that the declared files exist at
-      HEAD — a self-report that code is present, not machine-verified
-      corroboration that it works.
-    * When the ONLY ``proven=True`` refs are bare attestation
-      (:data:`ATTESTATION_ONLY_KINDS`, i.e. ``operator_attestation``) →
-      ``"partial"``. A human's word that a criterion holds carries no structural
-      machine-check at all, so it must NOT be laundered into ``proven`` parity
-      with a ``named_test`` that actually ran green — mirroring the acceptance
-      layer, which already tiers ``operator_attestation`` to a lower ``attested``
-      state rather than full ``covered``.
-
-    The mixed case is preserved as ``proven``: when at least one
-    machine-verified (non-backing, non-attestation) ``proven=True`` ref exists
-    alongside a structural or attestation one, the set reads ``proven``. A
-    ``proven=True`` ref whose ``kind`` is missing/blank is treated as NON-backing
-    (so it still reads ``proven``), staying conservative — an unlabeled proof is
-    never silently demoted.
-
-    ``partial`` / ``unproven`` / ``unverified`` are returned identically to
-    :func:`classify_evidence`; ``contradicted`` is never returned here.
-
-    **Freshness (opt-in).** Identical to :func:`classify_evidence`: when ``now``
-    is supplied, ``proven=True`` refs older than ``ttl`` (default
-    :data:`PROOF_FRESHNESS_TTL`) are dropped before tiering, so a stale write-once
-    proof demotes to ``partial`` and no longer clears an enforce-mode gate. A
-    ref with a missing/malformed ``recorded_at`` never expires; ``now=None``
-    (the default) evaluates no freshness and preserves legacy behaviour.
-    """
-    if not isinstance(refs, list):
-        return "unverified"
-    if not refs:
-        return "unproven"
-    checkable = [r for r in refs if isinstance(r, dict)]
-    if not checkable:
-        return "unverified"
-    proven = _active_proven(checkable, now, ttl)
-    if not proven:
-        return "partial"
-    return _proven_tier(proven)
+#: Backwards-compatible alias of :func:`classify_evidence` (audit finding #8).
+#:
+#: These were once two functions: a "plain" classifier and a "tiered" one that
+#: demoted a proven set with no machine-verified ref. The tiering was then folded
+#: into the plain classifier (both delegate to :func:`_proven_tier`), leaving two
+#: byte-for-byte equivalent implementations and a stale docstring story about a
+#: distinction that no longer existed — an open invitation for the two copies to
+#: drift apart under later edits.
+#:
+#: There is now exactly ONE implementation. This name is kept as a pure alias (an
+#: assignment, deliberately NOT a wrapper function, so drift is impossible by
+#: construction) because a dozen call sites and tests import it and the name still
+#: reads well at the enforce-gate seams that care about the tiering. New code
+#: should prefer :func:`classify_evidence`.
+classify_evidence_tiered = classify_evidence
 
 
 def claim_contradicts_evidence(

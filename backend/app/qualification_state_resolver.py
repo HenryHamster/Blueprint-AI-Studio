@@ -493,19 +493,46 @@ def resolve_dimension_states(
             else:
                 dim_status = "unavailable"
         elif key == "goal_alignment":
+            # "Earned, not claimed": this dimension reads PASSED only from a
+            # recognized alignment verdict.  It used to default to "passed" for
+            # any unrecognized dict status and for any non-dict truthy value — a
+            # fail-open display default that claimed a pass the audit never gave.
+            # It bit in practice: the real audit payload is
+            # {"state": "aligned"|"shortfall"|"not_applicable", ...} (see the
+            # release-audit prompt in agent/src/handlers/audits.ts), which carries
+            # NEITHER "status" NOR "verdict" — so every real verdict, "shortfall"
+            # included, fell into the fail-open else and displayed as passed.
+            # Now: read the real ``state`` key too, and default anything we do not
+            # recognize to "unavailable" (unknown), never to a pass.
+            # Display-only — no dimension here gates promotion.
             if goal_alignment is None:
                 dim_status = "unavailable"
             elif isinstance(goal_alignment, dict):
-                ga_status = goal_alignment.get("status") or goal_alignment.get("verdict")
+                ga_status = (
+                    goal_alignment.get("status")
+                    or goal_alignment.get("verdict")
+                    or goal_alignment.get("state")
+                )
                 if ga_status in ("pass", "met", "aligned"):
                     dim_status = "passed"
-                elif ga_status in ("fail", "unmet", "misaligned"):
+                elif ga_status in ("fail", "unmet", "misaligned", "shortfall"):
                     dim_status = "failed"
                     reason = ga_status
+                elif ga_status == "not_applicable":
+                    dim_status = "not_applicable"
                 else:
-                    dim_status = "passed"
+                    # Unrecognized / absent verdict — we cannot tell whether the
+                    # goal was met, so surface "unknown", not a pass.
+                    dim_status = "unavailable"
+                    reason = (
+                        f"goal_alignment_unrecognized:{ga_status}"
+                        if isinstance(ga_status, str) and ga_status.strip()
+                        else "goal_alignment_unrecognized"
+                    )
             else:
-                dim_status = "passed"
+                # A non-dict truthy value carries no readable verdict at all.
+                dim_status = "unavailable"
+                reason = "goal_alignment_unrecognized"
         elif key == "challenge":
             challenge_verdicts = q.get("challenge_verdicts")
             if challenge_verdicts:

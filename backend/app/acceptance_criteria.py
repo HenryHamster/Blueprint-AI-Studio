@@ -2686,21 +2686,39 @@ async def get_failed_corroboration_keys(
     The old failed task remains in the database but is *stale* — this function
     excludes keys that have a newer non-terminal task so that re-verified criteria
     are not stuck at ``'partial'`` coverage indefinitely.
+
+    **Scaling (audit finding #9).** This runs on the qualifier finalize path, so
+    it must not scale with the project's total failure history. Both queries
+    therefore push the ``corroboration_of`` filter into SQL and project ONLY that
+    one JSON key — never the full ``context`` JSONB blob of every FAILED /
+    CANCELLED task in the project. Corroboration tasks are a tiny fraction of a
+    mature project's terminal tasks, so the server-side ``IS NOT NULL`` predicate
+    is what keeps the row count (and the bytes on the wire) proportional to the
+    corroboration tasks rather than to the whole failure history.
+
+    Behaviour is unchanged: the JSON element is read back with its type intact and
+    the same ``isinstance(key, str)`` guard applies, so a malformed
+    ``corroboration_of`` (JSON null, number, object) is still ignored rather than
+    coerced into a key.
     """
     from app.models import Task, TaskStatus  # noqa: PLC0415
 
+    # The JSON element (typed) and its text form. The text form is only used for
+    # the SQL existence predicate (``->> 'corroboration_of' IS NOT NULL``, which a
+    # JSON null also fails — matching the isinstance guard below); the element is
+    # what we read, so a non-string value is still rejected in Python instead of
+    # being laundered into a key by the ``->>`` text cast.
+    corroboration_key = Task.context["corroboration_of"]
+    corroboration_key_text = corroboration_key.as_string()
+
     result = await session.execute(
-        select(Task.context).where(
+        select(corroboration_key).where(
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            corroboration_key_text.isnot(None),
         )
     )
-    failed: set[str] = set()
-    for (context,) in result.all():
-        if isinstance(context, dict) and "corroboration_of" in context:
-            key = context["corroboration_of"]
-            if isinstance(key, str):
-                failed.add(key)
+    failed: set[str] = {key for (key,) in result.all() if isinstance(key, str)}
 
     # Exclude keys that have a newer non-terminal task — the criterion was
     # re-attested and a fresh verification attempt is in progress, so the old
@@ -2708,19 +2726,18 @@ async def get_failed_corroboration_keys(
     if failed:
         active_titles = [f"Verify: {key}" for key in failed]
         active_result = await session.execute(
-            select(Task.context).where(
+            select(corroboration_key).where(
                 Task.project_id == project_id,
                 Task.title.in_(active_titles),
                 Task.status.not_in(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
+                corroboration_key_text.isnot(None),
             )
         )
-        for (context,) in active_result.all():
-            if isinstance(context, dict) and "corroboration_of" in context:
-                key = context["corroboration_of"]
-                if isinstance(key, str):
-                    failed.discard(key)
+        for (key,) in active_result.all():
+            if isinstance(key, str):
+                failed.discard(key)
 
     return failed
 
