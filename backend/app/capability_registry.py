@@ -644,6 +644,175 @@ def _ledger_proof_status(
     return classify_evidence_tiered(synthetic)
 
 
+def ledger_corroborated_proof_status(
+    proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
+    proof_records: object,
+    exempt_names: Iterable[str] = (),
+) -> dict[str, EvidenceStatus]:
+    """Demote every ``proven`` capability the PLATFORM ledger does not corroborate.
+
+    THE TRUST BOUNDARY, in one place. ``working_capability_proof_status`` grades a
+    capability from ``problem_model.capabilities[].evidence_refs`` and
+    ``proof_exempt`` — both AGENT-WRITABLE JSONB. An agent can therefore write
+    ``{"kind": "named_test", "proven": true}`` onto its own capability and read
+    back ``proven`` with nothing machine-verified behind it. This pass re-grades
+    such a map against ``project.capability_proof_records`` — the durable ledger
+    written ONLY by the platform recorders in :mod:`app.capability_proof` — so a
+    self-declared proof cannot clear an enforce gate:
+
+    * ``status != "proven"``  → passed through unchanged (already not clearing).
+    * name in ``exempt_names`` → passed through unchanged. A *provenance-authorized*
+      ``proof_exempt`` (:func:`exempt_capability_names`, which drops bare/unattributed
+      flags) is cleared BY ITS AUTHORIZATION, not by machine proof: the earn loop
+      deliberately never mints a ledger entry for an exempt capability, so demanding
+      corroboration from it would nullify the exemption the operator granted.
+    * ledger grades ``proven`` (:func:`_ledger_proof_status`) → corroborated, kept.
+    * otherwise → demoted to ``"unverified"``: the capability CLAIMS proof that no
+      platform record backs. ``unverified`` (not ``unproven``) names the situation
+      precisely — evidence was asserted, but nothing corroborates it — and, being
+      any tier other than ``proven``, it blocks
+      :func:`capability_need_blocked_by_proof_gate` exactly as an unproven claim does.
+
+    Shared verbatim by all THREE gate seams (the release qualifier via
+    :func:`capability_proof_gate_release_status`, the spawn-time prerequisite
+    resolver in :mod:`app.research_completion`, and the blocked-resume sweep in
+    :mod:`app.blocked_task_unblock_sweeps`) so the "who cleared this capability"
+    rule cannot drift between them — the drift IS the vulnerability (audit finding
+    #4: the two consumer seams graded from ``evidence_refs`` alone while the
+    release seam already corroborated).
+
+    IO-free; the input map is not mutated.
+    """
+    if not isinstance(proof_status_by_name, Mapping):
+        return {}
+    exempt = {n for n in exempt_names if isinstance(n, str)}
+    out: dict[str, EvidenceStatus] = {}
+    for name, status in proof_status_by_name.items():
+        if (
+            status != "proven"
+            or name in exempt
+            or _ledger_proof_status(proof_records, name) == "proven"
+        ):
+            out[name] = status
+            continue
+        out[name] = "unverified"
+    return out
+
+
+def fold_ledger_proof_upgrades(
+    proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
+    proof_records: object,
+    now: datetime | None = None,
+) -> dict[str, EvidenceStatus]:
+    """Upgrade an ``evidence_refs``-derived proof map with the durable proof ledger.
+
+    ``record_capability_proof`` stamps a landed provider's proof into BOTH the
+    capability's ``evidence_refs`` (tier-1, read by
+    :func:`working_capability_proof_status`) AND the project-level
+    ``capability_proof_records`` column (tier-2). The evidence_refs append is
+    fail-open — if the problem_model shape blocks it, the proof survives ONLY in
+    the ledger. Without this fold, a genuinely platform-verified capability whose
+    tier-1 append was lost would be held BLOCKED by the enforce gate.
+
+    Only capabilities already present in ``proof_status_by_name`` are considered
+    (the tier-1 map is authoritative on WHICH capabilities exist and are
+    ``working``), and a tier-2 status is applied only when it is strictly stronger
+    than the tier-1 status, so a ledger proof never REGRESSES a capability the
+    evidence_refs classify more highly.
+
+    Freshness parity with tier-1: each record's ``proved_at`` is carried into the
+    synthetic ref as ``recorded_at`` and ``now`` is threaded into the tiered
+    classifier, so a ledger record older than
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` can no longer resurrect an
+    expired capability at the gate. ``now`` defaults to the current UTC time.
+
+    The mirror image of :func:`ledger_corroborated_proof_status`: this pass lets
+    the platform ledger RAISE a claim, that one lets it REFUSE one. Both consumer
+    seams run them in that order (see :func:`consumer_gate_proof_status`).
+
+    IO-free; the input map is not mutated.
+    """
+    if not isinstance(proof_status_by_name, Mapping):
+        return {}
+    out: dict[str, EvidenceStatus] = dict(proof_status_by_name)
+    if not isinstance(proof_records, dict) or not out:
+        return out
+    from app.evidence_primitive import EVIDENCE_STATUS_RANK, evidence_status_rank
+
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+
+    for name, tier1 in list(out.items()):
+        if evidence_status_rank(tier1) >= EVIDENCE_STATUS_RANK["proven"]:
+            continue
+        entries = proof_records.get(name)
+        if not isinstance(entries, list):
+            continue
+        synthetic = [
+            {
+                "kind": e.get("proof_kind"),
+                "proven": True,
+                "recorded_at": e.get("proved_at"),
+            }
+            for e in entries
+            if isinstance(e, dict)
+        ]
+        if not synthetic:
+            continue
+        tier2 = classify_evidence_tiered(synthetic, now=now)
+        if evidence_status_rank(tier2) > evidence_status_rank(tier1):
+            out[name] = tier2
+    return out
+
+
+def consumer_gate_proof_status(
+    problem_model: object,
+    proof_records: object,
+    now: datetime | None = None,
+) -> dict[str, EvidenceStatus]:
+    """The proof map BOTH consumer enforce-gate seams grade a capability need against.
+
+    One function so the spawn-time prerequisite resolver
+    (:mod:`app.research_completion`) and the blocked-resume sweep
+    (:mod:`app.blocked_task_unblock_sweeps`) cannot disagree about whether a
+    capability is proven — and so neither can drift away from the release seam,
+    which applies the same corroboration rule
+    (:func:`capability_proof_gate_release_status`).
+
+    Three composed steps:
+
+    1. :func:`working_capability_proof_status` — the tier-1, problem_model-derived
+       (AGENT-WRITABLE) grade, with evidence-freshness already applied.
+    2. :func:`fold_ledger_proof_upgrades` — the platform ledger RAISES a capability
+       whose tier-1 ``evidence_refs`` append was lost to the fail-open path.
+    3. :func:`ledger_corroborated_proof_status` — the platform ledger REFUSES a
+       ``proven`` claim it does not corroborate, demoting a self-declared proof to
+       ``unverified`` so it cannot clear the enforce gate. Provenance-authorized
+       exemptions are carved out (they are cleared by authorization, never by a
+       ledger entry, which the earn loop never mints for them).
+
+    Net contract — a capability need clears the enforce gate at a consumer seam iff
+    the capability is ``working`` AND (it carries an operator/strategic-authorized
+    ``proof_exempt`` OR the platform ledger holds a machine-verified proof for it).
+    A self-declared ``proven=true`` ``evidence_ref`` alone NEVER clears it.
+
+    ``proof_records`` is the project's ``capability_proof_records`` column; ``None``
+    / a missing column is treated as an EMPTY ledger (nothing corroborates), which
+    fails CLOSED. This deliberately differs from
+    :func:`capability_proof_gate_release_status`, where ``proof_records=None`` means
+    "the caller did not supply the ledger" and preserves the legacy
+    problem_model-only derivation; here the caller ALWAYS supplies the project's
+    column, so ``None`` genuinely means "this project has no recorded proofs".
+    """
+    proof_map = working_capability_proof_status(problem_model, now=now)
+    proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now)
+    return ledger_corroborated_proof_status(
+        proof_map, proof_records, exempt_capability_names(problem_model)
+    )
+
+
 def capability_proof_gate_release_status(
     problem_model: object,
     mode: str | None,
@@ -739,15 +908,19 @@ def capability_proof_gate_release_status(
         # bare ``proof_exempt=True``), and an unauthorized exemption never grades
         # ``proven`` in the base map to begin with, so it stays in ``unproven``. A
         # self-reported ``evidence_ref`` still requires ledger corroboration.
-        already_unproven = set(unproven)
-        uncorroborated: list[str] = []
-        for name, status in proof_map.items():
-            if status != "proven" or name in already_unproven:
-                continue
-            if name in exempt_set:
-                continue
-            if _ledger_proof_status(proof_records, name) != "proven":
-                uncorroborated.append(name)
+        # The corroboration rule itself lives in ledger_corroborated_proof_status,
+        # which the two CONSUMER seams also call (via consumer_gate_proof_status) —
+        # one implementation, so this seam and they cannot drift apart. A "proven"
+        # capability the ledger refuses comes back demoted; that demotion IS the
+        # uncorroborated set.
+        corroborated_map = ledger_corroborated_proof_status(
+            proof_map, proof_records, exempt_set
+        )
+        uncorroborated: list[str] = [
+            name
+            for name, status in proof_map.items()
+            if status == "proven" and corroborated_map.get(name) != "proven"
+        ]
         if uncorroborated:
             unproven = sorted(set(unproven) | set(uncorroborated))
         uncorroborated_set = set(uncorroborated)

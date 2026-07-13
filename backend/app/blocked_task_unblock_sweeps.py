@@ -399,41 +399,16 @@ def _fold_proof_records_tier2(
     :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL`) can no longer resurrect an
     expired capability at the enforce gate after the fail-open evidence_refs append
     is missing. ``now`` defaults to the current UTC time when not supplied.
+
+    The rule itself now lives in
+    :func:`app.capability_registry.fold_ledger_proof_upgrades`: the spawn-time
+    resolver needs the IDENTICAL upgrade, and the two consumer seams must not grade
+    a capability differently. This thin wrapper stays as the blocked-sweep-local
+    name for it.
     """
-    if not isinstance(proof_records, dict) or not status_by_name:
-        return status_by_name
-    from app.evidence_primitive import (
-        EVIDENCE_STATUS_RANK,
-        classify_evidence_tiered,
-        evidence_status_rank,
-    )
+    from app.capability_registry import fold_ledger_proof_upgrades
 
-    if now is None:
-        from app.time_utils import _utcnow
-
-        now = _utcnow()
-
-    for name, tier1 in list(status_by_name.items()):
-        if evidence_status_rank(tier1) >= EVIDENCE_STATUS_RANK["proven"]:
-            continue
-        entries = proof_records.get(name)
-        if not isinstance(entries, list):
-            continue
-        synthetic = [
-            {
-                "kind": e.get("proof_kind"),
-                "proven": True,
-                "recorded_at": e.get("proved_at"),
-            }
-            for e in entries
-            if isinstance(e, dict)
-        ]
-        if not synthetic:
-            continue
-        tier2 = classify_evidence_tiered(synthetic, now=now)
-        if evidence_status_rank(tier2) > evidence_status_rank(tier1):
-            status_by_name[name] = tier2
-    return status_by_name
+    return fold_ledger_proof_upgrades(status_by_name, proof_records, now=now)
 
 
 async def _fetch_working_capability_proof_status(session, project_id) -> dict:
@@ -446,12 +421,22 @@ async def _fetch_working_capability_proof_status(session, project_id) -> dict:
     name set from these keys — one project fetch serves both the resolution and
     the OBSERVE-mode proof surfacing. Cached per project across the sweep batch.
 
-    The evidence_refs-derived tier-1 map is then folded with the project's durable
-    ``capability_proof_records`` (tier-2) so this enforce-gate seam agrees with the
-    release-qualifier / badge seams even when the fail-open evidence_refs append
-    did not land (see :func:`_fold_proof_records_tier2`).
+    The evidence_refs-derived tier-1 map is then reconciled against the project's
+    durable ``capability_proof_records`` ledger by
+    :func:`~app.capability_registry.consumer_gate_proof_status`, which the
+    spawn-time resolver calls too, so both consumer seams (and the release
+    qualifier) grade a capability identically. That reconciliation runs BOTH ways:
+
+    * the ledger RAISES a capability whose tier-1 ``evidence_refs`` append was lost
+      to the fail-open path (see :func:`_fold_proof_records_tier2`), and
+    * SECURITY (audit finding #4) the ledger REFUSES a ``proven`` claim it does not
+      corroborate. ``problem_model.capabilities[].evidence_refs`` is AGENT-WRITABLE
+      JSONB: without this, an agent that wrote itself a
+      ``{"kind": "named_test", "proven": true}`` ref would clear this gate and resume
+      every dependent blocked on that capability with nothing machine-verified behind
+      it. Only a provenance-authorized ``proof_exempt`` clears without a ledger entry.
     """
-    from app.capability_registry import working_capability_proof_status
+    from app.capability_registry import consumer_gate_proof_status
     from app.models import Project
     from app.time_utils import _utcnow
 
@@ -460,11 +445,10 @@ async def _fetch_working_capability_proof_status(session, project_id) -> dict:
     # capability_proof_records column (tier-2).
     now = _utcnow()
     project = await session.get(Project, project_id)
-    status_by_name = working_capability_proof_status(
-        getattr(project, "problem_model", None), now=now
-    )
-    return _fold_proof_records_tier2(
-        status_by_name, getattr(project, "capability_proof_records", None), now=now
+    return consumer_gate_proof_status(
+        getattr(project, "problem_model", None),
+        getattr(project, "capability_proof_records", None),
+        now=now,
     )
 
 

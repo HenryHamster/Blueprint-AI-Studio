@@ -7813,6 +7813,236 @@ async def test_working_registry_capability_prerequisite_blocks_under_enforce(
     )
 
 
+async def _spawn_child_under_enforce(
+    db_session,
+    mocker,
+    *,
+    direction_key: str,
+    capabilities: list[dict],
+    proof_records: dict | None,
+):
+    """Spawn one finding whose prerequisite names ``budgeted-compute-job-substrate``
+    through the REAL research-completion path with the proof gate in ENFORCE mode,
+    and return the spawned child task.
+
+    ``capabilities`` is written to ``project.problem_model`` (AGENT-WRITABLE) and
+    ``proof_records`` to ``project.capability_proof_records`` (the PLATFORM-ONLY
+    ledger) — the two sources whose disagreement finding #4 is about.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.shared_state import runtime_config as _rc
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, direction_key
+    )
+    _project.problem_model = {
+        **(_project.problem_model or {}),
+        "capabilities": capabilities,
+    }
+    _project.capability_proof_records = proof_records
+    db_session.add(_project)
+    await db_session.commit()
+
+    finding = _make_finding(
+        title="Add compute launch entrypoint", direction_id=direction["id"]
+    )
+    finding["prerequisite"] = {
+        "kind": "capability",
+        "ref": "budgeted-compute-job-substrate",
+    }
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is not None:
+            _rc["capability_proof_gate_mode"] = saved_mode
+        else:
+            _rc.pop("capability_proof_gate_mode", None)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    children = [c for c in children if (c.first_payload or {}).get("type") != "memo"]
+    assert len(children) == 1
+    return children[0]
+
+
+def _self_declared_working_cap() -> dict:
+    """A ``working`` capability whose ONLY proof is an agent-authored evidence_ref.
+
+    Exactly what an agent can write into the JSONB ``problem_model`` with nothing
+    machine-verified behind it.
+    """
+    return {
+        "name": "Budgeted compute job substrate",
+        "status": "working",
+        "evidence_refs": [
+            {"kind": "named_test", "ref": "testing/test_x.py::test_x", "proven": True}
+        ],
+    }
+
+
+def _platform_ledger(proof_kind: str = "named_test") -> dict:
+    """One machine-verified PLATFORM proof-record (an agent cannot write this)."""
+    return {
+        "budgeted-compute-job-substrate": [
+            {
+                "task_id": "T1",
+                "proof_kind": proof_kind,
+                "proof_ref": "testing/test_x.py::test_x",
+            }
+        ]
+    }
+
+
+@_pytest.mark.asyncio
+async def test_self_declared_capability_proof_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """SECURITY (finding #4), spawn-time seam. A prerequisite naming a ``working``
+    capability whose ``proven`` evidence_ref is a pure SELF-REPORT — no corroborating
+    entry in the platform-only ``capability_proof_records`` ledger — must NOT clear
+    the enforce gate: the dependent parks BLOCKED with the need recorded.
+
+    Before the fix the resolver graded from ``problem_model.capabilities[].evidence_refs``
+    alone (agent-writable JSONB), so this forged ref spawned the child unblocked.
+    """
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq20",
+        capabilities=[_self_declared_working_cap()],
+        proof_records={},  # empty platform ledger — nothing corroborates the claim
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "a self-declared capability proof must never satisfy a prerequisite — "
+        "without a platform ledger entry the dependent must stay BLOCKED"
+    )
+    assert any(n.get("kind") == "capability" for n in get_blocker_needs(child)), (
+        "the capability need must be recorded so the resume sweep can unblock it "
+        "once real proof is earned"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_ledger_corroborated_capability_clears_spawn_under_enforce(
+    db_session, mocker
+):
+    """A capability whose ``proven`` claim IS corroborated by a machine-verified
+    ``named_test`` entry in the platform ledger clears the enforce gate — the fix
+    blocks self-reports, not real proof."""
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq21",
+        capabilities=[_self_declared_working_cap()],
+        proof_records=_platform_ledger(),
+    )
+
+    assert child.status != TaskStatus.BLOCKED, (
+        "a ledger-corroborated capability must satisfy the prerequisite under enforce"
+    )
+    assert not get_blocker_needs(child)
+
+
+@_pytest.mark.asyncio
+async def test_backing_path_only_ledger_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """A ledger holding only a structural ``backing_path`` entry grades
+    ``path_proven``, not ``proven`` — it does not corroborate a ``proven``
+    self-report, so the enforce gate still blocks the dependent."""
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq22",
+        capabilities=[_self_declared_working_cap()],
+        proof_records=_platform_ledger(proof_kind="backing_path"),
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "a structural backing_path ledger entry is not machine-verified proof and "
+        "must not clear the gate for a self-reported 'proven' claim"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_authorized_proof_exempt_clears_spawn_without_ledger(
+    db_session, mocker
+):
+    """PRESERVED CARVE-OUT. A provenance-AUTHORIZED ``proof_exempt`` (operator- or
+    strategic-attributed ``source``) clears the spawn-time gate with NO ledger entry:
+    the earn loop deliberately never mints proof-records for an exempt capability, so
+    demanding corroboration would nullify the exemption the operator granted."""
+    from app.task_blocked import get_blocker_needs
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq23",
+        capabilities=[
+            {
+                "name": "Budgeted compute job substrate",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+                "source": {
+                    "type": "user_message",
+                    "ref": "operator granted exemption",
+                },
+            }
+        ],
+        proof_records={},  # exempt capabilities never get a ledger entry, by design
+    )
+
+    assert child.status != TaskStatus.BLOCKED, (
+        "an operator-authorized proof_exempt must still clear the gate without a "
+        "ledger entry"
+    )
+    assert not get_blocker_needs(child)
+
+
+@_pytest.mark.asyncio
+async def test_bare_proof_exempt_blocks_spawn_under_enforce(db_session, mocker):
+    """A BARE ``proof_exempt=True`` — no cited ``source``, so no operator/strategic
+    provenance — is the silent self-report escape hatch and must still BLOCK."""
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq24",
+        capabilities=[
+            {
+                "name": "Budgeted compute job substrate",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+            }
+        ],
+        proof_records={},
+    )
+
+    assert child.status == TaskStatus.BLOCKED, (
+        "an unattributed proof_exempt must never clear the gate"
+    )
+
+
 @_pytest.mark.asyncio
 async def test_planned_registry_capability_prerequisite_still_blocks(
     db_session, mocker

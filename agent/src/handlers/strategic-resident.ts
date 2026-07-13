@@ -223,6 +223,43 @@ type WatchOutcome =
  * authority lease and is the stop channel. Terminal status is posted only once
  * the session actually stops.
  */
+/**
+ * Refresh the resident's ambient git credential with a READ-SCOPED token.
+ *
+ * SECURITY (audit finding #10). The resident is the longest-lived process in the
+ * fleet, so whatever token sits in its credential file is AMBIENT — reachable by
+ * anything the strategist runs, for as long as the session lives. This refresh
+ * therefore mints from `/api/agent/git-read-token` (a `contents:read` installation
+ * token) and NOT from the push-capable `/api/agent/github/token`. Refreshing from
+ * the latter kept a standing, freshly-minted PUSH-capable installation token in
+ * that file every 8 minutes for the whole session — a standing privilege
+ * escalation.
+ *
+ * The resident does not need push: it only runs `git fetch origin` (automain
+ * verification). Push credentials are per-task and short-lived by design. A
+ * strategic op that genuinely needs to push must mint a push-capable token AT THE
+ * MOMENT OF USE and must not park it in this ambient file.
+ *
+ * Exported so the read-scoping is a directly testable property rather than an
+ * incidental detail of a background timer.
+ *
+ * Never throws: a failed refresh keeps the existing token (the credential is
+ * still valid until the 60-minute installation-token TTL expires).
+ */
+export async function refreshResidentGitReadToken(ws: WebSocket | null): Promise<void> {
+  try {
+    const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
+    if (result?.token) {
+      writeGitTokenFile(result.token);
+      sendLog(ws, '[resident] git read token refreshed (read-scoped)\n');
+    } else {
+      sendLog(ws, '[resident] git read token refresh: empty response (keeping existing token)\n');
+    }
+  } catch (e) {
+    sendLog(ws, `[resident] git read token refresh failed (keeping existing token): ${String(e)}\n`);
+  }
+}
+
 export async function handleStrategicResident(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -861,30 +898,40 @@ export async function handleStrategicResident(
     }
   };
 
-  // ── Git token background refresh (push-capable) ──────────────────────────────
-  // Periodically calls /api/agent/github/token and updates the credential
-  // helper's token file so `git fetch origin` and `git push` keep working
-  // beyond the 60-minute GitHub App installation token TTL. Uses the
-  // push-capable endpoint (not the read-only /api/agent/git-read-token) so
-  // in-session writes (strategic ops that push or use the credential) do not
-  // get a stale read-only token after the first 8-minute refresh cycle.
+  // ── Git READ-token background refresh ────────────────────────────────────────
+  // Periodically calls /api/agent/git-read-token and updates the credential
+  // helper's token file so `git fetch origin` keeps working beyond the 60-minute
+  // GitHub App installation token TTL.
+  //
+  // SECURITY (audit finding #10) — this MUST stay the read-scoped endpoint.
+  // The resident is a long-lived session (a multi-hour "workday"), so whatever
+  // token sits in its credential file is AMBIENT: reachable by anything the
+  // strategist runs, for as long as the session lives. Refreshing from the
+  // push-capable /api/agent/github/token?force_refresh=true instead kept a
+  // standing, freshly-minted push-capable installation token in that file every
+  // 8 minutes for the life of the session — a standing privilege escalation in
+  // the longest-lived process in the fleet.
+  //
+  // The resident does not need it: it only ever runs `git fetch origin` (automain
+  // verification) and never pushes — push credentials are per-task and
+  // short-lived, by design (see the endpoint docstring on agent_git_read_token).
+  // Reading read-scoped here also means the push-capable ghToken written at clone
+  // time (writeGitTokenFile above, which the clone itself needs) is REPLACED by a
+  // read-scoped one on the first tick: the ambient credential DECAYS to read-only
+  // within GIT_TOKEN_REFRESH_MS instead of being re-minted push-capable forever.
+  //
+  // If a strategic op ever genuinely needs to push, it must mint a push-capable
+  // token AT THE MOMENT OF USE and must not park it in the ambient credential
+  // file. (Dropping force_refresh also stops re-minting an installation token
+  // every 8 minutes against the shared 5000/hr GitHub App budget; the read-token
+  // endpoint is cache-backed.)
+  //
   // Self-scheduling named function expression so the timer reference is always
   // non-null and cleared cleanly in the finally.
   let gitTokenRefreshTimer: ReturnType<typeof setTimeout>;
   function gitReadTokenRefreshTick(): void {
     void (async () => {
-      try {
-        const result = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}&force_refresh=true`) as { data?: { token?: string } } | null;
-        const newToken = result?.data?.token;
-        if (newToken) {
-          writeGitTokenFile(newToken);
-          sendLog(ws, '[resident] git token refreshed (push-capable)\n');
-        } else {
-          sendLog(ws, '[resident] git token refresh: empty response (keeping existing token)\n');
-        }
-      } catch (e) {
-        sendLog(ws, `[resident] git token refresh failed (keeping existing token): ${String(e)}\n`);
-      }
+      await refreshResidentGitReadToken(ws);
       gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
     })();
   }

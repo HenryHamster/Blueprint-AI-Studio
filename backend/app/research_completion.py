@@ -5676,9 +5676,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     from app.capability_registry import (
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
+        consumer_gate_proof_status,
         registry_satisfies_capability_need,
         working_capability_names,
-        working_capability_proof_status,
     )
     from app.shared_state import runtime_config as _rc
     from app.task_blocked import build_need, enter_blocked_state
@@ -5700,8 +5700,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # NOT change which needs resolve; in ENFORCE mode (checked below via
     # capability_need_blocked_by_proof_gate) an unproven capability need DOES
     # block the dependent — the enforce gate is implemented and active.
-    _working_registry_proof = working_capability_proof_status(
-        getattr(project_obj, "problem_model", None)
+    #
+    # SECURITY (audit finding #4): graded through consumer_gate_proof_status, NOT
+    # from working_capability_proof_status alone. The latter reads only
+    # problem_model.capabilities[].evidence_refs / proof_exempt — AGENT-WRITABLE
+    # JSONB — so a task could write itself a {"kind":"named_test","proven":true}
+    # ref and clear this gate for its own dependents with nothing verified. The
+    # shared grader corroborates every ``proven`` claim against
+    # project.capability_proof_records (the platform-only ledger), exactly as the
+    # release-qualifier seam does; only a provenance-authorized proof_exempt clears
+    # without a ledger entry.
+    _working_registry_proof = consumer_gate_proof_status(
+        getattr(project_obj, "problem_model", None),
+        getattr(project_obj, "capability_proof_records", None),
     )
     # Prerequisites already satisfied by SHIPPED prior-cycle work or a durable
     # knowledge document are resolved at spawn time too — the completed-foundation

@@ -72,8 +72,11 @@ vi.mock('./strategic-sections.js', () => ({
 }));
 
 // ── Import after mocks ────────────────────────────────────────────────────────
-import { SessionStreamer, handleStrategicResident } from './strategic-resident.js';
+import {
+  SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
+} from './strategic-resident.js';
 import { apiGet, apiPost } from '../index.js';
+import { writeGitTokenFile } from '../git-credential.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
   ResidentSession, ResidentSessionEvent, ResidentTurnResult,
@@ -179,6 +182,7 @@ describe('SessionStreamer.flush — rate-limited boundary flush', () => {
 const mockApiGet = vi.mocked(apiGet);
 const mockApiPost = vi.mocked(apiPost);
 const mockStartSession = vi.mocked(startResidentClaudeSession);
+const mockWriteGitTokenFile = vi.mocked(writeGitTokenFile);
 
 /** A ResidentTurnResult with sane defaults, overridable per test. */
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
@@ -340,5 +344,49 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(capturedCheckpoint).toContain('[operator]');
     // …and DROPS the just-answered message (it is no longer open).
     expect(capturedCheckpoint).not.toContain('SHOULD_BE_DROPPED_AFTER_HANDLED');
+  });
+});
+
+// ── Ambient git credential must stay READ-SCOPED (audit finding #10) ───────────
+// The resident is a long-lived session, so the token in its credential file is
+// ambient for the whole workday. It must be minted from the read-scoped
+// /api/agent/git-read-token, never from the push-capable /api/agent/github/token
+// — the latter left a standing push-capable installation token in the file,
+// re-minted every 8 minutes.
+
+describe('refreshResidentGitReadToken — the resident holds no ambient push-capable token', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockSendLog.mockReset();
+    mockWriteGitTokenFile.mockReset();
+  });
+
+  it('refreshes from the READ-SCOPED endpoint and never from the push-capable one', async () => {
+    mockApiGet.mockResolvedValue({ token: 'read-scoped-token', owner: 'o', repo: 'r' });
+
+    await refreshResidentGitReadToken(null);
+
+    const urls = mockApiGet.mock.calls.map((c) => c[0]);
+    expect(urls).toEqual(['/api/agent/git-read-token']);
+    // The push-capable installation-token endpoint must never be reached from the
+    // background refresh — that is the standing privilege escalation itself.
+    expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
+    // …and the token written into the ambient credential file is the read-scoped one.
+    expect(mockWriteGitTokenFile).toHaveBeenCalledWith('read-scoped-token');
+  });
+
+  it('keeps the existing token when the refresh returns nothing', async () => {
+    mockApiGet.mockResolvedValue(null);
+
+    await refreshResidentGitReadToken(null);
+
+    expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
+  });
+
+  it('never throws when the refresh fails, so the resident loop survives', async () => {
+    mockApiGet.mockRejectedValue(new Error('502 bad gateway'));
+
+    await expect(refreshResidentGitReadToken(null)).resolves.toBeUndefined();
+    expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
   });
 });

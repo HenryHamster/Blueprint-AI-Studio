@@ -3635,3 +3635,162 @@ class TestAuthorizedExemptionLedgerCarveOut:
         assert detail["corroborated"] == ["real-cap"]
         assert detail["exempt_cleared"] == ["human-process-cap"]
         assert detail["uncorroborated"] == []
+
+
+class TestConsumerGateSharesTheReleaseRule:
+    """Finding #4: the TWO CONSUMER seams — the spawn-time prerequisite resolver
+    (``research_completion``) and the blocked-resume sweep
+    (``blocked_task_unblock_sweeps``) — graded a capability from
+    ``problem_model.capabilities[].evidence_refs`` ALONE, which is agent-writable
+    JSONB. The release seam already corroborated against the platform-only
+    ``capability_proof_records`` ledger; the consumers did not, so a self-declared
+    ``proven=true`` named_test ref cleared the prerequisite gate with zero platform
+    verification.
+
+    ``consumer_gate_proof_status`` is the map both consumer seams now grade against.
+    These tests pin the rule at the primitive, so a future edit to either seam that
+    stops routing through it fails here rather than silently reopening the hole.
+    """
+
+    @staticmethod
+    def _gate(problem_model, proof_records):
+        from app.capability_registry import consumer_gate_proof_status
+
+        return consumer_gate_proof_status(problem_model, proof_records)
+
+    @staticmethod
+    def _self_declared(name: str = "forged-cap") -> dict:
+        return {
+            "capabilities": [
+                {
+                    "name": name,
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+
+    @staticmethod
+    def _ledger(name: str, proof_kind: str = "named_test") -> dict:
+        return {name: [{"task_id": "T1", "proof_kind": proof_kind}]}
+
+    def test_self_declared_proven_ref_is_not_proven_without_ledger(self):
+        """THE CORE PROPERTY: no self-declared capability satisfies a prerequisite.
+        A forged ``proven`` evidence_ref with no platform ledger entry must NOT grade
+        ``proven`` — it demotes to ``unverified`` (claimed, uncorroborated)."""
+        gate = self._gate(self._self_declared(), {})
+        assert gate["forged-cap"] != "proven"
+        assert gate["forged-cap"] == "unverified"
+
+    def test_ledger_corroborated_ref_grades_proven(self):
+        """A ``proven`` claim backed by a machine-verified platform ledger entry
+        keeps grading ``proven`` and clears the gate."""
+        gate = self._gate(
+            self._self_declared("real-cap"), self._ledger("real-cap")
+        )
+        assert gate["real-cap"] == "proven"
+
+    def test_backing_path_ledger_does_not_corroborate(self):
+        """A structural ``backing_path`` ledger entry grades ``path_proven`` — it is
+        not machine-verified proof and must not corroborate a ``proven`` claim."""
+        gate = self._gate(
+            self._self_declared("structural-cap"),
+            self._ledger("structural-cap", proof_kind="backing_path"),
+        )
+        assert gate["structural-cap"] != "proven"
+
+    def test_authorized_exemption_clears_without_ledger(self):
+        """PRESERVED: a provenance-authorized ``proof_exempt`` is cleared BY ITS
+        AUTHORIZATION. The earn loop never mints a ledger entry for an exempt
+        capability, so requiring corroboration would nullify the exemption."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "human-process-cap",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": "user_message", "ref": "operator granted"},
+                }
+            ]
+        }
+        assert self._gate(model, {})["human-process-cap"] == "proven"
+
+    def test_bare_exemption_does_not_clear(self):
+        """A bare, unattributed ``proof_exempt=True`` is not an exemption at all and
+        must not grade ``proven``."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "self-exempt",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                }
+            ]
+        }
+        assert self._gate(model, {})["self-exempt"] != "proven"
+
+    def test_missing_ledger_column_fails_closed(self):
+        """A project whose ``capability_proof_records`` column is NULL has recorded
+        NO platform proofs, so a self-report must NOT clear the gate. The consumer
+        seams always pass the project's column, so ``None`` means "no proofs" — it
+        must fail CLOSED, unlike the release seam where ``None`` means "ledger not
+        supplied by this caller"."""
+        assert self._gate(self._self_declared(), None)["forged-cap"] != "proven"
+
+    def test_ledger_only_proof_is_raised_to_proven(self):
+        """The corroboration pass must not strand a genuinely-verified capability:
+        when the fail-open ``evidence_refs`` append was lost, the ledger alone still
+        RAISES the capability to ``proven``."""
+        model = {"capabilities": [{"name": "ledger-only", "status": "working"}]}
+        assert self._gate(model, self._ledger("ledger-only"))["ledger-only"] == "proven"
+
+    def test_consumer_gate_matches_release_gate_verdict(self):
+        """The consumer seams and the release seam must reach the SAME verdict on the
+        same inputs — divergence between them IS the vulnerability. Every capability
+        the consumer map refuses to grade ``proven`` is exactly one the release gate
+        counts as unproven, and vice versa."""
+        from app.capability_registry import capability_proof_gate_release_status
+
+        model = {
+            "capabilities": [
+                # self-report, no ledger → must be refused by BOTH
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                },
+                # ledger-corroborated → cleared by BOTH
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                },
+                # authorized exemption → cleared by BOTH, without a ledger entry
+                {
+                    "name": "human-process-cap",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": "user_message", "ref": "operator granted"},
+                },
+            ]
+        }
+        ledger = self._ledger("real-cap")
+
+        consumer = self._gate(model, ledger)
+        consumer_refused = {n for n, s in consumer.items() if s != "proven"}
+
+        _blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", ledger
+        )
+        assert consumer_refused == set(detail["unproven"]) == {"forged-cap"}
+        assert set(detail["corroborated"]) == {"real-cap"}
+        assert set(detail["exempt_cleared"]) == {"human-process-cap"}

@@ -893,6 +893,186 @@ def test_blocked_resume_sweep_routes_unproven_by_mode():
     assert off["completed_needs"] and not off["residual"]
 
 
+class _StubProject:
+    """Minimal stand-in for the ``Project`` row the proof-map fetch reads."""
+
+    def __init__(self, problem_model, capability_proof_records):
+        self.problem_model = problem_model
+        self.capability_proof_records = capability_proof_records
+
+
+class _StubSession:
+    """Async ``session.get`` returning one stubbed project (no DB needed)."""
+
+    def __init__(self, project):
+        self._project = project
+
+    async def get(self, _model, _pk):
+        return self._project
+
+
+async def _blocked_resume_disposition(problem_model, proof_records, ref: str) -> dict:
+    """Drive the REAL blocked-resume proof-map fetch, then classify a need against it.
+
+    Deliberately goes through ``_fetch_working_capability_proof_status`` rather than
+    hand-injecting a proof map: the ledger-corroboration pass this exercises lives
+    inside that fetch, so a test that injected the map would bypass the very code it
+    claims to cover.
+    """
+    from app import blocked_task_unblock_sweeps as btu
+
+    session = _StubSession(_StubProject(problem_model, proof_records))
+    proof_map = await btu._fetch_working_capability_proof_status(session, uuid.uuid4())
+    return await _classify_capability_need_async(
+        ref, proof_map, proof_gate_mode="enforce"
+    )
+
+
+def _self_declared_proven_model(name: str = "forged-cap") -> dict:
+    """A ``working`` capability whose ONLY proof is an agent-authored evidence_ref.
+
+    This is precisely what an agent can write into the JSONB ``problem_model``
+    without any platform verification whatsoever.
+    """
+    return {
+        "capabilities": [
+            {"name": name, "status": "working", "evidence_refs": [_proven_ref()]}
+        ]
+    }
+
+
+def _ledger(name: str, proof_kind: str = "named_test") -> dict:
+    """One machine-verified PLATFORM proof-record entry (agent cannot write this)."""
+    return {name: [{"task_id": "T1", "proof_kind": proof_kind, "proof_ref": "t.py::x"}]}
+
+
+def test_self_declared_proven_ref_without_ledger_blocks_blocked_resume():
+    """SECURITY (finding #4), blocked-resume seam. A capability whose ``proven``
+    evidence_ref is a pure SELF-REPORT — no corroborating entry in the platform-only
+    ``capability_proof_records`` ledger — must NOT satisfy a capability need under
+    enforce. The dependent stays BLOCKED (need stays residual + gate-held).
+
+    Before the fix the seam graded from ``problem_model.capabilities[].evidence_refs``
+    alone, so this forged ref cleared the gate and resumed the dependent.
+    """
+    disp = asyncio.run(
+        _blocked_resume_disposition(
+            _self_declared_proven_model(), {}, "forged-cap"
+        )
+    )
+
+    assert disp["completed_needs"] == [], (
+        "a self-declared capability proof must never satisfy a prerequisite"
+    )
+    assert disp["residual"] == [{"kind": "capability", "ref": "forged-cap"}]
+    assert disp["proof_gate_held"] == [{"kind": "capability", "ref": "forged-cap"}]
+
+
+def test_ledger_corroborated_capability_clears_blocked_resume():
+    """A capability whose ``proven`` claim IS corroborated by a machine-verified
+    ``named_test`` entry in the platform ledger still satisfies the need under
+    enforce — the fix blocks self-reports, not real proof."""
+    disp = asyncio.run(
+        _blocked_resume_disposition(
+            _self_declared_proven_model("real-cap"), _ledger("real-cap"), "real-cap"
+        )
+    )
+
+    assert disp["completed_needs"] == [{"kind": "capability", "ref": "real-cap"}]
+    assert disp["residual"] == []
+    assert disp["proof_gate_held"] == []
+
+
+def test_backing_path_only_ledger_does_not_clear_blocked_resume():
+    """A ledger holding only a structural ``backing_path`` entry grades
+    ``path_proven``, not ``proven`` — it does not corroborate a ``proven``
+    self-report, so the enforce gate still holds the dependent."""
+    disp = asyncio.run(
+        _blocked_resume_disposition(
+            _self_declared_proven_model("structural-cap"),
+            _ledger("structural-cap", proof_kind="backing_path"),
+            "structural-cap",
+        )
+    )
+
+    assert disp["completed_needs"] == []
+    assert disp["proof_gate_held"] == [
+        {"kind": "capability", "ref": "structural-cap"}
+    ]
+
+
+def test_authorized_proof_exempt_clears_blocked_resume_without_ledger():
+    """PRESERVED CARVE-OUT. A provenance-AUTHORIZED ``proof_exempt`` (operator- or
+    strategic-attributed ``source``) clears the gate with NO ledger entry — the earn
+    loop deliberately never mints proof-records for an exempt capability, so
+    demanding corroboration from it would nullify the exemption the operator granted.
+    """
+    model = {
+        "capabilities": [
+            {
+                "name": "human-process-cap",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+                "source": {"type": "user_message", "ref": "operator granted exemption"},
+            }
+        ]
+    }
+    disp = asyncio.run(
+        _blocked_resume_disposition(model, {}, "human-process-cap")
+    )
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "human-process-cap"}
+    ], "an authorized exemption must still clear the gate without a ledger entry"
+    assert disp["residual"] == []
+
+
+def test_bare_proof_exempt_blocks_blocked_resume():
+    """A BARE ``proof_exempt=True`` — no cited ``source``, so no operator/strategic
+    provenance — is the silent self-report escape hatch and must still BLOCK, ledger
+    or no ledger."""
+    model = {
+        "capabilities": [
+            {
+                "name": "self-exempt",
+                "status": "working",
+                "evidence_refs": [],
+                "proof_exempt": True,
+            }
+        ]
+    }
+    disp = asyncio.run(_blocked_resume_disposition(model, {}, "self-exempt"))
+
+    assert disp["completed_needs"] == [], (
+        "an unattributed proof_exempt must never clear the gate"
+    )
+    assert disp["proof_gate_held"] == [{"kind": "capability", "ref": "self-exempt"}]
+
+
+def test_ledger_only_proof_still_clears_blocked_resume():
+    """Regression guard for the fail-open evidence_refs append: a capability proven
+    ONLY in the platform ledger (tier-1 append lost) is still RAISED to proven and
+    clears the gate. The corroboration pass must refuse self-reports without
+    stranding genuinely-verified capabilities."""
+    model = {
+        "capabilities": [
+            # No evidence_refs at all — tier-1 reads unproven.
+            {"name": "ledger-only-cap", "status": "working"}
+        ]
+    }
+    disp = asyncio.run(
+        _blocked_resume_disposition(
+            model, _ledger("ledger-only-cap"), "ledger-only-cap"
+        )
+    )
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "ledger-only-cap"}
+    ]
+    assert disp["residual"] == []
+
+
 def test_capability_proof_gate_mode_three_way():
     """ACCEPTANCE EVIDENCE. The three-way mode knob (off/observe/enforce) controls
     whether an unproven 'working' capability satisfies a blocked-task need:
@@ -2776,8 +2956,17 @@ async def _spawn_db():
     await engine.dispose()
 
 
-async def _proof_project_and_task(db, direction_id: str, caps: list[dict]):
-    """A project with custom capabilities + a research task ready to complete."""
+async def _proof_project_and_task(
+    db, direction_id: str, caps: list[dict], proof_records: dict | None = None
+):
+    """A project with custom capabilities + a research task ready to complete.
+
+    ``caps`` populates ``problem_model.capabilities`` — the AGENT-WRITABLE view.
+    ``proof_records`` populates ``capability_proof_records`` — the PLATFORM-ONLY
+    ledger the enforce gate corroborates against. A capability is genuinely proven
+    only when BOTH agree; a ``proven`` evidence_ref in ``caps`` with no matching
+    ledger entry is a self-report and must not clear the gate (audit finding #4).
+    """
     from app.models import Project, Task, TaskStatus
 
     direction = {
@@ -2794,6 +2983,7 @@ async def _proof_project_and_task(db, direction_id: str, caps: list[dict]):
         autonomous_enabled=True,
         directions=[direction],
         problem_model={"capabilities": caps},
+        capability_proof_records=proof_records or {},
     )
     db.add(project)
     await db.commit()
@@ -2892,7 +3082,16 @@ async def test_enforce_gate_parks_child_blocked_at_spawn_time(_spawn_db, mocker)
 async def test_proven_cap_does_not_gate_at_spawn_time(_spawn_db, mocker):
     """Complement: a PROVEN working capability does NOT gate the dependent at spawn
     time — capability_need_blocked_by_proof_gate returns False so the child spawns
-    QUEUED (not BLOCKED) even when enforce mode is active."""
+    QUEUED (not BLOCKED) even when enforce mode is active.
+
+    "PROVEN" means PLATFORM-proven (audit finding #4): the ``proven`` evidence_ref
+    below lives on the agent-writable problem_model, so on its own it is only a
+    self-report and no longer clears the gate. What clears it is the corroborating
+    entry in ``capability_proof_records`` — the ledger only the platform's proof
+    recorders can write. Both are supplied here, which is what a genuinely earned
+    capability looks like; ``test_self_declared_proven_ref_without_ledger_blocks_
+    blocked_resume`` pins the case where the ledger is absent.
+    """
     from app.research_completion import _handle_research_completion
     from app.models import Task as _T, TaskStatus
     from app.task_blocked import get_blocker_needs
@@ -2908,8 +3107,18 @@ async def test_proven_cap_does_not_gate_at_spawn_time(_spawn_db, mocker):
             "evidence_refs": [_proven_ref()],
         }
     ]
+    # The platform-recorded proof that corroborates the capability's claim.
+    proof_records = {
+        "container-runtime": [
+            {
+                "task_id": "T1",
+                "proof_kind": "named_test",
+                "proof_ref": "testing/test_x.py::test_x",
+            }
+        ]
+    }
     _project, direction, task = await _proof_project_and_task(
-        _spawn_db, "d-pgspawn02", caps
+        _spawn_db, "d-pgspawn02", caps, proof_records
     )
 
     finding = {
