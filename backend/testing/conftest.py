@@ -318,19 +318,23 @@ def reset_runtime_config():
 def reset_github_module_caches():
     """Clear module-level GitHub API caches between tests.
 
-    ``_list_prs_for_commit_cache`` (github_refs) and ``_check_runs_cache``
-    (github_checks) are module-level dicts that persist across tests.  Without
-    this fixture a successful call in test A populates the cache, and test B
-    with the same SHA receives the stale cached result instead of making its own
-    mocked HTTP call — breaking non-200 and non-list-body error-path tests.
+    ``_list_prs_for_commit_cache`` (github_refs), ``_check_runs_cache``
+    (github_checks) and ``_issues_cache`` (github_issues) are module-level dicts
+    that persist across tests.  Without this fixture a successful call in test A
+    populates the cache, and test B with the same key receives the stale cached
+    result instead of making its own mocked HTTP call — breaking non-200 and
+    non-list-body error-path tests.  (Every github test uses the same
+    owner/repo/sha placeholders, so collisions are the norm, not the exception.)
     """
-    from app import github_refs, github_checks
+    from app import github_refs, github_checks, github_issues
 
     github_refs._list_prs_for_commit_cache.clear()
     github_checks._check_runs_cache.clear()
+    github_issues._issues_cache.clear()
     yield
     github_refs._list_prs_for_commit_cache.clear()
     github_checks._check_runs_cache.clear()
+    github_issues._issues_cache.clear()
 
 
 @pytest.fixture(autouse=True)

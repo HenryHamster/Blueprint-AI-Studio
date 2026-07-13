@@ -14600,7 +14600,7 @@ async def test_agent_github_check_runs_validates_commit_sha(
         "app.routers.agent.get_github_token_for_task", new=AsyncMock()
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent_github.get_check_runs", new=AsyncMock()
+        "app.routers.agent_github.get_check_runs_cached", new=AsyncMock()
     )
 
     token = create_agent_token(str(task.id), "agent-vm-check-runs-1")
@@ -14639,7 +14639,7 @@ async def test_agent_github_check_runs_response_omits_raw_token(
         new=AsyncMock(return_value=("secret-gh-token", "acme", "widget")),
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent_github.get_check_runs",
+        "app.routers.agent_github.get_check_runs_cached",
         new=AsyncMock(
             return_value={
                 "status": "completed",
@@ -14678,11 +14678,16 @@ async def test_agent_github_check_runs_response_omits_raw_token(
         ],
     }
     assert "token" not in body["data"]
+    # The proxy goes through the CACHED helper and explicitly opts OUT of the
+    # failure-log fan-out (3-10+ extra GitHub calls on a red sha, whose output this
+    # handler discards). Both are budget-load-bearing on an endpoint every agent
+    # polls, so pin them here.
     get_check_runs_mock.assert_awaited_once_with(
         token="secret-gh-token",
         owner="acme",
         repo="widget",
-        ref="deadbeef",
+        head_sha="deadbeef",
+        include_failed_logs=False,
     )
 
 

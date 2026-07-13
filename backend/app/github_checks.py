@@ -250,6 +250,7 @@ async def get_check_runs(
     project_id: str | None = None,
     *,
     treat_missing_as_success: bool = True,
+    include_failed_logs: bool = True,
 ) -> dict:
     """Get CI check run results for a commit SHA.
 
@@ -268,6 +269,16 @@ async def get_check_runs(
     ``None``) instead — the release qualifier passes this so it can tell
     'no CI ever verified this commit' apart from 'CI ran and passed' and
     refuse to promote on the absence of a signal.
+
+    ``include_failed_logs`` (default True — every existing caller keeps its
+    behaviour): on a RED sha the failure-detail fan-out below fetches workflow
+    runs + per-run jobs + per-failed-check job LOGS + annotations — 3-10+ extra
+    calls against the SHARED 5000/hr install-token bucket, per poll. That is
+    worth it for the fix loop (which consumes ``failed_logs``), and pure waste
+    for a caller that only reads status/conclusion/details and DISCARDS the
+    logs. Pass ``False`` to skip the fan-out entirely: the result is identical
+    apart from ``failed_logs``/``setup_phase_failure``/``failed_run_ids``, which
+    are returned empty.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -367,6 +378,18 @@ async def get_check_runs(
     # setup steps (infra flake). failed_run_ids: the workflow run(s) to re-run.
     setup_phase_failure = False
     failed_run_ids: list[int] = []
+    if failed_names and not include_failed_logs:
+        # Caller reads only status/conclusion/details (e.g. the agent check-runs
+        # proxy, which discards failed_logs) — skip the 3-10+ call failure fan-out
+        # rather than burn shared-bucket quota producing logs nobody reads.
+        return {
+            "status": agg_status,
+            "conclusion": agg_conclusion,
+            "details": details,
+            "failed_logs": "",
+            "setup_phase_failure": False,
+            "failed_run_ids": [],
+        }
     if failed_names and _deferrable_quota_active():
         logger.warning(
             "[CI LOGS] quota floor active — skipping failure-detail fan-out for %s",
@@ -721,7 +744,7 @@ async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> b
 # adding any cross-cycle staleness risk beyond the poll interval itself.
 _CHECK_RUNS_CACHE_TTL_S = 30
 _CHECK_RUNS_CACHE_MAX = 500  # entries; cheap eviction when oversized
-_check_runs_cache: dict[tuple[str, str, str, bool], tuple[dict, float]] = {}
+_check_runs_cache: dict[tuple[str, str, str, bool, bool], tuple[dict, float]] = {}
 
 
 def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
@@ -729,9 +752,15 @@ def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
     observes a transition it needs to see immediately (e.g. a webhook arrived
     indicating a new run started).  Safe to call when the key isn't present.
 
-    Drops both the lenient and strict cache variants for the SHA."""
-    _check_runs_cache.pop((owner, repo, head_sha, True), None)
-    _check_runs_cache.pop((owner, repo, head_sha, False), None)
+    Drops EVERY variant cached for the SHA (lenient/strict x with/without
+    failure logs) — a key dimension added later must never leave a stale entry
+    behind an invalidation."""
+    for key in [
+        k
+        for k in _check_runs_cache
+        if k[0] == owner and k[1] == repo and k[2] == head_sha
+    ]:
+        _check_runs_cache.pop(key, None)
 
 
 async def get_check_runs_cached(
@@ -743,6 +772,7 @@ async def get_check_runs_cached(
     project_id: str | None = None,
     ttl: float = _CHECK_RUNS_CACHE_TTL_S,
     treat_missing_as_success: bool = True,
+    include_failed_logs: bool = True,
 ) -> dict:
     """Cached wrapper around ``get_check_runs``.
 
@@ -754,11 +784,15 @@ async def get_check_runs_cached(
     ``treat_missing_as_success`` is forwarded to ``get_check_runs`` (default
     True preserves the fail-open behaviour) and is part of the cache key so the
     lenient and strict interpretations never serve each other's result.
+
+    ``include_failed_logs`` is likewise forwarded AND part of the cache key: a
+    logs-free result (cheap fetch, ``failed_logs=""``) must never be served to a
+    caller that needs the failure detail to drive the fix loop.
     """
     import app.shared_state as _ss
     from app import github as _gh
 
-    key = (owner, repo, head_sha, treat_missing_as_success)
+    key = (owner, repo, head_sha, treat_missing_as_success, include_failed_logs)
     now = time.time()
     cached = _check_runs_cache.get(key)
     if cached is not None and (now - cached[1]) < ttl:
@@ -773,6 +807,7 @@ async def get_check_runs_cached(
         head_sha,
         project_id=project_id,
         treat_missing_as_success=treat_missing_as_success,
+        include_failed_logs=include_failed_logs,
     )
     # Do NOT cache API-error results — ``get_check_runs`` tags them with
     # ``_from_api_error=True`` when a non-200 response was received.  Caching

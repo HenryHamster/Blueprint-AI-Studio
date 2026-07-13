@@ -1048,11 +1048,7 @@ async def test_verify_pr_merged_on_distinct_promotion_target_alerts_without_pr_m
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1099,11 +1095,7 @@ async def test_verify_pr_merged_on_single_branch_sets_pr_merged(cleanup_db, mock
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1210,11 +1202,7 @@ async def test_verify_pr_merged_success_close_on_distinct_promotion_target_alert
     result = await _verify_pr_merged(task, cleanup_db)
     await cleanup_db.commit()
     alerts = (
-        (
-            await cleanup_db.execute(
-                select(Alert).where(Alert.task_id == task.id)
-            )
-        )
+        (await cleanup_db.execute(select(Alert).where(Alert.task_id == task.id)))
         .scalars()
         .all()
     )
@@ -1519,10 +1507,13 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     )
     # No CHANGES_REQUESTED review, but also no positive cleanup signal — the
     # FIX A non-rejection classifier requires BOTH, so this stays FAILED.
+    # NOTE: rollup_management calls get_pull_request_reviews_CHECKED, which returns
+    # (reviews, status). Patching the list-only wrapper would VOID silently — the
+    # patch succeeds, nothing calls it, and the real helper makes a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=[],
+        return_value=([], "complete"),
     )
     mocker.patch(
         "app.failure_classification.classify_failure",
@@ -1552,10 +1543,14 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
 # ── FIX A: non-rejection PR-close → CANCELLED ──────────────────────────────
 
 
-def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
+def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews, reviews_status="complete"):
     """Common mocks for the closed-unmerged FIX A tests: token, PR fetch,
     reviews fetch, and a captured write_session so callers can assert the
-    persisted terminal state. Returns (write_session, alert_mock)."""
+    persisted terminal state. Returns (write_session, alert_mock).
+
+    ``reviews_status`` is the enumeration outcome from
+    ``get_pull_request_reviews_checked`` — "complete" / "truncated" / "failed".
+    """
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1566,10 +1561,12 @@ def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
         new_callable=AsyncMock,
         return_value=pr_data,
     )
+    # Must patch the _CHECKED variant: that is what rollup_management imports.
+    # Patching the list-only wrapper voids silently and leaks a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=reviews,
+        return_value=(reviews, reviews_status),
     )
     mocker.patch("app.routers.agent_status.record_task_result")
     alert_mock = mocker.patch(
@@ -1646,9 +1643,7 @@ async def test_verify_pr_closed_by_bot_no_review_lands_cancelled(cleanup_db, moc
 
 
 @pytest.mark.asyncio
-async def test_verify_pr_closed_with_changes_requested_stays_failed(
-    cleanup_db, mocker
-):
+async def test_verify_pr_closed_with_changes_requested_stays_failed(cleanup_db, mocker):
     """GUARDRAIL: a CHANGES_REQUESTED review is a genuine rejection — even on a
     bot-authored PR, the task stays FAILED + alert."""
     project = await _make_project(cleanup_db)
@@ -1679,6 +1674,91 @@ async def test_verify_pr_closed_with_changes_requested_stays_failed(
 
 
 @pytest.mark.asyncio
+async def test_verify_pr_closed_with_truncated_reviews_stays_failed(cleanup_db, mocker):
+    """GUARDRAIL (fail closed on TRUNCATION): the reviews list came back truncated —
+    we hold real pages and KNOW more reviews exist that we never saw. GitHub serves
+    reviews oldest-first, so the missing ones are exactly the NEWEST — where a late
+    CHANGES_REQUESTED would be. We cannot rule out a rejection, so a bot-authored
+    cleanup-close (which would otherwise land CANCELLED) must STAY FAILED.
+
+    Without this guard a rollup with >100 reviews that was genuinely rejected gets
+    silently downgraded FAILED -> CANCELLED with no alert.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    mocker.patch(
+        "app.failure_classification.classify_failure", return_value="CODE_ERROR"
+    )
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        # Bot-authored + no CHANGES_REQUESTED in what we DID see => every other
+        # signal points at CANCELLED. Only the truncation flag holds the line.
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[{"state": "COMMENTED"}, {"state": "APPROVED"}],
+        reviews_status="truncated",
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.FAILED, (
+        "a TRUNCATED reviews list cannot rule out a CHANGES_REQUESTED — the newest "
+        "reviews are precisely the ones missing, so the close must NOT be treated "
+        "as a non-rejection"
+    )
+    assert task.context.get("failure_detail") != "pr_closed_non_rejection"
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_with_failed_reviews_fetch_still_cancels(
+    cleanup_db, mocker
+):
+    """The truncation guard must NOT fire on a mere FETCH FAILURE.
+
+    A page-1 non-200 (rate limit / 502) enumerated NOTHING — that is absence of
+    evidence, exactly like the 401 path, and the positive-cleanup-signal
+    requirement already gates the verdict. Fail-closing here would let one
+    rate-limited reviews fetch — the very failure mode this PR's premise is built
+    on — flip a routine bot cleanup-close into a terminal FAILED + operator alert.
+
+    This is the counterpart to test_verify_pr_closed_with_truncated_reviews_stays_failed:
+    TRUNCATED and FAILED are different signals with opposite safe answers.
+    """
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[],
+        reviews_status="failed",  # page-1 403/502: we saw nothing
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.CANCELLED, (
+        "a transient reviews-fetch failure must NEVER on its own flip the verdict — "
+        "the bot-close cleanup signal still stands, and fail-closing here would make "
+        "a 502 stricter than a 401"
+    )
+    assert task.context.get("failure_detail") == "pr_closed_non_rejection"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_verify_pr_closed_with_pr_rejected_marker_stays_failed(
     cleanup_db, mocker
 ):
@@ -1686,9 +1766,7 @@ async def test_verify_pr_closed_with_pr_rejected_marker_stays_failed(
     bot author and no CHANGES_REQUESTED review (the reviews lookup is short-
     circuited by the marker)."""
     project = await _make_project(cleanup_db)
-    task = await _make_task(
-        cleanup_db, project.id, context={"pr_rejected": True}
-    )
+    task = await _make_task(cleanup_db, project.id, context={"pr_rejected": True})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
 
     mocker.patch(
@@ -1772,7 +1850,9 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
     CODE_ERROR > AGENT_TIMEOUT > infra classes.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     # Prevent GitHub token fetch (not needed for this path)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -1826,7 +1906,9 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
 async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     """When all failed children have infra categories, the parent keeps that category."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1870,7 +1952,9 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     """A rollup PR with 0 additions + 0 deletions is closed immediately:
     parent goes COMPLETED, staging branch deleted, no review task spawned."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2053,7 +2137,9 @@ async def test_unverified_pr_size_defers_instead_of_spawning_review(cleanup_db, 
     lines_changed=999 → review spawned on potentially-empty PRs → ~15
     VM-hours/day wasted per the audit."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2122,7 +2208,9 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
     retry cycle's crash-recovery check resumes the existing PR rather than
     creating a duplicate orphan."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2226,7 +2314,9 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(
     succeeded or a prior cycle wrote it), the rescue path must NOT overwrite
     it — the existing value is authoritative."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2320,7 +2410,9 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(
     ``parent.context`` and the rollup ``github_webhook`` returned 500.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2432,7 +2524,9 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
     transitions to FAILED with a rollup-PR-creation-failed message (the 404
     raises a non-transient exception that the outer handler converts to FAILED)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2485,7 +2579,9 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(
     the work already landed on the target branch. Parent transitions to
     COMPLETED with a 'no actionable changes' message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2641,7 +2737,9 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
       3. mergeable_state refetch after failed merge (line ~966)
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2956,7 +3054,9 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
     """When some children failed and _requeue_count < MAX_PARENT_REQUEUES (3),
     _requeue_parent_task is invoked instead of proceeding to partial rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3010,7 +3110,9 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
     while others failed, the rollup proceeds with the merged subset only —
     create_pull_request is invoked and _requeue_parent_task is NOT called."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3083,7 +3185,9 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
     task_results deque AND in the per-direction streak (when direction_id set)
     so anomaly detection and direction-hold logic can see the failure."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3148,7 +3252,9 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     to FAILED so completed_count drops to zero, the parent is marked FAILED in
     the all_done branch. That terminal path must also reach deploy_monitoring."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3218,7 +3324,9 @@ def _mock_high_risk_gate_deps(mocker, *, get_pull_request_responses):
     create_pull_request is skipped and control reaches the gate at line 846.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
         new_callable=AsyncMock,
@@ -3408,7 +3516,9 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     from app.rollup_management import _check_and_trigger_rollup
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -3671,18 +3781,29 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
     exhausted, merge is retried in the same sweep and succeeds — no deferral,
     no fix spawn."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
@@ -3713,7 +3834,11 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
         new_callable=AsyncMock,
         side_effect=[
             {"merged": False, "message": "mergeable state is null"},
-            {"merged": True, "sha": "abc", "message": "Pull Request successfully merged"},
+            {
+                "merged": True,
+                "sha": "abc",
+                "message": "Pull Request successfully merged",
+            },
         ],
     )
     mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
@@ -3766,18 +3891,29 @@ async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
     sweep falls through to the normal deferral path — counters are bumped, no
     fix task is spawned."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("token", "owner", "repo"),
     )
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(

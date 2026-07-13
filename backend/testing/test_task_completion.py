@@ -793,7 +793,8 @@ class TestEnsureBranch:
     async def test_branch_already_exists_short_circuits(
         self, db_session, mocker, _patch_ensure_branch_deps
     ):
-        """If create_branch fails but verify succeeds, we reuse the existing branch."""
+        """If create_branch fails but verify shows the branch already at the
+        source tip, we reuse the existing branch."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -811,12 +812,16 @@ class TestEnsureBranch:
         get_sha = mocker.patch(
             "app.task_completion.get_branch_sha",
             new_callable=AsyncMock,
-            side_effect=["sha1", "sha2"],  # source SHA, then verify returns OK
+            # source SHA, then verify: the branch is at the SAME tip we wanted.
+            side_effect=["sha1", "sha1"],
         )
         create = mocker.patch(
             "app.task_completion.create_branch",
             new_callable=AsyncMock,
             side_effect=HTTPException(status_code=422, detail="reference exists"),
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
         )
 
         relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
@@ -826,6 +831,365 @@ class TestEnsureBranch:
         assert create.await_count == 1
         assert get_sha.await_count == 2
         assert relocked.status != TaskStatus.FAILED
+        # An in-sync branch is adopted as-is; nothing is destroyed.
+        assert delete.await_count == 0
+
+    # ── stale-branch adoption (create_branch reuse) ──────────────────────────
+    #
+    # create_branch reports reuse of a pre-existing ref (422) instead of
+    # returning a success-shaped result. "The branch exists" is NOT "the branch
+    # is usable": a crashed prior run leaves a ref at a completely different
+    # SHA, and adopting it silently bases the whole plan/research fan-out on the
+    # wrong code.
+
+    @pytest.mark.asyncio
+    async def test_reused_branch_ahead_of_source_is_adopted_not_destroyed(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """A staging branch that already CONTAINS the source tip is ahead of it —
+        typically because children already merged their PRs into it. Adopt it;
+        deleting it would destroy landed child work."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="source-sha",
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value={
+                "reused": True,
+                "sha_matches": False,
+                "existing_sha": "branch-ahead-sha",
+                "requested_sha": "source-sha",
+            },
+        )
+        ancestry = mocker.patch(
+            "app.task_completion.compare_ref_status",
+            new_callable=AsyncMock,
+            return_value="ahead",  # existing tip already contains source-sha
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
+        )
+
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert relocked is not None
+        assert relocked.status != TaskStatus.FAILED
+        assert ancestry.await_count == 1
+        assert delete.await_count == 0, (
+            "a branch that already contains the source tip must NEVER be deleted — "
+            "children may have merged into it"
+        )
+        assert create.await_count == 1  # no recreate
+
+    @pytest.mark.asyncio
+    async def test_reused_branch_strictly_behind_source_is_reset(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """A pre-existing branch that is strictly BEHIND the source tip has NO
+        commits of its own — a stale leftover from a crashed run cut off an older
+        base. Resetting it to the source tip is a fast-forward that destroys
+        nothing, so delete + recreate is safe here (and ONLY here).
+
+        NOTE the narrowness: "behind" is the only status that licenses a delete.
+        This test used to assert the same behaviour for a DIVERGED branch, which
+        was a latent data-loss bug — see
+        ``test_diverged_branch_with_merged_children_is_adopted_never_deleted``."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="source-sha",
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            side_effect=[
+                # 1st: GitHub 422 → reused at a stale, divergent tip.
+                {
+                    "reused": True,
+                    "sha_matches": False,
+                    "existing_sha": "stale-sha",
+                    "requested_sha": "source-sha",
+                },
+                # 2nd (after the delete): a clean create at the source tip.
+                {"ref": "refs/heads/plan/xyz", "object": {"sha": "source-sha"}},
+            ],
+        )
+        mocker.patch(
+            "app.task_completion.compare_ref_status",
+            new_callable=AsyncMock,
+            return_value="behind",  # no unique commits — FF reset loses nothing
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
+        )
+
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert relocked is not None
+        assert relocked.status != TaskStatus.FAILED
+        assert delete.await_count == 1
+        assert delete.await_args.args[3] == "plan/xyz"
+        assert create.await_count == 2, "the branch must be recreated at the source tip"
+        assert create.await_args.args[4] == "source-sha"
+
+    @pytest.mark.asyncio
+    async def test_indeterminate_ancestry_adopts_rather_than_deleting(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """An ancestry check that FAILS (None — GitHub API error) must never be
+        able to destroy a ref: adopt the existing branch instead."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="source-sha",
+        )
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value={
+                "reused": True,
+                "sha_matches": False,
+                "existing_sha": "other-sha",
+                "requested_sha": "source-sha",
+            },
+        )
+        mocker.patch(
+            "app.task_completion.compare_ref_status",
+            new_callable=AsyncMock,
+            return_value=None,  # API error — indeterminate
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
+        )
+
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert relocked is not None
+        assert relocked.status != TaskStatus.FAILED
+        assert delete.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_diverged_branch_with_merged_children_is_adopted_never_deleted(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """A DIVERGED staging branch must be ADOPTED, never deleted. THE regression
+        test for a data-loss bug.
+
+        The real-world shape this reproduces:
+          * ``plan_completion`` / ``research_completion`` inherit an existing staging
+            branch (guarded on ``rollup_pr_number``), i.e. the HEAD BRANCH OF AN OPEN
+            ROLLUP PR, with CHILD PRs ALREADY MERGED INTO IT;
+          * the source branch (``parent_base``, normally automain) keeps advancing
+            underneath it — dozens of commits over the life of a rollup.
+
+        So the staging branch has unique commits (the merged children) AND the source
+        has unique commits (automain's advance) => compare status ``"diverged"``.
+
+        The trap: ``is_ancestor_of`` collapses BOTH ``"behind"`` and ``"diverged"``
+        onto ``False``. Any implementation that deletes on a falsy ancestry answer
+        will DELETE THE HEAD BRANCH OF AN OPEN PR — GitHub auto-closes the PR — and
+        destroy every merged child commit. Only the RAW status can tell the two apart.
+
+        A force-pushed source branch produces the same ``"diverged"`` status, and the
+        same rule applies: never destroy the side holding unique commits.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="automain-advanced-sha",
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value={
+                "reused": True,
+                "sha_matches": False,
+                # staging branch tip: carries the merged child commits
+                "existing_sha": "staging-with-merged-children-sha",
+                "requested_sha": "automain-advanced-sha",
+            },
+        )
+        compare = mocker.patch(
+            "app.task_completion.compare_ref_status",
+            new_callable=AsyncMock,
+            return_value="diverged",
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
+        )
+
+        relocked = await _ensure_branch(
+            task, "plan/staging-xyz", "automain", "PLAN", db_session
+        )
+
+        # Assert the DESTRUCTIVE call first: it is the whole point of this test, and
+        # it makes the failure message diagnostic if the guard ever regresses.
+        assert delete.await_count == 0, (
+            "DATA LOSS: a DIVERGED staging branch was deleted. It is the head branch "
+            "of an open rollup PR and holds merged child commits; deleting it closes "
+            "the PR and destroys that work. 'diverged' must ADOPT — only 'behind' "
+            "(no unique commits) may be reset."
+        )
+        assert create.await_count == 1, "no delete => no recreate"
+        assert compare.await_count == 1
+        assert relocked is not None
+        assert relocked.status != TaskStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_source_tip_retries_rather_than_adopting(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """A source tip we could not resolve must NOT silently adopt the existing
+        branch.
+
+        If ``get_branch_sha`` yields nothing, we have no anchor to compare the
+        pre-existing branch against — so we cannot know whether it is current or a
+        stale leftover. Adopting on that unverified read re-opens the stale-tip bug
+        this whole path exists to close. Retry instead; exhausting retries fails the
+        task loudly. The branch is never created off a null anchor either.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value=None,  # tip could not be resolved
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch", new_callable=AsyncMock
+        )
+        delete = mocker.patch(
+            "app.task_completion.delete_branch", new_callable=AsyncMock
+        )
+
+        result = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert result is None
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert create.await_count == 0, "never create a branch off a null anchor"
+        assert delete.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_branch_that_cannot_be_reset_fails_the_task(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """If the branch STILL points at the stale tip after delete+recreate, we
+        must not adopt it — retries exhaust and the task fails loudly rather than
+        fanning out children off the wrong base."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="source-sha",
+        )
+        stale_ref = {
+            "reused": True,
+            "sha_matches": False,
+            "existing_sha": "stale-sha",
+            "requested_sha": "source-sha",
+        }
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value=stale_ref,  # the delete never takes effect
+        )
+        mocker.patch(
+            "app.task_completion.compare_ref_status",
+            new_callable=AsyncMock,
+            return_value="behind",
+        )
+        mocker.patch("app.task_completion.delete_branch", new_callable=AsyncMock)
+
+        result = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert result is None
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_failure_after_all_retries_marks_task_failed(

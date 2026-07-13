@@ -127,3 +127,155 @@ async def test_job_logs_non200_emits_warning(caplog):
     ), f"Expected WARNING with '403' and 'job logs' in messages, got: {warning_messages}"
     # The result still has a non-empty failed_logs (falls back to check name)
     assert result["conclusion"] == "failure"
+
+
+# ---------------------------------------------------------------------------
+# include_failed_logs=False — skip the RED-sha failure fan-out
+#
+# On a RED sha get_check_runs fetches workflow runs + per-run jobs + per-failed
+# -check job LOGS + annotations: 3-10+ extra calls against the SHARED 5000/hr
+# install-token bucket, every poll. Callers that DISCARD failed_logs (the agent
+# check-runs proxy) must not pay that.
+# ---------------------------------------------------------------------------
+
+
+def _red_check_runs_response():
+    return _make_response(
+        200,
+        json_data={
+            "check_runs": [
+                {
+                    "name": "ci-build",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "id": 99,
+                    "output": {},
+                }
+            ]
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_include_failed_logs_false_skips_failure_fanout_on_red_sha():
+    """A RED sha with include_failed_logs=False costs exactly ONE GitHub call —
+    the check-runs list — and no workflow-runs / jobs / logs / annotations."""
+    request_mock = AsyncMock(return_value=_red_check_runs_response())
+
+    with patch.object(github_checks, "_github_request", new=request_mock):
+        result = await github_checks.get_check_runs(
+            token="tok",
+            owner="o",
+            repo="r",
+            ref="sha123abc",
+            include_failed_logs=False,
+        )
+
+    assert request_mock.await_count == 1, (
+        "the failure fan-out (workflow runs + jobs + logs + annotations) ran even "
+        "though the caller discards failed_logs"
+    )
+    # Verdict is unchanged — only the (discarded) detail is skipped.
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "failure"
+    assert result["details"] == [
+        {"name": "ci-build", "status": "completed", "conclusion": "failure"}
+    ]
+    assert result["failed_logs"] == ""
+    assert result["failed_run_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_include_failed_logs_default_true_still_fans_out():
+    """Existing callers (the fix loop) keep their behaviour: default True still
+    fetches the failure detail."""
+    call_iter = iter(
+        [
+            _red_check_runs_response(),
+            _make_response(200, json_data={"workflow_runs": []}),  # workflow runs
+            _make_response(200, text="FAILED testing/test_x.py::test_y"),  # job logs
+        ]
+    )
+    request_mock = AsyncMock(side_effect=lambda *a, **kw: next(call_iter))
+
+    with patch.object(github_checks, "_github_request", new=request_mock):
+        result = await github_checks.get_check_runs(
+            token="tok", owner="o", repo="r", ref="sha123abc"
+        )
+
+    assert request_mock.await_count > 1
+    assert "testing/test_x.py::test_y" in result["failed_logs"]
+
+
+@pytest.mark.asyncio
+async def test_check_runs_cache_does_not_serve_logsfree_result_to_a_logs_caller():
+    """include_failed_logs is part of the CACHE KEY.
+
+    Otherwise the cheap logs-free entry written by the agent proxy would be
+    served — within the 30s TTL — to auto_remediation / ci_resolution, which
+    would then see failed_logs="" and drive the fix loop blind.
+    """
+    github_checks._check_runs_cache.clear()
+    inner = AsyncMock(
+        side_effect=lambda *a, **kw: {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [],
+            "failed_logs": "" if kw.get("include_failed_logs") is False else "REAL LOGS",
+        }
+    )
+
+    with patch("app.github.get_check_runs", new=inner):
+        logs_free = await github_checks.get_check_runs_cached(
+            "tok", "o", "r", "sha1", include_failed_logs=False
+        )
+        with_logs = await github_checks.get_check_runs_cached("tok", "o", "r", "sha1")
+        # Second call on each variant is served from its own cache entry.
+        logs_free_again = await github_checks.get_check_runs_cached(
+            "tok", "o", "r", "sha1", include_failed_logs=False
+        )
+
+    assert logs_free["failed_logs"] == ""
+    assert with_logs["failed_logs"] == "REAL LOGS", (
+        "a logs-free cache entry was served to a caller that needs failed_logs"
+    )
+    assert logs_free_again["failed_logs"] == ""
+    # Two distinct variants fetched once each; the repeat hit the cache.
+    assert inner.await_count == 2
+
+    github_checks._check_runs_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_check_runs_cache_drops_every_variant():
+    """Invalidation must clear ALL variants for the sha — a key dimension added
+    later must not leave a stale entry behind an invalidation."""
+    github_checks._check_runs_cache.clear()
+    inner = AsyncMock(
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "details": [],
+            "failed_logs": "",
+        }
+    )
+
+    with patch("app.github.get_check_runs", new=inner):
+        await github_checks.get_check_runs_cached(
+            "tok", "o", "r", "sha1", include_failed_logs=False
+        )
+        await github_checks.get_check_runs_cached("tok", "o", "r", "sha1")
+        assert inner.await_count == 2
+        assert len(github_checks._check_runs_cache) == 2
+
+        github_checks.invalidate_check_runs_cache("o", "r", "sha1")
+        assert github_checks._check_runs_cache == {}
+
+        # Both variants re-fetch after invalidation.
+        await github_checks.get_check_runs_cached(
+            "tok", "o", "r", "sha1", include_failed_logs=False
+        )
+        await github_checks.get_check_runs_cached("tok", "o", "r", "sha1")
+        assert inner.await_count == 4
+
+    github_checks._check_runs_cache.clear()

@@ -1063,9 +1063,23 @@ async def promote(
                 version.version_number,
             )
             await github.delete_branch(token, owner, repo, release_branch)
-            await github.create_branch(
-                token, owner, repo, release_branch, candidate_sha
+            recreated = (
+                await github.create_branch(
+                    token, owner, repo, release_branch, candidate_sha
+                )
+                or {}
             )
+            # create_branch now reports reuse explicitly. If the recreate ALSO
+            # reused a ref at a non-candidate SHA (the delete silently failed, or
+            # a peer re-cut the branch), the release PR would promote the WRONG
+            # commit — the exact hazard this whole block exists to prevent. Fail
+            # the promotion instead of shipping an unqualified SHA.
+            if recreated.get("reused") and not recreated.get("sha_matches"):
+                raise RuntimeError(
+                    f"release branch {release_branch} still points at "
+                    f"{recreated.get('existing_sha')} after delete+recreate; "
+                    f"refusing to promote a non-candidate SHA"
+                )
     except Exception as exc:  # noqa: BLE001 — a branch-creation failure blocks, never raises
         logger.warning(
             "[RELEASE_QUALIFIER] promote: failed to create release branch %s "

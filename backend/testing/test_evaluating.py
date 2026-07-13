@@ -1444,7 +1444,9 @@ async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, m
     # respawn again if idempotency were broken — the respawn-count guard must
     # still prevent it.
     await eval_db.refresh(child)
-    child.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
+    child.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=20
+    )
     eval_db.add(child)
     await eval_db.commit()
     await _check_and_trigger_rollup(child, eval_db)
@@ -3452,10 +3454,12 @@ def _mock_strand_github(mocker, *, pr_state, pr_merged, reviews=None):
         new_callable=AsyncMock,
         return_value={"state": pr_state, "merged": pr_merged, "user": {}},
     )
+    # rollup_management imports get_pull_request_reviews_CHECKED -> (reviews, status).
+    # Patching the list-only wrapper voids silently and leaks a live HTTP call.
     mocker.patch(
-        "app.github.get_pull_request_reviews",
+        "app.github.get_pull_request_reviews_checked",
         new_callable=AsyncMock,
-        return_value=reviews or [],
+        return_value=(reviews or [], "complete"),
     )
 
 
@@ -3857,7 +3861,8 @@ async def test_chain_active_fresh_heartbeat_defers_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(seconds=30),
         vm_instance_id="vm-chain-alive",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is True
@@ -3876,14 +3881,16 @@ async def test_chain_active_vmcontact_overrides_stale_heartbeat(eval_db):
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
         # 20min-stale on-row heartbeat (past the default 600s/10min cutoff).
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-lockstarved",
     )
     # Fresh off-row contact (30s) within the 10min stale cutoff.
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-lockstarved",
-            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=30),
         )
     )
     await eval_db.commit()
@@ -3902,14 +3909,16 @@ async def test_chain_active_stale_heartbeat_and_stale_vmcontact_allows_kill(eval
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-dead",
     )
     # Off-row contact is ALSO stale (15min, past the 10min cutoff).
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-dead",
-            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=15),
         )
     )
     await eval_db.commit()
@@ -3925,7 +3934,8 @@ async def test_chain_active_no_vmcontact_row_allows_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=20),
         vm_instance_id="vm-chain-no-contact-row",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is False
@@ -5117,9 +5127,7 @@ async def test_sweep_orphaned_provider_task_detached_not_cancelled_for_retired_d
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_null_updated_at_detached(
-    eval_db, mocker
-):
+async def test_sweep_orphaned_provider_task_null_updated_at_detached(eval_db, mocker):
     """A null-updated_at EVALUATING task on a closed direction is detached.
 
     Regression: null updated_at makes a task invisible to the staleness sweep
@@ -5250,9 +5258,7 @@ async def test_sweep_orphaned_provider_task_no_direction_row_not_touched(
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
-    eval_db, mocker
-):
+async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(eval_db, mocker):
     """An EVALUATING task with a retired direction but an open PR must be detached, not cancelled.
 
     When a direction expires/completes, tasks that have already opened a PR have

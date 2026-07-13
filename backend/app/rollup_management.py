@@ -694,11 +694,19 @@ async def _pr_closed_is_non_rejection(
 
     GUARDRAIL: any CHANGES_REQUESTED review, or any genuine-rejection marker, or
     the absence of every cleanup signal → returns False so the caller keeps the
-    FAILED path. A failed reviews lookup is treated as "no recorded
-    CHANGES_REQUESTED" but can NEVER on its own flip the verdict, because a
-    positive cleanup signal is still required.
+    FAILED path. A FAILED reviews lookup (401, rate limit, 502, timeout — we saw
+    NOTHING) is treated as "no recorded CHANGES_REQUESTED" and can NEVER on its
+    own flip the verdict, because a positive cleanup signal is still required.
+
+    A TRUNCATED reviews list is a DIFFERENT signal and IS decisive: we fetched real
+    pages and know there are more we did not see, and because GitHub serves reviews
+    oldest-first the ones we are missing are precisely the NEWEST — exactly where a
+    late CHANGES_REQUESTED lives. That is evidence we cannot rule out a rejection,
+    so it keeps FAILED. (Do not collapse the two: fail-closing on a mere fetch
+    failure would let one rate-limited call turn a routine bot cleanup-close into a
+    terminal FAILED + operator alert, and would make a 502 stricter than a 401.)
     """
-    from app.github import get_pull_request_reviews
+    from app.github import REVIEWS_TRUNCATED, get_pull_request_reviews_checked
     from app.routers.agent import get_github_token_for_task
 
     ctx = task.context or {}
@@ -710,7 +718,7 @@ async def _pr_closed_is_non_rejection(
     # (2) Live CHANGES_REQUESTED check — a real reviewer rejection.
     try:
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        reviews = await get_pull_request_reviews(
+        reviews, reviews_status = await get_pull_request_reviews_checked(
             gh_token, owner, repo, pr_number, project_id=str(task.project_id)
         )
         if any(
@@ -719,6 +727,25 @@ async def _pr_closed_is_non_rejection(
             logger.info(
                 f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed-unmerged has a "
                 f"CHANGES_REQUESTED review — genuine rejection, keeping FAILED"
+            )
+            return False
+        if reviews_status == REVIEWS_TRUNCATED:
+            # FAIL CLOSED — on TRUNCATION only, never on a mere fetch failure.
+            # We hold real pages and know more reviews exist that we did not see;
+            # GitHub serves them oldest-first, so the missing ones are exactly the
+            # NEWEST — where a late CHANGES_REQUESTED would be. That is positive
+            # evidence we cannot rule out a rejection, and this is the last live
+            # guard before a rejected PR is downgraded FAILED → CANCELLED.
+            #
+            # A REVIEWS_FAILED (page-1 non-200: rate limit, 502, …) deliberately
+            # does NOT land here — it falls through to the best-effort path below,
+            # same as the 401/raise case, so one transient hiccup cannot flip a
+            # routine cleanup-close into a terminal FAILED + operator alert.
+            logger.warning(
+                f"[PR_VERIFY] Task {task.id} PR #{pr_number}: the reviews list is "
+                f"TRUNCATED ({len(reviews or [])} fetched, more exist) — the newest "
+                f"reviews are the ones missing, so a CHANGES_REQUESTED cannot be "
+                f"ruled out; NOT treating the close as non-genuine"
             )
             return False
     except Exception as _rev_err:

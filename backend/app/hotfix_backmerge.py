@@ -62,6 +62,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
+from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -759,6 +760,31 @@ async def open_backmerge_pr(
             project_id=str(project_id),
         )
     except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as blocked
+        # A RATE-LIMITED merge (503, raised by github_pulls._raise_merge_pr_retryable)
+        # is not a merge failure at all: the PUT never reached GitHub's merge
+        # machinery, so the PR is neither merged nor blocked — it simply has to be
+        # re-attempted after the quota window resets. Raising the persistent
+        # "blocked" operator alert here would page a human about a transient quota
+        # bucket, and that alert would still be sitting there long after the next
+        # back-merge sweep quietly succeeded. Retry instead.
+        #
+        # This branch is the ONLY reason the 503 reclassification changes any
+        # behaviour: every other consumer of merge_pull_request catches bare
+        # Exception and cannot tell a 503 from a 500. If you delete this branch,
+        # put the 500 back — otherwise the status code is decorative.
+        if (
+            isinstance(exc, HTTPException)
+            and exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        ):
+            logger.warning(
+                "[BACKMERGE] project %s: merge of back-merge PR #%s was RATE-LIMITED "
+                "(503) — the merge was never attempted upstream. Leaving the PR open "
+                "for the next sweep instead of raising a blocked alert. detail=%s",
+                project_id,
+                pr_number,
+                str(exc.detail)[:200],
+            )
+            return {"status": "retry", "error": "rate_limited", "pr_url": pr_url}
         logger.warning(
             "[BACKMERGE] merge raised for back-merge PR #%s (project %s): %s",
             pr_number,
@@ -803,6 +829,29 @@ async def open_backmerge_pr(
             pr_detail = await github.get_pull_request(
                 token, owner, repo, pr_number, project_id=str(project_id)
             )
+            # 5b. ALREADY MERGED. ``merge_pull_request`` collapses two different
+            #     outcomes onto {"merged": False}: a real block, and an
+            #     already-merged PR (GitHub's merge endpoint 405s once a PR is
+            #     merged). The second happens for real: the merge PUT lands
+            #     server-side but the response is lost to a 5xx, _github_request
+            #     retries, and the retry gets the 405. Reading only
+            #     ``mergeable_state`` cannot see that — so a back-merge that
+            #     LANDED was reported {"status": "blocked"} with a persistent
+            #     operator alert. The PR resource's own ``merged`` / ``merged_at``
+            #     is authoritative and flips synchronously on merge; consult it
+            #     BEFORE any block classification (mirrors ci_completion.py's
+            #     ``_recheck_pr.get("merged")`` success-close branch).
+            if pr_detail.get("merged") or pr_detail.get("merged_at"):
+                logger.info(
+                    "[BACKMERGE] project %s: back-merge PR #%s reports merged=False "
+                    "from the merge call but the PR resource says MERGED (merged_at=%s)"
+                    " — the merge landed (lost 5xx response / already-merged 405). "
+                    "Recording success instead of a false block.",
+                    project_id,
+                    pr_number,
+                    pr_detail.get("merged_at"),
+                )
+                return {"status": "merged", "pr_url": pr_url}
             if str(pr_detail.get("mergeable_state") or "").lower() == "dirty":
                 is_conflict = True
         except Exception as exc:  # noqa: BLE001 — best-effort; fall through to blocked

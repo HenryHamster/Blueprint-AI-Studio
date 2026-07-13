@@ -30,12 +30,9 @@ async def test_agent_github_routes_are_registered_under_api_agent():
     assert EXPECTED_GITHUB_PATHS <= paths
 
 
-@pytest.mark.asyncio
-async def test_agent_github_check_runs_uses_shared_verify_agent_token(
-    client: AsyncClient, db_session, mocker
-):
+async def _make_proxy_task(db_session, name: str = "GitHub Proxy Test") -> Task:
     project = Project(
-        name="GitHub Proxy Test",
+        name=name,
         user_id="test-user-123",
         github_owner="owner",
         github_repo="repo",
@@ -52,6 +49,14 @@ async def test_agent_github_check_runs_uses_shared_verify_agent_token(
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_agent_github_check_runs_uses_shared_verify_agent_token(
+    client: AsyncClient, db_session, mocker
+):
+    task = await _make_proxy_task(db_session)
 
     app.dependency_overrides[verify_agent_token] = lambda: {
         "sub": str(task.id),
@@ -61,8 +66,11 @@ async def test_agent_github_check_runs_uses_shared_verify_agent_token(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("gh-token", "owner", "repo")),
     )
-    mocker.patch(
-        "app.routers.agent_github.get_check_runs",
+    # The proxy polls on the SHARED 5000/hr install-token bucket, so it must go
+    # through the 30s-TTL cached wrapper (as auto_remediation / ci_resolution /
+    # hotfix_backmerge / orchestrator_ci_monitor all do), not raw get_check_runs.
+    cached = mocker.patch(
+        "app.routers.agent_github.get_check_runs_cached",
         new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
     )
     try:
@@ -79,8 +87,57 @@ async def test_agent_github_check_runs_uses_shared_verify_agent_token(
                 "details": [],
             },
         }
+        assert cached.await_count == 1
     finally:
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_github_check_runs_skips_failed_log_fanout(
+    client: AsyncClient, db_session, mocker
+):
+    """Budget guard: the handler returns only status/conclusion/details and
+    DISCARDS failed_logs, so it must ask for the logs-free variant.
+
+    On a RED sha, get_check_runs' failure fan-out costs 3-10+ extra calls
+    (workflow runs + per-run jobs + per-failed-check job LOGS + annotations)
+    against the shared installation-token bucket — pure waste here.
+    """
+    task = await _make_proxy_task(db_session, name="GitHub Proxy Budget")
+
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": str(task.id),
+        "vm_instance_id": "agent-vm-gh",
+    }
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("gh-token", "owner", "repo")),
+    )
+    cached = mocker.patch(
+        "app.routers.agent_github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "ci", "status": "completed", "conclusion": "failure"}],
+                "failed_logs": "",
+            }
+        ),
+    )
+    try:
+        resp = await client.get(
+            "/api/agent/github/check-runs",
+            params={"commit_sha": "b" * 40},
+        )
+        assert resp.status_code == 200, resp.text
+        # failed_logs is not part of the response contract — hence never fetched.
+        assert "failed_logs" not in resp.json()["data"]
+    finally:
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+    assert cached.await_args.kwargs.get("include_failed_logs") is False, (
+        "the check-runs proxy must skip the failure fan-out whose output it discards"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
