@@ -16,7 +16,7 @@ NOTE: hand-written to match ``models.ProjectComputeImage`` — ``alembic`` is no
 importable in the authoring environment, so ``--autogenerate`` could not be run.
 Column types/nullability mirror the model exactly.
 
-Revision ID: 0521
+Revision ID: 0526
 Revises: 0525
 Create Date: 2026-07-12 00:00:00.000000
 
@@ -25,7 +25,7 @@ Create Date: 2026-07-12 00:00:00.000000
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0521"
+revision = "0526"
 down_revision = "0525"
 branch_labels = None
 depends_on = None

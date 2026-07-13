@@ -1398,9 +1398,6 @@ async def compute_qualification_trigger_state(
           "open_version_id": str | None,
           "reason": str,   # machine-readable code
           "summary": str,  # human-readable explanation
-          "coverage_total": int,
-          "coverage_covered": int,
-          "coverage_attested": int,
         }
 
     ``trigger_state`` is ``"armed"`` exactly when:
@@ -1426,8 +1423,6 @@ async def compute_qualification_trigger_state(
             "open_version_id": None,
             "reason": "no_open_version",
             "summary": "no open release version — nothing to qualify",
-            "coverage_total": 0,
-            "coverage_covered": 0,
         }
 
     if version.phase != "stabilize":
@@ -1439,8 +1434,6 @@ async def compute_qualification_trigger_state(
                 f"version v{version.version_number} is in phase "
                 f"'{version.phase}', not 'stabilize'"
             ),
-            "coverage_total": 0,
-            "coverage_covered": 0,
         }
 
     has_prior_attempt = (
@@ -1456,8 +1449,6 @@ async def compute_qualification_trigger_state(
                 f"version v{version.version_number} already has a qualification "
                 "attempt recorded — initial trigger does not re-fire"
             ),
-            "coverage_total": 0,
-            "coverage_covered": 0,
         }
 
     return {
@@ -1469,8 +1460,6 @@ async def compute_qualification_trigger_state(
             "qualification attempt — initial trigger armed (acceptance contract "
             "is graded inside qualification)"
         ),
-        "coverage_total": 0,
-        "coverage_covered": 0,
     }
 
 

@@ -724,10 +724,10 @@ def criterion_evidence_status(evidence: list[CriterionEvidence]) -> str:
     criterion produces the same axis
     (:data:`~app.evidence_primitive.EvidenceStatus`) as a gap or capability.
     This makes the acceptance surface a full peer in the shared "evidence met"
-    contract (``evidence_met_summary`` / ``compute_evidence_health`` derive it
-    only in aggregate today) and lets the reconciliation sweep grade a single
-    criterion with :func:`~app.evidence_primitive.claim_contradicts_evidence`.
-    Pure, no IO.
+    contract and lets the reconciliation sweep
+    (``metrics_integrity_sweep.check_criterion_claim_reconciliation``, the only
+    remaining consumer) grade a single criterion with
+    :func:`~app.evidence_primitive.claim_contradicts_evidence`.  Pure, no IO.
     """
     return criterion_coverage_to_evidence_status(compute_criterion_coverage(evidence))
 

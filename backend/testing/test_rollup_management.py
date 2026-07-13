@@ -3796,7 +3796,10 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
         f"Expected 0 uncovered criteria, got {summary['uncovered']}: {summary}"
     )
 
-    # The release-scoring gate must not fire criterion_coverage_incomplete.
+    # The release-scoring gate must not fire criterion_coverage_incomplete.  The
+    # acceptance gate is now keyed on per-category verdicts (the retired
+    # coverage-count input is gone); every active category is ``met`` with no
+    # residual uncaptured gap, mirroring the fully-covered state asserted above.
     result = compute_composite(
         ci_green=True,
         audit_score=1.0,
@@ -3806,7 +3809,21 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
         smoketest_enabled=False,
         ci_state="no_checks",
         ci_required=False,
-        criterion_coverage=summary,
+        category_verdicts=[
+            {
+                "category_key": criterion_a.criterion_key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "diff", "ref": "a.py:1"}],
+            },
+            {
+                "category_key": criterion_b.criterion_key,
+                "status": "met",
+                "tier": "machine",
+                "citations": [{"kind": "diff", "ref": "b.py:1"}],
+            },
+        ],
+        residual_uncaptured_gap=None,
     )
     assert result["blocker"] != "criterion_coverage_incomplete", (
         f"Fully-covered version must not trigger criterion_coverage_incomplete; "

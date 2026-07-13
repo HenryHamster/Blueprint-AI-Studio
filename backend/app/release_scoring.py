@@ -50,33 +50,6 @@ MAX_COMPLETION_DEBT_WEIGHT = 0.5
 # so graduation actually changes the composite instead of being a no-op.
 DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
 
-# Confidence penalty applied when a version's acceptance criteria are ALL at
-# least covered-or-attested (no genuinely uncovered criterion), but some are
-# covered ONLY by a lower-confidence operator attestation rather than
-# machine-verified evidence.  The penalty is proportional to the attested
-# fraction: ``ATTESTATION_PENALTY_WEIGHT * (attested / total)``, applied as a
-# multiplier ``confidence *= (1 - penalty)`` after the weighted sum.  This makes
-# an attestation-covered criterion score visibly lower than one covered by
-# named_test / reachability / task_merge evidence, while preserving the
-# operator's deadlock-breaker waiver (the penalty is the cost of waiving without
-# machine evidence, not a hard block).  Configurable in one place.
-ATTESTATION_PENALTY_WEIGHT = 0.15
-
-# Confidence penalty applied when a version's acceptance criteria include
-# those covered ONLY by unverified-merge backfill evidence — the test file
-# shipped in the PR's changed files, but the merge was never CI-verified.
-# This is a lighter penalty than ATTESTATION_PENALTY_WEIGHT because backfill
-# evidence is machine-derived (the test was genuinely in the PR's changes),
-# not a pure operator waiver.  Proportional to the backfilled fraction:
-# ``BACKFILL_PENALTY_WEIGHT * (backfilled / total)``, applied as a multiplier
-# ``confidence *= (1 - penalty)`` after the attestation penalty.
-#
-# NOTE (goal-verification redesign): the attestation/backfill penalty constants
-# above belong to the retired criterion-"coverage" tier system.  They are kept
-# for back-compat rendering of historical verdicts; the LIVE confidence penalty
-# is now JUDGED_TIER_PENALTY_WEIGHT (below), keyed off per-category verdict tier.
-BACKFILL_PENALTY_WEIGHT = 0.05
-
 # Confidence penalty applied per the goal-verification redesign.  v1 grades every
 # acceptance-criterion CATEGORY at the JUDGED tier — an uninvested LLM reading the
 # merged diff — which is a lower-confidence signal than machine/test-cited
@@ -85,8 +58,11 @@ BACKFILL_PENALTY_WEIGHT = 0.05
 # categories still resting on the judged tier: ``JUDGED_TIER_PENALTY_WEIGHT *
 # (judged_met / met)``, applied as ``confidence *= (1 - penalty)``.  Deliberately
 # small so a healthy all-judged candidate (the whole of v1) stays promotable while
-# still scoring visibly below a machine-verified one.  This REUSES the old
-# attestation-penalty machinery, repurposed from evidence-tier to grader-tier.
+# still scoring visibly below a machine-verified one.
+#
+# This is the ONLY confidence penalty on the acceptance axis.  It replaced the
+# retired criterion-"coverage" evidence-tier penalties (attestation / backfill),
+# which keyed off evidence accumulated per criterion rather than a graded verdict.
 JUDGED_TIER_PENALTY_WEIGHT = 0.05
 
 # Recognised per-category verdict statuses.  ``partial`` gates identically to
@@ -673,7 +649,6 @@ def compute_composite(
     ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
-    criterion_coverage: dict[str, Any] | None = None,
     category_verdicts: list[dict[str, Any]] | None = None,
     residual_uncaptured_gap: str | None = None,
     merge_grade_misses: bool = False,
@@ -888,27 +863,6 @@ def compute_composite(
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
-    # Attestation/backfill observability: record how many active criteria
-    # are covered ONLY by a (non-expired) operator attestation or by
-    # unverified-merge backfill evidence.  Always recorded when a coverage
-    # summary is supplied so operators can see the lower-confidence surface
-    # even when a blocker fired for a different reason.
-    attested_count = 0
-    backfilled_count = 0
-    total_criteria = 0
-    covered_count = 0
-    if criterion_coverage is not None:
-        attested_count = int(criterion_coverage.get("attested") or 0)
-        backfilled_count = int(criterion_coverage.get("backfilled") or 0)
-        total_criteria = int(criterion_coverage.get("total") or 0)
-        covered_count = int(criterion_coverage.get("covered") or 0)
-        sub_scores["attested_count"] = attested_count
-        sub_scores["backfilled_count"] = backfilled_count
-        # Record whether attestations are completely uncorroborated (covered==0)
-        # for observability — kept for back-compat rendering of historical rows.
-        if covered_count == 0 and attested_count > 0 and total_criteria > 0:
-            sub_scores["uncorroborated_attested"] = True
-
     # Goal-verification observability (redesign): surface the per-category grade
     # and residual so operators see WHY the gate fired (or would fire), not just
     # the blocker string.  Recorded whenever a per-category grade was supplied,
@@ -965,25 +919,13 @@ def compute_composite(
     # confidence signal than machine/test-cited evidence (the v2 machine tier).
     # Dock confidence in proportion to the fraction of MET categories still on the
     # judged tier, so an all-judged candidate scores visibly below a
-    # machine-verified one WITHOUT hard-blocking.  This REUSES the old
-    # attestation-penalty machinery, repurposed from evidence-tier to grader-tier.
+    # machine-verified one WITHOUT hard-blocking.
     if category_verdicts:
         _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
         if _met:
             _judged = sum(1 for v in _met if (v or {}).get("tier", "judged") != "machine")
             penalty = JUDGED_TIER_PENALTY_WEIGHT * (_judged / len(_met))
             confidence *= 1.0 - penalty
-
-    # Back-compat: legacy callers that still pass a coverage-count summary (rather
-    # than per-category verdicts) retain the old attestation/backfill haircut so
-    # historical/second-caller behaviour is unchanged.  New callers pass
-    # ``category_verdicts`` and take the judged-tier penalty above instead.
-    if category_verdicts is None and attested_count > 0 and total_criteria > 0:
-        penalty = ATTESTATION_PENALTY_WEIGHT * (attested_count / total_criteria)
-        confidence *= 1.0 - penalty
-    if category_verdicts is None and backfilled_count > 0 and total_criteria > 0:
-        penalty = BACKFILL_PENALTY_WEIGHT * (backfilled_count / total_criteria)
-        confidence *= 1.0 - penalty
 
     confidence = round(_clamp01(confidence), 4)
     return {

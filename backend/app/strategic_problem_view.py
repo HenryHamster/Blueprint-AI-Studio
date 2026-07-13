@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any
 
-from app.problem_model import compute_evidence_health, compute_model_size_signal, parse_problem_model
+from app.problem_model import compute_model_size_signal, parse_problem_model
 
 logger = logging.getLogger(__name__)
 
@@ -50,30 +50,6 @@ def _compute_model_health(pm: dict | None) -> dict | None:
         logger.warning(
             "[STRATEGIC] could not compute model_health (durable problem_model "
             "failed strict validation); omitting the soft signal this cycle",
-            exc_info=True,
-        )
-        return None
-
-
-def _compute_evidence_health(
-    pm: dict | None,
-    coverage_summary: dict | None = None,
-) -> dict | None:
-    """Fail-open wrapper around :func:`compute_evidence_health`.
-
-    Parses the durable problem_model blob and computes the evidence health
-    signal. Returns ``None`` on any parse/compute failure so a malformed
-    stored model never crashes strategic spawning — the signal is advisory.
-    Callers conditionally include the key only when non-None.
-    """
-    if not pm and coverage_summary is None:
-        return compute_evidence_health(parse_problem_model(None), None)
-    try:
-        return compute_evidence_health(parse_problem_model(pm), coverage_summary)
-    except Exception:  # noqa: BLE001 — advisory signal must degrade, never raise
-        logger.warning(
-            "[STRATEGIC] could not compute evidence_health (problem_model "
-            "failed parse or evidence_health raised); omitting this cycle",
             exc_info=True,
         )
         return None

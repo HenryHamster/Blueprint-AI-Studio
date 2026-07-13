@@ -11517,6 +11517,16 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         # get_version_coverage_summary surfaces the open version's persisted
         # merge-evidence drop reasons (None when the version recorded none).
         "merge_evidence_gaps": None,
+        # Phantom-bookkeeping drift signal (consumed by operator_attention): a
+        # version with no criteria registers none and references none, so there
+        # is nothing to drift.
+        "phantom_bookkeeping": {
+            "has_drift": False,
+            "phantom_keys": [],
+            "referenced_keys": [],
+            "registered_count": 0,
+            "zero_registered": False,
+        },
     }
     promote_spy.assert_not_called()
 
@@ -24992,6 +25002,12 @@ async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, 
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    # A clean RELEASE_AUDIT_REPORT carries an explicit empty
+                    # findings list — the real agent always emits the key.  A
+                    # report that omits it is the malformed `no_findings_key`
+                    # shape _score_audit scores as UNMEASURED, which hard-blocks
+                    # on `audit_missing` before promotion is ever considered.
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 5,
@@ -25286,6 +25302,10 @@ async def test_overlapping_promote_does_not_double_promote(db_session, mocker):
             logs=json.dumps(
                 {
                     "audit_score": 1.0,
+                    # See the sibling promote test: a clean report must carry an
+                    # explicit empty findings list, else _score_audit reads it as
+                    # UNMEASURED and compute_composite hard-blocks `audit_missing`.
+                    "findings": [],
                     "test_erosion": {
                         "deleted_test_files": [],
                         "assertion_delta": 8,
@@ -33883,55 +33903,6 @@ class TestBlindMergeGradeBlock:
         assert result["sub_scores"]["judged_tier_met_fraction"] == 1.0
         assert result["confidence"] == round(1.0 * (1.0 - JUDGED_TIER_PENALTY_WEIGHT), 4)
 
-    def test_attested_criterion_still_penalizes_when_machine_evidence_exists(self):
-        """Mixed coverage (covered>0, attested>0) gets the penalty but no blocker.
-
-        When at least one criterion carries machine-verified evidence, the
-        uncorroborated_attestation blocker does NOT fire.  The proportional
-        attestation penalty (0.15 * 1/2 = 0.075 → confidence = 0.925) still
-        applies so an attestation-augmented version scores visibly below a
-        fully machine-verified one, but promotion is not hard-blocked.
-        """
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            criterion_coverage={
-                "total": 2,
-                "covered": 1,
-                "attested": 1,
-                "partial": 0,
-                "uncovered": 0,
-            },
-        )
-        assert result["blocker"] is None
-        # penalty = 0.15 * (1/2) = 0.075 → 1.0 * 0.925 == 0.925
-        assert result["confidence"] == 0.925
-        assert result["sub_scores"]["attested_count"] == 1
-
-    def test_compute_composite_attested_penalty_is_proportional(self):
-        """The penalty scales with the attested fraction of total criteria."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            criterion_coverage={
-                "total": 2,
-                "covered": 1,
-                "attested": 1,
-                "partial": 0,
-                "uncovered": 0,
-            },
-        )
-        assert result["blocker"] is None
-        # penalty = 0.15 * (1/2) = 0.075 → 1.0 * 0.925 == 0.925
-        assert result["confidence"] == 0.925
-        assert result["sub_scores"]["attested_count"] == 1
-
     def test_compute_composite_one_unmet_category_among_met_still_blocks(self):
         """One not_met category among otherwise-met categories still hard-blocks,
         regardless of the others' tier."""
@@ -35650,7 +35621,7 @@ async def test_compute_qualification_trigger_state_armed(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_compute_qualification_trigger_state_armed_no_criteria(db_session):
-    """No active criteria (total == 0) is not incomplete → trigger armed."""
+    """No active criteria is not incomplete → trigger armed."""
     from app.release_readiness import compute_qualification_trigger_state
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -35658,8 +35629,8 @@ async def test_compute_qualification_trigger_state_armed_no_criteria(db_session)
     result = await compute_qualification_trigger_state(db_session, project.id)
 
     assert result["trigger_state"] == "armed"
-    assert result["coverage_total"] == 0
-    assert result["coverage_covered"] == 0
+    assert result["open_version_id"] == str(version.id)
+    assert result["reason"] == "armed"
 
 
 @pytest.mark.asyncio
