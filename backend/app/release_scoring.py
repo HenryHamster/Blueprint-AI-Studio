@@ -375,9 +375,16 @@ def evaluate_merge_grade(
     :func:`_cited_test_is_machine_verified`); ``None`` leaves every met category at
     the judged tier (v1 behaviour).
 
+    When ``active_categories`` is supplied but the artifact omits the
+    ``category_verdicts`` key ENTIRELY, the grader cannot produce per-category
+    output (a stale agent image predating the protocol) — that is NOT the same as
+    a grader that assessed the rubric and found it unmet.  Reported as
+    ``status="category_grade_unsupported"`` so the caller can HOLD with an
+    actionable reason instead of fabricating a ``not_met`` verdict per criterion.
+
     Returns ``{status, covers_goal, coverage, biggest_gap, blocked, detail,
     category_verdicts, residual_uncaptured_gap}``. ``status`` is one of ``pass`` |
-    ``fail`` | ``not_applicable`` | ``unparseable``.
+    ``fail`` | ``not_applicable`` | ``unparseable`` | ``category_grade_unsupported``.
     """
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
@@ -437,6 +444,36 @@ def evaluate_merge_grade(
     category_verdicts: list[dict[str, Any]] | None = None
     residual_uncaptured_gap: str | None = None
     if active_categories:
+        if "category_verdicts" not in artifact:
+            # The grader returned a usable HOLISTIC verdict but omitted the
+            # per-category section ENTIRELY — not one key, not an empty list.  A
+            # grader that ACTUALLY assessed the rubric always emits the key (the
+            # prompt marks it REQUIRED), so its total absence means the grader
+            # CANNOT produce per-category output: it predates the per-category
+            # protocol (a stale agent image), not that it looked and found the
+            # criteria unmet.
+            #
+            # Those two are indistinguishable downstream and must NOT be conflated.
+            # `_normalize_category_verdicts` maps "never graded" → `not_met`, so
+            # falling through here would fabricate a `not_met` verdict for EVERY
+            # active criterion, hard-block on `criterion_coverage_incomplete`, and —
+            # because the ledger is sha-KEYED and verdicts never regress — freeze
+            # that fabricated failure against this candidate forever.  It would also
+            # report a reason ("graded, not met") that is simply false.
+            #
+            # Report the real state instead.  The caller routes this to a HOLD, so
+            # it still never promotes over an ungraded acceptance contract (no
+            # fail-open) — it just says WHY, and stops lying about it.
+            return {
+                "status": "category_grade_unsupported",
+                "covers_goal": covers_goal,
+                "coverage": coverage,
+                "biggest_gap": biggest_gap,
+                "blocked": True,
+                "detail": artifact,
+                "category_verdicts": None,
+                "residual_uncaptured_gap": None,
+            }
         category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
             artifact, active_categories, verified_merge_evidence
         )

@@ -261,6 +261,53 @@ class TestEvaluateMergeGradeCategories:
         assert out["category_verdicts"] is None
         assert out["residual_uncaptured_gap"] is None
 
+    def test_grader_omitting_the_key_entirely_is_unsupported_not_not_met(self):
+        """A grader that CANNOT emit per-category output must not be reported as
+        having graded the rubric and found it unmet.
+
+        The old (pre-protocol) agent returns a usable HOLISTIC verdict with no
+        ``category_verdicts`` key at all.  Fabricating a ``not_met`` verdict per
+        active criterion from that would (a) state a false reason — nothing was
+        graded — and (b) freeze the fabrication permanently, because the ledger is
+        sha-keyed and verdicts never regress.  Report the real state so the caller
+        can HOLD with an actionable reason.
+        """
+        art = {"covers_goal": True, "coverage_score": 0.9, "biggest_gap": ""}
+        out = rs.evaluate_merge_grade("ship the widget", art, self._CATS)
+        assert out["status"] == "category_grade_unsupported"
+        # Still fail-CLOSED: an ungraded acceptance contract never promotes.
+        assert out["blocked"] is True
+        # But NO fabricated per-category verdicts — nothing reaches the ledger.
+        assert out["category_verdicts"] is None
+        assert out["residual_uncaptured_gap"] is None
+        # The holistic signal it DID produce is preserved for observability.
+        assert out["covers_goal"] is True
+        assert out["coverage"] == 0.9
+
+    def test_grader_emitting_empty_list_still_grades_every_category_not_met(self):
+        """A CAPABLE grader that emits ``category_verdicts: []`` did answer — it
+        just graded nothing.  That is a real not_met, NOT the unsupported hold:
+        the fail-closed path must survive this change untouched."""
+        art = {
+            "covers_goal": True,
+            "coverage_score": 0.9,
+            "biggest_gap": "",
+            "category_verdicts": [],
+        }
+        out = rs.evaluate_merge_grade("ship the widget", art, self._CATS)
+        assert out["status"] != "category_grade_unsupported"
+        by_key = {v["category_key"]: v for v in out["category_verdicts"]}
+        assert by_key["c-1"]["status"] == "not_met"
+        assert by_key["c-2"]["status"] == "not_met"
+
+    def test_missing_key_without_active_categories_is_not_unsupported(self):
+        """No rubric → the per-category protocol is irrelevant; a grader that omits
+        the key is perfectly fine and the holistic path stands (no false hold)."""
+        art = {"covers_goal": True, "coverage_score": 0.9, "biggest_gap": ""}
+        out = rs.evaluate_merge_grade("ship the widget", art, None)
+        assert out["status"] == "pass"
+        assert out["blocked"] is False
+
     def test_uncited_met_downgraded_to_not_met(self):
         """A ``met`` verdict with no citations is not evidence → not_met."""
         art = {

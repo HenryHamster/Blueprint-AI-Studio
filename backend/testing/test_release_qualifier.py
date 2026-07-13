@@ -10768,12 +10768,24 @@ async def test_category_gate_read_back_exception_fails_closed(db_session, mocker
         },
         version_goal="Ship the widget end to end",
         seed_merge_grade=True,
-        # A fresh grade would normally write the verdicts; force the READ-BACK
-        # path (no fresh verdicts) so the ledger read is what decides the gate.
+        # A CAPABLE grader that graded the criterion MET.  The gate input is still
+        # taken from the ledger READ-BACK (the canonical source, which also covers
+        # the re-drive path), and that read is mocked to raise below — so the block
+        # this test asserts can ONLY come from the unreadable ledger, not from an
+        # unmet verdict.  (Omitting `category_verdicts` entirely would instead mean
+        # the grader CANNOT grade per-category, which is a HOLD, not this gate —
+        # see test_grader_omitting_the_key_entirely_is_unsupported_not_not_met.)
         merge_grade_logs={
             "covers_goal": True,
             "coverage_score": 0.9,
             "biggest_gap": None,
+            "category_verdicts": [
+                {
+                    "category_key": "c-needs-verify",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "widget.py:1"}],
+                }
+            ],
         },
     )
     await _add_version_criterion(

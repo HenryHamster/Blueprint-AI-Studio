@@ -5100,6 +5100,30 @@ async def _finalize_qualification(
                 else "merge_grade_report_unparseable"
             )
             return await _handle_infra_failure(session, version, qual, label)
+        # The grader produced a usable holistic verdict but CANNOT emit the
+        # per-category section (stale agent image predating the per-category
+        # protocol).  HOLD — never promote over an ungraded acceptance contract —
+        # but do NOT fabricate a ``not_met`` verdict for every active criterion:
+        # that would report a false reason ("graded, not met" when nothing was
+        # graded) and, because the ledger is sha-KEYED, freeze the fabricated
+        # failure against this candidate permanently.  Holding leaves the ledger
+        # clean, so the SAME candidate re-qualifies honestly the moment a grader
+        # that supports the protocol reaches the fleet.
+        if merge_grade_cert["status"] == "category_grade_unsupported":
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d candidate %s: the merge-grade agent "
+                "returned no `category_verdicts` section while %d acceptance "
+                "criteria are ACTIVE — the grader predates the per-category "
+                "protocol. HOLDING (not fabricating not_met verdicts). Rebake the "
+                "agent image from a ref carrying agent/src/handlers/merge-grade.ts "
+                "per-category output.",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                len(active_categories or []),
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "merge_grade_grader_lacks_category_verdicts"
+            )
 
     ci_state = ci_resolution.get("state", _CI_RED)
     ci_required = True
