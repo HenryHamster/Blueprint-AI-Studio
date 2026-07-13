@@ -10,11 +10,12 @@ Covers the four new surfaces:
 import asyncio
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import alert_dispatch
@@ -1910,11 +1911,15 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # When no LLM account is resolved, the handler returns 503
-        # with pool_exhausted=True, rolling back the dispatch marker
-        # so the task stays claimable by a future poll cycle.
+        # When no LLM account is resolved, the handler returns 503 with
+        # pool_exhausted=True and never sets the dispatch marker, so the task
+        # stays claimable by a future poll cycle. The body also carries WHY.
         assert resp.status_code == 503
-        assert resp.json() == {"pool_exhausted": True}
+        body = resp.json()
+        assert body["pool_exhausted"] is True
+        assert "reason" in body
+        # A plain no-account outcome is NOT flagged as a credential crash.
+        assert "credential_resolution_failed" not in body
 
         # Task context was NOT stamped since select_llm_runtime_for_task returned None.
         await db_session.refresh(task_instance)
@@ -1926,9 +1931,12 @@ class TestRunnerEndpoints:
         self, client: AsyncClient, db_session
     ):
         """When an unexpected exception occurs during credential resolution,
-        next-task must roll back the dispatch marker (started_at = None) and
-        return 503 with pool_exhausted=True so the task stays claimable rather
-        than being dispatched without credentials."""
+        next-task must leave the dispatch marker unset (started_at = None) and
+        503 so the task stays claimable rather than being dispatched without
+        credentials — AND must say so distinctly (credential_resolution_failed),
+        because a poisoned task that crashes _resolve_provider_materials used to
+        return the identical {"pool_exhausted": true} body as genuine rate
+        limiting, sending operators after the wrong cause."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -1954,17 +1962,33 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # Dispatch must be rolled back: 503 with pool_exhausted=True so the
-        # runner retries rather than receiving a task it can't execute.
+        # 503 so the runner backs off rather than receiving a task it can't
+        # execute — but with a DISTINCT machine-readable cause and the task id,
+        # not the same body a rate-limited pool returns.
         assert resp.status_code == 503
-        assert resp.json() == {"pool_exhausted": True}
+        body = resp.json()
+        assert body["credential_resolution_failed"] is True
+        # The offending task id is NESTED under "error", never at top level: a
+        # top-level "task_id" in a 503 body is one missed check away from an
+        # un-upgraded runner treating an error as a dispatched task.
+        assert body["error"]["code"] == "credential_resolution_failed"
+        assert body["error"]["skipped_task_id"] == str(task_instance.id)
+        assert "task_id" not in body
+        assert "pool connection lost" in body["reason"]
+        # pool_exhausted stays True for back-compat: field-deployed runners gate
+        # their back-off (and capacity-permit release) on exactly that key.
+        assert body["pool_exhausted"] is True
 
-        # Task context was NOT stamped and dispatch marker was rolled back.
+        # Task context was NOT stamped and the dispatch marker was never set.
         await db_session.refresh(task_instance)
         assert task_instance.llm_account_id is None
         assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
         # started_at must be None — task is still claimable.
         assert task_instance.started_at is None
+        # The WHY is stamped on the task itself, so it shows in the admin UI.
+        assert "credential_resolution_failed" in (
+            task_instance.latest_status_message or ""
+        )
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
@@ -2146,7 +2170,11 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert resp.status_code == 503
-            assert resp.json() == {"pool_exhausted": True}
+            body = resp.json()
+            assert body["pool_exhausted"] is True
+            # The 503 carries WHY the pool came up empty, so an operator does not
+            # have to reconstruct it from pool state.
+            assert body["reason"]
 
             # started_at must NOT be set — the task was not dispatched.
             await db_session.refresh(task)
@@ -2154,6 +2182,1273 @@ class TestRunnerEndpoints:
             assert task.status == TaskStatus.PROVISIONING
         finally:
             _clear_pool()
+
+    @staticmethod
+    def _pinned(project_id, runner_id, *, task_type="create", **kwargs) -> Task:
+        """A task pinned to `runner_id` and awaiting a /next-task pull."""
+        return Task(
+            project_id=project_id,
+            payloads=[{"type": task_type}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_id}",
+            context={"runner_target_id": str(runner_id)},
+            **kwargs,
+        )
+
+    @staticmethod
+    def _selection(account_id: str = "acct-002"):
+        from app.max_plan_pool import LLMSelectionResult
+
+        return LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier="opus",
+            account={
+                "id": account_id,
+                "oauth_token": "sk-ant-test-token",
+                "runtime_secret": "sk-ant-test-token",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_task_skips_unroutable_head_and_dispatches_next(
+        self, client: AsyncClient, db_session
+    ):
+        """An unroutable HEAD task must not starve the routable tasks behind it.
+
+        Regression for the 2026-07-11 PROVISIONING pileup: /next-task selected ONE
+        candidate and 503'd if it couldn't get an account. Routing is per-task
+        (task type / model pin / runner CLI inventory), so a single task pinned to
+        a provider in cooldown blocked every other pinned task — and the head is
+        reaper-exempt, so nothing ever cleared it. A healthy runner starved
+        indefinitely behind one bad task.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        head = self._pinned(
+            project.id, runner.id, task_type="fix", created_at=base
+        )
+        follower = self._pinned(
+            project.id,
+            runner.id,
+            task_type="review",
+            created_at=base + timedelta(minutes=1),
+        )
+        db_session.add_all([head, follower])
+        await db_session.commit()
+
+        async def _select(**kwargs):
+            if kwargs["task"].id == head.id:
+                kwargs["failure_reasons"].append(
+                    "deepseek/deepseek-v4: model in rate-limit cooldown (240s left)"
+                )
+                return None
+            return self._selection()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The routable follower dispatches; the unroutable head is skipped, not fatal.
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(follower.id)
+
+        # Head is untouched and still claimable by a later poll...
+        await db_session.refresh(head)
+        assert head.started_at is None
+        assert head.llm_account_id is None
+        assert head.status == TaskStatus.PROVISIONING
+        # ...but now carries the WHY, so it isn't a silent skip.
+        assert "cooldown" in (head.latest_status_message or "")
+        assert head.context["runner_pull_skip"]["code"] == "no_eligible_account"
+
+        # Follower really was dispatched.
+        await db_session.refresh(follower)
+        assert follower.started_at is not None
+        assert follower.llm_account_id == "acct-002"
+
+    @pytest.mark.asyncio
+    async def test_next_task_503_when_every_candidate_unroutable_and_carries_reasons(
+        self, client: AsyncClient, db_session
+    ):
+        """When NO candidate can be routed, 503 — but carrying each task's reason."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        t1 = self._pinned(project.id, runner.id, task_type="fix")
+        t2 = self._pinned(project.id, runner.id, task_type="plan")
+        db_session.add_all([t1, t2])
+        await db_session.commit()
+
+        async def _select(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["pool_exhausted"] is True
+        assert "all accounts at cap" in body["reason"]
+        # Every candidate is accounted for individually, not collapsed into one bit.
+        assert {s["task_id"] for s in body["skipped"]} == {str(t1.id), str(t2.id)}
+        assert all(s["code"] == "no_eligible_account" for s in body["skipped"])
+
+        for task in (t1, t2):
+            await db_session.refresh(task)
+            assert task.started_at is None
+            assert task.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_next_task_honors_priority_over_created_at(
+        self, client: AsyncClient, db_session
+    ):
+        """/next-task must use the SAME ordering as every cloud dispatch path
+        (priority DESC, created_at ASC). Ordering by created_at alone made the
+        pull-based fleet ignore priority entirely: a high-priority task pinned to
+        a runner lost to any older task."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        old_low = self._pinned(
+            project.id, runner.id, created_at=base, priority=10
+        )
+        new_high = self._pinned(
+            project.id,
+            runner.id,
+            created_at=base + timedelta(minutes=5),
+            priority=90,
+        )
+        db_session.add_all([old_low, new_high])
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        # The NEWER, higher-priority task wins over the older low-priority one.
+        assert resp.json()["task_id"] == str(new_high.id)
+
+    # ── Skip escalation: a bounded scan is only safe if skips have a consumer ──
+
+    @staticmethod
+    def _with_skip_marker(task: Task, *, count: int, age_seconds: int = 600) -> Task:
+        """Pre-age a runner_pull_skip marker so the next skip re-stamps it.
+
+        ``age_seconds`` must exceed SKIP_RESTAMP_SECONDS (300) so stamp_skip_reason
+        does not throttle, and SKIP_RESOLVE_TTL_SECONDS (30) so the candidate is
+        actually re-resolved rather than short-circuited.
+        """
+        ctx = dict(task.context or {})
+        stamped = (_utcnow() - timedelta(seconds=age_seconds)).isoformat()
+        ctx["runner_pull_skip"] = {
+            "code": "no_eligible_account",
+            "reason": "all accounts at cap",
+            "at": stamped,
+            "first_at": stamped,
+            "count": count,
+        }
+        task.context = ctx
+        return task
+
+    @pytest.mark.asyncio
+    async def test_repeated_skips_raise_operator_alert(
+        self, client: AsyncClient, db_session
+    ):
+        """A skip counter with NO consumer re-creates the P0 one row further down.
+
+        Nothing unpins, fails or reaps a permanently-unroutable pinned task — the
+        head is reaper-exempt and no sweep clears it. So a bounded candidate scan
+        of N means N+1 poisoned pinned tasks starve the runner exactly as before,
+        SILENTLY. /decline-task already escalates at 3; the pull skip must too.
+        """
+        from app.models import Alert
+        from app.runner_pull_skip import SKIP_ALERT_THRESHOLD, SKIP_ALERT_TITLE
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # One short of the alert threshold: this poll's skip crosses it.
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_ALERT_THRESHOLD - 1
+        )
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        assert poisoned.context["runner_pull_skip"]["count"] == SKIP_ALERT_THRESHOLD
+        # Below the unpin threshold, so the task is still pinned — but the operator
+        # now KNOWS, instead of the counter incrementing into the void.
+        assert poisoned.status == TaskStatus.PROVISIONING
+
+        alerts = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == poisoned.id, Alert.title == SKIP_ALERT_TITLE
+                )
+            )
+        ).scalars().all()
+        assert len(alerts) == 1, "repeated skips must escalate to an operator"
+        assert "all accounts at cap" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_skip_past_threshold_unpins_task_back_to_queued(
+        self, client: AsyncClient, db_session
+    ):
+        """Past the unpin threshold the task returns to QUEUED for re-dispatch.
+
+        This is what makes the poisoned set SELF-DRAINING. Without it, enough
+        permanently-unroutable pinned tasks permanently fill the candidate scan
+        window and the original head-of-line starvation returns — the scan bound
+        would only have MOVED the boundary, not removed it.
+        """
+        from app.runner_pull_skip import SKIP_UNPIN_THRESHOLD
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_UNPIN_THRESHOLD - 1
+        )
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        # Back to QUEUED, pin cleared — the orchestrator will re-dispatch it
+        # (other hardware, or cloud), and it no longer occupies a scan slot.
+        assert poisoned.status == TaskStatus.QUEUED
+        assert poisoned.vm_instance_id is None
+        assert "runner_target_id" not in (poisoned.context or {})
+        # The marker is DROPPED, not zeroed: a zeroed marker would leave seen_at
+        # recent, so a re-pin to the same runner inside the TTL would short-circuit
+        # a task we specifically want re-resolved on arrival — and has_skip_marker
+        # would keep deprioritising it in the resolve order forever.
+        assert "runner_pull_skip" not in (poisoned.context or {})
+        # The audit trail survives in its own key, where it cannot make a drained
+        # task look "already examined".
+        assert poisoned.context["runner_pull_unpins"] == 1
+
+    @pytest.mark.asyncio
+    async def test_fresh_skip_marker_short_circuits_credential_resolution(
+        self, client: AsyncClient, db_session
+    ):
+        """A candidate proved unroutable seconds ago is NOT re-resolved.
+
+        Credential resolution does a Project roundtrip AND acquires the global
+        _max_plan_pool_lock. Re-running it for every pinned candidate on every
+        poll of every runner — which is exactly what a batch scan would do —
+        multiplies pool-lock traffic precisely during the pool-exhaustion storm
+        this endpoint exists to survive. The marker we already write is read back
+        to suppress the repeat work, and the cached WHY is still reported.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Marker is FRESH (5s old, inside SKIP_RESOLVE_TTL_SECONDS=30).
+        fresh = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=1, age_seconds=5
+        )
+        db_session.add(fresh)
+        await db_session.commit()
+
+        select_mock = AsyncMock(return_value=None)
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        select_mock.assert_not_awaited()  # the pool lock was never taken
+        # ...and the runner still learns WHY, from the cached marker.
+        body = resp.json()
+        assert body["skipped"][0]["code"] == "no_eligible_account"
+        assert "all accounts at cap" in body["reason"]
+
+    @pytest.mark.asyncio
+    async def test_abandoned_resolution_refunds_daily_quota_not_just_active_slot(
+        self, client: AsyncClient, db_session
+    ):
+        """A dispatch that never happened must not burn a unit of DAILY quota.
+
+        `select_max_plan_account` pre-increments BOTH `active_tasks` AND
+        `daily_task_count`, and `_account_at_cap` gates on
+        `daily_task_count >= daily_task_cap`. Releasing only the active slot leaves
+        the daily counter permanently incremented, so every credential-resolution
+        crash and every lost row-lock race silently eats the account's day. The
+        canonical peer (orchestrator_provision) passes revert_daily_task_count=True.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id)
+        db_session.add(task)
+        await db_session.commit()
+
+        release_mock = AsyncMock()
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ), patch(
+            # Materials-building blows up AFTER an account was selected (and thus
+            # after both counters were pre-incremented).
+            "app.compute_manifest._resolve_provider_materials",
+            new=MagicMock(side_effect=RuntimeError("boom")),
+        ), patch(
+            "app.max_plan_pool.release_max_plan_account", new=release_mock
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        release_mock.assert_awaited_once()
+        assert release_mock.await_args.kwargs.get("revert_daily_task_count") is True, (
+            "the reserved account was released without refunding daily_task_count — "
+            "a dispatch that never happened just burned a unit of daily quota"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_row_lock_race_refunds_daily_quota(
+        self, client: AsyncClient, db_session
+    ):
+        """The OTHER release site: a candidate resolved but lost the winner row lock.
+
+        `test_abandoned_resolution_refunds_daily_quota...` only covers the exception
+        path inside _resolve_pool_credentials_for_dispatch. This covers
+        _release_dispatch_account — the lost-race refund — which stayed green when
+        its kwarg was reverted, i.e. it was untested and a refactor could drop it
+        silently. Both counters are pre-incremented by the selector, so a dispatch
+        that never happened must refund BOTH.
+
+        The race is forced deterministically: the account selection itself marks the
+        task dispatched (as a concurrent poll would), so the winner re-lock — which
+        re-checks `started_at IS NULL` — finds nothing.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id)
+        db_session.add(task)
+        await db_session.commit()
+
+        async def _select_and_steal(**kwargs):
+            # A concurrent poll wins the row between our unlocked read and our
+            # re-lock: started_at is set, so the claim guard excludes it.
+            kwargs["task"].started_at = _utcnow()
+            return self._selection()
+
+        release_mock = AsyncMock()
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select_and_steal),
+        ), patch(
+            "app.max_plan_pool.release_max_plan_account", new=release_mock
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # We resolved an account but never dispatched it — so it must be handed back.
+        assert resp.status_code == 503
+        release_mock.assert_awaited_once()
+        assert release_mock.await_args.kwargs.get("revert_daily_task_count") is True, (
+            "a candidate that lost the winner row-lock race released its active "
+            "slot but NOT its daily_task_count — every lost race permanently burns "
+            "a unit of the account's daily quota"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_dispatch_clears_the_skip_marker(
+        self, client: AsyncClient, db_session
+    ):
+        """The marker must not outlive its episode.
+
+        Left in place it is immortal: `count` persists in task.context across
+        SEPARATE episodes, so a task that hits a transient cooldown on five
+        different occasions — days apart, each recovering on its own — accumulates
+        count=5 and is eventually UNPINNED for no reason. `has_skip_marker` would
+        also stay True forever, permanently deprioritising a healthy task.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Carries a stale marker from an earlier cooldown that has since lifted.
+        task = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=2, age_seconds=600
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        assert "runner_pull_skip" not in (task.context or {}), (
+            "the skip marker survived a successful dispatch — its count will carry "
+            "into unrelated future episodes and eventually unpin a healthy task"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skip_marker_from_another_runner_is_not_trusted(
+        self, client: AsyncClient, db_session
+    ):
+        """Routability is RUNNER-dependent, so a marker is only valid for its author.
+
+        `runner_available_clis` feeds select_llm_runtime_for_task, so runner A's
+        "unroutable" says nothing about runner B. A task unpinned from A and
+        re-pinned to B carries A's marker — and if B trusted it, B would
+        short-circuit (and refuse to run) a task it is perfectly capable of running.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # A FRESH marker (well inside the TTL) — but written by a different runner.
+        task = self._pinned(project.id, runner.id)
+        ctx = dict(task.context or {})
+        ctx["runner_pull_skip"] = {
+            "code": "no_eligible_account",
+            "reason": "runner A has no CLI for this provider",
+            "runner_id": str(uuid.uuid4()),  # NOT this runner
+            "seen_at": _utcnow().isoformat(),
+            "at": _utcnow().isoformat(),
+            "first_at": _utcnow().isoformat(),
+            "count": 1,
+        }
+        task.context = ctx
+        db_session.add(task)
+        await db_session.commit()
+
+        select_mock = AsyncMock(return_value=self._selection())
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # This runner must resolve for ITSELF, not inherit the other runner's verdict.
+        select_mock.assert_awaited_once()
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_second_poll_short_circuits_a_task_it_just_resolved(
+        self, client: AsyncClient, db_session
+    ):
+        """Two REAL polls: the second must not re-resolve what the first proved bad.
+
+        This is the load-bearing claim of the whole batch scan — "an examined-and-
+        failed candidate carries a fresh marker, so the next poll short-circuits it
+        and spends its budget further down the list". If it is false, the resolve
+        budget is consumed re-proving the same head candidates forever and the P0 is
+        merely re-bounded from 1 to `resolve_attempts`, not removed.
+
+        The state that breaks it is the THROTTLED re-stamp: `stamp_skip_reason` only
+        writes its timestamp when it also increments `count` (once per 300s), but
+        freshness is judged against that same timestamp on a 30s TTL — and the runner
+        backs its poll interval off to exactly 30s on every 503. So the marker is
+        stale at exactly the poll cadence and the short-circuit never fires. A test
+        that hand-writes a 5s-old marker cannot see this: that state only exists in
+        the 30s after a restamp.
+
+        Setup reproduces it: BOTH tasks already carry a marker OLDER than the resolve
+        TTL but YOUNGER than the restamp window, so the next stamp takes the
+        THROTTLED path (the one that never refreshed the timestamp). T2's model has
+        since recovered, so it is routable now. Budget is 1, so if poll 2 wastes it
+        re-resolving T1, the routable T2 is never examined and the runner starves.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        # T1: still unroutable; skipped 100s ago (> TTL=90, < restamp=300).
+        t1 = self._with_skip_marker(
+            self._pinned(project.id, runner.id, created_at=base),
+            count=1,
+            age_seconds=100,
+        )
+        # T2: skipped at the same time, but its model has since recovered — it is
+        # routable now. Same stale-marker class as T1, so ordering between them is
+        # by priority/created_at, not by examined-vs-unexamined.
+        t2 = self._with_skip_marker(
+            self._pinned(
+                project.id, runner.id, created_at=base + timedelta(seconds=1)
+            ),
+            count=1,
+            age_seconds=100,
+        )
+        db_session.add_all([t1, t2])
+        await db_session.commit()
+
+        resolved_ids: list[str] = []
+
+        async def _select(**kwargs):
+            resolved_ids.append(str(kwargs["task"].id))
+            if kwargs["task"].id == t1.id:
+                kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+                return None
+            return self._selection()
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 1,  # one resolution per poll
+        }
+
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            first = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            # Poll 1 spends its single attempt on T1, fails, and marks it.
+            assert first.status_code == 503
+            assert resolved_ids == [str(t1.id)]
+
+            second = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Poll 2 MUST short-circuit T1 on its fresh marker and spend its budget on
+        # T2 — which is routable, so the runner finally gets work. If T1 is
+        # re-resolved instead, T2 is never examined and the runner starves.
+        assert str(t1.id) not in resolved_ids[1:], (
+            "poll 2 re-resolved a task poll 1 had just proved unroutable — the "
+            "skip short-circuit is dead and the resolve budget is being burned "
+            "re-proving the same head candidates"
+        )
+        assert second.status_code == 200
+        assert second.json()["task_id"] == str(t2.id)
+
+    @pytest.mark.asyncio
+    async def test_unexamined_candidates_win_the_budget_over_stale_reprobes(
+        self, client: AsyncClient, db_session
+    ):
+        """The scan window must SLIDE, not oscillate over the head.
+
+        Even with freshness fixed, markers expire (TTL). If an expired head
+        candidate outranks a never-examined one for the resolve budget, the poll
+        cycles re-probing T1..T3 and never reaches the routable task deeper in the
+        scan — starvation returns, just at a larger bound. So a candidate with NO
+        marker (never examined) takes the budget before a candidate whose marker
+        merely went stale.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        # Two already-examined-but-STALE unroutable heads (marker older than TTL).
+        stale = [
+            self._with_skip_marker(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                ),
+                count=1,
+                age_seconds=600,
+            )
+            for i in range(2)
+        ]
+        # A never-examined routable task behind them.
+        fresh_routable = self._pinned(
+            project.id, runner.id, created_at=base + timedelta(seconds=10)
+        )
+        db_session.add_all([*stale, fresh_routable])
+        await db_session.commit()
+
+        stale_ids = {str(s.id) for s in stale}
+
+        async def _select(**kwargs):
+            if str(kwargs["task"].id) in stale_ids:
+                kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+                return None
+            return self._selection()
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 1,  # budget of ONE
+        }
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_select),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # The single attempt went to the NEVER-EXAMINED task, not to re-proving a
+        # stale head — so the runner dispatches instead of starving.
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(fresh_routable.id)
+
+    @pytest.mark.asyncio
+    async def test_undatable_marker_never_500s_the_dispatch_endpoint(
+        self, client: AsyncClient, db_session
+    ):
+        """A marker with no parseable `seen_at` must SORT FIRST, not crash the poll.
+
+        `skip_seen_at` is used directly as a `sorted()` key over the stale group. If
+        its "cannot date this marker" sentinel is tz-AWARE while every real marker
+        parses NAIVE (`_utcnow()` / TIMESTAMP WITHOUT TIME ZONE), then the moment one
+        undatable marker shares the stale group with one datable marker:
+
+            TypeError: can't compare offset-naive and offset-aware datetimes
+
+        — an unhandled 500 on the pull fleet's dispatch endpoint, which is NOT the
+        503 the runner knows how to back off from.
+
+        The state is explicitly legal: `skip_marker_is_fresh` falls back to `at` for
+        markers predating `seen_at`, the helper below writes exactly that shape, and
+        operators hand-PATCH `task.context` during the very incidents this endpoint
+        exists to survive. It only bites at scale — the undatable marker must survive
+        long enough to MEET a stale datable one, which needs more never-examined
+        candidates ahead of it than the resolve budget clears. So: the default scan.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=30)
+        # One UNDATABLE marker (no `seen_at`, and an `at` that will not parse)...
+        undatable = self._pinned(project.id, runner.id, created_at=base)
+        undatable.context = {
+            **(undatable.context or {}),
+            "runner_pull_skip": {
+                "code": "no_eligible_account",
+                "reason": "hand-patched by an operator mid-incident",
+                "at": "not-a-timestamp",
+                "count": 1,
+            },
+        }
+        db_session.add(undatable)
+        # ...alongside enough datable candidates that the two must meet in the
+        # stale group (more than the ~9 the resolve budget clears per rotation).
+        for i in range(1, 25):
+            db_session.add(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                )
+            )
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        clock = {"t": _utcnow()}
+
+        def _now():
+            return clock["t"]
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},  # DEFAULT scan/attempts
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ), patch("app.routers.runner._utcnow", new=_now), patch(
+            "app.runner_pull_skip._utcnow", new=_now
+        ):
+            for _poll in range(8):
+                clock["t"] = clock["t"] + timedelta(seconds=30)
+                resp = await client.post(
+                    "/api/runner/next-task",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert resp.status_code == 503, (
+                    f"/next-task returned {resp.status_code}, not 503 — an undatable "
+                    "skip marker crashed the sort. A 500 is not something the runner "
+                    "can back off from; this takes the pull fleet down."
+                )
+
+    @pytest.mark.asyncio
+    async def test_steady_state_rotation_never_freezes_a_candidate(
+        self, client: AsyncClient, db_session
+    ):
+        """STEADY STATE, many polls: no candidate may be examined once and abandoned.
+
+        Unexamined-first fixes the initial SLIDE. But once every candidate carries a
+        marker, the stale group IS the whole list — and if that group is drained in
+        PRIORITY order it resonates with the TTL: exactly `attempts` markers come due
+        per poll, so the rotation locks onto the first `attempts * TTL/poll` = 9
+        candidates forever. Candidates 10+ are examined ONCE and frozen:
+
+          * never re-probed  => if one becomes routable it is NEVER dispatched;
+          * `count` frozen at 1 => never reaches the alert (3) or unpin (5) threshold
+            => never alerts, never drains, holds a candidate slot permanently.
+
+        That is verbatim the failure the escalation exists to close: N is bounded by
+        the scan (25), but the EFFECTIVE N would be 9. A 3-candidate single-poll test
+        only ever exercises the slide phase and cannot see this — so this one runs the
+        real endpoint over many polls at the runner's real 30s backoff cadence, on a
+        virtual clock, and asserts that every candidate keeps making progress.
+        """
+        from app.runner_pull_skip import skip_count
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=30)
+        tasks = [
+            self._pinned(
+                project.id, runner.id, created_at=base + timedelta(seconds=i)
+            )
+            for i in range(16)  # > the 9-candidate resonance bound
+        ]
+        db_session.add_all(tasks)
+        await db_session.commit()
+        task_ids = [t.id for t in tasks]
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        cfg = {
+            "provider_selection_mode": "exclusive",
+            "runner_next_task_resolve_attempts": 3,
+            "runner_next_task_candidate_scan": 25,
+        }
+
+        # Virtual clock: the runner backs off to 30s on every 503, so that is the
+        # real steady-state cadence. 24 polls = 720s, long enough for the escalation
+        # clock (300s) to advance every candidate that is actually being re-probed,
+        # and short enough that nothing reaches the unpin threshold (5) yet.
+        clock = {"t": _utcnow()}
+
+        def _now():
+            return clock["t"]
+
+        with patch("app.shared_state.runtime_config", new=cfg), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ), patch("app.routers.runner._utcnow", new=_now), patch(
+            "app.runner_pull_skip._utcnow", new=_now
+        ):
+            for poll in range(24):
+                clock["t"] = clock["t"] + timedelta(seconds=30)
+                resp = await client.post(
+                    "/api/runner/next-task",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert resp.status_code == 503
+
+        # Every candidate must still be making progress: re-probed often enough that
+        # its escalation counter advanced past the first sighting. A candidate stuck
+        # at count==1 after 24 polls was examined once and abandoned — it will never
+        # dispatch, never alert, and never drain.
+        frozen = []
+        for tid in task_ids:
+            row = (
+                await db_session.execute(select(Task).where(Task.id == tid))
+            ).scalars().first()
+            await db_session.refresh(row)
+            if row.status == TaskStatus.PROVISIONING and skip_count(row) <= 1:
+                frozen.append(str(tid))
+
+        assert not frozen, (
+            f"{len(frozen)} of {len(task_ids)} candidates were examined once and "
+            f"then FROZEN — never re-probed, never escalated, never drained. The "
+            f"stale-group rotation is resonating with the TTL and has locked onto "
+            f"the head of the list: {frozen}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolution_attempts_are_capped_per_poll(
+        self, client: AsyncClient, db_session
+    ):
+        """One poll runs at most `runner_next_task_resolve_attempts` resolutions.
+
+        The batch scan must not turn one poll into N credential resolutions (N
+        global-pool-lock acquisitions). The budget is spent, the examined
+        candidates get fresh skip markers, and the NEXT poll's budget slides down
+        the list — so work stays bounded without head-of-line blocking returning.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        base = _utcnow() - timedelta(minutes=10)
+        for i in range(6):
+            db_session.add(
+                self._pinned(
+                    project.id, runner.id, created_at=base + timedelta(seconds=i)
+                )
+            )
+        await db_session.commit()
+
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append("anthropic/opus: all accounts at cap")
+            return None
+
+        select_mock = AsyncMock(side_effect=_no_account)
+        with patch(
+            "app.shared_state.runtime_config",
+            new={
+                "provider_selection_mode": "exclusive",
+                "runner_next_task_resolve_attempts": 2,
+            },
+        ), patch("app.max_plan_pool.select_llm_runtime_for_task", new=select_mock):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+        # 6 candidates pinned, but only the configured budget was resolved.
+        assert select_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_decline_records_reason_and_counter(
+        self, client: AsyncClient, db_session
+    ):
+        """A decline must be RECORDED (reason + per-runner counter), not just logged.
+
+        Without a record the dispatcher has nothing to exclude on, and since
+        `_select_eligible_runner`'s tiebreak (`r.id.int ^ dispatch_seed`) is stable
+        per task, it deterministically re-picks the runner that just declined —
+        pin → pull → decline, forever.
+        """
+        from app.runner_decline import recently_declined_runner_ids
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id, started_at=_utcnow())
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task.id), "reason": "no bwrap: fail-closed"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["decline_count"] == 1
+
+        await db_session.refresh(task)
+        # Released back to QUEUED as before...
+        assert task.status == TaskStatus.QUEUED
+        assert "runner_target_id" not in (task.context or {})
+        # ...but now the WHY and WHO are persisted.
+        record = task.context["declined_by"][str(runner.id)]
+        assert record["count"] == 1
+        assert record["reason"] == "no bwrap: fail-closed"
+        assert "no bwrap" in (task.latest_status_message or "")
+
+        # And the dispatcher will now exclude this runner for THIS task.
+        assert recently_declined_runner_ids(task) == {str(runner.id)}
+
+    @pytest.mark.asyncio
+    async def test_declining_runner_not_reselected_and_escalates(
+        self, client: AsyncClient, db_session
+    ):
+        """The declining runner is excluded from re-selection for that task, and
+        crossing the decline threshold raises an operator alert carrying the reason."""
+        from app.runner_decline import (
+            DECLINE_ESCALATION_THRESHOLD,
+            recently_declined_runner_ids,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = self._pinned(project.id, runner.id, started_at=_utcnow())
+        db_session.add(task)
+        await db_session.commit()
+
+        for i in range(DECLINE_ESCALATION_THRESHOLD):
+            # Re-pin as the dispatch loop would, then decline again. Refresh
+            # first: the endpoint commits on its own session, so our copy is
+            # stale and re-assigning the same in-memory values would emit no
+            # UPDATE at all.
+            await db_session.refresh(task)
+            task.status = TaskStatus.PROVISIONING
+            task.vm_instance_id = f"runner:{runner.id}"
+            ctx = dict(task.context or {})
+            ctx["runner_target_id"] = str(runner.id)
+            task.context = ctx
+            flag_modified(task, "context")
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/decline-task",
+                json={"task_id": str(task.id), "reason": "docker is read-only"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["decline_count"] == i + 1
+
+        await db_session.refresh(task)
+
+        # 1. The declining runner is excluded, so `_select_eligible_runner` — whose
+        #    tiebreak would otherwise re-pick it every single time — returns None
+        #    rather than looping the task straight back to the same box.
+        snap = orch.RunnerDispatchSnapshot(
+            id=runner.id, project_id=project.id, capabilities={"task_types": "all"}
+        )
+        cache = {project.id: [snap]}
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project.id,
+                "create",
+                None,
+                {},
+                dispatch_seed=task.id.int,
+                declined_runner_ids=recently_declined_runner_ids(task),
+            )
+            is None
+        )
+        # Sanity: without the exclusion the SAME runner is picked right back —
+        # this is the livelock the exclusion breaks.
+        assert (
+            orch._select_eligible_runner(
+                cache, project.id, "create", None, {}, dispatch_seed=task.id.int
+            )
+            is snap
+        )
+
+        # 2. The operator is told, with the runner's own reason — not left with a
+        #    task silently cycling forever.
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1  # deduplicated across repeated declines
+        assert "docker is read-only" in alerts[0].message
+
+    def test_decline_exclusion_expires_before_strategic_hold_forces_cloud(self):
+        """The exclusion window MUST be shorter than the Strategic hold timeout.
+
+        On the single-runner Strategic fleet the decliner is the ONLY
+        Strategic-capable runner, so excluding it empties the candidate set,
+        `_select_eligible_runner` returns None, `_hold_strategic_local_runner_task`
+        parks the task — and at `strategic_local_hold_timeout_seconds` (default
+        900s) `_fail_stale_local_runner_holds` clears the local-required pin and
+        FORCES CLOUD FALLBACK.
+
+        If the exclusion outlived that timeout (it was 1800s), one transient
+        decline — a Popen spawn failure — would DETERMINISTICALLY evict a Resident
+        Strategic Agent task off local execution, defeating continuous-local mode:
+        the runner could not become eligible again until 15 min after the task had
+        already been shipped to the cloud.
+        """
+        from app.runner_decline import DECLINE_EXCLUSION_SECONDS
+
+        hold_timeout = orch._strategic_local_hold_timeout_seconds()
+        assert hold_timeout == 900  # documented default; the bound below is vs this
+        assert DECLINE_EXCLUSION_SECONDS < hold_timeout, (
+            "a decline exclusion that outlives the Strategic hold timeout evicts "
+            "the Resident Strategic Agent to cloud on a single transient decline"
+        )
+
+    def test_strategic_decline_exclusion_waived_rather_than_emptying_pool(self):
+        """A transient decline must not cost a Strategic task its local execution.
+
+        For a NORMAL task, emptying the candidate set is the graceful exit — the
+        task falls through to cloud dispatch. For a local-required Strategic task
+        it is not: an empty set parks the task and the 900s sweep evicts it to
+        cloud. So while the declines still look transient we re-pick the decliner
+        instead of emptying the pool — but ONLY while they look transient, and
+        ONLY when no other hardware exists.
+        """
+        from app.runner_decline import (
+            DECLINE_ESCALATION_THRESHOLD,
+            decline_exclusion_is_advisory,
+        )
+
+        project_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+        snap = orch.RunnerDispatchSnapshot(
+            id=runner_id, project_id=project_id, capabilities={"task_types": "all"}
+        )
+        cache = {project_id: [snap]}
+        seed = uuid.uuid4().int
+
+        def _task_with_declines(n: int) -> Task:
+            at = _utcnow().isoformat()
+            return Task(
+                project_id=project_id,
+                payloads=[{"type": "design_doc_update"}],  # a STRATEGIC task type
+                status=TaskStatus.QUEUED,
+                context={
+                    "declined_by": {
+                        str(runner_id): {"count": n, "at": at, "reason": "spawn failed"}
+                    }
+                },
+            )
+
+        # 1. ONE transient decline on a single-runner Strategic fleet: excluding
+        #    the decliner would empty the pool, so the waiver keeps it. The task
+        #    retries locally instead of being handed to the cloud.
+        transient = _task_with_declines(1)
+        assert decline_exclusion_is_advisory(transient, "design_doc_update") is True
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project_id,
+                "design_doc_update",
+                None,
+                {},
+                dispatch_seed=seed,
+                declined_runner_ids={str(runner_id)},
+                declined_exclusion_advisory=True,
+            )
+            is snap
+        )
+
+        # 2. Past the escalation threshold the decline is clearly NOT transient:
+        #    the waiver stops, the pool empties, and the ordinary hold →
+        #    cloud-fallback safety valve runs. Without this bound a persistently
+        #    incapable single-runner fleet would livelock forever.
+        persistent = _task_with_declines(DECLINE_ESCALATION_THRESHOLD)
+        assert decline_exclusion_is_advisory(persistent, "design_doc_update") is False
+        assert (
+            orch._select_eligible_runner(
+                cache,
+                project_id,
+                "design_doc_update",
+                None,
+                {},
+                dispatch_seed=seed,
+                declined_runner_ids={str(runner_id)},
+                declined_exclusion_advisory=False,
+            )
+            is None
+        )
+
+        # 3. A NON-Strategic task never gets the waiver — emptying the pool is the
+        #    correct outcome there (it falls through to cloud dispatch).
+        normal = _task_with_declines(1)
+        normal.payloads = [{"type": "create"}]
+        assert decline_exclusion_is_advisory(normal, "create") is False
+
+    def test_strategic_waiver_survives_an_ineligible_second_runner(self):
+        """The waiver must key on ELIGIBILITY, not on a runner ROW merely existing.
+
+        This is the LIVE Blueprint topology: a Strategic-capable laptop plus dgx-1,
+        which does NOT accept `design_doc_update`. If the waiver asks "did any other
+        candidate row survive the exclusion?", dgx-1 answers yes — so the exclusion
+        is applied, dgx-1 then falls out on the task-type gate, `eligible` is empty,
+        and the Resident Strategic Agent is parked and evicted to cloud by the 900s
+        hold sweep on ONE transient decline. Precisely the eviction the waiver was
+        written to prevent, defeated by a runner that could never have run the task.
+
+        A single-runner cache cannot see this bug; it needs a second runner that
+        exists but is incapable.
+        """
+        project_id = uuid.uuid4()
+        laptop = uuid.uuid4()
+        dgx = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=laptop,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                # Real dgx-1 shape: a compute box that does not take Strategic work.
+                orch.RunnerDispatchSnapshot(
+                    id=dgx,
+                    project_id=project_id,
+                    capabilities={"task_types": ["compute_experiment"]},
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(laptop)},
+            declined_exclusion_advisory=True,
+        )
+        assert chosen is not None, (
+            "the Strategic task was handed to nobody because an INELIGIBLE runner "
+            "row 'survived' the exclusion — it will now be evicted to cloud"
+        )
+        assert chosen.id == laptop
+
+    def test_strategic_waiver_survives_a_busy_second_runner(self):
+        """Same defect, other flavour: the second runner is capable but AT CAPACITY.
+
+        A merely BUSY runner must not make the exclusion bite either — it cannot
+        take the task this cycle, so the Strategic task would again be parked and
+        evicted rather than retried on the (recovered) decliner.
+        """
+        project_id = uuid.uuid4()
+        laptop = uuid.uuid4()
+        busy = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=laptop,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                orch.RunnerDispatchSnapshot(
+                    id=busy,
+                    project_id=project_id,
+                    capabilities={
+                        "task_types": "all",
+                        "max_concurrent": 1,
+                        # Authoritative per-cycle load (see _runner_active_task_count).
+                        "_active_agent_task_count": 1,
+                    },
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(laptop)},
+            declined_exclusion_advisory=True,
+        )
+        assert chosen is not None
+        assert chosen.id == laptop
+
+    def test_strategic_waiver_never_overrides_available_other_hardware(self):
+        """The waiver applies ONLY when the exclusion would empty the pool.
+
+        Whenever other hardware exists the decline exclusion is honoured
+        unconditionally — the whole point is to move the task OFF the box that
+        just said no.
+        """
+        project_id = uuid.uuid4()
+        decliner = uuid.uuid4()
+        healthy = uuid.uuid4()
+        cache = {
+            project_id: [
+                orch.RunnerDispatchSnapshot(
+                    id=decliner,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+                orch.RunnerDispatchSnapshot(
+                    id=healthy,
+                    project_id=project_id,
+                    capabilities={"task_types": "all"},
+                ),
+            ]
+        }
+        chosen = orch._select_eligible_runner(
+            cache,
+            project_id,
+            "design_doc_update",
+            None,
+            {},
+            dispatch_seed=uuid.uuid4().int,
+            declined_runner_ids={str(decliner)},
+            declined_exclusion_advisory=True,  # advisory, but the set is NOT empty
+        )
+        assert chosen is not None
+        assert chosen.id == healthy
 
     @pytest.mark.asyncio
     async def test_decline_task_releases_back_to_queued(
@@ -2199,7 +3494,11 @@ class TestRunnerEndpoints:
             headers={"Authorization": f"Bearer {t1}"},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
+        # ok:True as before; decline_count is an additive field (see the decline
+        # bookkeeping that breaks the pin -> pull -> decline livelock).
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["decline_count"] == 1
 
         await db_session.refresh(task1)
         assert task1.status == TaskStatus.QUEUED

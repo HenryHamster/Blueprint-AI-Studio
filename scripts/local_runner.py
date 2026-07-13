@@ -1457,7 +1457,12 @@ def _release_capacity(capacity: threading.Semaphore | None) -> None:
         capacity.release()
 
 
-def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
+def _notify_decline(
+    orchestrator_url: str,
+    token: str,
+    task_id: str,
+    reason: str | None = None,
+) -> None:
     """Best-effort: tell the orchestrator this runner declined a claimed task.
 
     When the runner claims a task from /next-task but then declines it at the
@@ -1466,10 +1471,18 @@ def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
     the task strands until the stale-runner sweep fires when THIS runner goes
     offline — which may be hours or never.  This call releases the pin so the
     dispatch loop can re-pin it next cycle.
+
+    ``reason`` carries WHY we declined (the sandbox/spawn failure string we
+    already print locally).  The orchestrator records it on the task and excludes
+    this runner from re-selection, which is what stops the pin→decline loop; it
+    is optional purely so an older orchestrator still accepts the call.
     """
     try:
         url = f"{orchestrator_url}/api/runner/decline-task"
-        _post(url, token, {"task_id": task_id})
+        body = {"task_id": task_id}
+        if reason:
+            body["reason"] = reason[:500]
+        _post(url, token, body)
     except Exception:
         pass  # best-effort — the stale-runner sweep is the safety net
 
@@ -4188,8 +4201,16 @@ def _spawn_agent_task(
     lock: threading.Lock,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
+    decline_reason_out: list[str] | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
+
+    On a False (declined / could-not-spawn) return, the WHY is appended to
+    ``decline_reason_out`` when the caller supplies a list, so it can be sent to
+    ``/api/runner/decline-task`` instead of being printed and dropped — an
+    orchestrator that cannot see the reason cannot stop re-pinning the task to
+    the very runner that keeps rejecting it. An out-param (rather than a richer
+    return type) keeps the ``bool`` contract every existing caller relies on.
 
     Routes the per-task backend choice through ``iso.decide_agent_backend`` with the
     task_type + agent_image so only READ-ONLY task types get the docker backend when
@@ -4206,14 +4227,21 @@ def _spawn_agent_task(
     backend = iso.decide_agent_backend(
         caps, present, task_type=task_type, agent_image=agent_image
     )
-    if backend == iso.DECLINE:
-        # No isolation boundary for THIS task type on this host (fail-closed).
-        reason = iso.agent_decline_reason(caps, present) or "no agent sandbox"
+    def _decline(reason: str) -> bool:
+        """Print the reason locally AND hand it back to the caller (→ orchestrator)."""
         print(
             f"[runner] DECLINED agent task {task_id} (fail-closed): {reason}",
             flush=True,
         )
+        if decline_reason_out is not None:
+            decline_reason_out.append(reason)
         return False
+
+    if backend == iso.DECLINE:
+        # No isolation boundary for THIS task type on this host (fail-closed).
+        return _decline(
+            iso.agent_decline_reason(caps, present) or "no agent sandbox"
+        )
     # The bwrap backend needs the HOST agent dist; the docker backend carries the
     # agent in the image, so a missing host binary is only fatal off the docker path.
     if backend != iso.BACKEND_DOCKER and not agent_binary:
@@ -4224,6 +4252,11 @@ def _spawn_agent_task(
             "auto-detection). Compute jobs are unaffected.",
             flush=True,
         )
+        if decline_reason_out is not None:
+            decline_reason_out.append(
+                "agent binary unavailable on this runner (bwrap backend needs the "
+                "host agent dist)"
+            )
         return False
 
     # Only hand the image to the planner when THIS task's decision is docker; a
@@ -4283,11 +4316,7 @@ def _spawn_agent_task(
         agent_image=plan_image,
     )
     if plan.declined:
-        print(
-            f"[runner] DECLINED agent task {task_id} (fail-closed): {plan.decline_reason}",
-            flush=True,
-        )
-        return False
+        return _decline(plan.decline_reason or "sandbox plan declined")
 
     # Open a per-task log file to persist the agent's stdout/stderr output
     # on disk (best-effort - a write failure must never prevent the task from
@@ -4316,6 +4345,10 @@ def _spawn_agent_task(
             except Exception:
                 pass
         print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
+        if decline_reason_out is not None:
+            decline_reason_out.append(
+                f"agent process spawn failed: {type(exc).__name__}: {exc}"[:500]
+            )
         return False
 
     # Reader thread: tee the agent's stdout to both the per-task log file and
@@ -4781,13 +4814,32 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
-            if status == 503 and isinstance(body, dict) and body.get("pool_exhausted"):
+            # Any 503 means "nothing dispatchable, back off" — match on the STATUS,
+            # not on a body key, so a new orchestrator reason shape can never make
+            # this branch miss and leak the capacity permit acquired above.
+            if status == 503 and isinstance(body, dict):
                 _release_capacity(agent_capacity)
-                print(
-                    "[runner] POOL EXHAUSTED — no LLM account available; "
-                    "task stays claimable for a future poll cycle",
-                    flush=True,
-                )
+                reason = body.get("reason") or "no reason reported by orchestrator"
+                if body.get("credential_resolution_failed"):
+                    # The offending task id is nested under "error" so that no
+                    # top-level "task_id" can ever be mistaken for a dispatched
+                    # task by a runner that skipped the pool_exhausted check.
+                    err = body.get("error")
+                    err = err if isinstance(err, dict) else {}
+                    bad_task = err.get("skipped_task_id") or "unknown"
+                    print(
+                        f"[runner] CREDENTIAL RESOLUTION FAILED for task "
+                        f"{bad_task} — the orchestrator could not build "
+                        f"credentials for this task (this is a task/config problem, "
+                        f"NOT rate limiting): {reason}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[runner] POOL EXHAUSTED — no LLM account available; "
+                        f"task stays claimable for a future poll cycle: {reason}",
+                        flush=True,
+                    )
                 poll_interval = min(poll_interval * 2, 30.0)
                 time.sleep(poll_interval)
                 continue
@@ -4865,9 +4917,19 @@ def main() -> None:
             except Exception as exc:
                 print(f"[runner] failed to prepare workspace for task {task_id}: {exc}", flush=True)
                 _release_capacity(agent_capacity)
+                # Decline explicitly: without this the task stays pinned in
+                # PROVISIONING until this runner goes offline, even though we
+                # know right now that we cannot run it.
+                _notify_decline(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    reason=f"workspace preparation failed: {type(exc).__name__}: {exc}",
+                )
                 time.sleep(poll_interval)
                 continue
 
+            decline_reason: list[str] = []
             spawned = _spawn_agent_task(
                 task_id=task_id,
                 task_type=task_type,
@@ -4884,14 +4946,21 @@ def main() -> None:
                 lock=lock,
                 llm_env=llm_env,
                 llm_files=llm_files,
+                decline_reason_out=decline_reason,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
                 # permit must be released here.
                 _release_capacity(agent_capacity)
                 # Notify the orchestrator so the task returns to QUEUED instead of
-                # stranding in PROVISIONING until the runner goes offline.
-                _notify_decline(orchestrator_url, token, task_id)
+                # stranding in PROVISIONING until the runner goes offline — WITH the
+                # reason, so it stops re-pinning the task to this same runner.
+                _notify_decline(
+                    orchestrator_url,
+                    token,
+                    task_id,
+                    reason=decline_reason[0] if decline_reason else None,
+                )
                 time.sleep(poll_interval)
                 continue
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner

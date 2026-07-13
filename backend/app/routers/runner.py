@@ -36,14 +36,31 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool, StrictStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token, get_current_runner
 from app.broadcast import broadcast_to_project
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
+from app.runner_pull_skip import (
+    SKIP_CODE_CREDENTIAL_ERROR,
+    SKIP_CODE_NO_ACCOUNT,
+    cached_skip,
+    clear_skip_marker,
+    has_skip_marker,
+    maybe_escalate_pull_skip,
+    skip_marker_is_fresh,
+    skip_seen_at,
+    stamp_skip_reason,
+)
 from app.database import get_session
 from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
+from app.runner_decline import (
+    DECLINE_ESCALATION_THRESHOLD as _DECLINE_ESCALATION_THRESHOLD,
+    DECLINED_BY_CONTEXT_KEY,
+    maybe_create_decline_alert as _maybe_create_decline_alert,
+)
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -434,184 +451,585 @@ class HeartbeatRequest(BaseModel):
     applied_gpus_per_job: int | None = None
 
 
+# ── /next-task work bounds (runtime-configurable) ────────────────────────────
+# Two SEPARATE bounds, because they cost wildly different things.
+#
+# The SCAN bound is how many pinned rows one poll READS. Rows are read WITHOUT a
+# lock now, and a candidate with a fresh skip marker is discarded on a dict
+# lookup, so scanning is nearly free — and the bound has to be generous, because
+# a too-small scan silently re-creates the head-of-line P0 one row further down
+# (N+1 poisoned pinned tasks starve the runner again). Escalation
+# (``runner_pull_skip``) drains permanently-poisoned tasks out of the scan window,
+# so the two work together.
+#
+# The RESOLVE bound is how many candidates one poll may run credential resolution
+# for. THAT is the expensive one: each does a ``Project`` roundtrip and acquires
+# the global ``_max_plan_pool_lock``. It is capped far below the scan bound. It
+# does not re-introduce head-of-line blocking, because a resolved-and-failed
+# candidate gets a fresh skip marker and is short-circuited on the next poll —
+# so the resolve budget SLIDES down the candidate list across successive polls
+# (seconds apart) instead of restarting at the head every time.
+_NEXT_TASK_CANDIDATE_SCAN_DEFAULT = 25
+_NEXT_TASK_RESOLVE_ATTEMPTS_DEFAULT = 3
+
+
+def _next_task_bound(key: str, default: int) -> int:
+    """Live work bound from runtime config, clamped so a bad value can't wedge.
+
+    A zero/negative bound would make every poll a no-op (204 forever) and take
+    the whole pull-based fleet offline, so it is clamped to >= 1.
+    """
+    from app.shared_state import runtime_config as _rc
+
+    try:
+        value = int((_rc or {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _next_task_candidate_scan() -> int:
+    return _next_task_bound(
+        "runner_next_task_candidate_scan", _NEXT_TASK_CANDIDATE_SCAN_DEFAULT
+    )
+
+
+def _next_task_resolve_attempts() -> int:
+    return _next_task_bound(
+        "runner_next_task_resolve_attempts", _NEXT_TASK_RESOLVE_ATTEMPTS_DEFAULT
+    )
+
+
+class _ResolvedDispatch:
+    """Everything needed to dispatch a task, resolved but not yet APPLIED to it.
+
+    Holding the resolution as a value — rather than stamping the task inside the
+    resolver — is what lets credential resolution run OUTSIDE the task-row lock
+    (see :func:`next_task`). It also makes abandoning a resolved candidate safe:
+    nothing was written, so there is nothing to roll back beyond releasing the
+    pool slot the selector reserved (:func:`_release_dispatch_account`).
+    """
+
+    __slots__ = (
+        "credentials",
+        "account_id",
+        "provider",
+        "auth_mode",
+        "model",
+        "execution_mode",
+    )
+
+    def __init__(
+        self,
+        credentials: dict | None,
+        account_id: str | None = None,
+        provider: str | None = None,
+        auth_mode: str | None = None,
+        model: str | None = None,
+        execution_mode: str | None = None,
+    ) -> None:
+        self.credentials = credentials
+        self.account_id = account_id
+        self.provider = provider
+        self.auth_mode = auth_mode
+        self.model = model
+        self.execution_mode = execution_mode
+
+
+def _apply_dispatch_credentials(task: Task, resolved: _ResolvedDispatch) -> None:
+    """Stamp the resolved LLM runtime onto the winning task (cost attribution).
+
+    Called ONLY for the candidate that actually wins the row lock, so a candidate
+    we resolved and then abandoned never has its context rewritten.
+    """
+    if resolved.account_id is None:
+        return
+    from app.max_plan_pool import apply_task_llm_runtime_context
+
+    task.context = apply_task_llm_runtime_context(
+        task.context,
+        account_id=resolved.account_id,
+        provider=resolved.provider,
+        auth_mode=resolved.auth_mode,
+        model=resolved.model,
+        execution_mode=resolved.execution_mode,
+    )
+    task.llm_account_id = resolved.account_id
+    flag_modified(task, "context")
+
+
+async def _release_dispatch_account(
+    resolved: _ResolvedDispatch, project_id: Any
+) -> None:
+    """Give back the pool slot ``select_llm_runtime_for_task`` pre-incremented.
+
+    The selector reserves capacity on the chosen account the moment it picks one.
+    If we then DON'T dispatch that candidate — it lost the winner row-lock race —
+    the reservation must be handed back or the poll bleeds pool capacity on every
+    lost race. Best-effort: a release failure must never fail the poll.
+
+    ``revert_daily_task_count=True`` because the selector pre-increments BOTH
+    ``active_tasks`` AND ``daily_task_count``, and ``_account_at_cap`` gates on
+    ``daily_task_count >= daily_task_cap``. A dispatch that never happened must
+    not permanently burn a unit of the account's DAILY quota — otherwise every
+    lost row-lock race and every credential-resolution retry silently eats the
+    day's budget. Matches the canonical peer in ``orchestrator_provision``.
+    """
+    if resolved.account_id is None:
+        return
+    try:
+        from app.max_plan_pool import release_max_plan_account
+
+        await release_max_plan_account(
+            resolved.account_id,
+            revert_daily_task_count=True,
+            project_id=str(project_id) if project_id else None,
+        )
+    except Exception:
+        logger.exception(
+            "[RUNNERS] pool slot release failed for account %s",
+            resolved.account_id,
+        )
+
+
+async def _resolve_pool_credentials_for_dispatch(
+    task: Task,
+    session: AsyncSession,
+    runner: LocalRunner,
+) -> tuple[bool, _ResolvedDispatch | None, str | None, str | None]:
+    """Resolve pooled LLM credentials for dispatching ``task`` to ``runner``.
+
+    Returns ``(ok, resolved, skip_reason, skip_code)``:
+    - ``(True, _ResolvedDispatch(credentials={...}, account_id=...), None, None)``
+      — account resolved and a pool slot RESERVED on it.
+    - ``(True, _ResolvedDispatch(credentials=None), None, None)`` — no runtime
+      config / no project row: dispatch with host-env credential fallback
+      (pre-pool behavior). No slot reserved.
+    - ``(False, None, reason, code)`` — no eligible account, or resolution raised.
+
+    The task row is NEVER mutated here — not on success, not on failure. The
+    caller applies the resolution to the winner only (``_apply_dispatch_credentials``)
+    and releases the reservation for any candidate it abandons
+    (``_release_dispatch_account``). That separation is what allows this — a
+    ``Project`` roundtrip plus the global ``_max_plan_pool_lock`` — to run
+    OUTSIDE the task-row lock instead of inside it.
+
+    ``code`` separates a genuinely exhausted pool (``no_eligible_account``) from
+    a task whose own payload/context crashes credential resolution
+    (``credential_resolution_failed``) — the two used to return an identical
+    ``{"pool_exhausted": true}`` body, so a poisoned task looked exactly like
+    rate limiting and sent operators after the wrong cause.
+    """
+    task_type = (task.first_payload or {}).get("type", "")
+    selected_account_id: str | None = None
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _rc_dict = dict(_rc) if _rc else {}
+        if not _rc_dict:
+            return True, _ResolvedDispatch(credentials=None), None, None
+        project = await session.get(Project, task.project_id)
+        if project is None:
+            return True, _ResolvedDispatch(credentials=None), None, None
+
+        from app.max_plan_pool import select_llm_runtime_for_task
+        from app.compute_manifest import (
+            _apply_llm_env,
+            _resolve_provider_materials,
+        )
+
+        # Resolve the billing user: launcher pays; fall back to project owner.
+        dispatch_user_id = (
+            task.launched_by_user_id
+            if task.launched_by_user_id
+            else project.user_id
+        )
+
+        failure_reasons: list[str] = []
+        selection = await select_llm_runtime_for_task(
+            user_id=dispatch_user_id,
+            task=task,
+            runtime_config=_rc_dict,
+            project_id=str(task.project_id) if task.project_id else None,
+            runner_available_clis=(runner.capabilities or {}).get("llm_clis"),
+            failure_reasons=failure_reasons,
+        )
+        if selection is None or selection.account is None:
+            reason = "; ".join(failure_reasons) or "no eligible LLM account"
+            logger.warning(
+                "[RUNNERS] No LLM account available for task %s (type=%s) — %s",
+                task.id,
+                task_type,
+                reason[:1500],
+            )
+            return False, None, reason, SKIP_CODE_NO_ACCOUNT
+
+        account = selection.account
+        selected_account_id = account.get("id")
+
+        # Build credential env/files using the same provider-impl path that
+        # cloud-VM manifests use — BEFORE stamping the task, so an exception
+        # here leaves the row untouched.
+        materials = _resolve_provider_materials(
+            oauth_token=account.get("runtime_secret") or account.get("oauth_token"),
+            claude_config_json=account.get("claude_config_json"),
+            provider=selection.provider,
+            auth_mode=selection.auth_mode,
+            model=selection.model,
+            provider_metadata=account.get("provider_metadata"),
+            provider_settings=selection.settings,
+        )
+        cred_env: dict[str, str] = {
+            "PROVIDER": materials.provider_name,
+            "AUTH_MODE": materials.auth_mode_value,
+        }
+        _apply_llm_env(
+            cred_env,
+            model=selection.model,
+            execution_mode=selection.execution_mode,
+            provider_settings=selection.settings,
+            materials=materials,
+        )
+        credentials = {
+            "env": cred_env,
+            "files": [
+                {"path": item.path, "content": item.content, "mode": item.mode}
+                for item in materials.files
+            ],
+        }
+
+        logger.info(
+            "[RUNNERS] Resolved pooled account %s for task %s (type=%s) on "
+            "runner %s (provider=%s model=%s)",
+            account.get("id"),
+            task.id,
+            task_type,
+            runner.id,
+            selection.provider,
+            selection.model,
+        )
+        # The runtime-context stamp happens in _apply_dispatch_credentials, on
+        # the winner only — see this function's docstring.
+        return (
+            True,
+            _ResolvedDispatch(
+                credentials=credentials,
+                account_id=account.get("id"),
+                provider=selection.provider,
+                auth_mode=selection.auth_mode,
+                model=selection.model,
+                execution_mode=selection.execution_mode,
+            ),
+            None,
+            None,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[RUNNERS] Failed to resolve LLM credentials for task %s; skipping "
+            "candidate so it stays claimable",
+            task.id,
+        )
+        # The selector pre-increments active_tasks AND daily_task_count; release
+        # both so a task that repeatedly crashes materials-building doesn't bleed
+        # pool capacity or permanently burn the account's DAILY quota on retries
+        # (_account_at_cap gates on daily_task_count >= daily_task_cap).
+        if selected_account_id is not None:
+            try:
+                from app.max_plan_pool import release_max_plan_account
+
+                await release_max_plan_account(
+                    selected_account_id,
+                    revert_daily_task_count=True,
+                    project_id=str(task.project_id) if task.project_id else None,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] pool slot release failed for account %s",
+                    selected_account_id,
+                )
+        return (
+            False,
+            None,
+            f"{type(exc).__name__}: {exc}",
+            SKIP_CODE_CREDENTIAL_ERROR,
+        )
+
+
 @router.post("/next-task")
 async def next_task(
     response: Response,
     runner: LocalRunner = Depends(get_current_runner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Return the oldest task pinned to this runner, or 204 if none.
+    """Return the highest-priority DISPATCHABLE task pinned to this runner, or 204.
 
     Uses ``SELECT ... FOR UPDATE SKIP LOCKED`` so concurrent polls from the same
     runner never double-claim a task. On a hit a task-scoped agent JWT is minted
     and returned; the task stays in PROVISIONING so the agent binary can call
     ``/api/agent/claim`` to perform the PROVISIONING → IN_PROGRESS transition
     (identical contract to GCP-provisioned VMs).
+
+    Candidates are scanned in the SAME order every cloud dispatch path uses
+    (priority DESC, then created_at ASC), and a candidate whose LLM account
+    selection fails is SKIPPED rather than failing the whole poll. Selecting a
+    single candidate and 503-ing on it starved healthy runners indefinitely:
+    routing is per-task (task type, explicit model pin, runner CLI inventory),
+    so ONE unroutable task at the head — e.g. pinned to a provider in cooldown —
+    blocked every routable task behind it, and the head is reaper-exempt
+    (``_is_runner_pinned_awaiting_pull``), so nothing ever cleared it.
+
+    Three phases, so that scanning a BATCH costs no more lock-time than the old
+    single-candidate poll did:
+
+    1. READ the candidates with NO row lock. Reading is cheap; locking a batch is
+       not — holding N task rows ``FOR UPDATE`` across N sequential credential
+       resolutions (each a ``Project`` roundtrip AND an acquisition of the global
+       ``_max_plan_pool_lock``) would multiply both the row-lock hold time and the
+       pool-lock traffic by N, and would only reach that multiple during the
+       pool-exhaustion incident this endpoint exists to survive.
+    2. RESOLVE credentials outside every lock, for at most
+       ``runner_next_task_resolve_attempts`` candidates, skipping any whose
+       ``runner_pull_skip`` marker is still fresh (we proved it unroutable seconds
+       ago — don't pay the pool lock to prove it again).
+    3. LOCK ONLY THE WINNER, re-checking the claim guard (``PROVISIONING`` +
+       ``started_at IS NULL``) under ``FOR UPDATE SKIP LOCKED``. That is what
+       preserves the no-double-dispatch invariant now that phase 1 is unlocked:
+       two concurrent polls may both resolve the same task, but only one can win
+       the row, and the loser hands its reserved pool slot back and moves on.
     """
     allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_task")
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
     pinned_vm_id = f"runner:{runner.id}"
+    # Skip markers are scoped to the runner that wrote them: routability depends on
+    # the runner's own CLI inventory, so another runner's verdict says nothing about
+    # what THIS one can run (a task unpinned from A and re-pinned to B must not
+    # inherit A's "unroutable" and be refused by B, which could run it fine).
+    runner_id = str(runner.id)
+    claim_guard = (
+        Task.status == TaskStatus.PROVISIONING,
+        Task.project_id == runner.project_id,
+        Task.vm_instance_id == pinned_vm_id,
+        Task.context["runner_target_id"].as_string() == str(runner.id),
+        # Exclude tasks already dispatched: started_at is set on dispatch so
+        # a re-poll while the agent is booting and calling /api/agent/claim
+        # skips this task instead of returning it again (dispatch-storm guard).
+        Task.started_at.is_(None),
+    )
+
+    # ── Phase 1: read candidates, NO row lock ────────────────────────────────
     result = await session.execute(
         select(Task)
-        .where(
-            Task.status == TaskStatus.PROVISIONING,
-            Task.project_id == runner.project_id,
-            Task.vm_instance_id == pinned_vm_id,
-            Task.context["runner_target_id"].as_string() == str(runner.id),
-            # Exclude tasks already dispatched: started_at is set on dispatch so
-            # a re-poll while the agent is booting and calling /api/agent/claim
-            # skips this task instead of returning it again (dispatch-storm guard).
-            Task.started_at.is_(None),
-        )
-        .order_by(Task.created_at.asc())
-        .limit(1)
-        .with_for_update(skip_locked=True)
+        .where(*claim_guard)
+        # Same ordering as every cloud dispatch path (orchestrator.py): pulling
+        # by created_at alone made the pull-based fleet ignore priority entirely,
+        # so a high-priority task pinned to a runner lost to any older one.
+        .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
+        .limit(_next_task_candidate_scan())
     )
-    task = result.scalars().first()
-    if task is None:
+    candidates = list(result.scalars().all())
+    if not candidates:
         response.status_code = status.HTTP_204_NO_CONTENT
         return response
 
-    # Mark as dispatched so re-polls skip this task while the agent boots and
-    # calls /api/agent/claim.  The task stays in PROVISIONING so claim can still
-    # perform the PROVISIONING → IN_PROGRESS transition (same contract as GCP VMs).
-    task.started_at = _utcnow()
-    session.add(task)
-
-    # ── Resolve per-task LLM credentials from the account pool ────────────────
+    # ── Phase 2: resolve per-task LLM credentials from the account pool ───────
     # Self-hosted runners receive credential env vars (PROVIDER, AUTH_MODE, and
     # provider-specific secret keys) alongside the task, exactly like cloud VMs
     # get them from their startup-secret manifest.  When no pool account is
     # selected (no accounts configured, or the pool is full/rate-limited), the
     # runner falls back to host env vars — same as the current behavior.
-    task_type = (task.first_payload or {}).get("type", "")
-    credentials = None
-    try:
-        from app.shared_state import runtime_config as _rc
+    task: Task | None = None
+    credentials: dict | None = None
+    skipped: list[dict] = []
+    to_escalate: list[tuple[Task, str, str]] = []
+    lost_races = 0
+    attempts_left = _next_task_resolve_attempts()
+    now = _utcnow()
 
-        _rc_dict = dict(_rc) if _rc else {}
-        if _rc_dict:
-            project = await session.get(Project, task.project_id)
-            if project is not None:
-                from app.max_plan_pool import (
-                    apply_task_llm_runtime_context,
-                    select_llm_runtime_for_task,
-                )
-                from app.compute_manifest import (
-                    _apply_llm_env,
-                    _resolve_provider_materials,
-                )
-
-                # Resolve the billing user: launcher pays; fall back to project owner.
-                dispatch_user_id = (
-                    task.launched_by_user_id
-                    if task.launched_by_user_id
-                    else project.user_id
-                )
-
-                selection = await select_llm_runtime_for_task(
-                    user_id=dispatch_user_id,
-                    task=task,
-                    runtime_config=_rc_dict,
-                    project_id=str(task.project_id) if task.project_id else None,
-                    runner_available_clis=(runner.capabilities or {}).get("llm_clis"),
-                )
-                if selection is not None and selection.account is not None:
-                    account = selection.account
-
-                    # Stamp runtime context so cost attribution works.
-                    new_context = apply_task_llm_runtime_context(
-                        task.context,
-                        account_id=account.get("id"),
-                        provider=selection.provider,
-                        auth_mode=selection.auth_mode,
-                        model=selection.model,
-                        execution_mode=selection.execution_mode,
-                    )
-                    task.context = new_context
-                    task.llm_account_id = account.get("id")
-                    from sqlalchemy.orm.attributes import flag_modified
-
-                    flag_modified(task, "context")
-
-                    # Build credential env/files using the same provider-impl
-                    # path that cloud-VM manifests use.
-                    materials = _resolve_provider_materials(
-                        oauth_token=account.get("runtime_secret")
-                        or account.get("oauth_token"),
-                        claude_config_json=account.get("claude_config_json"),
-                        provider=selection.provider,
-                        auth_mode=selection.auth_mode,
-                        model=selection.model,
-                        provider_metadata=account.get("provider_metadata"),
-                        provider_settings=selection.settings,
-                    )
-                    cred_env: dict[str, str] = {
-                        "PROVIDER": materials.provider_name,
-                        "AUTH_MODE": materials.auth_mode_value,
-                    }
-                    _apply_llm_env(
-                        cred_env,
-                        model=selection.model,
-                        execution_mode=selection.execution_mode,
-                        provider_settings=selection.settings,
-                        materials=materials,
-                    )
-                    credentials = {
-                        "env": cred_env,
-                        "files": [
-                            {
-                                "path": item.path,
-                                "content": item.content,
-                                "mode": item.mode,
-                            }
-                            for item in materials.files
-                        ],
-                    }
-
-                    logger.info(
-                        "[RUNNERS] Dispatched task %s (type=%s) to runner %s "
-                        "with pooled account %s (provider=%s model=%s)",
-                        task.id,
-                        task_type,
-                        runner.id,
-                        account.get("id"),
-                        selection.provider,
-                        selection.model,
-                    )
-                else:
-                    # Pool exhausted — no eligible account.  Roll back the dispatch
-                    # marker so the task stays claimable by a future poll once an
-                    # account frees up.
-                    logger.warning(
-                        "[RUNNERS] No LLM account available for task %s (type=%s) — "
-                        "pool exhausted; leaving task unclaimed",
-                        task.id,
-                        task_type,
-                    )
-                    task.started_at = None
-                    session.add(task)
-                    await session.commit()
-                    return JSONResponse(
-                        {"pool_exhausted": True},
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    )
-    except Exception:
-        logger.exception(
-            "[RUNNERS] Failed to resolve LLM credentials for task %s; "
-            "rolling back dispatch so task stays claimable",
-            task.id,
+    def _note_skip(candidate: Task, code: str, reason: str) -> None:
+        skipped.append(
+            {
+                "task_id": str(candidate.id),
+                "task_type": (candidate.first_payload or {}).get("type", ""),
+                "code": code,
+                "reason": (reason or "")[:500],
+            }
         )
-        task.started_at = None
-        session.add(task)
+
+    resolvable: list[Task] = []
+    for candidate in candidates:
+        # Short-circuit: this candidate was proved unroutable seconds ago. Reuse
+        # the recorded reason instead of re-acquiring the global pool lock to
+        # re-derive it. This is what stops a poll from costing one pool-lock
+        # acquisition per pinned task, every few seconds, per runner, for the
+        # entire duration of a pool-exhaustion storm.
+        if skip_marker_is_fresh(candidate, runner_id, now):
+            code, reason = cached_skip(candidate, runner_id)
+            _note_skip(candidate, code, reason)
+            continue
+        resolvable.append(candidate)
+
+    # Resolve order, in two groups:
+    #
+    #   1. NEVER-EXAMINED first (priority order). This makes the scan window SLIDE:
+    #      each poll advances `resolve_attempts` further down the list, so a
+    #      routable task at position N is reached in about N/attempts polls. If a
+    #      stale re-probe could outrank a never-seen candidate, the poll would
+    #      re-prove the head every TTL and never reach position N at all.
+    #
+    #   2. Then stale re-probes, OLDEST-EXAMINED FIRST — round-robin, NOT priority.
+    #      This is the part that is easy to get wrong. In steady state EVERY
+    #      candidate carries a marker, so the stale group is the whole list, and
+    #      exactly `attempts` markers come due per poll (TTL / poll_interval * ...).
+    #      Draining them in PRIORITY order resonates with that cadence and locks the
+    #      rotation onto the first `attempts * TTL / poll_interval` candidates —
+    #      9, with the defaults — FOREVER. Everything past 9 is examined once and
+    #      frozen: never re-probed (so it never dispatches even once it becomes
+    #      routable) and its skip count never advances (so it never alerts, never
+    #      unpins, never drains) — it holds a candidate slot permanently, and the
+    #      effective scan bound silently collapses from 25 to 9. Oldest-first breaks
+    #      the resonance: the rotation is fair, every candidate is re-probed, every
+    #      counter advances, and the poisoned set actually drains.
+    #
+    # Losing priority ordering inside group 2 costs nothing real: every member of it
+    # has already been proven unroutable (its proof merely EXPIRED — that is what
+    # makes it stale rather than fresh), and priority still governs both the scan
+    # order and group 1, which is where it decides who actually dispatches first.
+    resolve_order = [c for c in resolvable if not has_skip_marker(c, runner_id)]
+    resolve_order += sorted(
+        (c for c in resolvable if has_skip_marker(c, runner_id)),
+        key=lambda c: skip_seen_at(c, runner_id),
+    )
+
+    for candidate in resolve_order:
+        if attempts_left <= 0:
+            # Resolve budget spent. Remaining candidates are simply not examined
+            # this poll — the ones we DID examine now carry fresh skip markers, so
+            # the next poll short-circuits them and spends its budget further down
+            # the list.
+            break
+
+        attempts_left -= 1
+        ok, resolved, skip_reason, skip_code = (
+            await _resolve_pool_credentials_for_dispatch(candidate, session, runner)
+        )
+        if not ok or resolved is None:
+            stamp_skip_reason(
+                candidate, skip_code or "", skip_reason or "", runner_id=runner_id
+            )
+            _note_skip(candidate, skip_code or "", skip_reason or "")
+            # Escalation is DEFERRED to after this loop: it takes a row lock (to
+            # unpin), and taking one here would hold it across the remaining
+            # credential resolutions — each of which acquires the global pool
+            # lock. That is the very "row lock held across slow I/O" shape this
+            # change exists to remove, so it must not be re-introduced on the
+            # escalation path.
+            to_escalate.append((candidate, skip_code or "", skip_reason or ""))
+            continue
+
+        # ── Phase 3: lock ONLY the winner and re-check the claim guard ────────
+        locked = (
+            await session.execute(
+                select(Task)
+                .where(Task.id == candidate.id, *claim_guard)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().first()
+        if locked is None:
+            # Lost the race: a concurrent poll claimed this task (or it moved on)
+            # between our unlocked read and now. Hand back the pool slot the
+            # selector reserved — otherwise every lost race bleeds capacity — and
+            # try the next candidate.
+            await _release_dispatch_account(resolved, candidate.project_id)
+            lost_races += 1
+            continue
+
+        # The episode is over: drop the skip marker. Left in place it is immortal —
+        # `count` and `first_at` persist across episodes, so a task that hits a
+        # transient cooldown on five SEPARATE occasions (possibly days apart, each
+        # recovering on its own) accumulates count=5 and is eventually unpinned for
+        # no reason; and `has_skip_marker` would stay True forever, permanently
+        # deprioritising a perfectly healthy task in every future resolve order.
+        clear_skip_marker(locked)
+        _apply_dispatch_credentials(locked, resolved)
+        task = locked
+        credentials = resolved.credentials
+        break
+
+    # ── Escalate skips, now that no credential resolution remains ─────────────
+    # A skip counter with no consumer is how the ORIGINAL P0 comes back one row
+    # further down: nothing unpins, fails or reaps a permanently-unroutable pinned
+    # task, so enough of them silently refill the candidate scan. Alerts at
+    # SKIP_ALERT_THRESHOLD; unpins back to QUEUED at SKIP_UNPIN_THRESHOLD so the
+    # poisoned set drains instead of being permanent.
+    for skipped_task, skip_code, skip_reason in to_escalate:
+        await maybe_escalate_pull_skip(
+            session, skipped_task, skip_code, skip_reason, runner_id=runner_id
+        )
+
+    if task is None:
+        # Nothing dispatchable. Commit the per-task skip reasons + escalations (so
+        # the WHY is visible on each task in the admin UI) and tell the runner WHY,
+        # with a code that separates a rate-limited pool from a task that crashes
+        # credential resolution — same 503 status either way, so runner backoff
+        # is unchanged.
         await session.commit()
-        return JSONResponse(
-            {"pool_exhausted": True},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        poisoned = [s for s in skipped if s["code"] == SKIP_CODE_CREDENTIAL_ERROR]
+        reason_summary = " | ".join(
+            f"{s['task_id']} ({s['task_type']}): {s['reason']}" for s in skipped
         )
+        if not reason_summary:
+            # Every examined candidate was claimed by a concurrent poll between
+            # our unlocked read and the winner lock. Not exhaustion — contention.
+            # Say so rather than returning a 503 with an empty reason: a blank WHY
+            # is the failure mode this whole endpoint is being fixed for.
+            reason_summary = (
+                f"{lost_races} candidate(s) were claimed concurrently by another "
+                "poll; retry shortly"
+                if lost_races
+                else "no candidate could be examined within this poll's resolve budget"
+            )
+        logger.warning(
+            "[RUNNERS] No dispatchable task for runner %s — all %d pinned "
+            "candidate(s) skipped: %s",
+            runner.id,
+            len(skipped),
+            reason_summary[:2000],
+        )
+        body: dict[str, Any] = {
+            # Always present, even when the real cause is a poisoned task:
+            # field-deployed runners gate their back-off-and-release-permit
+            # branch on this exact key, and dropping it would make an older
+            # runner fall through and leak its capacity permit. It now reads as
+            # "nothing dispatchable, back off"; the precise cause is below.
+            "pool_exhausted": True,
+            "reason": reason_summary[:2000],
+            "skipped": skipped,
+        }
+        if poisoned:
+            # At least one candidate CRASHED credential resolution rather than
+            # merely finding no account — surface that distinctly so an operator
+            # fixes the task, not the pool. These were indistinguishable before.
+            #
+            # Nested under "error", NOT at top level: a bare top-level "task_id"
+            # in a body whose sibling is a task payload is one missed check away
+            # from an un-upgraded runner treating this 503 as a task to run. Only
+            # `pool_exhausted` being checked first makes a flat `task_id` safe,
+            # and that is far too load-bearing for a diagnostic field.
+            body["error"] = {
+                "code": SKIP_CODE_CREDENTIAL_ERROR,
+                "skipped_task_id": poisoned[0]["task_id"],
+            }
+            body["credential_resolution_failed"] = True
+        return JSONResponse(body, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
+    # Mark as dispatched so re-polls skip this task while the agent boots and
+    # calls /api/agent/claim.  The task stays in PROVISIONING so claim can still
+    # perform the PROVISIONING → IN_PROGRESS transition (same contract as GCP VMs).
+    task_type = (task.first_payload or {}).get("type", "")
+    task.started_at = _utcnow()
+    session.add(task)
     await session.commit()
 
     agent_token = create_agent_token(
@@ -634,6 +1052,10 @@ async def next_task(
 
 class DeclineTaskRequest(BaseModel):
     task_id: str
+    # Optional: WHY the runner declined (no bwrap, docker-only host on a write
+    # task, agent spawn failure...). Older runners omit it — the endpoint stays
+    # backward-compatible and simply records "unspecified".
+    reason: str | None = None
 
 
 @router.post("/decline-task")
@@ -649,6 +1071,16 @@ async def decline_task(
     read-only docker image on a write task, etc.).  Without this notification
     the task strands in PROVISIONING until the stale-runner sweep fires — which
     only happens when THIS runner goes offline.
+
+    The decline is RECORDED on the task (``declined_by`` in context, plus the
+    reason on ``latest_status_message``). It used to record nothing, which made
+    a livelock invisible AND unbreakable: ``_select_eligible_runner``'s tiebreak
+    (``r.id.int ^ dispatch_seed``) is stable per task, so with nothing to
+    exclude the orchestrator deterministically re-picked the SAME runner that
+    just declined — pin → pull → decline, forever, with no counter and no alert.
+    ``declined_by`` is what the dispatcher now excludes on, and crossing
+    :data:`_DECLINE_ESCALATION_THRESHOLD` raises an operator Alert carrying the
+    runner's own reason.
     """
     pinned_vm_id = f"runner:{runner.id}"
     result = await session.execute(
@@ -688,6 +1120,8 @@ async def decline_task(
             payload.task_id,
         )
 
+    reason = (payload.reason or "").strip() or "unspecified"
+
     task.llm_account_id = None
     task.status = TaskStatus.QUEUED
     task.vm_instance_id = None
@@ -700,18 +1134,47 @@ async def decline_task(
         "_slot_released",
     ):
         new_ctx.pop(key, None)
+
+    # ── Record the decline so the dispatcher can stop re-picking this runner ──
+    declined_by = dict(new_ctx.get(DECLINED_BY_CONTEXT_KEY) or {})
+    prev = declined_by.get(str(runner.id)) or {}
+    count = int(prev.get("count") or 0) + 1
+    declined_by[str(runner.id)] = {
+        "count": count,
+        "at": _utcnow().isoformat(),
+        "reason": reason[:500],
+        "hostname": runner.hostname,
+    }
+    new_ctx[DECLINED_BY_CONTEXT_KEY] = declined_by
+    total_declines = sum(
+        int((rec or {}).get("count") or 0) for rec in declined_by.values()
+    )
     task.context = new_ctx
+    flag_modified(task, "context")
+    task.latest_status_message = (
+        f"Declined by runner {runner.hostname or runner.id} "
+        f"(decline #{total_declines}): {reason}"
+    )[:500]
     session.add(task)
+
+    # Escalate rather than looping silently: N declines means the pin keeps
+    # coming back to hardware that cannot run this task.
+    if total_declines >= _DECLINE_ESCALATION_THRESHOLD:
+        await _maybe_create_decline_alert(session, task, total_declines, reason)
+
     await session.commit()
 
-    logger.info(
-        "[RUNNERS] Runner %s declined task %s — released back to QUEUED "
-        "(pool account %s released)",
+    logger.warning(
+        "[RUNNERS] Runner %s declined task %s (decline #%d for this task, #%d "
+        "from this runner) — released back to QUEUED (pool account %s released): %s",
         runner.id,
         payload.task_id,
+        total_declines,
+        count,
         acct_id,
+        reason,
     )
-    return {"ok": True}
+    return {"ok": True, "decline_count": total_declines}
 
 
 @router.post("/heartbeat")

@@ -168,6 +168,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # definitions it complements) — a deferred load-order import, the same
 # intentional E402 pattern as main.py / orchestrator.py above.
 "app/reaper.py" = ["E402"]
+# orchestrator_runner_dispatch.py re-exports the runner eligibility predicates
+# extracted to app.runner_eligibility via a deferred mid-module import (keeps the
+# existing `orchestrator_runner_dispatch._runner_*` call sites and patch targets
+# working). Same intentional re-export-via-deferred-import pattern as reaper.py /
+# routers/agent.py above.
+"app/orchestrator_runner_dispatch.py" = ["E402"]
 # admin_analytics.py is read-only analytics/reporting endpoints. except blocks are
 # defensive fallbacks (Cloud Logging, zone health) to show partial data instead of 500.
 "app/routers/admin_analytics.py" = ["BLE001"]

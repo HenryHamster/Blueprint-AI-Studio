@@ -1469,6 +1469,57 @@ def _account_state_for_model(
     return "probing"
 
 
+def _account_unavailable_reason(
+    acct: dict, model: str | None, now: datetime | None = None
+) -> str:
+    """The WHY behind an ``"unavailable"`` verdict from _account_state_for_model.
+
+    ``_account_state_for_model`` collapses five distinct causes (no token,
+    disabled, startup-failure cooldown, model-not-on-account, rate-limit
+    cooldown) into one string, so a caller that only sees "unavailable" cannot
+    tell an operator what to fix. This recomputes the cause — lazily, only for
+    accounts a selector actually skipped, so the hot path stays a single state
+    lookup.
+
+    Mirrors the branch ORDER of ``_account_state_for_model``; the two must be
+    kept in sync or the reason will name the wrong cause.
+    """
+    if not _account_runtime_ready(acct):
+        return "credentials not runtime-ready"
+    if not acct.get("enabled", True):
+        return f"account disabled ({acct.get('disabled_reason') or 'manually'})"
+    sf_cooldown_at = acct.get("startup_failure_cooldown_at")
+    if sf_cooldown_at is not None:
+        sf_elapsed = ((now or _utcnow()) - sf_cooldown_at).total_seconds()
+        if sf_elapsed < _STARTUP_FAILURE_COOLDOWN_SECONDS:
+            left = int(_STARTUP_FAILURE_COOLDOWN_SECONDS - sf_elapsed)
+            return f"startup-failure cooldown ({left}s left)"
+    if model is not None:
+        from app.account_model_availability import account_has_model
+
+        if account_has_model(acct, model) is False:
+            return f"model {model} not available on this account"
+    dm = acct.get("disabled_models") or {}
+    if not dm:
+        return "unavailable"
+    if model is None:
+        return "no concrete model requested and account has active disables"
+    # Haiku shares Opus's meter (normalized key); regression entries are keyed
+    # un-normalized — same two-step lookup as the state function.
+    info = dm.get(_normalize_rl_model(model)) or dm.get(model)
+    if info is None:
+        return "unavailable"
+    at_dt = info.get("at")
+    if at_dt is None:
+        return f"model {model} disabled (no cooldown timestamp)"
+    left = int(
+        _cooldown_seconds_for_info(info)
+        - ((now or _utcnow()) - at_dt).total_seconds()
+    )
+    kind = info.get("kind") or "rate-limit"
+    return f"model {model} in {kind} cooldown ({max(left, 0)}s left)"
+
+
 def _account_available_for_model(acct: dict, model: str | None) -> bool:
     """True if the account is either healthy OR probing for the given model.
     Probing accounts are serialized inside select_max_plan_account; outside
@@ -2820,6 +2871,7 @@ async def select_max_plan_account_balanced(
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
     project_id: str | None = None,
+    reject_reasons: List[str] | None = None,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -2835,7 +2887,10 @@ async def select_max_plan_account_balanced(
     single-provider selector's contract.
 
     When *project_id* is provided, per-project cap gating is applied BEFORE
-    the global cap check. See ``_project_at_cap``."""
+    the global cap check. See ``_project_at_cap``.
+
+    When *reject_reasons* is provided, a short per-account reason is appended
+    for every provider-matching account that was skipped."""
     if not provider_models:
         return None
     async with _max_plan_pool_lock:
@@ -2847,6 +2902,13 @@ async def select_max_plan_account_balanced(
         now = _utcnow()
         dirty_from_reset: list[str] = []
         seen_ids: set[str] = set()
+
+        def _reject(acct: dict, provider: str, why: str) -> None:
+            if reject_reasons is not None:
+                reject_reasons.append(
+                    f"{provider}:{acct.get('name') or acct.get('id')}: {why}"
+                )
+
         for provider_name, model in provider_models:
             normalized_provider = _normalize_provider_name(provider_name)
             if not normalized_provider:
@@ -2854,28 +2916,57 @@ async def select_max_plan_account_balanced(
             for a in user_pool:
                 if a["id"] in seen_ids:
                     continue
-                if blacklist and a["id"] in blacklist:
-                    continue
                 acct_provider = (
                     _normalize_provider_name(a.get("provider"))
                     or LLMProviderName.ANTHROPIC.value
                 )
                 if acct_provider != normalized_provider:
                     continue
+                if blacklist and a["id"] in blacklist:
+                    _reject(a, normalized_provider, "blacklisted for this task")
+                    continue
                 if _daily_reset_if_elapsed(a, now):
                     dirty_from_reset.append(a["id"])
                 # Per-project cap check runs BEFORE global cap check.
-                if _project_at_cap(a, project_id):
+                proj_cap_reason = _project_at_cap(a, project_id)
+                if proj_cap_reason:
+                    _reject(a, normalized_provider, proj_cap_reason)
                     continue
-                if _account_at_cap(a):
+                cap_reason = _account_at_cap(a)
+                if cap_reason:
+                    _reject(a, normalized_provider, cap_reason)
                     continue
                 state = _account_state_for_model(a, model, now)
                 if state == "healthy":
                     candidates_healthy.append((a, normalized_provider, model))
                     seen_ids.add(a["id"])
-                elif state == "probing" and a.get("active_tasks", 0) == 0:
-                    candidates_probing.append((a, normalized_provider, model))
-                    seen_ids.add(a["id"])
+                elif state == "probing":
+                    if a.get("active_tasks", 0) == 0:
+                        candidates_probing.append((a, normalized_provider, model))
+                        seen_ids.add(a["id"])
+                    else:
+                        _reject(
+                            a,
+                            normalized_provider,
+                            "cooldown elapsed, probe already in flight",
+                        )
+                else:
+                    # Guarded AT THE CALL SITE, not inside _reject: Python
+                    # evaluates arguments eagerly, so an unguarded
+                    # `_reject(a, p, _account_unavailable_reason(...))` would
+                    # build the reason (in-function import + datetime math +
+                    # f-strings) for EVERY rejected account on EVERY selection,
+                    # while this function holds the global _max_plan_pool_lock.
+                    # Cost would scale with pool size x rejected accounts and
+                    # peak during a cooldown storm — the exact incident the
+                    # reasons exist to diagnose. Every other _reject arg above
+                    # is a constant or a value the control flow already had.
+                    if reject_reasons is not None:
+                        _reject(
+                            a,
+                            normalized_provider,
+                            _account_unavailable_reason(a, model, now),
+                        )
 
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
@@ -2991,6 +3082,7 @@ async def select_max_plan_account(
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
     project_id: str | None = None,
+    reject_reasons: List[str] | None = None,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -3007,6 +3099,10 @@ async def select_max_plan_account(
     selection alongside the global counters. When *project_id* is None, no
     per-project gating is applied (fully backward-compatible).
 
+    When *reject_reasons* is provided, a short per-account reason is appended
+    for every provider-matching account that was skipped, so callers can report
+    WHY the pool came up empty instead of a bare "pool exhausted".
+
     Pre-increments active_tasks atomically under lock."""
     async with _max_plan_pool_lock:
         user_pool = _max_plan_pools.get(user_id, [])
@@ -3015,9 +3111,13 @@ async def select_max_plan_account(
         normalized_provider = _normalize_provider_name(provider)
         now = _utcnow()
         dirty_from_reset: list[str] = []
+        provider_matched = 0
+
+        def _reject(acct: dict, why: str) -> None:
+            if reject_reasons is not None:
+                reject_reasons.append(f"{acct.get('name') or acct.get('id')}: {why}")
+
         for a in user_pool:
-            if blacklist and a["id"] in blacklist:
-                continue
             if (
                 normalized_provider
                 and (
@@ -3027,20 +3127,42 @@ async def select_max_plan_account(
                 != normalized_provider
             ):
                 continue
+            provider_matched += 1
+            if blacklist and a["id"] in blacklist:
+                _reject(a, "blacklisted for this task")
+                continue
             if _daily_reset_if_elapsed(a, now):
                 dirty_from_reset.append(a["id"])
             # Per-project cap check runs BEFORE global cap check.
             proj_cap_reason = _project_at_cap(a, project_id)
             if proj_cap_reason:
+                _reject(a, proj_cap_reason)
                 continue
             cap_reason = _account_at_cap(a)
             if cap_reason:
+                _reject(a, cap_reason)
                 continue
             state = _account_state_for_model(a, model, now)
             if state == "healthy":
                 healthy.append(a)
-            elif state == "probing" and a.get("active_tasks", 0) == 0:
-                probing.append(a)
+            elif state == "probing":
+                if a.get("active_tasks", 0) == 0:
+                    probing.append(a)
+                else:
+                    _reject(a, "cooldown elapsed, probe already in flight")
+            else:
+                # Guarded at the CALL SITE — see the identical guard in
+                # select_max_plan_account_balanced. Arguments are evaluated
+                # eagerly, so the guard inside _reject does not stop
+                # _account_unavailable_reason from running under the global
+                # _max_plan_pool_lock for every rejected account.
+                if reject_reasons is not None:
+                    _reject(a, _account_unavailable_reason(a, model, now))
+
+        if provider_matched == 0 and reject_reasons is not None:
+            reject_reasons.append(
+                f"no accounts configured for provider {normalized_provider or 'any'}"
+            )
 
         for acct_id in dirty_from_reset:
             _pending_cap_persists.add(acct_id)
@@ -3131,7 +3253,64 @@ async def select_llm_runtime_for_task(
     blacklist: List[str] | None = None,
     project_id: str | None = None,
     runner_available_clis: dict[str, dict] | None = None,
+    failure_reasons: List[str] | None = None,
 ) -> LLMSelectionResult | None:
+    """Resolve the (provider, model, account) runtime for a task.
+
+    Returns None — or an account-less result when routing knows the intended
+    provider/model — when no pool account is eligible. In that case the
+    per-(provider, model) rejection reasons are logged at WARNING and, when the
+    caller passes ``failure_reasons``, copied into it: a computed-but-discarded
+    reason is how "pool exhausted" turns into an hour of debugging the wrong
+    thing.
+    """
+    # Did THIS call's caller actually ask for the WHY? Everything expensive
+    # about reason-building is gated on this.
+    #
+    # Per-account reasons are built inside select_max_plan_account{,_balanced}
+    # while they hold the global _max_plan_pool_lock. Handing those selectors a
+    # non-None reject_reasons list unconditionally would make every LLM
+    # selection system-wide — cloud dispatch included — construct a reason
+    # string for every rejected account under that lock, with the cost peaking
+    # during a cooldown storm. So the sub-lists below are None unless the
+    # caller wants them, which turns the selectors' reason work off entirely.
+    _want_reasons = failure_reasons is not None
+
+    # Coarse per-(provider, model) attempt lines. Cheap (a handful of f-strings,
+    # built OUTSIDE the pool lock) and always collected, so the no-account log
+    # line still names which routes were tried even at DEBUG.
+    _reasons: List[str] = []
+
+    def _sub_reasons() -> List[str] | None:
+        """Fresh per-account reason sink, or None when nobody asked."""
+        return [] if _want_reasons else None
+
+    def _note_attempt(
+        provider_name: str, model_name: str | None, sub: List[str] | None
+    ) -> None:
+        detail = "; ".join(sub) if sub else "no eligible accounts"
+        _reasons.append(f"{provider_name}/{model_name or 'any'}: {detail}")
+
+    def _flush_reasons(outcome: str) -> None:
+        if not _reasons:
+            _reasons.append("no provider/model attempts were possible")
+        # WARNING only when the caller asked for reasons (i.e. it will surface
+        # them to an operator). Otherwise DEBUG: a pool-exhaustion storm makes
+        # EVERY dispatch attempt fleet-wide hit this path, and a multi-KB
+        # WARNING per attempt is log amplification at the worst possible moment
+        # — the incident itself. The caller that wants the WHY (the runner pull
+        # path) still gets both the log line and the list.
+        log = logger.warning if _want_reasons else logger.debug
+        log(
+            "[LLM_SELECT] project=%s task_type=%s %s — %s",
+            _log_project_id,
+            routing_task_type,
+            outcome,
+            " | ".join(_reasons)[:1500],
+        )
+        if failure_reasons is not None:
+            failure_reasons.extend(_reasons)
+
     explicit_model = _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
     allow_fallback = mode in ("balanced", "preferred")
@@ -3209,12 +3388,18 @@ async def select_llm_runtime_for_task(
                 "— no runtime available for runner project=%s",
                 _log_project_id,
             )
+            if failure_reasons is not None:
+                failure_reasons.append(
+                    "all routed providers filtered out by the runner's available "
+                    "CLI inventory (runner has no CLI for any allowed provider)"
+                )
             return None
 
     if model_preferences:
         for pref in model_preferences:
             provider_name = pref["provider"]
             model_name = pref["model"]
+            sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
                 user_id=user_id,
                 model=model_name,
@@ -3223,7 +3408,10 @@ async def select_llm_runtime_for_task(
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
+                reject_reasons=sub_reasons,
             )
+            if not account:
+                _note_attempt(provider_name, model_name, sub_reasons)
             if account:
                 logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", _log_project_id, account.get("id"), provider_name, model_name)
                 return LLMSelectionResult(
@@ -3288,6 +3476,7 @@ async def select_llm_runtime_for_task(
                 continue
             provider_models.append((provider_name, model))
         if provider_models:
+            balanced_sub = _sub_reasons()
             balanced_result = await select_max_plan_account_balanced(
                 user_id=user_id,
                 provider_models=provider_models,
@@ -3295,7 +3484,14 @@ async def select_llm_runtime_for_task(
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
+                reject_reasons=balanced_sub,
             )
+            if balanced_result is None:
+                _note_attempt(
+                    "balanced[" + ",".join(p for p, _m in provider_models) + "]",
+                    None,
+                    balanced_sub,
+                )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
                 if intended_provider and provider_name != intended_provider:
@@ -3341,6 +3537,7 @@ async def select_llm_runtime_for_task(
             model = provider.tier_to_model(quality_tier, runtime_config)
         if not model:
             continue
+        sub_reasons = _sub_reasons()
         account = await select_max_plan_account(
             user_id=user_id,
             model=model,
@@ -3349,7 +3546,10 @@ async def select_llm_runtime_for_task(
             task_type=routing_task_type,
             runtime_config=runtime_config,
             project_id=_resolved_project_id,
+            reject_reasons=sub_reasons,
         )
+        if not account:
+            _note_attempt(provider_name, model, sub_reasons)
         if account:
             if intended_provider and provider_name != intended_provider:
                 _record_routing_fallback(
@@ -3381,6 +3581,7 @@ async def select_llm_runtime_for_task(
         # failure mode.
         fallback = provider.fallback_model(model)
         if fallback and fallback != model:
+            sub_reasons = _sub_reasons()
             account = await select_max_plan_account(
                 user_id=user_id,
                 model=fallback,
@@ -3389,7 +3590,10 @@ async def select_llm_runtime_for_task(
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
                 project_id=_resolved_project_id,
+                reject_reasons=sub_reasons,
             )
+            if not account:
+                _note_attempt(provider_name, fallback, sub_reasons)
             if account:
                 logger.warning(
                     "[LLM_SELECT] project=%s No pool account has %s; falling back to GA "
@@ -3419,6 +3623,7 @@ async def select_llm_runtime_for_task(
                 )
 
     if explicit_provider and explicit_model:
+        _flush_reasons("no pool account (returning account-less explicit result)")
         _record_routing_fallback(
             task,
             intended_provider=intended_provider,
@@ -3439,6 +3644,7 @@ async def select_llm_runtime_for_task(
         )
 
     if provider_preference:
+        _flush_reasons("no pool account (returning account-less fallback result)")
         fallback_provider = provider_preference[0]
         provider = get_provider(fallback_provider)
         fallback_settings = resolve_task_provider_settings(
@@ -3471,6 +3677,7 @@ async def select_llm_runtime_for_task(
             settings=fallback_settings,
         )
 
+    _flush_reasons("no pool account and no routing to fall back on")
     return None
 
 

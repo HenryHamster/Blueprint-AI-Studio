@@ -1378,6 +1378,153 @@ async def test_select_llm_runtime_records_no_account_fallback(clean_runtime_pool
 
 
 @pytest.mark.asyncio
+async def test_select_llm_runtime_populates_failure_reasons(clean_runtime_pool):
+    """A no-account outcome fills the caller's failure_reasons with the
+    per-(provider, model) WHY — e.g. "in rate-limit cooldown" — instead of
+    leaving the caller with a bare "pool exhausted" bit. The reason is computed
+    either way; discarding it is what turns a 30-second fix into an hour of
+    guessing whether the pool is rate-limited or the task is poisoned."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    cooled = {
+        "id": "acct-cooled",
+        "user_id": _TEST_USER,
+        "name": "cooled",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+        "disabled_models": {
+            "claude-opus-4-7": {"hits": 3, "at": _utcnow() - timedelta(seconds=10)}
+        },
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(cooled)
+    _account_by_id[cooled["id"]] = cooled
+
+    runtime_config = {
+        "provider_selection_mode": "exclusive",
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+        },
+        "task_type_provider_preference": {"create": ["anthropic"]},
+    }
+
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+    failure_reasons: list[str] = []
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+        failure_reasons=failure_reasons,
+    )
+
+    assert result is None or result.account is None
+    assert failure_reasons, "a no-account outcome must surface WHY"
+    joined = " | ".join(failure_reasons)
+    assert "cooled" in joined  # names the account...
+    assert "cooldown" in joined  # ...and the actual cause
+
+
+@pytest.mark.asyncio
+async def test_no_reason_strings_built_when_caller_did_not_ask(
+    clean_runtime_pool, monkeypatch
+):
+    """No reason string is CONSTRUCTED when the caller passes no failure_reasons.
+
+    The per-account reasons are built inside select_max_plan_account{,_balanced}
+    while they hold the global _max_plan_pool_lock, and _account_unavailable_reason
+    does real work (an in-function import, datetime arithmetic, f-string builds).
+    Python evaluates call arguments EAGERLY, so a `_reject(a, _account_unavailable_reason(...))`
+    with the None-check only inside `_reject` would run that work for every
+    rejected account on EVERY LLM selection system-wide — cloud dispatch included
+    — under the hottest lock in the system, with the cost peaking during exactly
+    the cooldown storm the reasons exist to explain.
+
+    This pins the guard: same pool, same no-account outcome, reasons requested or
+    not — and _account_unavailable_reason must not be called in the "not
+    requested" case.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    cooled = {
+        "id": "acct-cooled-lazy",
+        "user_id": _TEST_USER,
+        "name": "cooled-lazy",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+        "disabled_models": {
+            "claude-opus-4-7": {"hits": 3, "at": _utcnow() - timedelta(seconds=10)}
+        },
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(cooled)
+    _account_by_id[cooled["id"]] = cooled
+
+    runtime_config = {
+        "provider_selection_mode": "exclusive",
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            },
+        },
+        "task_type_provider_preference": {"create": ["anthropic"]},
+    }
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+
+    import app.max_plan_pool as mpp
+
+    real_reason = mpp._account_unavailable_reason
+    calls: list[str] = []
+
+    def _counting_reason(acct, model, now=None):
+        calls.append(acct.get("id"))
+        return real_reason(acct, model, now)
+
+    monkeypatch.setattr(mpp, "_account_unavailable_reason", _counting_reason)
+
+    # (a) Caller does NOT want reasons — the hot path must build none.
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+        # failure_reasons deliberately omitted — this is the cloud-dispatch
+        # shape, i.e. the overwhelming majority of selections.
+    )
+    assert result is None or result.account is None  # same no-account outcome
+    assert calls == [], (
+        "reason strings were built under the global pool lock for a caller that "
+        f"never asked for them (built for: {calls})"
+    )
+
+    # (b) Caller DOES want reasons — the same rejection now explains itself, so
+    #     the guard suppresses the work without suppressing the diagnostic.
+    failure_reasons: list[str] = []
+    await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+        failure_reasons=failure_reasons,
+    )
+    assert calls == [cooled["id"]], "the WHY must still be computed on request"
+    assert any("cooldown" in r for r in failure_reasons)
+
+
+@pytest.mark.asyncio
 async def test_select_llm_runtime_no_fallback_marker_on_intended_provider(
     clean_runtime_pool,
 ):

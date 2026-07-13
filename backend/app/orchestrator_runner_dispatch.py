@@ -26,7 +26,6 @@ import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -40,6 +39,11 @@ from app.models import (
     TaskStatus,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.runner_decline import (
+    decline_exclusion_is_advisory,
+    decline_record_for_runner,
+    recently_declined_runner_ids,
+)
 from app.runner_health_monitors import (  # noqa: F401
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     _RUNNER_LIVENESS_SECONDS,
@@ -214,266 +218,29 @@ def _coerce_vram_gb(payload: dict) -> tuple[float | None, str | None]:
     return value, None
 
 
-class RunnerDispatchSnapshot(NamedTuple):
-    """Session-independent view of a live local runner used during dispatch."""
-
-    id: uuid.UUID
-    project_id: uuid.UUID
-    capabilities: dict
-    consecutive_job_failures: int = 0
-    hostname: str | None = None
-
-
-def _runner_handles_task_type(
-    runner: LocalRunner | RunnerDispatchSnapshot, task_type: str
-) -> bool:
-    """Whether a runner covers this task type, honoring BOTH policy and capability.
-
-    Two independent gates, intersected:
-
-    * **Operator policy (ceiling)** — ``capabilities['task_types']`` is
-      operator-configured (``"all"`` or an allowlist). It is the maximum set the
-      operator permits this runner to serve.
-    * **Runner-declared capability (floor)** — ``capabilities['supported_agent_task_types']``
-      is advertised by the runner itself over the heartbeat: a docker-only box
-      (docker+image, no bwrap) declares the read-only agent slice it can actually
-      run. When present (not None), an AGENT task type must also appear in it, so
-      the orchestrator never pins a write/heavy type this box would decline after
-      dispatch. Absent/None → no extra restriction (backward compatible with
-      runners that never advertise it).
-
-    ``compute_experiment`` is a COMPUTE-class task fulfilled by a different backend
-    (the runner's ``decide_compute_backend``, not the agent path), so the
-    agent-only floor never applies to it — a docker-only runner still handles
-    compute jobs. This mirrors the ``task_type == "compute_experiment"`` carve-out
-    the caller already applies to ``_runner_agent_available``.
-    """
-    caps = runner.capabilities or {}
-    task_types = caps.get("task_types", "all")
-    if task_types == "all":
-        policy_ok = True
-    elif isinstance(task_types, (list, tuple, set)):
-        policy_ok = task_type in task_types
-    else:
-        # Malformed capability shape — be conservative and treat as no-cover.
-        policy_ok = False
-    if not policy_ok:
-        return False
-
-    # Runner-declared agent-capability floor. Only constrains AGENT task types;
-    # compute_experiment is exempt (handled by the compute backend, not the agent).
-    supported_agent = caps.get("supported_agent_task_types")
-    if (
-        supported_agent is not None
-        and task_type != "compute_experiment"
-        and isinstance(supported_agent, (list, tuple, set))
-    ):
-        return task_type in supported_agent
-    return True
-
-
-# Reserved capability key holding the AUTHORITATIVE active agent-task count that
-# _load_active_runners_cache computes from Task rows for the dispatch cycle. Kept
-# distinct from the heartbeat-reported ``active_task_ids`` so it can never be
-# overwritten by a runner heartbeat payload.
-_ACTIVE_AGENT_TASK_COUNT_KEY = "_active_agent_task_count"
-
-
-def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
-    """Current AGENT-task load for the runner.
-
-    Authoritative source: the count of the runner's own Task rows in an active
-    status (PROVISIONING/IN_PROGRESS pinned to ``runner:<id>``), computed ONCE per
-    dispatch cycle and injected as ``capabilities['_active_agent_task_count']`` by
-    :func:`_load_active_runners_cache`. The heartbeat-reported ``active_task_ids``
-    list is only a HINT: it can go stale-HIGH (still listing tasks that already
-    COMPLETED/FAILED), which inflates the load and falsely trips
-    :func:`_runner_at_capacity` — holding a pinned head while the runner is actually
-    idle. Falls back to the heartbeat list only when the authoritative count is
-    absent (a bare ``LocalRunner`` ORM outside the dispatch-cache path, or an old
-    snapshot), preserving backward-compatible behaviour.
-    """
-    caps = runner.capabilities or {}
-    authoritative = caps.get(_ACTIVE_AGENT_TASK_COUNT_KEY)
-    if isinstance(authoritative, int) and not isinstance(authoritative, bool):
-        return max(0, authoritative)
-    active = caps.get("active_task_ids") or []
-    try:
-        return len(active)
-    except TypeError:
-        return 0
-
-
-def _runner_active_compute_job_count(
-    runner: LocalRunner | RunnerDispatchSnapshot,
-) -> int:
-    """Best-effort compute-job load, from heartbeat-reported active job ids."""
-    active = (runner.capabilities or {}).get("active_compute_job_ids") or []
-    try:
-        return len(active)
-    except TypeError:
-        return 0
-
-
-def _runner_active_work_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
-    return _runner_active_task_count(runner) + _runner_active_compute_job_count(runner)
-
-
-def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
-    """Old runners omit the field, which remains backward-compatible."""
-    available = (runner.capabilities or {}).get("agent_available")
-    return available is not False
-
-
-def _coerce_max_concurrent(raw) -> int | None:
-    """Coerce a raw capability value to a positive int, or None if invalid."""
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, float):
-        return int(raw) if raw.is_integer() else None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-_CONTAINER_BACKEND_KEYS = {
-    "docker_usable",
-    "podman_usable",
-    "apptainer_ok",
-    "enroot_ok",
-}
-
-
-def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
-    """Whether a runner advertises a container isolation backend.
-
-    Reads the heartbeat-reported ``isolation_backends`` map and returns True
-    when at least one container-capable backend (docker, podman, apptainer,
-    enroot) is reported as available. Runners that never report
-    ``isolation_backends`` (old runners) are treated as NOT container-capable:
-    the orchestrator cannot safely route a container-image job to a runner
-    whose isolation support is unknown.
-    """
-    caps = runner.capabilities or {}
-    backends = caps.get("isolation_backends")
-    if not isinstance(backends, dict):
-        return False
-    return any(backends.get(key) for key in _CONTAINER_BACKEND_KEYS)
-
-
-def _runner_has_free_vram(
-    runner: LocalRunner | RunnerDispatchSnapshot,
-    required_mib: int,
-) -> bool:
-    """Whether any GPU on this runner has at least ``required_mib`` MiB free.
-
-    Reads the heartbeat-reported ``gpu_free_vram_mib`` list (one entry per
-    GPU, index-aligned with ``gpu_names``). When the runner has not reported
-    this field (older runners, or a runner that does not expose nvidia-smi)
-    the check is skipped and the runner is treated as eligible — we only
-    gate dispatch when we have real data, not on absence of telemetry.
-    """
-    caps = runner.capabilities or {}
-    free_mib_list = caps.get("gpu_free_vram_mib")
-    if not isinstance(free_mib_list, list) or not free_mib_list:
-        return True
-    return any(mib >= required_mib for mib in free_mib_list)
-
-
-def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
-    """Whether a runner is trustworthy GPU-capable for accelerator dispatch.
-
-    The runner self-reports ``has_gpu`` (a ``StrictBool``) in its heartbeat, but a
-    mis-set flag would SILENTLY DEFEAT the GPU capability gate — the runner would win
-    GPU-accelerator jobs it cannot execute, and they die missing-GPU on the box
-    instead of holding for real hardware. We therefore do NOT trust the bare bool
-    over the runner's own GPU TELEMETRY: the same heartbeat carries
-    ``gpu_count`` / ``gpu_names`` (nvidia-smi-derived facts persisted alongside
-    ``has_gpu`` in capabilities JSONB). When ``has_gpu`` is claimed true but that
-    telemetry positively contradicts it (a reported count of 0, or an empty names
-    list), the claim is disbelieved: the runner is treated as CPU-only and simply not
-    sent accelerator jobs (they hold for a genuinely GPU-capable runner, per the
-    existing no-eligible-runner hold paths — never a crash).
-
-    Absence of telemetry is NOT a contradiction. An older runner (or one that does
-    not expose nvidia-smi) may set ``has_gpu`` without reporting a count/names; as
-    with :func:`_runner_has_free_vram`, we gate only on real contradicting data, not
-    on missing telemetry — so a legitimately-configured runner that just does not
-    report the extra fields is never demoted (backward compatible). ``gpu_count`` is
-    authoritative when present; ``gpu_names`` is the fallback signal when the count
-    is absent.
-    """
-    caps = runner.capabilities or {}
-    if not caps.get("has_gpu"):
-        return False
-    # has_gpu is claimed true — cross-check the runner's own GPU telemetry, trusting
-    # the fact over the bare bool when the fact is present.
-    gpu_count = caps.get("gpu_count")
-    if isinstance(gpu_count, int) and not isinstance(gpu_count, bool):
-        return gpu_count > 0
-    gpu_names = caps.get("gpu_names")
-    if isinstance(gpu_names, list):
-        return len(gpu_names) > 0
-    # No GPU telemetry reported at all — trust the self-report (backward compatible).
-    return True
-
-
-def _runner_max_concurrent_compute(
-    runner: LocalRunner | RunnerDispatchSnapshot,
-) -> int | None:
-    """Max concurrent compute jobs for this runner, defaulting to max_concurrent.
-
-    Reads ``capabilities['max_concurrent_compute']`` when set by the runner
-    heartbeat or operator PATCH.  Falls back to ``max_concurrent`` so runners
-    that do not yet advertise a separate compute limit keep the old combined
-    behaviour (backward compatible).
-    """
-    caps = runner.capabilities or {}
-    raw = caps.get("max_concurrent_compute")
-    if raw is not None:
-        result = _coerce_max_concurrent(raw)
-        if result is not None:
-            return result
-    # Fall back to the combined max_concurrent.
-    return _coerce_max_concurrent(caps.get("max_concurrent"))
-
-
-def _runner_at_compute_capacity(
-    runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
-) -> bool:
-    """True when the runner's compute-job load has reached max_concurrent_compute."""
-    max_compute = _runner_max_concurrent_compute(runner)
-    if max_compute is None:
-        return False
-    return _runner_active_compute_job_count(runner) + pins_this_cycle >= max_compute
-
-
-def _runner_at_capacity(
-    runner: LocalRunner | RunnerDispatchSnapshot,
-    pins_this_cycle: int = 0,
-    task_type: str = "agent",
-) -> bool:
-    """True when the runner's EFFECTIVE load has reached its class capacity limit.
-
-    For ``compute_experiment`` tasks, checks the COMPUTE-class capacity:
-    ``active_compute_job_count + pins >= max_concurrent_compute`` (falling back to
-    ``max_concurrent`` when ``max_concurrent_compute`` is absent — backward compat).
-
-    For all other task types (agent), checks the AGENT-class capacity:
-    ``active_task_count + pins >= max_concurrent``.
-
-    The in-cycle pin count prevents over-pinning within a single dispatch pass
-    when the heartbeat-reported active count still reflects the old state.
-    """
-    caps = runner.capabilities or {}
-    if task_type == "compute_experiment":
-        return _runner_at_compute_capacity(runner, pins_this_cycle)
-    # Agent task: check active AGENT task count against max_concurrent.
-    max_concurrent = _coerce_max_concurrent(caps.get("max_concurrent"))
-    if max_concurrent is None:
-        return False
-    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
+# ── Runner eligibility predicates ────────────────────────────────────────────
+# Moved to app/runner_eligibility.py. This module is a chronic size-limit
+# offender (decomposition required; cap bumps are forbidden by
+# app.size_limit_policy), and the capability predicates were the one large,
+# perfectly self-contained unit here: pure functions over a runner snapshot, no
+# session, no I/O. Re-exported so every existing `orch._runner_*` reference and
+# import path keeps working unchanged.
+from app.runner_eligibility import (  # noqa: F401
+    _ACTIVE_AGENT_TASK_COUNT_KEY,
+    RunnerDispatchSnapshot,
+    _coerce_max_concurrent,
+    _runner_active_compute_job_count,
+    _runner_active_task_count,
+    _runner_active_work_count,
+    _runner_agent_available,
+    _runner_at_capacity,
+    _runner_at_compute_capacity,
+    _runner_gpu_capable,
+    _runner_handles_task_type,
+    _runner_has_container_capability,
+    _runner_has_free_vram,
+    _runner_max_concurrent_compute,
+)
 
 
 async def _load_active_runners_cache(
@@ -733,6 +500,15 @@ async def _try_runner_dispatch(
         dispatch_seed=task.id.int,
         container_image=container_image,
         vram_gb=vram_gb,
+        # Runners that recently declined THIS task are excluded — otherwise the
+        # per-task-stable tiebreak re-pins it to the same runner that just said
+        # no, and the pin→pull→decline loop never terminates.
+        declined_runner_ids=recently_declined_runner_ids(task),
+        # ...but never at the cost of a local-required Strategic task's local
+        # execution: on a single-runner Strategic fleet an exclusion empties the
+        # pool, and the 900s hold sweep then evicts the task to cloud. While the
+        # declines still look transient, re-pick the decliner instead.
+        declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
     )
     if runner is None:
         return False
@@ -987,18 +763,36 @@ async def _diagnose_strict_runner_pin_hold(
     accelerator: str | None,
     container_image: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
+    declined_record: dict | None = None,
 ) -> tuple[str, str]:
     """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
 
     Returns ``(reason_code, detail)``. The reason must be truthful and specific
     (runner id + why), never a generic no-runner message: reason codes are
-    ``at_capacity`` / ``task_type_not_allowed`` / ``missing_gpu`` /
-    ``missing_container_runtime`` / ``not_eligible`` (live but failed another
-    gate) for runners in the live cache, and ``not_found`` / ``not_enrolled`` /
-    ``offline`` for runners that are not live. The pair is stamped into
-    ``task.context['runner_pin_hold']`` and the hold status message so the
-    admin UI can show exactly why nothing is dispatching.
+    ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
+    ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
+    failed another gate) for runners in the live cache, and ``not_found`` /
+    ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
+    stamped into ``task.context['runner_pin_hold']`` and the hold status message
+    so the admin UI can show exactly why nothing is dispatching.
     """
+    # Checked FIRST, mirroring _select_eligible_runner: the decline exclusion is
+    # applied to the candidate pool BEFORE any eligibility filter, so a runner it
+    # dropped never reaches the capacity/task-type/GPU gates below. Reporting one
+    # of those instead would be a lie, and reporting the generic "not_eligible"
+    # would leave the operator with no idea the runner had said no — and no
+    # sight of the reason the runner itself gave.
+    if declined_record is not None:
+        count = declined_record.get("count") or 1
+        why = declined_record.get("reason") or "unspecified"
+        left = declined_record.get("seconds_left")
+        left_txt = f"; excluded for another {left}s" if left is not None else ""
+        return (
+            "declined_recently",
+            f"runner declined this task {count}x (most recent reason: {why})"
+            f"{left_txt}",
+        )
+
     candidates = active_runners_cache.get(project_id) or []
     snapshot = next(
         (r for r in candidates if str(r.id) == pinned_runner_id), None
@@ -1107,6 +901,8 @@ def _select_eligible_runner(
     container_image: str | None = None,
     forced_runner_target_id: str | None = None,
     vram_gb: float | None = None,
+    declined_runner_ids: set[str] | None = None,
+    declined_exclusion_advisory: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
@@ -1135,6 +931,25 @@ def _select_eligible_runner(
     dispatched task/job UUID) breaks ties deterministically so repeated dispatch
     bursts rotate across the fleet rather than always landing on the same runner.
 
+    ``declined_runner_ids`` are runners that recently DECLINED this specific task
+    (see :mod:`app.runner_decline`). They are removed from the candidate pool
+    because that same stable per-task tiebreak would otherwise re-pick the runner
+    that just declined — pin → pull → decline → pin, forever. Excluding them is
+    what makes the loop terminate: the task moves to other hardware, or to no
+    runner at all, which correctly falls through to cloud dispatch.
+
+    ``declined_exclusion_advisory`` waives that exclusion when honouring it would
+    empty the candidate set (see ``runner_decline.decline_exclusion_is_advisory``,
+    which sets it only for a Strategic task whose declines still look transient).
+    For a normal task an empty set IS the graceful exit — cloud dispatch. For a
+    local-required Strategic task it is not: the task parks and the 900s hold
+    sweep evicts it to cloud, defeating continuous-local mode. So rather than
+    empty the pool we re-pick the decliner and let the retry try again; the
+    decline counter and operator alert still escalate, and the waiver stops at
+    ``DECLINE_ESCALATION_THRESHOLD`` so a genuinely incapable single-runner fleet
+    still reaches the hold → cloud-fallback safety valve instead of livelocking.
+    Whenever other hardware exists the exclusion is honoured unconditionally.
+
     Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
     compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
     a single eligibility / least-loaded rule.
@@ -1147,31 +962,56 @@ def _select_eligible_runner(
     if forced_runner_target_id:
         forced_id = str(forced_runner_target_id).strip()
         candidates = [r for r in candidates if str(r.id) == forced_id]
+
     pins = runner_pins_this_cycle
-    eligible = [
-        r
-        for r in candidates
-        if _runner_handles_task_type(r, task_type)
-        and (task_type == "compute_experiment" or _runner_agent_available(r))
-        and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
-    ]
-    if accelerator:
-        # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool: a
-        # mis-set flag would silently defeat this gate and win GPU jobs the runner
-        # cannot run. _runner_gpu_capable cross-checks has_gpu against the runner's
-        # own nvidia-smi telemetry (gpu_count/gpu_names) and disbelieves a claim its
-        # telemetry contradicts. Fail-safe: a runner that cannot be verified
-        # GPU-capable falls out of `eligible` and the task holds for real hardware.
-        eligible = [r for r in eligible if _runner_gpu_capable(r)]
-    if container_image:
-        eligible = [r for r in eligible if _runner_has_container_capability(r)]
-    if vram_gb is not None and vram_gb > 0:
-        required_mib = int(vram_gb * 1024)
-        eligible = [
+
+    def _eligible(pool: list) -> list:
+        """Runners in ``pool`` that can actually take this task THIS cycle."""
+        out = [
             r
-            for r in eligible
-            if _runner_has_free_vram(r, required_mib)
+            for r in pool
+            if _runner_handles_task_type(r, task_type)
+            and (task_type == "compute_experiment" or _runner_agent_available(r))
+            and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
         ]
+        if accelerator:
+            # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
+            # a mis-set flag would silently defeat this gate and win GPU jobs the
+            # runner cannot run. _runner_gpu_capable cross-checks has_gpu against the
+            # runner's own nvidia-smi telemetry (gpu_count/gpu_names) and disbelieves
+            # a claim its telemetry contradicts. Fail-safe: a runner that cannot be
+            # verified GPU-capable falls out of `eligible` and the task holds for
+            # real hardware.
+            out = [r for r in out if _runner_gpu_capable(r)]
+        if container_image:
+            out = [r for r in out if _runner_has_container_capability(r)]
+        if vram_gb is not None and vram_gb > 0:
+            required_mib = int(vram_gb * 1024)
+            out = [r for r in out if _runner_has_free_vram(r, required_mib)]
+        return out
+
+    if declined_runner_ids and not forced_runner_target_id:
+        # Not applied under a forced pin: an operator hard-pin is an explicit
+        # instruction to use that runner and nothing else, so it out-ranks the
+        # decline heuristic (the hold + decline alert still surface the problem).
+        eligible = _eligible(
+            [r for r in candidates if str(r.id) not in declined_runner_ids]
+        )
+        # The waiver is decided on ELIGIBILITY, not on whether some other runner
+        # ROW merely exists. Deciding it on the raw candidate list made the waiver
+        # inert on every multi-runner fleet — including the live one: with a
+        # Strategic laptop + a dgx-1, excluding the laptop leaves dgx-1 "surviving",
+        # so the exclusion was applied — and dgx-1 then fails the task-type /
+        # capacity gate, `eligible` is empty, and the Strategic task is parked and
+        # evicted to cloud by the hold sweep. Exactly what the waiver exists to
+        # prevent, defeated by a runner that could never have taken the task.
+        #
+        # So: fall back to the decliner only when no ELIGIBLE runner survives.
+        if not eligible and declined_exclusion_advisory:
+            eligible = _eligible(candidates)
+    else:
+        eligible = _eligible(candidates)
+
     if not eligible:
         return None
     if preferred_runner_target_id:
@@ -1670,6 +1510,10 @@ async def _dispatch_compute_experiment_directly(
         container_image=container_image,
         forced_runner_target_id=forced_runner_target_id,
         vram_gb=vram_gb,
+        declined_runner_ids=recently_declined_runner_ids(task),
+        declined_exclusion_advisory=decline_exclusion_is_advisory(
+            task, "compute_experiment"
+        ),
     )
 
     # ── Strict runner pin: ONLY the pinned runner may take this job ────────────
@@ -1693,6 +1537,18 @@ async def _dispatch_compute_experiment_directly(
             accelerator,
             container_image,
             runner_pins_this_cycle,
+            # A strict `runner_target` pin is passed to _select_eligible_runner as
+            # a SOFT preference, so the decline exclusion DOES drop the pinned
+            # runner from the candidate pool (unlike an operator hard pin, which
+            # short-circuits it). Without this the diagnosis would blame a generic
+            # "not_eligible" for a runner that is perfectly healthy and simply
+            # declined the task — the exact observability hole this campaign is
+            # closing. Not consulted under a forced hard pin, mirroring selection.
+            declined_record=(
+                None
+                if forced_runner_target_id
+                else decline_record_for_runner(task, pin_runner_id)
+            ),
         )
         message = (
             f"runner_target hold: strict pin to runner {pin_runner_id} cannot "

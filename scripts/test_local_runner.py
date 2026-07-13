@@ -4295,6 +4295,61 @@ class TestDockerAgentBackend(unittest.TestCase):
             {"task_id": "task-abc"},
         )
 
+    def test_notify_decline_sends_reason_when_known(self):
+        """The decline reason rides along so the orchestrator can record it and
+        stop re-pinning the task to the runner that keeps rejecting it. Reasons
+        used to be printed locally and dropped, leaving the dispatcher with
+        nothing to exclude on — the pin -> pull -> decline livelock."""
+        from unittest.mock import patch
+
+        with patch.object(local_runner, "_post") as post_mock:
+            local_runner._notify_decline(
+                "https://api.example.com",
+                "tok-123",
+                "task-abc",
+                reason="no bwrap: fail-closed",
+            )
+        post_mock.assert_called_once_with(
+            "https://api.example.com/api/runner/decline-task",
+            "tok-123",
+            {"task_id": "task-abc", "reason": "no bwrap: fail-closed"},
+        )
+
+    def test_spawn_agent_task_reports_decline_reason(self):
+        """_spawn_agent_task hands the fail-closed reason back to the caller
+        (which forwards it to /decline-task) instead of only printing it."""
+        from unittest.mock import patch
+
+        reasons: list[str] = []
+        with patch.object(
+            local_runner.iso,
+            "decide_agent_backend",
+            return_value=local_runner.iso.DECLINE,
+        ), patch.object(
+            local_runner.iso,
+            "agent_decline_reason",
+            return_value="docker present but image is read-only; task type needs write",
+        ):
+            spawned = local_runner._spawn_agent_task(
+                task_id="t1",
+                task_type="fix",
+                agent_token="tok",
+                vm_instance_id="runner:1",
+                orchestrator_url="https://api",
+                workspace="/tmp/ws",
+                caps=local_runner.iso.Capabilities(),
+                agent_binary=["node", "agent.js"],
+                agent_image=None,
+                active_tasks={},
+                agent_started_at={},
+                agent_teardown={},
+                lock=threading.Lock(),
+                decline_reason_out=reasons,
+            )
+
+        assert spawned is False
+        assert reasons and "read-only" in reasons[0]
+
     def test_notify_decline_swallows_exceptions(self):
         """_notify_decline is best-effort — exceptions must not propagate."""
         from unittest.mock import patch
