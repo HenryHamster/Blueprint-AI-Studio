@@ -63,6 +63,7 @@ def _make_code_task(
     acceptance_evidence: dict | None = None,
     changed_files: list[str] | None = None,
     unverified_reason: str | None = None,
+    targeted_green: bool = False,
     task_type: str = "create",
 ) -> Task:
     payload: dict = {"type": task_type, "prompt": "do the thing"}
@@ -79,6 +80,12 @@ def _make_code_task(
     elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
         # named_test requires verification; set empty review_loop to indicate verified
         context[REVIEW_LOOP_KEY] = {}
+    # The no-CI monitor stamps this durable signal when it independently ran the
+    # declared acceptance test as a TARGETED run and it exited green. It rides on
+    # the same review_loop the merge-verification reason lives on.
+    if targeted_green:
+        rl = context.setdefault(REVIEW_LOOP_KEY, {})
+        rl["acceptance_test_targeted_green"] = True
     return Task(
         project_id=uuid.uuid4(),
         title="code task",
@@ -226,6 +233,137 @@ def test_named_test_unverified_merge_fails_closed():
     verdict = evaluate_code_acceptance(task)
     assert verdict.satisfied is False
     assert "did not run green" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# named_test — targeted-green proof under an UNVERIFIED (fell-open) merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_targeted_named_test_execution_earns_proven_under_unverified_merge():
+    # This project's task PRs target the ``automain`` integration branch, whose
+    # no-CI FULL-SUITE gate legitimately falls open BENIGN (stamping an
+    # unverified_merge_reason → verified=False). But the merge gate INDEPENDENTLY
+    # ran ONLY the declared acceptance test as a targeted run and it exited green,
+    # stamping ``acceptance_test_targeted_green=True``. That is honest,
+    # machine-checked proof of the exact claim, so the named_test gate must mint
+    # proven=True even though the full-suite merge fell open unverified.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+            "test_id": "test_targeted_named_test_execution_earns_proven_under_unverified_merge",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",  # benign fall-open
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "targeted" in verdict.reason.lower()
+    # proof_ref points at the specific declared test.
+    assert verdict.proof_ref == "backend/testing/test_acceptance_gate.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
+    assert acceptance_blocks_success(stamped) is False
+
+
+def test_targeted_green_but_test_absent_still_fails_closed():
+    # Even with the targeted-green signal, the declared test must be among the
+    # PR's changed files. A targeted-green flag with the test absent (never added
+    # in this PR) still fails closed — the signal relaxes ONLY the full-suite
+    # verification requirement, not the "test was actually added" requirement.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],  # test file absent
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "not among" in verdict.reason
+
+
+def test_targeted_green_test_only_diff_still_fails_closed():
+    # A targeted-green run of a test with NO changed production seam is still a
+    # test-only diff — nothing for the test to exercise. Fails closed regardless
+    # of the green signal.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/testing/test_acceptance_gate.py"],
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "test-only" in verdict.reason
+
+
+def test_targeted_green_parent_derived_capped_at_soft():
+    # A rollup-child inheriting the parent's combined diff must NOT mint machine
+    # proven credit even with a targeted-green run — the matched test could live
+    # in a sibling's slice of the union diff. targeted_green never overrides the
+    # parent-derived soft cap.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,
+    )
+    ctx = dict(task.context)
+    ctx["_pr_changed_files_from_rollup_parent"] = True
+    task.context = ctx
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is False
+    assert "sibling" in verdict.reason.lower()
+
+
+def test_verified_merge_ignores_absent_targeted_green_signal():
+    # A normally VERIFIED merge (no unverified_reason) does not depend on the
+    # targeted-green signal at all — it stays proven exactly as before.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason=None,  # verified merge
+        targeted_green=False,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    # The verified-merge reason wording (not the targeted wording).
+    assert "verified merge" in verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────

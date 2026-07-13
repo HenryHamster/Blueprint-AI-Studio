@@ -484,6 +484,16 @@ async def reconcile_backfill(
             session, open_version
         )
 
+    # Rollup-child changed-files reconcile: already-landed rollup children merged
+    # via a parent PR never received the parent's GitHub-verified _pr_changed_files,
+    # so their declared named_test cannot be located in a diff and they are stuck at
+    # declared_unsatisfied.  Runs BEFORE the unverified-merge backfill so a child
+    # newly stamped here is picked up by that pass within the SAME reconcile run and
+    # earns criterion evidence.  Best-effort and idempotent (setdefault stamping).
+    rollup_child_changed_files_reconciled = await ac.backfill_rollup_child_changed_files(
+        session, project_id, direction_key=body.direction_key
+    )
+
     # Unverified-merge backfill: tasks whose staging merge fell open could never
     # record evidence via record_task_merge_evidence (because the verdict is
     # proven=False).  This runs in parallel with the direction merge evidence
@@ -503,6 +513,7 @@ async def reconcile_backfill(
             "total_evidence_recorded": rows,
             "acceptance_window_evidence_recorded": window_evidence,
             "unverified_merge_evidence_recorded": unverified_evidence,
+            "rollup_child_changed_files_reconciled": rollup_child_changed_files_reconciled,
         }
 
     # Backfill all directions in the project.
@@ -543,12 +554,14 @@ async def reconcile_backfill(
 
     logger.info(
         "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d "
-        "acceptance_window_evidence=%d unverified_merge_evidence=%d",
+        "acceptance_window_evidence=%d unverified_merge_evidence=%d "
+        "rollup_child_changed_files_reconciled=%d",
         project_id,
         len(direction_keys),
         total,
         window_evidence,
         unverified_evidence,
+        rollup_child_changed_files_reconciled,
     )
     return {
         "status": "ok",
@@ -556,4 +569,5 @@ async def reconcile_backfill(
         "total_evidence_recorded": total,
         "acceptance_window_evidence_recorded": window_evidence,
         "unverified_merge_evidence_recorded": unverified_evidence,
+        "rollup_child_changed_files_reconciled": rollup_child_changed_files_reconciled,
     }

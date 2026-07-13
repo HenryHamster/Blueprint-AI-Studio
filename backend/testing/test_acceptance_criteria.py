@@ -8460,3 +8460,385 @@ async def test_backfill_all_directions_merge_evidence_ignores_other_directions(d
 
     other_ev = await ac.get_evidence_for_criterion(db_session, other_criterion.id)
     assert other_ev == [], "task for unlisted direction must not have evidence"
+
+
+# ---------------------------------------------------------------------------
+# Rollup child inherits parent's changed-files context for acceptance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_inherits_parent_changed_files_for_acceptance(db_session):
+    """A landed rollup child that merged via the PARENT's PR never owns a GitHub
+    PR, so it never receives its own ``_pr_changed_files`` context — its declared
+    ``named_test`` cannot be located in any diff and its acceptance verdict is
+    stuck at ``declared_unsatisfied``.
+
+    When the rollup parent lands, ``_propagate_landed_to_staging_merged_descendants``
+    must propagate the parent's changed-file context DOWN to the child (marked
+    parent-derived, NOT github-verified) and re-stamp the child's acceptance
+    verdict so the stale ``declared_unsatisfied`` flips off. Because the parent's
+    diff is the union of every sibling's changes, the credit is capped at the
+    ``satisfied_unproven`` tier — it must NOT mint machine ``proven`` credit.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import REVIEW_LOOP_KEY
+
+    prod_seam = "backend/app/rollup_widget.py"
+    declared_test = "backend/testing/test_rollup_widget.py"
+
+    project = await _make_project(db_session, name="RollupInheritCF")
+
+    # Rollup PR-owning parent: carries the authoritative GitHub-verified diff
+    # (the union of all its children's changes) and has landed on integration.
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([declared_test, prod_seam], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+
+    # Child merged via the parent's PR: pr_merged=True but landed_on_integration
+    # still False (it merged to staging, not integration) and NO own
+    # _pr_changed_files. It declares the named_test as acceptance evidence.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=None,  # set below after parent has an id
+        title="rollup child",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": declared_test,
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            # verified merge: review_loop present with no unverified reason.
+            REVIEW_LOOP_KEY: {},
+        },
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    child.parent_task_id = parent.id
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # BEFORE: with no changed-file context the declared test cannot be located,
+    # so the verdict is fail-closed declared_unsatisfied.
+    before = record_code_acceptance_verdict(child)
+    assert before is not None
+    assert before.satisfied is False
+    assert (
+        classify_merged_acceptance_context(child.context)
+        == "declared_unsatisfied"
+    )
+    await db_session.commit()
+
+    # Land-time propagation from the rollup parent.
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, db_session
+    )
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    assert child.id in {t.id for t in stamped}, "child must be stamped as landed"
+
+    child_ctx = child.context or {}
+    # Parent's changed files were inherited, marked parent-derived, and NOT
+    # github-verified (the union diff must not mint a false proof).
+    assert child_ctx.get("_pr_changed_files") == [declared_test, prod_seam]
+    assert child_ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+    assert "_pr_changed_files_github_verified" not in child_ctx
+
+    # AFTER: the verdict flips off declared_unsatisfied to the soft
+    # satisfied_unproven tier — satisfied but NOT machine-proven.
+    recorded = child_ctx.get("code_acceptance_verdict")
+    assert recorded is not None
+    assert recorded["satisfied"] is True
+    assert recorded["proven"] is False
+    assert classify_merged_acceptance_context(child_ctx) == "satisfied_unproven"
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_own_changed_files_not_clobbered_by_parent(db_session):
+    """setdefault semantics: a rollup child that carries its OWN self-reported
+    ``_pr_changed_files`` must keep it — the parent-derived propagation must never
+    overwrite a child's authoritative self-report."""
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+
+    project = await _make_project(db_session, name="RollupNoClobber")
+
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/parent_seam.py", "backend/testing/test_parent_seam.py"],
+            github_verified=True,
+        )
+    )
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        payloads=[{"type": "research", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    own_files = ["backend/app/child_seam.py"]
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="child-with-own-files",
+        payloads=[{"type": "create", "prompt": "c"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "_pr_changed_files": own_files,
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, db_session)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    child_ctx = child.context or {}
+    assert child_ctx.get("_pr_changed_files") == own_files, (
+        "child's own self-reported changed files must not be clobbered"
+    )
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_stamps_landed_child_changed_files_from_parent(
+    db_session,
+):
+    """Retroactive reconcile stamps a rollup parent's changed files onto
+    already-landed children, flips a stale declared_unsatisfied verdict, and lets
+    the unverified-merge backfill earn criterion evidence in the same run.
+
+    The forward-path propagation only heals NEW landings, so already-landed
+    children (stamped only on the PR-owning parent) stay without
+    ``_pr_changed_files``.  This exercises
+    :func:`ac.backfill_rollup_child_changed_files`:
+
+      1. A VERIFIED-merge child's verdict flips declared_unsatisfied ->
+         satisfied_unproven once the parent's diff is inherited (parent-derived,
+         never github-verified -> never machine-proven).
+      2. An UNVERIFIED-merge child gains the parent's changed-file context so the
+         declared named_test can be located in the diff — clearing the "not among
+         the PR's changed files" declared_unsatisfied cause — and the subsequent
+         unverified-merge backfill records criterion evidence for it.
+      3. Re-running the reconcile is a no-op (setdefault / idempotent).
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    prod_seam = "backend/app/widgetflow.py"
+    declared_test = "backend/testing/test_widgetflow.py"
+
+    project = await _make_project(db_session, name="ReconcileRollupChild")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="widgetflow named_test passes",
+        created_by="strategist",
+    )
+
+    # Parent (PR-owning rollup) landed on integration carrying the GitHub-verified
+    # combined diff (a test path + a production seam).
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([prod_seam, declared_test], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    def _child(context: dict) -> Task:
+        return Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            title="rollup child",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "child",
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": declared_test,
+                    },
+                }
+            ],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            criterion_ids=[criterion.criterion_key],
+            context=context,
+        )
+
+    # Verified-merge child: landed, review_loop present with NO unverified reason.
+    child_verified = _child(
+        {"pr_merged": True, "landed_on_integration": True, REVIEW_LOOP_KEY: {}}
+    )
+    # Unverified-merge child: landed but the merge fell open (unverified reason set).
+    child_unverified = _child(
+        {
+            "pr_merged": True,
+            "landed_on_integration": True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "no_detectable_test_command"},
+        }
+    )
+    db_session.add_all([child_verified, child_unverified])
+    await db_session.commit()
+
+    # BEFORE: with no changed-file context both children fail closed as
+    # declared_unsatisfied (the declared test cannot be located in any diff).
+    for c in (child_verified, child_unverified):
+        assert record_code_acceptance_verdict(c) is not None
+        assert (
+            classify_merged_acceptance_context(c.context) == "declared_unsatisfied"
+        )
+    await db_session.commit()
+
+    # Reconcile: stamp the parent's changed files onto both landed children.
+    stamped = await ac.backfill_rollup_child_changed_files(db_session, project.id)
+    assert stamped == 2, "both landed children lacking changed files must be stamped"
+
+    await db_session.refresh(child_verified)
+    await db_session.refresh(child_unverified)
+
+    # Both inherited the parent's diff as PARENT-DERIVED (never github-verified, so
+    # a union-diff match can never mint machine-proven credit).
+    for c in (child_verified, child_unverified):
+        ctx = c.context or {}
+        assert ctx.get("_pr_changed_files") == [prod_seam, declared_test]
+        assert ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+        assert "_pr_changed_files_github_verified" not in ctx
+
+    # Verified child: verdict flips off declared_unsatisfied to satisfied_unproven.
+    assert (
+        classify_merged_acceptance_context(child_verified.context)
+        == "satisfied_unproven"
+    )
+
+    # Unverified child: the declared test is now locatable in the diff, so the
+    # "not among the PR's changed files" declared_unsatisfied cause is cleared —
+    # its verdict reason now reflects the unverified merge, not a missing diff.
+    unverified_verdict = (child_unverified.context or {}).get(
+        CODE_ACCEPTANCE_VERDICT_KEY
+    )
+    assert unverified_verdict is not None
+    assert "not among the PR's changed files" not in unverified_verdict["reason"]
+    assert "did not run green" in unverified_verdict["reason"]
+
+    # The unverified-merge backfill now finds a locatable named_test + production
+    # seam and records criterion evidence — the whole point of running the
+    # reconcile BEFORE it in the same endpoint.
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded >= 1, "unverified-merge backfill must credit the stamped child"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert any(str(child_unverified.id) == e.source_id for e in evidence), (
+        "backfill evidence must be attributed to the stamped rollup child"
+    )
+
+    # Idempotent: a second reconcile stamps nothing new (setdefault semantics).
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_skips_child_without_github_verified_ancestor(
+    db_session,
+):
+    """A landed child whose ancestor carries NO github-verified changed files is
+    left untouched — the reconcile must never fabricate a diff from a
+    non-authoritative parent list."""
+    from app.acceptance_gate import PARENT_DERIVED_CHANGED_FILES_KEY
+
+    project = await _make_project(db_session, name="ReconcileNoVerifiedParent")
+
+    # Parent landed but its changed files are self-reported (NOT github-verified).
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": ["backend/app/foo.py"],
+        },
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="child",
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 0
+
+    await db_session.refresh(child)
+    child_ctx = child.context or {}
+    assert "_pr_changed_files" not in child_ctx
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx

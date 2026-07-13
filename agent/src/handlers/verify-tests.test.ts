@@ -995,7 +995,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     context: { acceptance_evidence: { kind, descriptor: 'the seam test', selector } },
   });
 
-  type Acc = { declared: boolean; descriptor: string; selector?: string; present: boolean; ran: boolean; status: string };
+  type Acc = { declared: boolean; descriptor: string; selector?: string; present: boolean; ran: boolean; status: string; passed?: boolean };
   function acceptanceBlock(): Acc | undefined {
     return (JSON.parse(lastPostedPayload().logs as string) as { acceptanceTest?: Acc }).acceptanceTest;
   }
@@ -1020,6 +1020,27 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     expect(block?.ran).toBe(true);
     expect(block?.present).toBe(true);
     expect(block?.selector).toBe('testing/test_seam.py::test_x');
+    // Targeted run exited zero and classified `ran` → the declared test is GREEN.
+    expect(block?.passed).toBe(true);
+  });
+
+  it('declared test that FAILED (non-zero exit, still classified ran) → passed=false', async () => {
+    // The targeted runner exits non-zero (rejects) with a real test-FAILURE
+    // signature (not an environment failure), so it classifies as `ran` but the
+    // run is RED — passed must be false so a failing declared test cannot mint proven.
+    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
+      if (cmd === 'git') return Promise.resolve('');
+      const err = Object.assign(new Error('pytest exited 1'), {
+        stdout: 'collected 1 item\n\ntest_seam.py::test_x FAILED\n\n1 failed in 0.12s',
+        stderr: '',
+      });
+      return Promise.reject(err);
+    });
+    await handleVerifyTests('at1b', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('ran');
+    expect(block?.ran).toBe(true);
+    expect(block?.passed).toBe(false);
   });
 
   it('declared test SKIPPED → status=skipped, ran=false (backend blocks)', async () => {
@@ -1031,6 +1052,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     expect(block?.status).toBe('skipped');
     expect(block?.ran).toBe(false);
     expect(block?.present).toBe(true);
+    expect(block?.passed).toBe(false);
   });
 
   it('declared test ABSENT → status=absent, present=false (backend blocks)', async () => {
@@ -1042,6 +1064,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     expect(block?.status).toBe('absent');
     expect(block?.present).toBe(false);
     expect(block?.ran).toBe(false);
+    expect(block?.passed).toBe(false);
   });
 
   it('environment failure during targeted run → could_not_run (degrades, never false-absent)', async () => {
@@ -1054,6 +1077,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     const block = acceptanceBlock();
     expect(block?.status).toBe('could_not_run');
     expect(block?.ran).toBe(false);
+    expect(block?.passed).toBe(false);
   });
 
   it('non-pytest / un-targetable selector → could_not_run (no execFile run)', async () => {
@@ -1062,6 +1086,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     await handleVerifyTests('at5', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
     expect(block?.status).toBe('could_not_run');
+    expect(block?.passed).toBe(false);
   });
 
   it('no acceptance evidence declared → acceptanceTest omitted entirely', async () => {

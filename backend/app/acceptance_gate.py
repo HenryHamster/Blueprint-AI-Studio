@@ -219,6 +219,31 @@ def stamp_changed_files_signal(
     return signal
 
 
+# Sentinel marking a child's ``_pr_changed_files`` as INHERITED from its rollup
+# parent's combined diff rather than sourced from the child's own PR. The
+# parent's diff is the union of every sibling's changes, so a child's declared
+# test that actually lives in a SIBLING's slice would appear "present" here — the
+# named_test gate must therefore cap parent-derived credit at the unproven
+# (inferred) tier and never mint machine ``proven`` credit from it.
+PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
+
+
+def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Changed-file signal for a rollup child inheriting its parent's combined diff.
+
+    Reuses :func:`stamp_changed_files_signal` for the non-lossy summary but marks
+    the list parent-derived and deliberately does NOT set the
+    ``_pr_changed_files_github_verified`` sentinel: the combined diff is a
+    superset (the union of all siblings' changes), so a child's declared test that
+    lives in a sibling's slice must not falsely earn full machine-``proven``
+    credit. Parent-derived credit is capped at the satisfied/unproven tier by
+    :func:`_evaluate_named_test`.
+    """
+    signal = stamp_changed_files_signal(paths, github_verified=False)
+    signal[PARENT_DERIVED_CHANGED_FILES_KEY] = True
+    return signal
+
+
 def _is_test_path(path: str) -> bool:
     """Whether ``path`` names a test file (under a tests/testing dir or by name)."""
     return _looks_like_test_file(path)
@@ -345,12 +370,38 @@ def _merge_was_test_verified(task: Task) -> bool:
     return not (isinstance(reason, str) and reason)
 
 
+# Durable signal the no-CI merge monitor stamps onto ``review_loop`` when it
+# independently ran ONLY the declared acceptance test as a targeted run and it
+# exited green (see ``orchestrator_ci_monitor`` and
+# ``ci_resolution.acceptance_test_is_green``). Read defensively so a task without
+# it (every legacy / older-agent merge) behaves exactly as today.
+ACCEPTANCE_TEST_TARGETED_GREEN_KEY = "acceptance_test_targeted_green"
+
+
+def _acceptance_test_targeted_green(task: Task) -> bool:
+    """Whether the merge gate independently ran the declared acceptance test as a
+    TARGETED run and it exited GREEN (fail-safe / defensive).
+
+    Reads ``review_loop['acceptance_test_targeted_green']`` — the durable signal
+    the no-CI monitor stamps when :func:`ci_resolution.acceptance_test_is_green`
+    held. Returns True ONLY on a literal ``True`` value; a missing / malformed /
+    non-dict review_loop, or an older agent that never emitted the signal, yields
+    False so today's behavior is preserved.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return False
+    return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
+
+
 def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
     verified: bool,
     truncated: bool = False,
     github_verified: bool = False,
+    parent_derived: bool = False,
+    targeted_green: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -362,6 +413,22 @@ def _evaluate_named_test(
     the changed seam, and an always-true assertion added in isolation is exactly
     that shape. Trivial / placeholder test references are already rejected
     fail-closed at declaration time by ``AcceptanceEvidence`` validation.
+
+    ``targeted_green`` is the ONE relaxation of requirement (2): when the
+    full-suite merge fell open UNVERIFIED (``verified is False``) but the merge
+    gate INDEPENDENTLY executed the SPECIFIC declared acceptance test as a
+    TARGETED run and it exited green (stamped by the no-CI monitor onto
+    ``review_loop['acceptance_test_targeted_green']`` when
+    :func:`ci_resolution.acceptance_test_is_green` held), the gate does NOT fail
+    closed at the verification step — the targeted green run is honest
+    machine-checked proof of the exact claim, so it continues to the proven
+    branch and mints ``proven=True``. This does NOT require running the whole
+    suite. When BOTH ``verified`` and ``targeted_green`` are False the gate keeps
+    today's fail-closed outcome. ``targeted_green`` never overrides the
+    parent-derived soft cap or the truncation / github-verified handling — those
+    stay as-is (a parent-derived match is still capped at satisfied/unproven even
+    when the declared test ran green, because the match may live in a sibling's
+    slice of the combined diff).
 
     ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
     declared test may have shipped beyond the truncation point, so its absence
@@ -376,6 +443,13 @@ def _evaluate_named_test(
     GitHub-verified, an absent declared test is an authoritative absence — the
     soft truncation credit is suppressed even when ``truncated=True`` because
     GitHub's API paginates fully and the absence is not a data artifact.
+
+    ``parent_derived`` marks that the changed-file list was INHERITED from a
+    rollup parent's combined diff (the union of all siblings' changes) rather than
+    the child's own PR. Because a child's declared test could physically live in a
+    sibling's slice of that union, a parent-derived match is real enough to clear
+    ``declared_unsatisfied`` (satisfied) but must NOT mint machine ``proven``
+    credit — the final proof branch is capped at ``satisfied=True, proven=False``.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
@@ -396,7 +470,7 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} is not among the PR's "
             "changed files — the claimed test was not added or modified here",
         )
-    if not verified:
+    if not verified and not targeted_green:
         return AcceptanceGateVerdict(
             True,
             False,
@@ -404,6 +478,11 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} did not run green under a "
             "real merge-test verdict (the merge fell open without verification)",
         )
+    # When ``verified`` is False but ``targeted_green`` is True, the merge gate
+    # ran ONLY the declared test as a targeted run and it exited green — honest
+    # machine-checked proof of the exact claim, so we continue past the
+    # verification step to the proven branch below rather than failing closed.
+    via_targeted = targeted_green and not verified
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
         return AcceptanceGateVerdict(
@@ -422,13 +501,39 @@ def _evaluate_named_test(
             "that does not semantically correspond to the declared test module — "
             "none of the changed production files match the test file's module name",
         )
+    if parent_derived:
+        # The changed-file list was inherited from a rollup parent's combined
+        # diff (a superset union of every sibling's changes). The declared test
+        # matches SOMEWHERE in that union, but it could be a sibling's slice, so
+        # this cannot be a machine proof. Credit soft: clears declared_unsatisfied
+        # without minting proven credit.
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} matches the rollup parent's "
+            "combined changed-file diff (inherited, not the child's own PR) — "
+            "credited soft without machine proof, as the match may live in a "
+            "sibling's slice of the union diff",
+        )
+    if via_targeted:
+        reason = (
+            f"named_test {declared_path!r} was added/modified and ran GREEN via a "
+            f"TARGETED execution of the declared test (the full-suite merge fell "
+            f"open unverified), and exercises a semantically grounded production "
+            f"seam ({len(seam_files)} non-test file(s))"
+        )
+    else:
+        reason = (
+            f"named_test {declared_path!r} was added/modified, ran green under a "
+            f"verified merge, and exercises a semantically grounded production seam "
+            f"({len(seam_files)} non-test file(s))"
+        )
     return AcceptanceGateVerdict(
         True,
         True,
         evidence.kind,
-        f"named_test {declared_path!r} was added/modified, ran green under a "
-        f"verified merge, and exercises a semantically grounded production seam "
-        f"({len(seam_files)} non-test file(s))",
+        reason,
         proven=True,
         proof_ref=evidence.test_path or declared_path or None,
     )
@@ -657,10 +762,20 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     verified = _merge_was_test_verified(task)
     truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
     github_verified_files = bool((task.context or {}).get("_pr_changed_files_github_verified"))
+    parent_derived_files = bool(
+        (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
+    )
+    targeted_green = _acceptance_test_targeted_green(task)
 
     if evidence.kind == "named_test":
         return _evaluate_named_test(
-            evidence, changed, verified, truncated, github_verified=github_verified_files
+            evidence,
+            changed,
+            verified,
+            truncated,
+            github_verified=github_verified_files,
+            parent_derived=parent_derived_files,
+            targeted_green=targeted_green,
         )
 
     if evidence.kind == "downstream_artifact":

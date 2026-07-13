@@ -2120,6 +2120,30 @@ export function classifyAcceptanceTestRun(output: string): 'ran' | 'skipped' | '
   return 'ran';
 }
 
+/** Decide whether the declared acceptance test's TARGETED run was GREEN.
+ *
+ *  Because the runner targets ONLY the declared test, the pass determination is
+ *  unambiguous: the run is green iff the runner invocation exited zero
+ *  (``cleanExit``) AND the classified status is ``ran`` (the test actually
+ *  executed, rather than being skipped/absent or degrading to could_not_run).
+ *
+ *  Conservative by construction — every other combination yields ``false``:
+ *    - a non-zero exit (``cleanExit === false``): a failing/erroring test, so
+ *      even a ``ran`` classification from the failure output is NOT a pass;
+ *    - ``skipped`` / ``absent``: the promised test did not execute;
+ *    - ``could_not_run``: an environment failure or un-targetable selector left
+ *      the pass unobservable.
+ *
+ *  No pass is ever inferred from ambiguous output — the authoritative signal is
+ *  exit-zero + ``ran``. Mirrors :func:`classifyAcceptanceTestRun` as a small pure
+ *  helper so the determination is independently unit-testable. */
+export function acceptanceTestRunPassed(
+  cleanExit: boolean,
+  status: 'ran' | 'skipped' | 'absent' | 'could_not_run',
+): boolean {
+  return cleanExit && status === 'ran';
+}
+
 // isDockerRunner is used by callers in index.ts via re-export
 export { isDockerRunner };
 

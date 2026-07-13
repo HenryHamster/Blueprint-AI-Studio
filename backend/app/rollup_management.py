@@ -480,6 +480,7 @@ async def _propagate_landed_to_staging_merged_descendants(
     drive one ``refresh_direction_outcomes_after_merge`` per distinct direction.
     Existing callers that ignore the return value are unaffected.
     """
+    from app import acceptance_gate as _acceptance_gate
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
         has_landed_signal,
@@ -495,9 +496,22 @@ async def _propagate_landed_to_staging_merged_descendants(
     # to descendants; coverage_delta acceptance evidence needs this key
     # present on each child task's context at verdict time.
     _parent = await session.get(Task, parent_task_id)
-    _parent_coverage: dict | None = (_parent.context or {}).get(
-        "test_coverage_result"
-    )
+    _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
+    _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
+
+    # Read the landed PR-owning parent's GitHub-verified changed-file list so it
+    # can be propagated DOWN to every landed descendant that lacks its own
+    # ``_pr_changed_files`` context.  Rollup children merge via the PARENT's
+    # single PR — they never own a GitHub PR, so ``_stamp_github_verified_
+    # changed_files`` never runs on them and their declared ``named_test``
+    # acceptance evidence cannot be located in the diff (declared_unsatisfied).
+    # The parent's diff is the union of every sibling's changes, so it is stamped
+    # as parent-derived (capped at the satisfied/unproven tier, never proven).
+    _parent_changed: list[str] = [
+        p
+        for p in (_parent_ctx.get("_pr_changed_files") or [])
+        if isinstance(p, str) and p.strip()
+    ]
 
     while queue:
         rows = (
@@ -532,6 +546,24 @@ async def _propagate_landed_to_staging_merged_descendants(
                     _desc_ctx = dict(row.context or {})
                     _desc_ctx.setdefault("test_coverage_result", _parent_coverage)
                     row.context = _desc_ctx
+
+                # Propagate the parent's changed-file context to descendants that
+                # lack their own self-reported ``_pr_changed_files`` so a declared
+                # named_test can be located in the diff and a stale
+                # declared_unsatisfied verdict flips.  setdefault semantics: NEVER
+                # clobber a child that already carries its own list.  After
+                # stamping, re-evaluate the acceptance verdict so it re-stamps.
+                if _parent_changed and not (row.context or {}).get(
+                    "_pr_changed_files"
+                ):
+                    _cf_ctx = dict(row.context or {})
+                    _cf_ctx.update(
+                        _acceptance_gate.stamp_parent_derived_changed_files_signal(
+                            _parent_changed
+                        )
+                    )
+                    row.context = _cf_ctx
+                    _acceptance_gate.record_code_acceptance_verdict(row)
 
                 mark_landed_on_integration(row)
                 session.add(row)

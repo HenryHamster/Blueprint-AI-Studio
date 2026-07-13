@@ -1054,12 +1054,15 @@ def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
     acceptance test (``acceptance_evidence`` with ``kind="test"``).
 
     Returns ``{"declared", "descriptor", "selector"?, "present", "ran",
-    "status"}`` when a well-formed ``declared=true`` block with a recognized
-    ``status`` is present, else ``None``. ``status`` is one of ``ran`` /
-    ``skipped`` / ``absent`` / ``could_not_run``. Pure read-side accessor,
-    mirroring :func:`disabled_tests_block`: defensive about a missing / non-dict /
-    malformed / older-agent block (returns ``None``), so an agent that omits it
-    degrades silently and the gate is unchanged.
+    "status", "passed"}`` when a well-formed ``declared=true`` block with a
+    recognized ``status`` is present, else ``None``. ``status`` is one of ``ran``
+    / ``skipped`` / ``absent`` / ``could_not_run``. ``passed`` is a defensive bool
+    (default ``False`` on a missing / non-bool value) marking that the TARGETED
+    run of ONLY the declared test exited green — an older agent that omits the
+    field simply yields ``passed=False`` (today's behavior, no green signal). Pure
+    read-side accessor, mirroring :func:`disabled_tests_block`: defensive about a
+    missing / non-dict / malformed / older-agent block (returns ``None``), so an
+    agent that omits it degrades silently and the gate is unchanged.
     """
     if not isinstance(verdict, dict):
         return None
@@ -1078,6 +1081,10 @@ def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
         "present": bool(raw.get("present")),
         "ran": bool(raw.get("ran")),
         "status": status,
+        # Defensive: only a literal ``True`` counts as green. A missing /
+        # non-bool value (older agent, malformed artifact) reads as False so no
+        # spurious green signal is ever minted.
+        "passed": raw.get("passed") is True,
     }
     selector = raw.get("selector")
     if isinstance(selector, str) and selector.strip():
@@ -1104,6 +1111,32 @@ def acceptance_test_is_clear_failure(block: Any) -> bool:
     if block.get("ran") is True:
         return False
     return block.get("status") in {"absent", "skipped"}
+
+
+def acceptance_test_is_green(block: Any) -> bool:
+    """Whether a declared acceptance-test block proves the promised test ran GREEN.
+
+    True only when the block is the declared acceptance test, it actually ran
+    (``ran is True`` AND ``status == "ran"``), AND the targeted run of ONLY that
+    declared test exited green (``passed is True``). Because the agent targets
+    just the declared test, this is honest machine-checked proof of the exact
+    claim WITHOUT running the whole suite — the no-CI merge gate can mint
+    ``proven`` from it even when the full-suite gate fell open unverified.
+
+    Defensive about a missing / non-dict / old-shape block, and about an older
+    agent that omits ``passed`` (:func:`acceptance_test_block` defaults it to
+    False): all yield False, so today's behavior is preserved and no green signal
+    is minted on absence.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("declared") is not True:
+        return False
+    if block.get("ran") is not True:
+        return False
+    if block.get("status") != "ran":
+        return False
+    return block.get("passed") is True
 
 
 def _acceptance_test_failure_detail(block: dict[str, Any]) -> str:

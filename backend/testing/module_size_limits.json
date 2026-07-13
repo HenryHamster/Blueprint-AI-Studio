@@ -117,7 +117,7 @@
     "recovery_post_commit_pending.py": 1100,
     "recovery_sidecar.py": 400,
     "release_version.py": 2050,
-    "ci_resolution.py": 1800,
+    "ci_resolution.py": 2100,
     "routers/admin_project_config.py": 1800,
     "compute_backends.py": 3850,
     "direction_lifecycle.py": 2200,
@@ -139,7 +139,8 @@
     "routers/agent_strategic_fetch.py": 1750,
     "runner_health_monitors.py": 1001,
     "strategic_context_package.py": 1800,
-    "routers/runner.py": 1650
+    "routers/runner.py": 1650,
+    "acceptance_gate.py": 1800
   },
   "agent": {
     "index.ts": 4600,

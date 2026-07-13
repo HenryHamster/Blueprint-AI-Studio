@@ -1661,6 +1661,176 @@ async def backfill_unverified_merge_evidence(
         return 0
 
 
+# Depth cap for the parent-ancestor walk in
+# :func:`backfill_rollup_child_changed_files`. Rollup nesting is shallow (a
+# child under a rollup parent, occasionally a rollup-of-rollups), so a small
+# cap bounds the walk cheaply while a visited-set guards against a cyclic
+# parent_task_id chain from corrupt data.
+_ROLLUP_PARENT_WALK_MAX_DEPTH = 8
+
+
+async def backfill_rollup_child_changed_files(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str | None = None,
+) -> int:
+    """Retroactively stamp a rollup parent's changed files onto landed children.
+
+    The forward-path propagation in
+    :func:`app.rollup_management._propagate_landed_to_staging_merged_descendants`
+    only heals NEW landings.  Already-landed rollup children (merged via the
+    parent's single PR) carry ``landed_on_integration`` but never received the
+    parent's GitHub-verified ``_pr_changed_files``, so their declared
+    ``named_test`` cannot be located in a diff and their acceptance verdict is
+    stuck at ``declared_unsatisfied``; the unverified-merge backfill skips them
+    because ``_changed_files(task)`` is empty.
+
+    This best-effort reconcile pass finds landed COMPLETED tasks that carry NO
+    ``_pr_changed_files`` but whose nearest landed ancestor (walking
+    ``parent_task_id``) DOES carry a GitHub-verified changed-file list, and
+    stamps that list onto the child using the SAME parent-derived semantics as
+    the forward path: :func:`stamp_parent_derived_changed_files_signal`
+    (``setdefault`` — never clobber a child's own list — and deliberately NO
+    ``_pr_changed_files_github_verified`` sentinel, so credit is capped at the
+    satisfied/unproven tier and never mints machine ``proven`` credit from the
+    parent's union diff).  The acceptance verdict is then re-evaluated so a stale
+    ``declared_unsatisfied`` reason flips.
+
+    Wired to run BEFORE :func:`backfill_unverified_merge_evidence` in the
+    reconcile endpoint so that, within the SAME run, a newly-stamped child is
+    picked up by the unverified-merge backfill and earns criterion evidence.
+
+    ``direction_key``, when provided, scopes the search to tasks whose context
+    carries that ``direction_id`` (matching the sibling backfills).
+
+    Idempotent (``setdefault`` — a re-run stamps nothing new) and best-effort
+    (errors are logged and swallowed so a failure never blocks the caller).
+
+    Returns the count of children newly stamped by this call.
+    """
+    try:
+        from app import acceptance_gate as _acceptance_gate
+        from app.database import resolve_dialect_name
+        from app.landed_signal import is_merged_completion, landed_signal_predicate
+        from app.models import Task, TaskStatus
+
+        _BATCH_LIMIT = 500
+        stamped_total = 0
+        offset = 0
+        # Cache ancestor lookups across the scan — sibling children share the
+        # same rollup parent, so one github-verified resolution per ancestor id
+        # avoids re-walking the chain for every child.
+        resolved_parent_changed: dict[uuid.UUID, list[str]] = {}
+
+        async def _github_verified_ancestor_changed(child: Task) -> list[str]:
+            """Nearest landed ancestor's GitHub-verified changed files, or []."""
+            visited: set[uuid.UUID] = {child.id}
+            parent_id = child.parent_task_id
+            depth = 0
+            while parent_id is not None and depth < _ROLLUP_PARENT_WALK_MAX_DEPTH:
+                if parent_id in visited:
+                    break
+                visited.add(parent_id)
+                if parent_id in resolved_parent_changed:
+                    return resolved_parent_changed[parent_id]
+                ancestor = await session.get(Task, parent_id)
+                if ancestor is None:
+                    break
+                ctx = ancestor.context or {}
+                if ctx.get("_pr_changed_files_github_verified") is True:
+                    changed = [
+                        p
+                        for p in (ctx.get("_pr_changed_files") or [])
+                        if isinstance(p, str) and p.strip()
+                    ]
+                    resolved_parent_changed[parent_id] = changed
+                    return changed
+                depth += 1
+                parent_id = ancestor.parent_task_id
+            return []
+
+        while True:
+            query = (
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
+                )
+                .order_by(Task.id)
+                .limit(_BATCH_LIMIT)
+                .offset(offset)
+            )
+
+            if direction_key:
+                dialect = resolve_dialect_name(session)
+                if dialect == "sqlite":
+                    from sqlalchemy import func as _func
+                    query = query.where(
+                        _func.json_extract(Task.context, "$.direction_id")
+                        == direction_key
+                    )
+                else:
+                    from sqlalchemy import cast as _cast
+                    from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+                    query = query.where(
+                        Task.context.op("@>")(
+                            _cast({"direction_id": direction_key}, _JSONB)
+                        )
+                    )
+
+            batch = list((await session.execute(query)).scalars().all())
+            if not batch:
+                break
+            offset += len(batch)
+
+            batch_stamped = 0
+            for task in batch:
+                if not is_merged_completion(task):
+                    continue
+                # Only children that lack their own changed-file context — a
+                # child that already carries a list is left untouched (setdefault
+                # / idempotency).
+                if _acceptance_gate._changed_files(task):
+                    continue
+                if task.parent_task_id is None:
+                    continue
+
+                parent_changed = await _github_verified_ancestor_changed(task)
+                if not parent_changed:
+                    continue
+
+                new_ctx = dict(task.context or {})
+                for k, v in _acceptance_gate.stamp_parent_derived_changed_files_signal(
+                    parent_changed
+                ).items():
+                    new_ctx.setdefault(k, v)
+                task.context = new_ctx
+                _acceptance_gate.record_code_acceptance_verdict(task)
+                session.add(task)
+                batch_stamped += 1
+
+            if batch_stamped:
+                await session.commit()
+                stamped_total += batch_stamped
+
+        if stamped_total:
+            logger.info(
+                "backfill_rollup_child_changed_files: project=%s "
+                "tasks_scanned=%d stamped=%d",
+                project_id,
+                offset,
+                stamped_total,
+            )
+        return stamped_total
+    except Exception:
+        logger.exception(
+            "backfill_rollup_child_changed_files: failed for project %s",
+            project_id,
+        )
+        return 0
+
+
 async def _resolve_acceptance_window_criteria(
     session: AsyncSession,
     version: Any,

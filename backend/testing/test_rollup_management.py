@@ -3072,6 +3072,155 @@ async def test_propagate_landed_descendants_copies_coverage_data(cleanup_db):
     )
 
 
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_inherits_changed_files(cleanup_db):
+    """The BFS sweep propagates the rollup parent's ``_pr_changed_files`` context
+    DOWN to each qualifying landed descendant that lacks its own list, marked
+    parent-derived (never github-verified), and respects setdefault: a descendant
+    that carries its own self-reported list is never clobbered.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    parent_files = [
+        "backend/app/rollup_seam.py",
+        "backend/testing/test_rollup_seam.py",
+    ]
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(stamp_changed_files_signal(parent_files, github_verified=True))
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context=parent_ctx,
+    )
+
+    # ── CASE 1: child with no own changed files inherits parent-derived list ──
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # ── CASE 2: grandchild (deeper descendant) also inherits via BFS ──────────
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # ── CASE 3: child with OWN changed files must NOT be clobbered ────────────
+    own_files = ["backend/app/child_own_seam.py"]
+    child_own = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "_pr_changed_files": own_files,
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+    await cleanup_db.refresh(grandchild)
+    await cleanup_db.refresh(child_own)
+
+    stamped_ids = {t.id for t in stamped}
+    assert child.id in stamped_ids
+    assert grandchild.id in stamped_ids
+
+    for inheritor in (child, grandchild):
+        ctx = inheritor.context or {}
+        assert ctx.get("_pr_changed_files") == parent_files
+        assert ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+        # The union diff must never be marked github-verified on a child.
+        assert "_pr_changed_files_github_verified" not in ctx
+
+    own_ctx = child_own.context or {}
+    assert own_ctx.get("_pr_changed_files") == own_files, (
+        "a child's own self-reported changed files must not be clobbered"
+    )
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in own_ctx
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_no_parent_changed_files_noop(cleanup_db):
+    """When the rollup parent has no ``_pr_changed_files`` (e.g. a research/plan
+    parent with no code diff), descendants inherit nothing — the changed-files
+    propagation is a clean no-op and the landed signal still stamps."""
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import PARENT_DERIVED_CHANGED_FILES_KEY
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, cleanup_db)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+
+    child_ctx = child.context or {}
+    assert has_landed_signal(child)
+    assert "_pr_changed_files" not in child_ctx
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
+
+
 # ---------------------------------------------------------------------------
 # _do_rollup_post_merge_housekeeping: multi-direction refresh
 # ---------------------------------------------------------------------------
