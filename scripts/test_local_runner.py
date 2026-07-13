@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -730,8 +731,16 @@ class TestHeartbeatLiveConfig(unittest.TestCase):
 
         active_tasks: dict = {}
         lock = threading.Lock()
+        # An idle runner + a mismatched version_hint arms the AUTO-UPDATE path.
+        # Unstubbed, that runs a real `git fetch` (do_update) and then either
+        # os._exit()s or os.execv()s — killing the pytest process itself and
+        # silently truncating the run (exit 0, later tests never reported). These
+        # tests are about the config echo, so the update path is stubbed inert.
         with patch.object(local_runner, "_post", side_effect=fake_post), \
              patch.object(local_runner, "_write_status_json"), \
+             patch.object(local_runner.br, "do_update", return_value=1), \
+             patch.object(os, "_exit"), \
+             patch.object(os, "execv"), \
              patch("time.sleep", lambda *_: None):
             local_runner._heartbeat_loop(
                 "https://api.example.com", "tok", active_tasks, lock, {},
@@ -3888,7 +3897,13 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
                  patch.object(local_runner.br, "do_update",
                               return_value=0), \
                  patch.object(os, "_exit"), \
+                 patch.object(os, "execv"), \
                  patch("builtins.print", side_effect=fake_print):
+                # BOTH exits are stubbed: after a successful update the runner
+                # either exits for its supervisor OR re-execs in place, and which
+                # branch it takes depends on the HOST running the tests. An
+                # unstubbed os.execv replaces the pytest process itself, silently
+                # truncating the run (exit 0, remaining tests never reported).
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -6298,8 +6313,108 @@ class TestInputArtifactRehydration(unittest.TestCase):
             self.assertIn("input_artifact_rehydration_failed", str(ctx.exception))
 
 
+class _FakeDocker:
+    """Scriptable ``docker`` for _prune_docker_images.
+
+    *images* is a list of dicts: ``{"id", "created", "last_tag_time", "tags",
+    "rm_fails"}``. Records every argv the prune pass invokes so a test can assert
+    on the MECHANISM (e.g. that no creation-time `until=` filter is used) and not
+    just on the outcome.
+    """
+
+    def __init__(self, images, list_rc=0, inspect_rc=0):
+        self.images = images
+        self.list_rc = list_rc
+        self.inspect_rc = inspect_rc
+        self.calls = []
+        self.removed = []
+
+    def _result(self, rc, out="", err=""):
+        class P:
+            returncode = rc
+            stdout = out
+            stderr = err
+        return P()
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        if cmd[:4] == ["docker", "image", "ls", "-a"]:
+            if self.list_rc != 0:
+                return self._result(self.list_rc, err="permission denied")
+            return self._result(0, "".join(f"{i['id']}\n" for i in self.images))
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if self.inspect_rc != 0:
+                return self._result(self.inspect_rc, err="no such image")
+            rows = []
+            for img in self.images:
+                tags = "[" + " ".join(img.get("tags") or []) + "]"
+                rows.append(
+                    f"{img['id']}\t{img.get('last_tag_time', '')}\t"
+                    f"{img.get('created', '')}\t{tags}"
+                )
+            return self._result(0, "\n".join(rows))
+        if cmd[:3] == ["docker", "image", "prune"]:
+            # The OLD, creation-time-keyed mechanism. Answered (not raised) so a
+            # regression fails on the assertions below, not on a fake's exception.
+            return self._result(0, "Total reclaimed space: 5GB")
+        if cmd[:3] == ["docker", "image", "rm"]:
+            target = cmd[3]
+            img = next((i for i in self.images if i["id"] == target), None)
+            if img is not None and img.get("rm_fails"):
+                return self._result(
+                    1, err="conflict: image is being used by stopped container"
+                )
+            self.removed.append(target)
+            return self._result(0, f"Deleted: {target}")
+        raise AssertionError(f"unexpected docker invocation: {cmd}")
+
+    @property
+    def used_until_filter(self) -> bool:
+        """True iff any invocation used docker's creation-time `until=` filter."""
+        return any(
+            any(str(arg).startswith("until=") for arg in cmd) for cmd in self.calls
+        )
+
+
+def _go_time(dt) -> str:
+    """Render *dt* the way `docker image inspect .Metadata.LastTagTime` does."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f000 +0000 UTC")
+
+
+def _rfc3339(dt) -> str:
+    """Render *dt* the way `docker image inspect .Created` does."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f000Z")
+
+
 class TestDockerImageCacheHygiene(unittest.TestCase):
-    """Runner Docker image cache hygiene (_prune_docker_images)."""
+    """Runner Docker image cache hygiene (_prune_docker_images).
+
+    Hygiene must key on LAST-USE / PULL recency. `docker image prune --filter
+    until=<age>` keys on the image's upstream CREATION date, so a just-pulled
+    registry base image (built months ago) was evicted immediately and re-pulled
+    by the next job — the prune thrashed the cache it exists to protect.
+    """
+
+    def setUp(self):
+        self.now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+        self.tmpdir = tempfile.mkdtemp(prefix="bp_prune_test_")
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self.tmpdir
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+
+    def _prune(self, docker, keep_days=7, ledger=None, protected=()):
+        return local_runner._prune_docker_images(
+            "/tmp",
+            1,
+            keep_days=keep_days,
+            _run=docker,
+            _disk_below=lambda root, m: True,
+            _now=self.now,
+            _ledger=ledger or {},
+            _protected=set(protected),
+        )
 
     def test_noop_when_disk_above_threshold(self):
         result = local_runner._prune_docker_images(
@@ -6308,26 +6423,128 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         self.assertFalse(result["pruned"])
         self.assertEqual(result["reason"], "disk_above_threshold")
 
-    def test_runs_when_disk_low(self):
-        seen = {}
+    def test_freshly_pulled_old_base_image_is_kept(self):
+        """FINDING 7: an image BUILT 400 days ago but PULLED an hour ago stays.
 
-        def fake_run(cmd, **kw):
-            seen["cmd"] = cmd
+        This is the exact cache-thrash case: NGC/CUDA base images carry an
+        upstream creation date far older than any sane keep window, so a
+        creation-time `until=` prune deletes them the moment they land.
+        """
+        docker = _FakeDocker([
+            {
+                "id": "sha256:cuda",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(hours=1)),
+                "tags": ["nvcr.io/nvidia/pytorch:24.05-py3"],
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
 
-            class P:
-                returncode = 0
-                stdout = "Total reclaimed space: 5GB"
-                stderr = ""
-            return P()
-
-        result = local_runner._prune_docker_images(
-            "/tmp", 1, keep_days=3, _run=fake_run, _disk_below=lambda root, m: True
-        )
         self.assertTrue(result["pruned"])
-        self.assertEqual(result["keep_days"], 3)
-        # until filter is keep_days*24 hours; Docker protects in-use + recent images.
-        self.assertIn("until=72h", seen["cmd"])
-        self.assertIn("-a", seen["cmd"])
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+        self.assertEqual(result["kept"], 1)
+        # And the creation-time-keyed mechanism is gone for good.
+        self.assertFalse(
+            docker.used_until_filter,
+            "hygiene must not use docker's creation-time until= filter",
+        )
+
+    def test_ledger_last_use_protects_an_old_pull(self):
+        """An image pulled 30d ago but USED an hour ago (runner ledger) is kept."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:inuse",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=30)),
+                "tags": ["registry.example.com/proj/train:v3"],
+            }
+        ])
+        result = self._prune(
+            docker,
+            keep_days=7,
+            ledger={
+                "registry.example.com/proj/train:v3":
+                    (self.now - timedelta(hours=1)).isoformat()
+            },
+        )
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+
+    def test_stale_unused_image_is_removed(self):
+        """An image neither used nor pulled inside the window IS reclaimed."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:stale",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=90)),
+                "tags": ["old/experiment:v1"],
+            },
+            {
+                "id": "sha256:fresh",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=1)),
+                "tags": ["new/experiment:v2"],
+            },
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(docker.removed, ["sha256:stale"])
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["kept"], 1)
+
+    def test_in_use_image_is_never_force_removed(self):
+        """A stale image still referenced by a container is left to docker to refuse.
+
+        The removal must not pass ``-f``: docker's own refusal ("image is being
+        used by ... container") is the in-use protection.
+        """
+        docker = _FakeDocker([
+            {
+                "id": "sha256:running",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=90)),
+                "tags": ["busy/job:v1"],
+                "rm_fails": True,
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["in_use_skipped"], 1)
+        rm_calls = [c for c in docker.calls if c[:3] == ["docker", "image", "rm"]]
+        self.assertTrue(rm_calls)
+        for call in rm_calls:
+            self.assertNotIn("-f", call)
+            self.assertNotIn("--force", call)
+
+    def test_agent_image_is_protected(self):
+        """The configured agent image is never evicted, however old its build date."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:agent",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=400)),
+                "tags": ["ghcr.io/blueprint/agent:prod"],
+            }
+        ])
+        result = self._prune(
+            docker, keep_days=7, protected={"ghcr.io/blueprint/agent:prod"}
+        )
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(docker.removed, [])
+
+    def test_undatable_image_is_kept(self):
+        """No parseable timestamp anywhere → keep. Never delete what we can't age."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:unknown",
+                "created": "",
+                "last_tag_time": "0001-01-01T00:00:00Z",
+                "tags": [],
+            }
+        ])
+        result = self._prune(docker, keep_days=7)
+        self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["kept"], 1)
 
     def test_handles_docker_failure(self):
         def fake_run(cmd, **kw):
@@ -6340,16 +6557,8 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         self.assertIn("prune_error", result["reason"])
 
     def test_nonzero_exit_reported(self):
-        def fake_run(cmd, **kw):
-            class P:
-                returncode = 1
-                stdout = ""
-                stderr = "permission denied"
-            return P()
-
-        result = local_runner._prune_docker_images(
-            "/tmp", 1, keep_days=7, _run=fake_run, _disk_below=lambda root, m: True
-        )
+        docker = _FakeDocker([], list_rc=1)
+        result = self._prune(docker, keep_days=7)
         self.assertFalse(result["pruned"])
         self.assertEqual(result["reason"], "prune_nonzero")
 
@@ -6362,6 +6571,45 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
             os.environ, {"BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS": "notanint"}
         ):
             self.assertEqual(local_runner._compute_image_keep_days(), 7)
+
+    def test_record_image_use_round_trips_through_ledger(self):
+        """The runner's own last-use stamp survives a write/read cycle."""
+        local_runner._record_image_use("nvcr.io/nvidia/pytorch:24.05-py3", _now=self.now)
+        ledger = local_runner._load_image_use_ledger()
+        self.assertIn("nvcr.io/nvidia/pytorch:24.05-py3", ledger)
+        parsed = local_runner._parse_docker_time(
+            ledger["nvcr.io/nvidia/pytorch:24.05-py3"]
+        )
+        self.assertEqual(parsed, self.now)
+        # And a recorded use protects the image end-to-end (no _ledger injection).
+        docker = _FakeDocker([
+            {
+                "id": "sha256:cuda",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=400)),
+                "tags": ["nvcr.io/nvidia/pytorch:24.05-py3"],
+            }
+        ])
+        result = local_runner._prune_docker_images(
+            "/tmp", 1, keep_days=7, _run=docker,
+            _disk_below=lambda root, m: True, _now=self.now, _protected=set(),
+        )
+        self.assertEqual(result["removed"], 0, result)
+
+    def test_parse_docker_time_formats(self):
+        """Docker emits RFC3339 (.Created), Go time.Time (.Metadata.LastTagTime),
+        and a Go zero value for never-tagged images."""
+        self.assertEqual(
+            local_runner._parse_docker_time("2026-07-01T12:34:56.789012345Z"),
+            datetime(2026, 7, 1, 12, 34, 56, 789012, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            local_runner._parse_docker_time("2026-07-01 12:34:56.789012 +0000 UTC"),
+            datetime(2026, 7, 1, 12, 34, 56, 789012, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(local_runner._parse_docker_time("0001-01-01T00:00:00Z"))
+        self.assertIsNone(local_runner._parse_docker_time(""))
+        self.assertIsNone(local_runner._parse_docker_time("not-a-time"))
 
 
 class _FakeResp:
@@ -6476,6 +6724,269 @@ class DownloadInputArtifactTests(unittest.TestCase):
         # Only the safe member landed; no escape above the artifact dir.
         self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "ok.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "escape.txt")))
+
+
+class SupervisorDetectionTests(unittest.TestCase):
+    """FINDING 3: supervision must be a claim about THIS PROCESS, not the host.
+
+    The old detector returned "systemd" whenever /proc/1/comm was systemd — true
+    of EVERY process on a systemd host, including a runner started by hand in
+    tmux. The self-update path then took the "a supervisor will restart me"
+    branch, os._exit(0)-ed, and nothing came back (the dgx-1 outage), while
+    --check printed a healthy "systemd (auto-restart on crash/update)".
+    """
+
+    # A hand-started runner on a systemd host: systemd tracks the login session
+    # in a *scope*, which it never restarts.
+    SESSION_CGROUP = "0::/user.slice/user-1000.slice/session-3.scope\n"
+    # A runner running as a real systemd service unit.
+    SERVICE_CGROUP = "0::/system.slice/blueprint-runner.service\n"
+
+    def _state(self, env=None, pid1="", cgroup="", ancestry=True):
+        with patch.dict(os.environ, env or {}, clear=True), \
+             patch.object(local_runner, "_pid1_comm", return_value=pid1), \
+             patch.object(local_runner, "_self_cgroup_text", return_value=cgroup), \
+             patch.object(
+                 local_runner, "_ancestry_reaches_pid1", return_value=ancestry
+             ):
+            return local_runner._detect_supervisor_state()
+
+    def test_systemd_host_manual_launch_is_unsupervised(self):
+        """PID 1 == systemd + a session SCOPE cgroup → NOT supervised."""
+        state = self._state(pid1="systemd", cgroup=self.SESSION_CGROUP)
+        self.assertFalse(state["supervised"])
+        self.assertIsNone(state["supervisor"])
+        self.assertIn("not a systemd .service unit", state["evidence"])
+        self.assertIn("will NOT restart", state["detail"])
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(local_runner, "_pid1_comm", return_value="systemd"), \
+             patch.object(
+                 local_runner, "_self_cgroup_text", return_value=self.SESSION_CGROUP
+             ):
+            self.assertIsNone(local_runner._detect_process_supervisor())
+
+    def test_systemd_service_unit_is_supervised(self):
+        state = self._state(pid1="systemd", cgroup=self.SERVICE_CGROUP)
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "systemd")
+        self.assertIn("blueprint-runner.service", state["evidence"])
+
+    def test_service_cgroup_but_orphaned_ancestry_is_unsupervised(self):
+        """Inherited service cgroup with a parent chain that never reaches PID 1
+        (e.g. a re-parented `docker exec`) is not a supervision guarantee."""
+        state = self._state(
+            pid1="systemd", cgroup=self.SERVICE_CGROUP, ancestry=False
+        )
+        self.assertFalse(state["supervised"])
+
+    def test_systemd_unit_env_is_supervised(self):
+        state = self._state(env={"INVOCATION_ID": "abc"}, pid1="systemd")
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "systemd")
+
+    def test_operator_declared_wrapper_is_supervised(self):
+        state = self._state(
+            env={"BLUEPRINT_RUNNER_SUPERVISED": "1"},
+            pid1="systemd",
+            cgroup=self.SESSION_CGROUP,
+        )
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "declared")
+
+    def test_supervisord_init_in_process_tree_is_supervised(self):
+        state = self._state(pid1="supervisord", ancestry=True)
+        self.assertTrue(state["supervised"])
+        self.assertEqual(state["supervisor"], "supervisord")
+
+    def test_supervising_init_but_not_in_its_tree_is_unsupervised(self):
+        """`docker exec` into a supervised container: the init never started us."""
+        state = self._state(pid1="supervisord", ancestry=False)
+        self.assertFalse(state["supervised"])
+        self.assertIn("NOT in its process tree", state["evidence"])
+
+    def test_tini_is_not_a_supervisor(self):
+        """tini reaps zombies and forwards signals — it restarts nothing."""
+        state = self._state(pid1="tini")
+        self.assertFalse(state["supervised"])
+        self.assertIn("does not restart", state["evidence"])
+
+    def test_systemd_service_unit_parser(self):
+        self.assertEqual(
+            local_runner._systemd_service_unit(self.SERVICE_CGROUP),
+            "blueprint-runner.service",
+        )
+        # cgroup v1 multi-line form.
+        v1 = (
+            "12:pids:/system.slice/blueprint-runner.service\n"
+            "0::/system.slice/blueprint-runner.service\n"
+        )
+        self.assertEqual(
+            local_runner._systemd_service_unit(v1), "blueprint-runner.service"
+        )
+        self.assertIsNone(local_runner._systemd_service_unit(self.SESSION_CGROUP))
+        self.assertIsNone(local_runner._systemd_service_unit(""))
+
+
+@contextlib.contextmanager
+def _fake_host(pid1="", cgroup="", ancestry=True, env=None):
+    """Simulate a host's PID-1/cgroup/ancestry facts for the REAL detector."""
+    with patch.dict(os.environ, env or {}, clear=True), \
+         patch.object(local_runner, "_pid1_comm", return_value=pid1), \
+         patch.object(local_runner, "_self_cgroup_text", return_value=cgroup), \
+         patch.object(local_runner, "_ancestry_reaches_pid1", return_value=ancestry):
+        yield
+
+
+class SelfUpdateSurvivalTests(unittest.TestCase):
+    """The self-update survival path must not exit into the void on a systemd
+    host where nothing is actually supervising the runner (the dgx-1 outage).
+
+    These drive the REAL detector against simulated host facts — a detector that
+    calls every systemd host "supervised" makes the first test fail.
+    """
+
+    def test_unsupervised_systemd_host_reexecs_in_place(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SESSION_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv") as execv, \
+             patch.object(local_runner.os, "_exit") as exit_:
+            local_runner._reexec_after_update()
+        execv.assert_called_once()
+        exit_.assert_not_called()
+
+    def test_real_systemd_unit_exits_for_restart(self):
+        with _fake_host(
+            pid1="systemd",
+            cgroup=SupervisorDetectionTests.SERVICE_CGROUP,
+        ), \
+             patch.object(local_runner.os, "execv") as execv, \
+             patch.object(
+                 local_runner.os, "_exit", side_effect=SystemExit(0)
+             ) as exit_:
+            # os._exit is real-process-fatal; SystemExit emulates it under test.
+            with self.assertRaises(SystemExit):
+                local_runner._reexec_after_update()
+        exit_.assert_called_once_with(0)
+        execv.assert_not_called()
+
+
+class PreflightSupervisorReportTests(unittest.TestCase):
+    """--check must report the REAL supervision state — the concealment half of
+    FINDING 3 (a hand-launched runner on a systemd host read as healthy)."""
+
+    def _preflight_output(self, pid1, cgroup):
+        buf = io.StringIO()
+        with _fake_host(pid1=pid1, cgroup=cgroup), \
+             patch.object(
+                 local_runner, "_post",
+                 return_value=(200, {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}),
+             ), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), 2, 2,
+            )
+        return result, buf.getvalue()
+
+    def test_unsupervised_systemd_host_is_reported_as_unsupervised(self):
+        result, out = self._preflight_output(
+            "systemd", SupervisorDetectionTests.SESSION_CGROUP
+        )
+        self.assertIsNone(result["supervisor"])
+        self.assertFalse(result["supervised"])
+        self.assertIn("UNSUPERVISED", out)
+        self.assertIn("not a systemd .service unit", out)
+        # It must NOT claim an auto-restart that will never happen.
+        self.assertNotIn("auto-restart on crash/update", out)
+
+    def test_real_supervisor_is_reported_with_its_evidence(self):
+        result, out = self._preflight_output(
+            "systemd", SupervisorDetectionTests.SERVICE_CGROUP
+        )
+        self.assertEqual(result["supervisor"], "systemd")
+        self.assertTrue(result["supervised"])
+        self.assertIn("auto-restart on crash/update", out)
+        self.assertIn("blueprint-runner.service", out)
+
+
+class GpuSandboxSmokeTests(unittest.TestCase):
+    """FINDING 6: the preflight GPU smoke must probe against a LIVE workspace.
+
+    The plan's bwrap argv binds workspace_host into the sandbox, and bwrap fails
+    hard ("Can't find source path") when a bind source is missing — so deleting
+    the temp workspace between plan and probe made the smoke fail 100% of the
+    time on a real GPU host and report a CUDA outage that did not exist.
+    """
+
+    def _fake_plan(self, captured, declined=False, reason=None):
+        def plan_compute_execution(**kwargs):
+            captured["workspace"] = kwargs["workspace_host"]
+            captured["existed_at_plan"] = os.path.isdir(kwargs["workspace_host"])
+            plan = MagicMock()
+            plan.declined = declined
+            plan.decline_reason = reason
+            return plan
+        return plan_compute_execution
+
+    def _fake_probe(self, captured, raises=False):
+        def probe_gpu_in_sandbox(plan, timeout=30):
+            workspace = captured["workspace"]
+            captured["existed_at_probe"] = os.path.isdir(workspace)
+            if raises:
+                raise RuntimeError("probe blew up")
+            if not captured["existed_at_probe"]:
+                # Exactly what bwrap does with a missing bind source.
+                return False, (
+                    f"bwrap: Can't find source path {workspace}: "
+                    "No such file or directory"
+                )
+            return True, "GPU 0: Tesla V100-SXM2-32GB (UUID: GPU-abc)\n"
+        return probe_gpu_in_sandbox
+
+    def test_probe_runs_against_an_existing_workspace(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(iso, "plan_compute_execution", self._fake_plan(captured)), \
+             patch.object(iso, "probe_gpu_in_sandbox", self._fake_probe(captured)):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertTrue(captured["existed_at_plan"])
+        self.assertTrue(
+            captured["existed_at_probe"],
+            "the smoke workspace must still exist while the probe binds it",
+        )
+        self.assertTrue(line.startswith("CUDA reachable"), line)
+        self.assertNotIn("Can't find source path", line)
+        # Cleaned up AFTER the probe — no temp-dir leak.
+        self.assertFalse(os.path.isdir(captured["workspace"]))
+
+    def test_workspace_cleaned_up_even_when_probe_raises(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(iso, "plan_compute_execution", self._fake_plan(captured)), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox", self._fake_probe(captured, raises=True)
+             ):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertIn("smoke check error", line)
+        self.assertFalse(os.path.isdir(captured["workspace"]))
+
+    def test_declined_plan_reported_and_cleaned_up(self):
+        captured = {}
+        with patch.object(local_runner, "_read_ldconfig", return_value=""), \
+             patch.object(
+                 iso, "plan_compute_execution",
+                 self._fake_plan(captured, declined=True, reason="no sandbox"),
+             ), \
+             patch.object(iso, "probe_gpu_in_sandbox", self._fake_probe(captured)):
+            line = local_runner._gpu_sandbox_smoke(_bwrap_caps((0,)), [0])
+
+        self.assertIn("plan declined: no sandbox", line)
+        self.assertFalse(os.path.isdir(captured["workspace"]))
 
 
 if __name__ == "__main__":

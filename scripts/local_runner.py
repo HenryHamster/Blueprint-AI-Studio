@@ -106,7 +106,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import runner_isolation as iso
 import blueprint_runner as br
@@ -239,46 +239,208 @@ def _die(reason: str, code: int = 1) -> None:
     os._exit(code)
 
 
-def _detect_process_supervisor() -> str | None:
-    """Return the name of the process supervisor managing this runner, or None.
+# PID-1 programs that actually SUPERVISE (restart) their managed children.
+# `tini` is deliberately absent: it forwards signals and reaps zombies but never
+# restarts anything, so treating it as a supervisor would be the same lie this
+# detector exists to stop telling.
+_SUPERVISING_INITS = ("supervisord", "runit", "runsv", "s6-svscan")
 
-    A supervisor is what restarts the runner after it exits (crash or clean
-    exit-for-restart following a self-update). If NONE is detected, the runner
-    was almost certainly launched manually (tmux/nohup/screen) and a plain
-    ``os._exit`` leaves nothing to bring it back — the dgx-1 ~45min-outage
-    failure mode. Detection is intentionally broad and conservative: any
-    positive signal returns a supervisor name; only the genuinely-unsupervised
-    case returns None.
 
-    Signals checked (any hit wins):
-      * ``INVOCATION_ID`` / ``JOURNAL_STREAM`` env → launched by systemd.
-      * ``SUPERVISOR_ENABLED`` env → launched by supervisord.
-      * PID 1 is systemd/supervisord/runit (``/proc/1/comm``) AND we are a
-        child chain of it — a containerized runner with an init supervisor.
-      * ``BLUEPRINT_RUNNER_SUPERVISED=1`` → operator-declared restart wrapper
-        (documented in the RUNNER_RUNBOOK so a ``while true`` loop can opt in).
-    """
-    # systemd sets these for units it launches.
-    if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
-        return "systemd"
-    # supervisord exports this to managed children.
-    if os.environ.get("SUPERVISOR_ENABLED"):
-        return "supervisord"
-    # Operator-declared restart wrapper (see RUNNER_RUNBOOK). Lets a manual
-    # `while true; do local_runner ...; done` loop tell the runner it IS
-    # supervised so it exits cleanly instead of re-exec'ing in place.
-    if os.environ.get("BLUEPRINT_RUNNER_SUPERVISED") == "1":
-        return "declared"
-    # An init-style PID 1 (systemd/supervisord/runit) — typical of a container
-    # whose entrypoint is a supervisor that will restart this process.
+def _pid1_comm() -> str:
+    """``/proc/1/comm`` (the PID-1 program name), or "" when unreadable."""
     try:
         with open("/proc/1/comm", "r") as fh:
-            pid1 = fh.read().strip()
-        if pid1 in ("systemd", "supervisord", "runit", "runsv", "s6-svscan", "tini"):
-            return pid1
+            return fh.read().strip()
     except Exception:
-        pass
+        return ""
+
+
+def _self_cgroup_text() -> str:
+    """``/proc/self/cgroup`` contents, or "" when unreadable."""
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _cgroup_path(cgroup_text: str) -> str:
+    """First cgroup path in *cgroup_text* (``0::/user.slice/...`` → the path)."""
+    for line in cgroup_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        return parts[2] if len(parts) == 3 else line
+    return ""
+
+
+def _systemd_service_unit(cgroup_text: str) -> str | None:
+    """Return the systemd ``*.service`` unit owning this process, else None.
+
+    This is THE discriminator between "systemd exists on this host" and "systemd
+    is actually supervising this process". A runner launched from a login shell
+    on a systemd host lives in ``/user.slice/user-1000.slice/session-3.scope`` —
+    a *scope*, which systemd tracks but NEVER restarts. Only a ``.service`` unit
+    carries a ``Restart=`` policy, so only a ``.service`` cgroup means "systemd
+    will bring this back".
+    """
+    for line in cgroup_text.splitlines():
+        parts = line.split(":", 2)
+        path = parts[2] if len(parts) == 3 else line
+        for component in reversed(path.strip().split("/")):
+            if component.endswith(".service"):
+                return component
     return None
+
+
+def _parent_pid(pid: int) -> int | None:
+    """PPid of *pid* from ``/proc/<pid>/status``, or None when unreadable."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _ancestry_reaches_pid1(max_hops: int = 64) -> bool:
+    """True iff this process's parent chain actually reaches PID 1.
+
+    A ``docker exec``-launched process inside a supervised container is NOT in
+    the init's process tree (its parent chain dead-ends at PPid 0), so the init
+    would never restart it. Walking the chain is what makes the PID-1 signal an
+    honest claim about *this* process rather than about the host.
+    """
+    pid = os.getpid()
+    for _ in range(max_hops):
+        if pid == 1:
+            return True
+        ppid = _parent_pid(pid)
+        if ppid is None or ppid <= 0:
+            return False
+        pid = ppid
+    return False
+
+
+def _detect_supervisor_state() -> dict:
+    """Report whether a supervisor will ACTUALLY restart this runner.
+
+    Returns ``{"supervisor": str | None, "supervised": bool, "evidence": str,
+    "detail": str}``. ``supervised`` is True only when a positive, process-scoped
+    signal says something will respawn this process after it exits — never merely
+    because a supervisor exists somewhere on the host.
+
+    Positive signals (any hit wins):
+      * ``INVOCATION_ID`` / ``JOURNAL_STREAM`` env → systemd launched THIS process.
+      * ``SUPERVISOR_ENABLED`` env → supervisord launched THIS process.
+      * ``BLUEPRINT_RUNNER_SUPERVISED=1`` → operator-declared restart wrapper
+        (documented in the RUNNER_RUNBOOK so a ``while true`` loop can opt in).
+      * PID 1 is systemd AND this process's cgroup is a systemd ``*.service``
+        unit AND its parent chain reaches PID 1.
+      * PID 1 is a supervising init (supervisord/runit/s6) AND this process's
+        parent chain reaches PID 1.
+
+    Explicitly NEGATIVE (the bug this replaces): PID 1 being ``systemd`` on its
+    own. Every process on a systemd host has systemd as PID 1, including a runner
+    started by hand in tmux. The old detector returned "systemd" for all of them,
+    so the self-update survival path took the "supervisor will restart me" branch,
+    ``os._exit(0)``-ed, and nothing ever came back — while ``--check`` printed a
+    healthy "systemd (auto-restart on crash/update)". Both now tell the truth.
+    """
+    if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
+        return {
+            "supervisor": "systemd",
+            "supervised": True,
+            "evidence": "systemd unit env (INVOCATION_ID/JOURNAL_STREAM)",
+            "detail": "launched by a systemd unit — it restarts the runner if Restart= is set",
+        }
+    if os.environ.get("SUPERVISOR_ENABLED"):
+        return {
+            "supervisor": "supervisord",
+            "supervised": True,
+            "evidence": "supervisord env (SUPERVISOR_ENABLED)",
+            "detail": "launched by supervisord — it restarts the runner on exit",
+        }
+    if os.environ.get("BLUEPRINT_RUNNER_SUPERVISED") == "1":
+        return {
+            "supervisor": "declared",
+            "supervised": True,
+            "evidence": "operator-declared (BLUEPRINT_RUNNER_SUPERVISED=1)",
+            "detail": "operator declared an external restart wrapper (e.g. a `while true` loop)",
+        }
+
+    pid1 = _pid1_comm()
+    if pid1 == "systemd":
+        unit = _systemd_service_unit(_self_cgroup_text())
+        if unit and _ancestry_reaches_pid1():
+            return {
+                "supervisor": "systemd",
+                "supervised": True,
+                "evidence": f"systemd service cgroup ({unit})",
+                "detail": f"running inside systemd unit {unit} — it restarts the runner if Restart= is set",
+            }
+        cgroup = _cgroup_path(_self_cgroup_text()) or "unknown"
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": f"pid1=systemd but cgroup {cgroup} is not a systemd .service unit",
+            "detail": (
+                "systemd is PID 1 on this HOST, but this runner is NOT running as a "
+                "systemd service unit (looks like a manual tmux/nohup/screen launch). "
+                "systemd will NOT restart it — a crash is permanent"
+            ),
+        }
+    if pid1 in _SUPERVISING_INITS:
+        if _ancestry_reaches_pid1():
+            return {
+                "supervisor": pid1,
+                "supervised": True,
+                "evidence": f"pid1={pid1} and this process is in its process tree",
+                "detail": f"container init {pid1} supervises this process and restarts it on exit",
+            }
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": f"pid1={pid1} but this process is NOT in its process tree (docker exec?)",
+            "detail": (
+                f"{pid1} is PID 1 but this process was not started by it (parent chain "
+                "does not reach PID 1) — it will NOT be restarted"
+            ),
+        }
+    if pid1 == "tini":
+        return {
+            "supervisor": None,
+            "supervised": False,
+            "evidence": "pid1=tini (init/zombie-reaper — does not restart children)",
+            "detail": (
+                "tini forwards signals and reaps zombies but never restarts the runner. "
+                "Rely on the container restart policy and set BLUEPRINT_RUNNER_SUPERVISED=1 "
+                "to declare it"
+            ),
+        }
+    return {
+        "supervisor": None,
+        "supervised": False,
+        "evidence": f"no supervisor signal (pid1={pid1 or 'unknown'})",
+        "detail": (
+            "no process supervisor detected — a crash will NOT restart the runner"
+        ),
+    }
+
+
+def _detect_process_supervisor() -> str | None:
+    """Name of the supervisor that will ACTUALLY restart this runner, else None.
+
+    Thin wrapper over :func:`_detect_supervisor_state` — None means the runner is
+    genuinely unsupervised (manual tmux/nohup/screen launch, or a systemd host
+    that is not running the runner as a service unit), which is what makes the
+    self-update path re-exec in place instead of exiting into the void.
+    """
+    state = _detect_supervisor_state()
+    return state["supervisor"] if state.get("supervised") else None
 
 
 def _reexec_after_update() -> None:
@@ -896,13 +1058,15 @@ def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
 
 
 def _compute_image_keep_days() -> int:
-    """Minimum age (days) of Docker images protected from cache-hygiene pruning.
+    """Days of LAST-USE recency that protect a Docker image from cache hygiene.
 
-    Configurable via ``BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS`` (default 7). Images
-    younger than this — and any image backing a running container — are never
-    pruned. The dgx-1 has ~30 GB of image-layer storage, so unbounded growth of
-    per-project compute images would eventually wedge the runner; this bounds it
-    without evicting images that a recent or in-flight job still needs.
+    Configurable via ``BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS`` (default 7). An image
+    used or pulled within this window — and any image backing a container — is
+    never pruned (see :func:`_prune_docker_images`; the window is measured
+    against last-use/pull, NOT the image's upstream creation date). The dgx-1 has
+    ~30 GB of image-layer storage, so unbounded growth of per-project compute
+    images would eventually wedge the runner; this bounds it without evicting
+    images that a recent or in-flight job still needs.
     """
     raw = os.environ.get("BLUEPRINT_RUNNER_IMAGE_KEEP_DAYS", "").strip()
     if not raw:
@@ -913,6 +1077,108 @@ def _compute_image_keep_days() -> int:
         return 7
 
 
+def _image_use_ledger_path() -> str:
+    """Path of the runner's image last-use ledger (``~/.blueprint/image_use.json``)."""
+    return os.path.join(_credential_dir(), "image_use.json")
+
+
+def _load_image_use_ledger() -> dict:
+    """``{image_ref: iso8601_last_used}``. Best-effort — {} on any read error."""
+    try:
+        with open(_image_use_ledger_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_image_use(image_ref: str | None, *, _now=None) -> None:
+    """Stamp *image_ref* as used NOW in the last-use ledger (best-effort).
+
+    Docker records no last-use time for an image, so the runner keeps its own.
+    Without this, cache hygiene can only see image CREATION time — which says
+    nothing about whether a job needs the image (see :func:`_prune_docker_images`).
+    """
+    if not image_ref:
+        return
+    now = _now or datetime.now(timezone.utc)
+    try:
+        ledger = _load_image_use_ledger()
+        ledger[image_ref] = now.isoformat()
+        # Bound the ledger: drop stamps older than 90 days so it cannot grow
+        # without limit on a long-lived runner.
+        floor = now - timedelta(days=90)
+        pruned = {
+            ref: ts
+            for ref, ts in ledger.items()
+            if ref == image_ref
+            or ((_parse_docker_time(ts) or now) >= floor)
+        }
+        path = _image_use_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(pruned, fh)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass  # cache bookkeeping must never break a job
+
+
+def _parse_docker_time(raw: str | None) -> datetime | None:
+    """Parse a Docker/Go timestamp into an aware UTC datetime, else None.
+
+    Handles the three shapes docker emits across versions/fields:
+      * RFC3339 (``.Created``):            ``2026-07-01T12:34:56.789012345Z``
+      * Go ``time.Time`` (``.Metadata.LastTagTime``):
+                                           ``2026-07-01 12:34:56.789 +0000 UTC``
+      * the Go zero value (never tagged locally) → None, not year 1.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text or text.startswith("0001-01-01"):
+        return None
+    # Go time.Time default rendering ("2026-07-01 12:34:56.789 +0000 UTC"):
+    # date and time are space-separated. Rebuild it as ISO and drop the trailing
+    # zone NAME (keeping the numeric offset). NB: the zone name itself contains a
+    # "T" ("UTC"), so the separator position — not a naive "T" scan — is the test.
+    if len(text) > 10 and text[10] == " ":
+        parts = text.split()
+        if len(parts) >= 3:
+            text = f"{parts[0]}T{parts[1]}{parts[2]}"
+        elif len(parts) == 2:
+            text = f"{parts[0]}T{parts[1]}"
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # Python's fromisoformat rejects >6 fractional digits (docker emits 9).
+    if "." in text:
+        head, _, tail = text.partition(".")
+        frac = ""
+        idx = 0
+        while idx < len(tail) and tail[idx].isdigit():
+            frac += tail[idx]
+            idx += 1
+        text = f"{head}.{frac[:6]}{tail[idx:]}"
+    # Normalize a compact UTC offset (+0000) to the ISO form (+00:00).
+    if len(text) >= 5 and text[-5] in "+-" and text[-4:].isdigit():
+        text = f"{text[:-2]}:{text[-2:]}"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_repo_tags(raw: str) -> list[str]:
+    """Parse a Go-rendered RepoTags slice (``[a:1 b:2]``) into a list."""
+    text = (raw or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return [t for t in text.split() if t and t != "<none>:<none>"]
+
+
 def _prune_docker_images(
     workspace_root: str | None,
     min_free_bytes: int,
@@ -920,52 +1186,151 @@ def _prune_docker_images(
     keep_days: int | None = None,
     _run=subprocess.run,
     _disk_below=None,
+    _now=None,
+    _ledger=None,
+    _protected=None,
 ) -> dict:
     """Best-effort: reclaim Docker image storage when disk runs low.
 
     Runs ONLY when *workspace_root*'s free space is below *min_free_bytes* — the
-    same guard the agent-claim path uses (:func:`_disk_below_min`). Delegates to
-    ``docker image prune -a`` with an ``until=<keep_days>`` filter, so Docker
-    removes only images that are (a) not referenced by any running/active
-    container and (b) older than the keep window. Images backing an in-flight
-    compute job run inside a live container and are therefore protected; recent
-    images (last *keep_days*) are also kept.
+    same guard the agent-claim path uses (:func:`_disk_below_min`).
 
-    Returns a small status dict for logging/testing. Never raises — a missing
-    ``docker`` binary or a prune error degrades to ``{"pruned": False, ...}``.
+    Selection keys on LAST-USE / PULL recency, never on image CREATION time.
+    ``docker image prune --filter until=<age>`` (what this used to call) keys on
+    the image's *creation* timestamp — baked into the image at BUILD time by the
+    registry. A CUDA base image published upstream months ago is "older than the
+    keep window" the instant it lands on disk, so a just-pulled, actively-needed
+    multi-GB image was deleted immediately and re-pulled by the very next job:
+    the hygiene pass thrashed the cache it exists to protect.
+
+    An image is KEPT when any of these is within the keep window:
+      * the runner's own last-use stamp (:func:`_record_image_use`) — the true
+        "a job needed this image" signal;
+      * ``Metadata.LastTagTime`` — when docker last tagged it locally, i.e. the
+        PULL time for registry images;
+      * ``.Created`` — only as a floor for locally-built images that were never
+        tagged (there, build time IS local recency).
+    It is also kept when it is the configured agent image, or when it is
+    referenced by any container (``docker image rm`` without ``-f`` refuses to
+    delete those, so in-use protection is enforced by docker itself).
+
+    Returns a status dict for logging/testing. Never raises — a missing ``docker``
+    binary or a docker error degrades to ``{"pruned": False, ...}``.
     """
     keep = _compute_image_keep_days() if keep_days is None else keep_days
     disk_below = _disk_below if _disk_below is not None else _disk_below_min
     if not disk_below(workspace_root, min_free_bytes):
         return {"pruned": False, "reason": "disk_above_threshold"}
-    until_hours = max(1, keep * 24)
+
+    now = _now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(0, keep))
+    ledger = _load_image_use_ledger() if _ledger is None else dict(_ledger)
+    if _protected is None:
+        protected_refs = {
+            r for r in [(os.environ.get("BLUEPRINT_AGENT_IMAGE") or "").strip()] if r
+        }
+    else:
+        protected_refs = set(_protected)
+
     try:
-        proc = _run(
-            [
-                "docker",
-                "image",
-                "prune",
-                "-a",
-                "-f",
-                "--filter",
-                f"until={until_hours}h",
-            ],
+        listing = _run(
+            ["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return {"pruned": False, "reason": f"prune_error:{type(e).__name__}"}
-    if proc.returncode != 0:
+    if listing.returncode != 0:
         return {
             "pruned": False,
             "reason": "prune_nonzero",
-            "stderr": (proc.stderr or "")[-500:],
+            "stderr": (listing.stderr or "")[-500:],
         }
+    image_ids = sorted({ln.strip() for ln in (listing.stdout or "").splitlines() if ln.strip()})
+    if not image_ids:
+        return {"pruned": True, "keep_days": keep, "removed": 0, "kept": 0,
+                "removed_ids": [], "in_use_skipped": 0, "output": "no images"}
+
+    # Local recency of every image: last local tag (== pull time for registry
+    # images), with creation time only as a floor for never-tagged local builds.
+    try:
+        inspected = _run(
+            [
+                "docker", "image", "inspect", "--format",
+                "{{.Id}}\t{{.Metadata.LastTagTime}}\t{{.Created}}\t{{.RepoTags}}",
+                *image_ids,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"pruned": False, "reason": f"prune_error:{type(e).__name__}"}
+    if inspected.returncode != 0:
+        return {
+            "pruned": False,
+            "reason": "prune_nonzero",
+            "stderr": (inspected.stderr or "")[-500:],
+        }
+
+    stale: list[str] = []
+    kept = 0
+    for line in (inspected.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        image_id = fields[0].strip()
+        tag_time = _parse_docker_time(fields[1])
+        created = _parse_docker_time(fields[2])
+        repo_tags = _parse_repo_tags(fields[3] if len(fields) > 3 else "")
+
+        if protected_refs.intersection(repo_tags):
+            kept += 1
+            continue
+
+        candidates = [t for t in (tag_time, created) if t is not None]
+        for ref in repo_tags:
+            used = _parse_docker_time(ledger.get(ref))
+            if used is not None:
+                candidates.append(used)
+        last_used = max(candidates) if candidates else None
+        # Undatable image: keep it. Never delete what we cannot age honestly.
+        if last_used is None or last_used >= cutoff:
+            kept += 1
+            continue
+        stale.append(image_id)
+
+    removed: list[str] = []
+    in_use_skipped = 0
+    for image_id in stale:
+        try:
+            # No `-f`: docker refuses to delete an image referenced by a running
+            # OR stopped container, which is exactly the protection we want.
+            rm = _run(
+                ["docker", "image", "rm", image_id],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            in_use_skipped += 1
+            continue
+        if rm.returncode == 0:
+            removed.append(image_id)
+        else:
+            in_use_skipped += 1
+
     return {
         "pruned": True,
         "keep_days": keep,
-        "output": (proc.stdout or "").strip()[-500:],
+        "removed": len(removed),
+        "removed_ids": removed,
+        "kept": kept,
+        "in_use_skipped": in_use_skipped,
+        "output": f"removed={len(removed)} kept={kept} in_use_or_error={in_use_skipped}",
     }
 
 
@@ -3057,6 +3422,12 @@ def _run_compute_job(
             )
             return
 
+        # Cache hygiene bookkeeping: stamp this image as USED now. Docker keeps no
+        # last-use time, so without this stamp the low-disk prune could only see
+        # the image's upstream CREATION date and would evict a base image this job
+        # just pulled (see _prune_docker_images).
+        _record_image_use(container_image)
+
         # GPU-used enforcement: run a lightweight nvidia-smi -L probe INSIDE the
         # same sandbox before the real command, so (a) torch/TF cannot silently
         # fall back to CPU if CUDA is not actually reachable, and (b) an image
@@ -3437,15 +3808,19 @@ def _run_compute_job(
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
         # Cache hygiene: reclaim Docker image storage if disk is low. No-op when
-        # free space is above threshold; protects in-use and recent images.
+        # free space is above threshold; protects in-use and recently-used images
+        # (last-use/pull recency, not upstream image creation date).
         try:
             prune_result = _prune_docker_images(
                 _workspace_root(), _min_free_disk_bytes()
             )
             if prune_result.get("pruned"):
                 print(
-                    f"[compute] job {job_id}: pruned Docker images (low disk) "
-                    f"keep_days={prune_result.get('keep_days')}",
+                    f"[compute] job {job_id}: Docker image hygiene (low disk) "
+                    f"keep_days={prune_result.get('keep_days')} "
+                    f"removed={prune_result.get('removed')} "
+                    f"kept={prune_result.get('kept')} "
+                    f"in_use_skipped={prune_result.get('in_use_skipped')}",
                     flush=True,
                 )
         except Exception:  # noqa: BLE001 — cache hygiene must never fail a job
@@ -3829,6 +4204,56 @@ def _agent_deps_missing() -> bool:
     return False
 
 
+def _gpu_sandbox_smoke(caps: "iso.Capabilities", allowlist: list) -> str:
+    """Run the preflight GPU probe in a REAL sandbox workspace; return one line.
+
+    The probe re-runs the plan's argv verbatim, and that argv binds
+    ``workspace_host`` into the sandbox — bwrap fails hard ("Can't find source
+    path") when a bind source is missing. The workspace therefore MUST still
+    exist while the probe runs: the temp dir is torn down in a ``finally`` AFTER
+    the probe, never between the plan and the probe (which made the preflight
+    smoke fail 100% of the time on a real GPU host, reporting a sandbox CUDA
+    outage that did not exist).
+    """
+    smoke_indices = list(allowlist)[:1]
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="bp_gpu_smoke_")
+        result_file = os.path.join(tmpdir, "result.json")
+        artifact_dir = os.path.join(tmpdir, "artifacts")
+        os.makedirs(artifact_dir, exist_ok=True)
+        ldconfig = _read_ldconfig() if iso.BACKEND_BWRAP else ""
+        plan = iso.plan_compute_execution(
+            caps=caps,
+            command="nvidia-smi -L",
+            image=None,
+            registry_auth=None,
+            workspace_host=tmpdir,
+            result_file_host=result_file,
+            artifact_dir_host=artifact_dir,
+            clone_dir_host=None,
+            cwd_host=None,
+            job_env={},
+            gpu_indices=smoke_indices,
+            container_name="bp-smoke",
+            source_env=dict(os.environ),
+            ldconfig_output=ldconfig,
+        )
+        if plan.declined:
+            return f"plan declined: {plan.decline_reason}"
+        # Workspace still on disk here — the probe binds it.
+        probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
+        if probe_ok:
+            first_line = (probe_detail or "").splitlines()
+            return f"CUDA reachable: {first_line[0] if first_line else probe_detail}"
+        return f"WARNING — CUDA unreachable in sandbox: {probe_detail}"
+    except Exception as exc:  # noqa: BLE001 — a smoke error must not fail --check
+        return f"smoke check error: {exc}"
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -3995,45 +4420,7 @@ def _preflight(
     # bwrap is available; a non-zero exit or empty output here means any
     # accelerator-declared job would be aborted by the GPU probe gate.
     if caps.has_gpu and caps.bwrap_ok and allowlist:
-        _smoke_indices = list(allowlist)[:1]
-        try:
-            import tempfile as _tempfile
-            _smoke_tmpdir = _tempfile.mkdtemp(prefix="bp_gpu_smoke_")
-            _smoke_result_file = os.path.join(_smoke_tmpdir, "result.json")
-            _smoke_artifact_dir = os.path.join(_smoke_tmpdir, "artifacts")
-            os.makedirs(_smoke_artifact_dir, exist_ok=True)
-            _smoke_ldconfig = _read_ldconfig() if iso.BACKEND_BWRAP else ""
-            _smoke_plan = iso.plan_compute_execution(
-                caps=caps,
-                command="nvidia-smi -L",
-                image=None,
-                registry_auth=None,
-                workspace_host=_smoke_tmpdir,
-                result_file_host=_smoke_result_file,
-                artifact_dir_host=_smoke_artifact_dir,
-                clone_dir_host=None,
-                cwd_host=None,
-                job_env={},
-                gpu_indices=_smoke_indices,
-                container_name="bp-smoke",
-                source_env=dict(os.environ),
-                ldconfig_output=_smoke_ldconfig,
-            )
-            import shutil as _shutil
-            _shutil.rmtree(_smoke_tmpdir, ignore_errors=True)
-            if not _smoke_plan.declined:
-                _probe_ok, _probe_detail = iso.probe_gpu_in_sandbox(_smoke_plan)
-                if _probe_ok:
-                    _fmt(
-                        "gpu sandbox",
-                        f"CUDA reachable: {_probe_detail.splitlines()[0]}",
-                    )
-                else:
-                    _fmt("gpu sandbox", f"WARNING — CUDA unreachable in sandbox: {_probe_detail}")
-            else:
-                _fmt("gpu sandbox", f"plan declined: {_smoke_plan.decline_reason}")
-        except Exception as _exc:
-            _fmt("gpu sandbox", f"smoke check error: {_exc}")
+        _fmt("gpu sandbox", _gpu_sandbox_smoke(caps, allowlist))
     elif caps.has_gpu:
         _fmt("gpu sandbox", "skipped (bwrap not usable)")
 
@@ -4106,21 +4493,35 @@ def _preflight(
     # will `os._exit`/die and never come back (operator-observed dgx-1 ~45min
     # outage). The auto-updater now re-execs in place when unsupervised, but a
     # crash still needs a restarter — so surface the recommended launch patterns.
-    supervisor = None
+    # The report prints the REAL state, including the "systemd is PID 1 but this
+    # runner is not a systemd unit" case that used to read as healthy.
+    supervisor_state = {
+        "supervisor": None,
+        "supervised": False,
+        "evidence": "supervisor detection failed",
+        "detail": "could not determine supervision state — assume unsupervised",
+    }
     try:
-        supervisor = _detect_process_supervisor()
-    except Exception:
-        supervisor = None
+        supervisor_state = _detect_supervisor_state()
+    except Exception as exc:  # pragma: no cover - defensive
+        supervisor_state["evidence"] = f"supervisor detection error: {exc}"
+    supervisor = supervisor_state["supervisor"] if supervisor_state["supervised"] else None
     if supervisor is not None:
-        _fmt("supervisor", f"{supervisor} (auto-restart on crash/update)")
+        _fmt(
+            "supervisor",
+            f"{supervisor} (auto-restart on crash/update) "
+            f"[{supervisor_state['evidence']}]",
+        )
     else:
         print(
-            "  supervisor      : NONE DETECTED\n"
-            "                    No process supervisor found. If launched manually\n"
-            "                    (tmux, nohup, screen), the runner recovers from\n"
-            "                    auto-updates via in-place re-exec, but a CRASH will\n"
-            "                    NOT restart it. Wrap it in a restart loop or a\n"
-            "                    systemd service. See RUNNER_RUNBOOK (--help).",
+            "  supervisor      : NONE — UNSUPERVISED\n"
+            f"                    {supervisor_state['evidence']}\n"
+            f"                    {supervisor_state['detail']}.\n"
+            "                    The runner recovers from AUTO-UPDATES via in-place\n"
+            "                    re-exec, but a CRASH will NOT restart it. Run it as a\n"
+            "                    systemd service (Restart=always), under supervisord, or\n"
+            "                    in a restart loop with BLUEPRINT_RUNNER_SUPERVISED=1.\n"
+            "                    See RUNNER_RUNBOOK (--help).",
             flush=True,
         )
 
@@ -4138,6 +4539,8 @@ def _preflight(
         "gpu_caps": gpu_caps,
         "workspace_writable": ws_writable,
         "supervisor": supervisor,
+        "supervised": bool(supervisor_state["supervised"]),
+        "supervisor_evidence": supervisor_state["evidence"],
         "setup_ok": setup_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
     }
