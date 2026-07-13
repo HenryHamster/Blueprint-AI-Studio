@@ -1323,10 +1323,65 @@ def _compute_strategic_state_etag(result: Dict[str, Any]) -> str:
         for k, v in result.items()
         if k not in ("context_package", "state_revision")
     }
+    projected["work_session"] = _drop_context_derived_for_etag(
+        projected.get("work_session")
+    )
     seed = json.dumps(
         _strip_volatile_for_etag(projected), sort_keys=True, default=str
     )
     return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _drop_context_derived_for_etag(work_session: Any) -> Any:
+    """Drop the parts of ``work_session`` that MIRROR the context package.
+
+    ``context_package`` is deliberately excluded from the ETag (its signed URLs
+    change every poll), but ``work_session`` re-projects it: ``context_package_id``,
+    ``context_sources``, and the ``commands`` / ``curated_metrics`` entries tagged
+    ``provenance.surface == "context"``.  On a build-SKIPPED poll those collapse
+    (``context.items`` reports 0, a command disappears), so the ETag flipped on
+    every skip — a client's held token could never 304 and the whole body was
+    re-transmitted every time, defeating the short-circuit the ETag exists for.
+
+    Excluding the mirror is consistent with excluding the original: the context
+    package's meaningful INPUTS are already covered by the top-level strategic /
+    problem_model / directions / count / attention fields, and the narrow
+    ``state_revision`` gates the build-skip itself, so nothing real is hidden.
+
+    NOTE (separate bug, deliberately not masked here): the build-skip DEGRADES
+    ``work_session`` rather than merely omitting the raw block — a skipped poll
+    reports ``context.items = 0`` when the client's cached package holds 8. That
+    is a response-fidelity bug in the skip path, not an ETag bug; this function
+    only stops it from corrupting the ETag.
+    """
+    if not isinstance(work_session, dict):
+        return work_session
+    out = {
+        k: v
+        for k, v in work_session.items()
+        if k not in ("context_package_id", "context_sources")
+    }
+    for list_key in ("commands", "curated_metrics"):
+        items = out.get(list_key)
+        if isinstance(items, list):
+            out[list_key] = [it for it in items if not _is_context_derived_entry(it)]
+    return out
+
+
+def _is_context_derived_entry(entry: Any) -> bool:
+    """True when a work_session command/metric is a projection of the context package.
+
+    Two shapes carry that tag: an explicit ``provenance.surface == "context"``
+    (the curated metrics), and a ``context.``-namespaced id (the commands — e.g.
+    ``context.canvas.open``, which is only offered when a package was built).
+    """
+    if not isinstance(entry, dict):
+        return False
+    provenance = entry.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("surface") == "context":
+        return True
+    entry_id = entry.get("id")
+    return isinstance(entry_id, str) and entry_id.startswith("context.")
 
 
 def _quote_etag(token: str) -> str:
@@ -1334,7 +1389,7 @@ def _quote_etag(token: str) -> str:
     return f'"{token}"'
 
 
-def _if_none_match_hits(if_none_match: str | None, etag: str) -> bool:
+def _if_none_match_hits(if_none_match: object | None, etag: str) -> bool:
     """Return True when a client ``If-None-Match`` header matches the current
     full-body ``etag``.
 
@@ -1342,12 +1397,19 @@ def _if_none_match_hits(if_none_match: str | None, etag: str) -> bool:
     comma-separated list, weak validators (``W/"…"``), surrounding quotes, and
     the ``*`` wildcard.
 
-    Also tolerant of non-``str`` inputs: internal direct callers invoke
-    ``get_project_strategic_state`` as a plain function, so its
-    ``if_none_match: str | None = Header(None, ...)`` parameter arrives as the
-    unresolved FastAPI ``Header`` sentinel (a truthy object, not ``None``).
-    Treat anything that is not a real header string as absent so those callers
-    always receive the full dict instead of tripping on ``.split``.
+    Only a real ``str`` is a header VALUE.  ``get_project_strategic_state`` is a
+    FastAPI endpoint whose ``if_none_match`` default is a ``Header(...)`` marker
+    object, and that default is resolved to a string ONLY by dependency injection
+    on a real HTTP request.  The six INTERNAL direct callers in this module call it
+    as a plain function and omit the argument — so they received the ``Header``
+    marker itself, which is truthy, fell through to ``.split(",")`` and raised
+    ``AttributeError: 'Header' object has no attribute 'split'``, 500-ing
+    ``POST /strategic-session/messages`` (and every other internal caller).
+
+    Treat any non-``str`` as ABSENT: an internal caller has no request headers, so
+    "no If-None-Match → always return the full body" is exactly the documented
+    intent at the call sites.  Guarding here (rather than at each of the six call
+    sites) also fail-safes any future direct caller.
     """
     if not isinstance(if_none_match, str) or not if_none_match:
         return False

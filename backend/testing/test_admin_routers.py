@@ -12928,6 +12928,16 @@ class TestAcceptanceCriteriaRouter:
             "criteria": [],
             "failed_corroboration_keys": [],
             "merge_evidence_gaps": None,
+            # Phantom-bookkeeping drift signal (consumed by operator_attention):
+            # a version with no criteria registers none and references none, so
+            # there is nothing to drift.
+            "phantom_bookkeeping": {
+                "has_drift": False,
+                "phantom_keys": [],
+                "referenced_keys": [],
+                "registered_count": 0,
+                "zero_registered": False,
+            },
         }
 
         create_resp = await client.post(
