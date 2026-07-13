@@ -1,13 +1,28 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 
 /** Derive the evidence tier for a compute job, mirroring backend
- *  knowledge_completion.py::_compute_evidence_tier. */
+ *  knowledge_completion.py::_compute_evidence_tier.
+ *
+ *  `covered` renders as "Machine verified", so it requires BOTH that the job ran
+ *  on operator hardware AND that it produced a measurable result. A local run
+ *  that reported no metric proves only WHERE it ran — labelling that
+ *  "Machine verified" is a claimed, not earned, status. It is demoted to
+ *  `partial`: real execution provenance, nothing verified. */
 export function computeJobEvidenceTier(
-  job: Pick<ComputeJob, 'backend' | 'status' | 'outcome'>,
-): 'covered' | 'attested' | 'backfilled' | 'uncovered' {
+  job: Pick<
+    ComputeJob,
+    'backend' | 'status' | 'outcome' | 'criterion_verdict' | 'per_arm_verdicts'
+  >,
+): 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' {
   const backend = job.backend ?? '';
-  if (backend.startsWith('local-') || backend === 'runner-subprocess') return 'covered';
+  const ranOnOperatorHardware =
+    backend.startsWith('local-') || backend === 'runner-subprocess';
+  const producedResult =
+    (job.per_arm_verdicts != null && Object.keys(job.per_arm_verdicts).length > 0) ||
+    job.criterion_verdict != null;
+  if (ranOnOperatorHardware) return producedResult ? 'covered' : 'partial';
   if (backend) return 'attested';
+  if (producedResult) return 'backfilled';
   return 'uncovered';
 }
 import { parseTimestamp } from '../utils/time';

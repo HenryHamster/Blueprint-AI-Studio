@@ -26,17 +26,39 @@ class TestComputeEvidenceTier:
     def test_no_job_with_metrics_returns_backfilled(self):
         assert _compute_evidence_tier(None, {"accuracy": 0.95}) == "backfilled"
 
-    def test_local_backend_returns_covered(self):
+    def test_local_backend_with_metrics_returns_covered(self):
+        """Ran on operator hardware AND produced a result → genuinely verified."""
         job = self._make_job(backend="local-bwrap")
-        assert _compute_evidence_tier(job, None) == "covered"
+        assert _compute_evidence_tier(job, {"accuracy": 0.95}) == "covered"
 
     def test_local_container_backend_returns_covered(self):
         job = self._make_job(backend="local-container")
         assert _compute_evidence_tier(job, {"loss": 0.1}) == "covered"
 
-    def test_runner_subprocess_backend_returns_covered(self):
+    def test_local_backend_WITHOUT_metrics_is_not_machine_verified(self):
+        """A local run that measured NOTHING must not render as "Machine verified".
+
+        ``covered`` is the tier the UI labels "Machine verified".  Deriving it from
+        the backend name alone made it a LOCATION proxy: an empty run on operator
+        hardware — one that crashed, or never emitted its metric — claimed
+        verification it never earned.  That is the claimed-not-earned status this
+        version exists to eliminate, and it contradicts the compute results
+        contract (an unmeasured run is a FAILURE, not a success).
+
+        Execution provenance is real, so it is not ``uncovered`` — it is
+        ``partial``: we know WHERE it ran, we have nothing it proved.
+        """
+        job = self._make_job(backend="local-bwrap")
+        assert _compute_evidence_tier(job, None) == "partial"
+        assert _compute_evidence_tier(job, {}) == "partial"
+
+    def test_runner_subprocess_without_metrics_is_not_machine_verified(self):
         job = self._make_job(backend="runner-subprocess")
-        assert _compute_evidence_tier(job, None) == "covered"
+        assert _compute_evidence_tier(job, None) == "partial"
+
+    def test_runner_subprocess_with_metrics_returns_covered(self):
+        job = self._make_job(backend="runner-subprocess")
+        assert _compute_evidence_tier(job, {"throughput": 1200}) == "covered"
 
     def test_gcp_backend_returns_attested(self):
         job = self._make_job(backend="gcp")

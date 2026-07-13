@@ -1290,14 +1290,31 @@ def _compute_evidence_tier(
 ) -> str:
     """Compute the evidence tier for a compute-experiment knowledge document.
 
-    Uses the ComputeJob's backend attribute as the primary signal so that
-    both successful and failed runs are classified correctly.
+    WHERE a job ran is not WHETHER it proved anything.  ``covered`` is rendered
+    to the operator as "Machine verified", so it requires BOTH facts:
+
+      1. it executed on operator hardware (a local runner, not billable cloud), AND
+      2. it produced a measurable result.
+
+    A local-runner job that reported NO metric measured nothing — it establishes
+    only its own execution location.  Grading that ``covered`` labels an empty run
+    "Machine verified", which is exactly the claimed-not-earned status this
+    version exists to eliminate; it also contradicts the compute results contract
+    (an unmeasured run is a FAILURE, not a success).  Such a run is demoted to
+    ``partial``: real execution provenance, no result to verify.
+
+    Cloud execution stays ``attested`` (we trust the platform's report of the run
+    but it is not operator-verified), and metrics without any execution record
+    stay ``backfilled``.
     """
     if job is None:
         return "backfilled" if result_metrics else "uncovered"
     backend = getattr(job, "backend", None) or ""
-    if backend.startswith("local-") or backend == "runner-subprocess":
-        return "covered"
+    ran_on_operator_hardware = (
+        backend.startswith("local-") or backend == "runner-subprocess"
+    )
+    if ran_on_operator_hardware:
+        return "covered" if result_metrics else "partial"
     if backend:
         return "attested"
     if result_metrics:

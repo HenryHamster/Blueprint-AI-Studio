@@ -231,10 +231,26 @@ describe('ComputeJobsPanel helpers', () => {
     expect(computeJobExecutionLocation('unknown-backend')).toEqual({ label: 'unknown-backend', isOperatorHardware: false });
   });
 
-  test('computeJobEvidenceTier: local-subprocess and runner-subprocess → covered', () => {
-    expect(computeJobEvidenceTier(makeJob({ backend: 'local-subprocess' }))).toBe('covered');
-    expect(computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess' }))).toBe('covered');
-    expect(computeJobEvidenceTier(makeJob({ backend: 'local-gpu' }))).toBe('covered');
+  test('computeJobEvidenceTier: operator hardware + a result → covered', () => {
+    const result = { armA: { value: 1.5, met: true, cost_usd: null } };
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'local-subprocess', per_arm_verdicts: result })),
+    ).toBe('covered');
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess', per_arm_verdicts: result })),
+    ).toBe('covered');
+    expect(
+      computeJobEvidenceTier(makeJob({ backend: 'local-gpu', per_arm_verdicts: result })),
+    ).toBe('covered');
+  });
+
+  test('computeJobEvidenceTier: operator hardware with NO result is not machine-verified', () => {
+    // `covered` renders as "Machine verified". Deriving it from the backend name
+    // alone made it a LOCATION proxy — an empty run claimed verification it never
+    // earned. Provenance is real (so not `uncovered`), but nothing was proved.
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-subprocess' }))).toBe('partial');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'runner-subprocess' }))).toBe('partial');
+    expect(computeJobEvidenceTier(makeJob({ backend: 'local-gpu' }))).toBe('partial');
   });
 
   test('computeJobEvidenceTier: gcp → attested', () => {
@@ -257,6 +273,9 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       backend: 'local-subprocess',
       status: 'SUCCEEDED',
       outcome: 'SUCCESS',
+      // A measurable result is REQUIRED for "Machine verified" — operator hardware
+      // alone only says where it ran. Without this the job is `partial`.
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
       accrued_cost_usd: 0,
       final_cost_usd: 0,
       completed_at: new Date().toISOString(),
