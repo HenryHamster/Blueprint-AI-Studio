@@ -32,6 +32,7 @@ from app.compute_backends import (
     LOCAL_GPU_BACKEND_NAME,
     RUNNER_SUBPROCESS_BACKEND_NAME,
     ComputeLaunchSpec,
+    ComputeLaunchSpecError,
     ComputeStatusResult,
     PreflightSmokeResult,
     _parse_digest_from_pinned_ref,
@@ -233,7 +234,7 @@ def append_progress_sample(
     so the caller never raises on malformed input.
     """
     try:
-        if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.match(metric):
+        if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.fullmatch(metric):
             return meta
         float_val = float(value)
         if not math.isfinite(float_val):
@@ -2158,6 +2159,69 @@ async def _process_single_compute_job(
                     failed_at=failed_at,
                     next_retry_at=None,
                     reason="provisioning_timeout",
+                ),
+            )
+            return
+        except ComputeLaunchSpecError as exc:
+            # A deterministic spec defect (e.g. an env key that is not a shell
+            # identifier). The generic handler below is retry-shaped: it records a
+            # diagnostic and re-polls, so this same exception is re-raised every
+            # monitor tick until provisioning_deadline_at, and the job finally
+            # finalizes TIMED_OUT with "compute job timed out while provisioning" —
+            # a terminal reason that never names the offending field. Retrying an
+            # unretryable spec buys nothing, so terminalize now and put the
+            # exception message (which names the bad key) in terminal_reason, where
+            # the operator actually reads it.
+            #
+            # On today's code the raise happens before provision_ephemeral_vm (the
+            # startup script is rendered as an ARGUMENT to it), so no billable
+            # resource exists and cost is zero. The terminate call below is NOT
+            # conditional on that holding: _reserve_compute_job_launch always
+            # assigns external_compute_id before launch, so `terminated` is always
+            # a real backend.terminate() — a belt-and-braces reap that costs one
+            # 404-ing lookup on this rare path and is the only thing that keeps a
+            # future post-provision raise from LEAKING a billed GPU VM. Deliberately
+            # kept unconditional for that reason; see
+            # test_process_compute_jobs_once_reaps_vm_when_launch_rejects_post_provision.
+            failed_at = _utcnow()
+            logger.warning(
+                "[COMPUTE_JOB] launch rejected for job=%s (unretryable launch spec): %s",
+                job.id,
+                exc,
+            )
+            terminated = True
+            if reserved.external_compute_id:
+                try:
+                    terminated = await backend.terminate(
+                        reserved, reason="launch_spec_rejected"
+                    )
+                except Exception:
+                    logger.exception(
+                        "[COMPUTE_JOB] terminate failed for rejected-spec job=%s",
+                        job.id,
+                    )
+                    terminated = False
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.FAILED,
+                outcome=ComputeJobOutcome.FAILURE,
+                terminal_reason=str(exc),
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=_build_compute_rpc_diagnostic(
+                    job,
+                    operation="launch",
+                    exc=exc,
+                    started_at=started_at,
+                    failed_at=failed_at,
+                    next_retry_at=None,
+                    reason="launch_spec_rejected",
                 ),
             )
             return

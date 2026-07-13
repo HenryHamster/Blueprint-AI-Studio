@@ -18,14 +18,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# NOTE on matching: every charset gate below MUST be applied with `.fullmatch()`,
+# never `.match()`. Python's `$` also matches just *before* a trailing newline, so
+# `_RE.match("GOOD\n")` SUCCEEDS on all three patterns — the trailing newline is
+# never seen, and the value reaches the shell as an identifier split across two
+# lines. `fullmatch` requires the whole string to be consumed and is the only
+# correct anchor here; the `^...$` below is kept only so the pattern reads well
+# when it is interpolated into an operator-facing rejection reason.
+
 # Safe identifier charset for arm names: no shell metacharacters, no colons
 # (colon is the delimiter in the NAME:PATH aggregator spec), no slashes/dots
 # (would escape per-arm result directories).
-_ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Safe charset for metric keys: allows common patterns like val/loss, top-1
 # while excluding shell metacharacters (", $, ;, backticks, spaces).
-_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+# Env var names must be valid shell identifiers. The GCP startup script emits
+# `export {key}=...` with the key interpolated BARE, and it runs without
+# `set -e` — so a key like "my-model" would error and the script would
+# silently continue, billing an experiment run that is missing that env var.
+# Reject at contract-validation time so a bad contract fails loud at
+# authoring instead (see also the defense-in-depth guard in
+# compute_backends._build_gcp_startup_script, which imports this pattern).
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Read and encode the aggregator script at module-load time.  The blob is then
 # embedded in generated per-arm bash wrappers so the aggregator runs on the
@@ -236,7 +253,7 @@ def _validate_compute_launch_contract(
             arm_cmd = arm.get("command")
             if not (isinstance(arm_name, str) and arm_name.strip()):
                 return False, f"arms[{i}].name is missing or empty"
-            if not _ARM_NAME_RE.match(arm_name):
+            if not ARM_NAME_RE.fullmatch(arm_name):
                 return (
                     False,
                     f"arms[{i}].name {arm_name!r} contains invalid characters — "
@@ -250,7 +267,7 @@ def _validate_compute_launch_contract(
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
-        if not _METRIC_KEY_RE.match(declared_metric):
+        if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
@@ -311,7 +328,7 @@ def _validate_compute_launch_contract(
     if declared_metric is not None:
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric must be a non-empty string"
-        if not _METRIC_KEY_RE.match(declared_metric):
+        if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
@@ -369,6 +386,19 @@ def _validate_compute_launch_contract(
                 f"input_artifact_job_id must be a UUID string "
                 f"({input_artifact_job_id!r})",
             )
+
+    env = contract.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            return False, "env must be an object of NAME -> value pairs"
+        for env_key in env:
+            if not (isinstance(env_key, str) and ENV_KEY_RE.fullmatch(env_key)):
+                return (
+                    False,
+                    f"env key {env_key!r} is not a valid shell identifier — "
+                    "env keys must match ^[A-Za-z_][A-Za-z0-9_]*$ (the startup "
+                    "script exports them as `export KEY=value`)",
+                )
 
     container_image = contract.get("container_image")
     if container_image is not None:

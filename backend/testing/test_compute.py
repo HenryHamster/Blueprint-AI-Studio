@@ -15,6 +15,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 import os
+import re
 import shlex
 import signal
 import uuid
@@ -38,6 +39,7 @@ from app.compute_backends import (
     GcpComputeBackend,
     ComputeLaunchResult,
     ComputeLaunchSpec,
+    ComputeLaunchSpecError,
     LocalSubprocessComputeBackend,
     ComputeStatusResult,
     RunnerSubprocessBackend,
@@ -2098,6 +2100,65 @@ async def test_no_progress_watchdog_inert_when_unset():
     assert terminal.exit_code == 0
 
 
+@pytest.mark.asyncio
+async def test_local_wrapper_preserves_nonzero_exit_code():
+    """A failing command's REAL exit code must reach the terminal record.
+
+    Regression test for an ordering bug in the wrapper's else-branch: it did
+        STATUS=FAILED
+        EXIT_CODE=$?
+    so `$?` captured the STATUS *assignment's* status (always 0), not python3's.
+    Every failing local/runner job therefore recorded EXIT_CODE=0 — the exit code,
+    the one piece of evidence about HOW the command failed, was silently lost.
+
+    Executes the wrapper for real (not a string assertion) so only correct
+    ordering can pass.
+    """
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="exit 42",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    terminal = None
+    for _ in range(80):
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert terminal is not None, "expected terminal marker for failed subprocess"
+    assert terminal.status == ComputeJobStatus.FAILED
+    # The assertion that fails on the old ordering (it recorded 0).
+    assert terminal.exit_code == 42
+
+
+def test_local_wrapper_captures_exit_code_before_setting_status():
+    """Static guard on the emitted order: `$?` is read BEFORE anything else runs.
+
+    Pairs with the e2e test above — this one pins the *shape* so a future edit
+    cannot reintroduce the ordering bug even if the e2e test is skipped.
+    """
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-exit-order"
+    )
+    lines = [line.strip() for line in wrapper.splitlines()]
+    assert "EXIT_CODE=$?" in lines
+    # In the failure branch, EXIT_CODE=$? must precede STATUS=FAILED.
+    assert lines.index("EXIT_CODE=$?") < lines.index("STATUS=FAILED")
+
+
 def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     artifact_dir = compute_backends_module._local_artifact_dir_for_external_id(
         "local-z"
@@ -2111,6 +2172,30 @@ def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     # Use trailing newline to avoid matching files inside the dir (e.g. command.log.json).
     assert f"rm -f {shlex.quote(artifact_dir)}\n" not in wrapper
     assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
+
+
+def test_local_wrapper_ships_command_runner_as_base64_not_heredoc():
+    """The local wrapper must deliver the shared command_runner.py as a base64
+    blob (the CLAUDE.md pattern for embedding another language) — never as a
+    multi-line python heredoc, which has to survive two escape passes and is
+    invisible to python linters."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id="local-runner-b64"
+    )
+    # The same real, lintable file the GCP startup script ships.
+    assert compute_backends_module._COMMAND_RUNNER_B64 in wrapper
+    assert "base64 -d" in wrapper
+    # No embedded-python heredoc.
+    assert "<<'PY'" not in wrapper
+    # The runner is decoded into the job's private state dir (no /tmp races)
+    # and invoked with the bounded-log limit as an argument.
+    state_dir = compute_backends_module._local_state_dir_for_external_id(
+        "local-runner-b64"
+    )
+    runner_path = os.path.join(state_dir, "command_runner.py")
+    assert shlex.quote(runner_path) in wrapper
+    assert f"if python3 {shlex.quote(runner_path)}" in wrapper
+    assert str(compute_backends_module._MAX_COMMAND_LOG_BYTES) in wrapper
 
 
 def test_local_wrapper_wraps_command_in_container_when_image_set(monkeypatch):
@@ -2313,6 +2398,130 @@ def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     assert "|| true" in script
 
 
+def _gcp_spec_with_env(env: dict[str, str]) -> ComputeLaunchSpec:
+    return ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        env=env,
+    )
+
+
+def test_gcp_startup_script_emits_valid_env_keys():
+    script = compute_backends_module._build_gcp_startup_script(
+        _gcp_spec_with_env({"GOOD_KEY": "ok", "_PRIVATE": "x", "SEED2": "42"}),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert "export GOOD_KEY=ok" in script
+    assert "export _PRIVATE=x" in script
+    assert "export SEED2=42" in script
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "my-model",
+        "1LEADING",
+        "A B",
+        "$(whoami)",
+        # Trailing newline: a `.match()` gate PASSES this (Python's `$` also
+        # matches just before a final newline), rendering `export GOOD\n=v` —
+        # bash runs `export GOOD` (empty) then `=v` (command not found) and, with
+        # no `set -e`, bills the run anyway. `bash -n` accepts it, so the shell
+        # harness cannot catch it either. Only `.fullmatch()` closes this.
+        "GOOD\n",
+        "GOOD\nEVIL=1",
+    ],
+)
+def test_gcp_startup_script_refuses_env_keys_that_are_not_shell_identifiers(bad_key):
+    """Defense-in-depth for the contract-time ENV_KEY_RE gate.
+
+    A key like "my-model" renders as `export my-model=...`, which bash rejects
+    ("not a valid identifier") — and the startup script runs WITHOUT `set -e`,
+    so it would silently continue and bill a GPU run missing that env var.
+
+    The builder must RAISE, not skip: skipping would still launch the exact run
+    this guard exists to prevent. The raise happens before provision_ephemeral_vm,
+    so no VM is ever created. It raises ComputeLaunchSpecError so the caller can
+    terminalize the job FAILED immediately with this message (which names the key)
+    rather than retrying an unretryable spec until the provisioning deadline.
+    """
+    spec = _gcp_spec_with_env({"GOOD_KEY": "ok", bad_key: "bad"})
+    with pytest.raises(compute_backends_module.ComputeLaunchSpecError) as excinfo:
+        compute_backends_module._build_gcp_startup_script(
+            spec, artifact_upload_url="https://storage.example.com/upload"
+        )
+    # The reason must name the offending key (surface WHY, not just "invalid").
+    # It is interpolated with !r deliberately: repr renders an otherwise-invisible
+    # trailing newline as a visible \n, so the operator can SEE what was wrong.
+    assert repr(bad_key) in str(excinfo.value)
+    assert "shell identifier" in str(excinfo.value)
+    # Unretryable-spec signal must survive as a ValueError for existing handlers.
+    assert isinstance(excinfo.value, ValueError)
+
+
+# Independent restatement of the shell-identifier rule, deliberately NOT imported
+# from app code: this is the OUTPUT-level backstop, so weakening the production
+# ENV_KEY_RE must not silently weaken the check that catches its output.
+_WELL_FORMED_EXPORT_RE = re.compile(r"^export [A-Za-z_][A-Za-z0-9_]*=", re.M)
+_ANY_EXPORT_RE = re.compile(r"^export ", re.M)
+
+
+def _multi_line_exports(script: str) -> list[str]:
+    """Return every top-level `export` in the RAW script that is not `IDENT=...`.
+
+    Must run on the raw string. `splitlines()` cannot see this defect: a key
+    carrying a newline renders as TWO physical lines — `export GOOD` and `=v` —
+    and after the split the first reads as the perfectly valid key "GOOD". The
+    newline is only visible while it is still in the string.
+    """
+    well_formed = {m.start() for m in _WELL_FORMED_EXPORT_RE.finditer(script)}
+    return [
+        script[m.start() : script.find("\n", m.start()) + 1 or len(script)]
+        for m in _ANY_EXPORT_RE.finditer(script)
+        if m.start() not in well_formed
+    ]
+
+
+def test_gcp_startup_script_never_emits_a_multi_line_export():
+    """Backstop on the rendered artifact: no `export` may be split across lines.
+
+    A newline smuggled into a key produces a second physical line that bash
+    executes as a command, and `bash -n` still accepts the script. This checks the
+    OUTPUT, not the guard — see the negative control below, which proves it can
+    actually catch a bad script.
+    """
+    script = compute_backends_module._build_gcp_startup_script(
+        _gcp_spec_with_env({"GOOD_KEY": "ok", "SEED": "42"}),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert _multi_line_exports(script) == []
+
+
+def test_multi_line_export_backstop_catches_a_genuinely_bad_script(monkeypatch):
+    """NEGATIVE CONTROL: the backstop above must fail on a script that is bad.
+
+    The guard normally raises first, so the backstop never sees a bad script and
+    contributes zero assurance unless we prove it CAN catch one. Neuter the guard
+    (permissive ENV_KEY_RE) so a real multi-line export is actually rendered, then
+    show the backstop flags it.
+    """
+    monkeypatch.setattr(
+        compute_backends_module, "ENV_KEY_RE", re.compile(r"[\s\S]*")
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        _gcp_spec_with_env({"GOOD\n": "v"}),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    # The guard is off, so the bad script really exists: two physical lines.
+    assert "export GOOD\n" in script
+    # ...and the backstop catches it, naming the offending statement.
+    assert _multi_line_exports(script) == ["export GOOD\n"]
+
+
 @pytest.mark.asyncio
 async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
     backend = GcpComputeBackend()
@@ -2373,6 +2582,50 @@ async def test_gcp_backend_launch_uses_signed_artifact_upload(monkeypatch):
     assert "https://storage.example.com/upload" in startup_script
     assert "gcloud storage cp" not in startup_script
     assert "gsutil -m cp -r" not in startup_script
+
+
+@pytest.mark.asyncio
+async def test_gcp_backend_launch_rejects_bad_env_key_before_provisioning(monkeypatch):
+    """The env-key gate must fire BEFORE a VM exists — on the real backend.
+
+    This is the production-code proof behind "cost is zero": the fakes in the
+    compute_jobs tests can only model the ordering, they cannot verify it. Here the
+    real GcpComputeBackend.launch runs against a recording provision_ephemeral_vm,
+    so if the gate ever moves below provisioning, provision_calls is non-empty and
+    this fails — a billed GPU VM for a spec that can never run.
+    """
+    backend = GcpComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=50.0,
+        deadline_at=None,
+        env={"GOOD_KEY": "ok", "my-model": "bad"},
+    )
+
+    provision_calls: list[str] = []
+
+    async def fake_provision(vm_id, **kwargs):
+        provision_calls.append(vm_id)
+        return True
+
+    async def fake_signed_url(jid, *, expires_at=None):
+        return "https://storage.example.com/upload"
+
+    monkeypatch.setattr(
+        storage, "generate_compute_job_artifact_upload_signed_url", fake_signed_url
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    with pytest.raises(compute_backends_module.ComputeLaunchSpecError) as excinfo:
+        await backend.launch(spec)
+
+    assert "my-model" in str(excinfo.value)
+    # The load-bearing assertion: no VM was ever asked for, so nothing is billing.
+    assert provision_calls == []
 
 
 @pytest.mark.asyncio
@@ -2926,6 +3179,172 @@ async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_s
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
     assert "compute_rpc_diagnostic" not in job.polling_metadata
+
+
+class _RejectingBackend:
+    """Backend whose launch fails the spec gate. Records calls; NEVER asserts.
+
+    An `assert`/`raise` inside a backend method is worthless here: compute_jobs'
+    ComputeLaunchSpecError handler wraps `terminate()` in a bare `except
+    Exception:`, so an AssertionError raised in `terminate` is swallowed, logged,
+    and the test still passes green while the property it "guards" is violated.
+    Record the calls and assert in the TEST BODY, outside any handler.
+
+    `provision_after_reject` models the refactor hazard: a future change that moves
+    the env-key gate to AFTER provision_ephemeral_vm, so a billed VM exists by the
+    time the spec is rejected. The handler must still leave no live VM behind.
+    """
+
+    def __init__(self, *, provision_after_reject: bool = False):
+        self.launch_attempts = 0
+        self.provision_after_reject = provision_after_reject
+        # VMs that exist and are BILLING right now. Must be empty when the job
+        # terminalizes — that is the whole property this suite is guarding.
+        self.live_vms: list[str] = []
+        self.terminate_calls: list[str | None] = []
+
+    def external_id_for(self, persisted_job):
+        return "launch-spec-rejected"
+
+    async def launch(self, spec):
+        self.launch_attempts += 1
+        if self.provision_after_reject:
+            # Pessimal ordering: the VM is up and billing before the gate fires.
+            self.live_vms.append("launch-spec-rejected")
+        raise ComputeLaunchSpecError(
+            "compute job x: env key 'my-model' is not a valid shell identifier"
+        )
+
+    async def terminate(self, persisted_job, reason=None):
+        self.terminate_calls.append(reason)
+        self.live_vms.clear()
+        return True
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_terminalizes_unretryable_launch_spec(
+    db_session, monkeypatch
+):
+    """A ComputeLaunchSpecError terminalizes the job FAILED, naming the bad field.
+
+    Contrast with the retry-shaped generic handler exercised by the test above: a
+    bad env key can NEVER succeed on retry, so re-attempting it every monitor tick
+    until provisioning_deadline_at only buys the operator a terminal reason of
+    "compute job timed out while provisioning" — which does not say WHICH key was
+    bad. The terminal_reason must carry the real cause.
+    """
+    project = Project(name="Compute Launch Spec Rejected", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    backend = _RejectingBackend()
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: backend)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Terminal immediately — NOT left STARTING to re-raise until the deadline.
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    # The operator-visible reason names the offending key (surface WHY).
+    assert "my-model" in job.terminal_reason
+    assert "shell identifier" in job.terminal_reason
+    assert backend.launch_attempts == 1
+
+    # ZERO-COST claim: today's gate raises before provision_ephemeral_vm, so no VM
+    # was ever created and none is billing. Asserted in the test body, NOT inside a
+    # backend method the handler's bare `except Exception:` would swallow.
+    assert backend.live_vms == []
+    # The handler reaps unconditionally (external_compute_id is always reserved
+    # pre-launch), so terminate IS invoked — a belt-and-braces no-op here. Locked in
+    # because it is the only thing that stops the post-provision case below leaking.
+    assert backend.terminate_calls == ["launch_spec_rejected"]
+
+    # A second tick must not re-launch a terminal job.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    assert backend.launch_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reaps_vm_when_launch_rejects_post_provision(
+    db_session, monkeypatch
+):
+    """No billed VM may survive a rejected launch spec — even if one got created.
+
+    The property the whole ComputeLaunchSpecError path turns on is "no billed VM
+    exists once we terminalize". Today that holds for free because the gate raises
+    before provision_ephemeral_vm. This test refuses to depend on that: it hands
+    the handler the pessimal backend — one that brings a GPU VM UP and only then
+    rejects the spec — and demands the VM is gone anyway.
+
+    That makes the guard non-vacuous. Delete the `backend.terminate(...)` call from
+    the ComputeLaunchSpecError handler, or move the real gate after provisioning
+    without one, and this test goes red with a live VM in hand.
+    """
+    project = Project(name="Compute Launch Spec Post Provision", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    backend = _RejectingBackend(provision_after_reject=True)
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: backend)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    # The VM that existed when the spec was rejected has been reaped. Not "terminate
+    # was called" — no VM is LEFT. A leak would show up here as a live instance id.
+    assert backend.live_vms == []
+    assert backend.terminate_calls == ["launch_spec_rejected"]
 
 
 @pytest.mark.asyncio
@@ -11305,9 +11724,9 @@ def test_local_wrapper_includes_setup_step():
     )
     # The setup step command is in the wrapper.
     assert "pip install torch" in wrapper
-    # The setup step runs before the main command (python3 - <<'PY' block).
+    # The setup step runs before the main command (the command_runner invocation).
     setup_idx = wrapper.index("pip install torch")
-    cmd_idx = wrapper.index("python3 -")
+    cmd_idx = wrapper.index("if python3 ")
     assert setup_idx < cmd_idx
     # On failure the wrapper writes the terminal file and exits early.
     assert "SETUP_EXIT" in wrapper

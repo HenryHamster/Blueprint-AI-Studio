@@ -39,6 +39,7 @@ from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
+from app.compute_experiment_contract import ENV_KEY_RE
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
 
@@ -211,6 +212,18 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
+
+class ComputeLaunchSpecError(ValueError):
+    """A launch spec is malformed in a way no retry can fix.
+
+    Raised only from code paths that run BEFORE any billable resource is
+    provisioned, so the caller can terminalize the job immediately (FAILED, with
+    this exception's message as the operator-visible terminal_reason) instead of
+    re-attempting the identical launch every monitor tick until the provisioning
+    deadline. Generic launch exceptions stay retryable — this class is the
+    explicit opt-out for deterministic, zero-cost, spec-level rejections.
+    """
+
 
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
@@ -1493,6 +1506,17 @@ RELEASE_ECHO=
 SETUP_EOF
   exit "$SETUP_EXIT"
 fi"""
+    # The command runner is the same real, lintable file the GCP startup script
+    # ships (backend/app/_compute_scripts/command_runner.py), delivered as a
+    # base64 blob so no character has to survive an escape pass — per the
+    # "Generating Code for One Language From Another" rule, never a multi-line
+    # heredoc of another language. It is decoded into the job's private state
+    # dir (not a shared /tmp path) so concurrent local jobs cannot race on it.
+    runner_path = shlex.quote(
+        os.path.join(
+            _local_state_dir_for_external_id(external_id), "command_runner.py"
+        )
+    )
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
     _no_progress_watchdog_block = ""
@@ -1533,12 +1557,19 @@ NP_EOF
 _NP_WATCHDOG_PID=$!
 """
         _np_watchdog_cleanup = 'kill "$_NP_WATCHDOG_PID" 2>/dev/null || true'
+    # NOTE on the failure branch below: `EXIT_CODE=$?` MUST come before
+    # `STATUS=FAILED`. This block previously assigned STATUS first, so `$?` read
+    # the *assignment's* exit status (always 0) instead of python3's — every failing
+    # local/runner job recorded EXIT_CODE=0 and the real exit code, the only
+    # evidence of HOW the command failed, was silently lost. The GCP startup script
+    # already gets this order right; this path did not.
     return f"""mkdir -p {state_dir}
 mkdir -p {artifact_dir}
 printf '%s\\n' "$$" > {pid_path}
 rm -f {terminal_path}
 rm -f {result_path}
 rm -f {command_log_path}
+echo '{_COMMAND_RUNNER_B64}' | base64 -d > {runner_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
 export {PROGRESS_FILE_ENV}={progress_file}
@@ -1546,77 +1577,17 @@ export {PROGRESS_FILE_ENV}={progress_file}
 {container_setup_block}
 {_no_progress_watchdog_block}
 EXIT_CODE=0
-if python3 - \
+if python3 {runner_path} \
   {command_literal} \
   {command_log_path} \
-  {live_tail_path_local} <<'PY'; then
-import base64, json, pathlib, subprocess, sys, threading
-
-command = sys.argv[1]
-log_path = pathlib.Path(sys.argv[2])
-live_tail_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
-log_path.parent.mkdir(parents=True, exist_ok=True)
-proc = subprocess.Popen(
-    ["bash", "-lc", command],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-)
-captured = bytearray()
-truncated = False
-_stop = threading.Event()
-
-def _flush_tail():
-    if live_tail_path is None:
-        return
-    snap = bytes(captured)
-    tail = snap[-10240:]
-    payload = json.dumps({{"text": tail.decode("utf-8", "replace"), "truncated": len(snap) > 10240 or truncated}}, ensure_ascii=False).encode()
-    try:
-        live_tail_path.write_bytes(base64.b64encode(payload))
-    except OSError:
-        pass
-
-def _tail_worker():
-    while not _stop.wait(30):
-        _flush_tail()
-
-_t = threading.Thread(target=_tail_worker, daemon=True)
-_t.start()
-assert proc.stdout is not None
-while True:
-    chunk = proc.stdout.read(8192)
-    if not chunk:
-        break
-    if len(captured) < {_MAX_COMMAND_LOG_BYTES}:
-        remaining = {_MAX_COMMAND_LOG_BYTES} - len(captured)
-        if len(chunk) <= remaining:
-            captured.extend(chunk)
-        else:
-            captured.extend(chunk[:remaining])
-            truncated = True
-    else:
-        truncated = True
-exit_code = proc.wait()
-_stop.set()
-if proc.stdout is not None:
-    proc.stdout.close()
-if captured or truncated:
-    payload = {{
-        "text": captured.decode("utf-8", "replace"),
-        "truncated": truncated,
-        "byte_count": len(captured),
-    }}
-    log_path.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-sys.exit(exit_code)
-PY
+  {_MAX_COMMAND_LOG_BYTES} \
+  {live_tail_path_local}; then
   STATUS=SUCCEEDED
   EXIT_CODE=0
 else
-  STATUS=FAILED
+  # Order is load-bearing: read $? before any other command runs.
   EXIT_CODE=$?
+  STATUS=FAILED
 fi
 {_np_watchdog_cleanup}
 FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -2308,6 +2279,31 @@ def _build_gcp_startup_script(
 ) -> str:
     env_lines = []
     for key, value in sorted((spec.env or {}).items()):
+        # Defense-in-depth mirror of the contract-time ENV_KEY_RE gate. The key
+        # is interpolated BARE into `export {key}=...` and this script runs
+        # WITHOUT `set -e`, so a key like "my-model" makes bash error ("not a
+        # valid identifier") and then SILENTLY CONTINUE — burning a GPU on a run
+        # that is missing that env var.
+        #
+        # fullmatch, not match: `$` also matches before a trailing newline, so
+        # `.match("GOOD\n")` would pass this guard and emit `export GOOD\n=v` —
+        # two lines, `export GOOD` (empty) then `=v` (command not found), and
+        # with no `set -e` the billed run continues without the var. That is the
+        # exact silent degradation this guard exists to stop, so it must not be
+        # reachable through the guard itself.
+        #
+        # Raise rather than skip: dropping the key would still launch the very
+        # run this guard exists to prevent (missing env var, full GPU spend),
+        # just with a warning nobody reads. This runs BEFORE provision_ephemeral_vm,
+        # so the raise costs no VM, and ComputeLaunchSpecError tells compute_jobs
+        # to terminalize the job FAILED right away with this message — which names
+        # the offending key — as the operator-visible terminal_reason.
+        if not ENV_KEY_RE.fullmatch(str(key)):
+            raise ComputeLaunchSpecError(
+                f"compute job {spec.job_id}: env key {key!r} is not a valid "
+                f"shell identifier (must match {ENV_KEY_RE.pattern}) — refusing "
+                "to launch a billed run whose `export` would fail silently"
+            )
         env_lines.append(f"export {key}={shlex.quote(value)}")
     env_block = "\n".join(env_lines)
     cwd_line = f"cd {shlex.quote(spec.cwd)}" if spec.cwd else ""

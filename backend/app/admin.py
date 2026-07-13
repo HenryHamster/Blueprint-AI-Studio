@@ -2768,11 +2768,15 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
     """Coerce and sanitize the LLM's raw dict into a valid ComputeExperimentDraft."""
     import re as _re
 
+    # fullmatch, not match: `$` also matches just before a trailing newline, so
+    # `.match()` accepts a key ending in a newline and lets it into an arm name /
+    # metric key that is later interpolated into generated bash (the same hole as
+    # the gates in compute_experiment_contract).
     _METRIC_RE = _re.compile(r"^[A-Za-z0-9_./-]+$")
     _ARM_NAME_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
 
     def _safe_metric(v: object) -> str | None:
-        if isinstance(v, str) and _METRIC_RE.match(v):
+        if isinstance(v, str) and _METRIC_RE.fullmatch(v):
             return v
         return None
 
@@ -2795,7 +2799,7 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
             if isinstance(arm, dict):
                 name = arm.get("name", "")
                 cmd = arm.get("command", "")
-                if isinstance(name, str) and _ARM_NAME_RE.match(name) and isinstance(cmd, str):
+                if isinstance(name, str) and _ARM_NAME_RE.fullmatch(name) and isinstance(cmd, str):
                     coerced_arms.append({"name": name, "command": cmd})
         arms = coerced_arms if coerced_arms else None
 

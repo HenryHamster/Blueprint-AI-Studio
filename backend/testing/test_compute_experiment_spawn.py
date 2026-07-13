@@ -411,6 +411,91 @@ def test_validate_contract_rejects_malformed_runner_target(runner_target, needle
     assert needle in reason
 
 
+# --- env validation ---------------------------------------------------------
+# Env keys are interpolated BARE into `export {key}=...` in the GCP startup
+# script, which runs without `set -e` — a non-identifier key would error and
+# the script would silently continue, billing a run missing that env var.
+# The contract validator must therefore fail loud at authoring time.
+
+
+def test_validate_contract_accepts_valid_env_keys():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {"MY_SEED": "42", "_PRIVATE": "x", "DATASET2": "/data"},
+        },
+        require_smoke=False,
+    )
+    assert ok is True
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "my-model",
+        "1LEADING",
+        "A B",
+        "PATH=X",
+        "KEY;rm -rf /",
+        "$(whoami)",
+        "",
+        # Trailing newline: `re.match(r"^\w+$", "GOOD\n")` SUCCEEDS (Python's `$`
+        # also matches just before a final newline), so a `.match()` gate lets this
+        # through and the script emits `export GOOD\n=v` — bash runs `export GOOD`
+        # (empty) then `=v` (command not found) and, with no `set -e`, bills the run
+        # anyway. `bash -n` passes it too, so the shell harness cannot catch it.
+        # Only `.fullmatch()` rejects it. This case is the regression lock.
+        "GOOD\n",
+        "GOOD\nEVIL=1",
+        "\nGOOD",
+    ],
+)
+def test_validate_contract_rejects_env_keys_that_are_not_shell_identifiers(bad_key):
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {bad_key: "value"},
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env key" in reason
+    assert "shell identifier" in reason
+
+
+def test_validate_contract_rejects_non_string_env_key():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": {42: "value"},
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env key" in reason
+
+
+def test_validate_contract_rejects_non_dict_env():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "run",
+            "spend_cap_usd": 3.0,
+            "deadline_seconds": 300,
+            "env": ["MY_SEED=42"],
+        },
+        require_smoke=False,
+    )
+    assert ok is False
+    assert "env must be an object" in reason
+
+
 # --- smoke_sample validation ---------------------------------------------
 
 
@@ -2554,6 +2639,43 @@ def test_arms_contract_validation_empty_declared_metric():
     ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
     assert ok is False
     assert "declared_metric" in reason
+
+
+@pytest.mark.parametrize("bad_name", ["bad name", "a;rm -rf /", "arm:1", "a/b", "GOOD\n"])
+def test_arms_contract_validation_rejects_arm_name_charset(bad_name):
+    """Arm names outside the safe charset are rejected — including trailing-newline.
+
+    `ARM_NAME_RE.match("GOOD\\n")` SUCCEEDS (Python's `$` matches before a final
+    newline), and the arm name is interpolated into the generated per-arm bash
+    wrapper and the NAME:PATH aggregator spec. Only `.fullmatch()` rejects it.
+    """
+    contract = {
+        "arms": [{"name": bad_name, "command": "python a.py"}],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "invalid characters" in reason
+
+
+@pytest.mark.parametrize("bad_metric", ["val loss", "$(whoami)", "a;b", "GOOD\n"])
+def test_arms_contract_validation_rejects_declared_metric_charset(bad_metric):
+    """declared_metric outside the safe charset is rejected — including trailing-newline.
+
+    Same `.match()` + `$` hole as the arm-name gate: the metric key reaches the
+    generated wrapper, so a newline must not survive validation.
+    """
+    contract = {
+        "arms": [{"name": "a", "command": "python a.py"}],
+        "declared_metric": bad_metric,
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "invalid characters" in reason
 
 
 def test_arms_contract_validation_empty_arms_list():
