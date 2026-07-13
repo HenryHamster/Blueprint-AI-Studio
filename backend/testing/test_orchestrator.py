@@ -1824,6 +1824,85 @@ class TestMaxPlanPool:
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
+    # ── Test 1a: per-project active_tasks is zero-reconciled from the DB ─────
+
+    @pytest.mark.asyncio
+    async def test_load_max_plan_pool_zero_reconciles_stale_per_project_active_tasks(
+        self, db_session, mocker, reset_max_plan_pool
+    ):
+        """On restart, the per-project active_tasks in the persisted project_state
+        is NOT trusted — it is reset to 0 and then re-derived from the live DB
+        tasks table. daily_task_count and other persisted keys survive.
+
+        Regression for gating finding 94f454f4: a project whose persisted
+        active_tasks was a stale nonzero value but which has ZERO currently-active
+        tasks would otherwise keep the stale count forever, permanently starving
+        that (account, project) pair once per-project concurrency caps apply.
+        """
+        mocker.patch(
+            "app.max_plan_pool.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        # Two projects: p_stale has stale persisted active_tasks but no live
+        # tasks; p_live has stale persisted active_tasks AND live tasks.
+        proj_stale = make_project(name="Stale proj", user_id="user1")
+        proj_live = make_project(name="Live proj", user_id="user1")
+        db_session.add(proj_stale)
+        db_session.add(proj_live)
+        await db_session.commit()
+        await db_session.refresh(proj_stale)
+        await db_session.refresh(proj_live)
+
+        pid_stale = str(proj_stale.id)
+        pid_live = str(proj_live.id)
+
+        acct_id = uuid.uuid4()
+        account = MaxPlanAccount(
+            id=acct_id,
+            user_id=_TEST_USER,
+            name="test-account",
+            oauth_token="sk-ant-test-token",
+            enabled=True,
+            total_tasks=10,
+            project_state={
+                pid_stale: {"active_tasks": 3, "daily_task_count": 5},
+                pid_live: {"active_tasks": 3, "daily_task_count": 7},
+            },
+        )
+        db_session.add(account)
+        await db_session.commit()
+
+        # Only p_live has a live IN_PROGRESS task on this account.
+        db_session.add(
+            make_task(
+                project_id=proj_live.id,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.IN_PROGRESS,
+                llm_account_id=str(acct_id),
+                context={"max_plan_account_id": str(acct_id)},
+            )
+        )
+        await db_session.commit()
+
+        await load_max_plan_pool()
+
+        entry = _account_by_id[str(acct_id)]
+        pstate = entry["project_state"]
+
+        # Stale project: active_tasks zeroed (no live tasks), other keys survive.
+        assert pstate[pid_stale]["active_tasks"] == 0, (
+            "stale per-project active_tasks must be zero-reconciled from the DB"
+        )
+        assert pstate[pid_stale]["daily_task_count"] == 5, (
+            "daily_task_count must be preserved across reconciliation"
+        )
+
+        # Live project: DB count override applies (1 live task), other keys survive.
+        assert pstate[pid_live]["active_tasks"] == 1, (
+            "per-project active_tasks must reflect the live DB count when present"
+        )
+        assert pstate[pid_live]["daily_task_count"] == 7
+
     # ── Test 1b: hot-loop reconcile reads the promoted column, not Task.context ─
 
     @pytest.mark.asyncio

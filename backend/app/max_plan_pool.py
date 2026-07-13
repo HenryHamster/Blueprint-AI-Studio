@@ -1080,7 +1080,17 @@ async def load_max_plan_pool():
             db_project_state = getattr(acct, "project_state", None) or {}
             for pid, pstate in db_project_state.items():
                 if isinstance(pstate, dict):
-                    reconciled_project_state[pid] = dict(pstate)
+                    # Copy persisted per-project state, but zero out active_tasks:
+                    # the DB tasks table is the single source of truth for the
+                    # live active count at startup. A project whose persisted
+                    # active_tasks is a stale nonzero value but which has ZERO
+                    # currently-active tasks would otherwise keep the stale count
+                    # forever (no override below), permanently starving that
+                    # (account, project) pair once per-project concurrency caps
+                    # are configured. Other keys (daily_task_count, ...) survive.
+                    copied = dict(pstate)
+                    copied["active_tasks"] = 0
+                    reconciled_project_state[pid] = copied
             # Override active_tasks with reconciled counts from current DB (tasks table).
             for pid, count in active_per_account_project.get(acct_id, {}).items():
                 reconciled_project_state.setdefault(pid, {})["active_tasks"] = count
