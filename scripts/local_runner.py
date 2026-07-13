@@ -1621,8 +1621,20 @@ class _LiveRunnerConfig:
     # keeps reporting the older one, so the server renders it as pending rather
     # than the daemon silently dropping a field it does not understand.
     _KNOWN_KEYS = frozenset(
-        {"max_concurrent", "max_concurrent_compute", "task_types", "gpu_indices_allowed"}
+        {
+            "max_concurrent",
+            "max_concurrent_compute",
+            "task_types",
+            "gpu_indices_allowed",
+            "gpus_per_job",
+        }
     )
+
+    # Per-job GPU-count bounds, mirroring the server projection (runner_config).
+    # A live push is clamped into this range so a bad value can never wedge the
+    # scheduler (< 1) or reserve an absurd number of devices per job.
+    MIN_GPUS_PER_JOB = 1
+    MAX_GPUS_PER_JOB = 8
 
     def __init__(
         self,
@@ -1641,8 +1653,15 @@ class _LiveRunnerConfig:
         # echoed generation matches without recomputing the hash).
         self._gpu_indices_allowed = "all"
         # Shared GPU-scheduling dict; the concrete allowlist lives under
-        # ["allowed"] and is read by _assign_gpus under ["lock"].
+        # ["allowed"] and is read by _assign_gpus under ["lock"]. The per-job
+        # GPU count lives under ["per_job"] and is read by _assign_gpus too, so a
+        # live update to it takes effect on the NEXT job assignment.
         self._gpu_state = gpu_state
+        # Reported per-job GPU count, seeded from the startup gpu_state value so
+        # the echoed report matches the count the scheduler actually uses.
+        self._gpus_per_job = self._clamp_gpus_per_job(
+            (gpu_state or {}).get("per_job", self.MIN_GPUS_PER_JOB)
+        )
         self._all_gpu_indices = list(all_gpu_indices or [])
         # None until the first server generation is applied; the server treats a
         # null applied generation as pending/unknown (never an error).
@@ -1655,6 +1674,14 @@ class _LiveRunnerConfig:
         except (TypeError, ValueError):
             return cls.MIN_CONCURRENT
         return max(cls.MIN_CONCURRENT, min(cls.MAX_CONCURRENT, v))
+
+    @classmethod
+    def _clamp_gpus_per_job(cls, value) -> int:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return cls.MIN_GPUS_PER_JOB
+        return max(cls.MIN_GPUS_PER_JOB, min(cls.MAX_GPUS_PER_JOB, v))
 
     def max_concurrent(self) -> int:
         with self._lock:
@@ -1673,6 +1700,7 @@ class _LiveRunnerConfig:
                 "applied_max_concurrent_compute": self._max_concurrent_compute,
                 "applied_task_types": self._task_types,
                 "applied_gpu_indices_allowed": self._gpu_indices_allowed,
+                "applied_gpus_per_job": self._gpus_per_job,
             }
 
     def apply(self, config) -> bool:
@@ -1711,6 +1739,8 @@ class _LiveRunnerConfig:
                     self._task_types = [str(x) for x in tt if isinstance(x, str) and x]
             if "gpu_indices_allowed" in config:
                 self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
+            if "gpus_per_job" in config:
+                self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
             if fully_applicable and isinstance(generation, str) and generation:
                 self._applied_generation = generation
         return fully_applicable
@@ -1759,6 +1789,32 @@ class _LiveRunnerConfig:
                     self._gpu_state["allowed"] = concrete
             else:
                 self._gpu_state["allowed"] = concrete
+
+    def _apply_gpus_per_job_locked(self, raw) -> None:
+        """Update the reported per-job GPU count and the shared scheduling state.
+
+        ``None`` keeps the current value (the server omitting the field is not a
+        request to reset it). A valid value is clamped into
+        ``[MIN_GPUS_PER_JOB, MAX_GPUS_PER_JOB]`` and written to
+        ``gpu_state["per_job"]`` so the NEXT ``_assign_gpus`` reserves that many
+        devices — running jobs keep the GPUs they were already assigned.
+        Called with ``self._lock`` held.
+        """
+        if raw is None:
+            return
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return
+        per_job = self._clamp_gpus_per_job(raw)
+        self._gpus_per_job = per_job
+        if self._gpu_state is not None:
+            gpu_lock = self._gpu_state.get("lock")
+            if gpu_lock is not None:
+                with gpu_lock:
+                    self._gpu_state["per_job"] = per_job
+            else:
+                self._gpu_state["per_job"] = per_job
 
 
 # ── Heartbeat (background thread) ─────────────────────────────────────────────

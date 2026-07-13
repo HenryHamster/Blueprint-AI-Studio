@@ -423,6 +423,7 @@ class HeartbeatRequest(BaseModel):
     applied_max_concurrent_compute: int | None = None
     applied_task_types: List[StrictStr] | str | None = None
     applied_gpu_indices_allowed: List[int] | str | None = None
+    applied_gpus_per_job: int | None = None
 
 
 @router.post("/next-task")
@@ -875,6 +876,8 @@ async def heartbeat(
             if payload.applied_gpu_indices_allowed == "all"
             else [max(0, int(v)) for v in payload.applied_gpu_indices_allowed]
         )
+    if payload.applied_gpus_per_job is not None:
+        applied_report["gpus_per_job"] = max(1, int(payload.applied_gpus_per_job))
     if applied_report:
         caps["applied_config"] = applied_report
     if payload.hostname:

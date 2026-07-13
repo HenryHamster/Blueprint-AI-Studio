@@ -564,6 +564,55 @@ class TestLiveRunnerConfig(unittest.TestCase):
         # generation matches), even though only [0] is concretely assignable.
         self.assertEqual(holder.report()["applied_gpu_indices_allowed"], [0, 5])
 
+    def test_gpus_per_job_applied_updates_scheduling_set(self):
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        # Seeded from gpu_state["per_job"] == 1.
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 1)
+        holder.apply({"gpus_per_job": 2, "config_generation": "g"})
+        # The shared scheduling state now reserves 2 GPUs per job, and the
+        # applied value is echoed for the desired-vs-applied fleet view.
+        self.assertEqual(gpu_state["per_job"], 2)
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 2)
+
+    def test_gpus_per_job_clamped_to_bounds(self):
+        holder, gpu_state = self._holder()
+        holder.apply({"gpus_per_job": 999, "config_generation": "hi"})
+        self.assertEqual(
+            gpu_state["per_job"], local_runner._LiveRunnerConfig.MAX_GPUS_PER_JOB
+        )
+        holder.apply({"gpus_per_job": 0, "config_generation": "lo"})
+        self.assertEqual(
+            gpu_state["per_job"], local_runner._LiveRunnerConfig.MIN_GPUS_PER_JOB
+        )
+
+    def test_gpus_per_job_null_keeps_current(self):
+        holder, gpu_state = self._holder()
+        holder.apply({"gpus_per_job": 3, "config_generation": "g1"})
+        self.assertEqual(gpu_state["per_job"], 3)
+        # A later block omitting/nulling the field must not reset it.
+        holder.apply({"gpus_per_job": None, "config_generation": "g2"})
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 3)
+
+    def test_gpus_per_job_seeded_from_gpu_state(self):
+        gpu_state = _gpu_state((0, 1))
+        gpu_state["per_job"] = 2
+        holder = local_runner._LiveRunnerConfig(
+            2, 2, task_types="all", gpu_state=gpu_state, all_gpu_indices=[0, 1],
+        )
+        # The reported value matches the scheduler's startup per-job count so the
+        # first heartbeat echo is not spuriously pending.
+        self.assertEqual(holder.report()["applied_gpus_per_job"], 2)
+
+    def test_gpus_per_job_unknown_field_still_blocks_generation(self):
+        # gpus_per_job is now a KNOWN key — a block carrying only it (plus known
+        # fields) is fully applicable and advances the generation.
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"gpus_per_job": 2, "config_generation": "gen-pj"})
+        )
+        self.assertEqual(holder.report()["applied_config_generation"], "gen-pj")
+
     def test_generation_advances_only_when_fully_applicable(self):
         holder, _ = self._holder()
         self.assertIsNone(holder.report()["applied_config_generation"])

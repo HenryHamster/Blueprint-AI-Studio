@@ -502,13 +502,17 @@ interface Props {
    *  refreshSignal and post-mutation loads instead. Absent or false keeps the
    *  poll running as a safety-net (WS down / prop not yet plumbed). */
   live?: boolean;
+  /** Navigate to a task/compute-job detail view by id. When provided, per-runner
+   *  recent-outcome rows render the task id as a keyboard-accessible link;
+   *  when absent the id degrades to plain text. */
+  onNavigateToTask?: (taskId: string) => void;
 }
 
 function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
   return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1203,7 +1207,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 </div>
               </div>
               {telemetryOpen && (
-                <RunnerTelemetryDetail projectId={projectId} runnerId={runner.id} />
+                <RunnerTelemetryDetail
+                  projectId={projectId}
+                  runnerId={runner.id}
+                  onNavigateToTask={onNavigateToTask}
+                />
               )}
               </div>
             );
@@ -1290,7 +1298,15 @@ function Sparkline({
 
 /** Expandable per-runner detail: heartbeat time-series sparklines (GPU/disk/mem
  *  over the last hour) + compute-job rollups. Lazy-loaded when the row expands. */
-function RunnerTelemetryDetail({ projectId, runnerId }: { projectId: string; runnerId: string }) {
+function RunnerTelemetryDetail({
+  projectId,
+  runnerId,
+  onNavigateToTask,
+}: {
+  projectId: string;
+  runnerId: string;
+  onNavigateToTask?: (taskId: string) => void;
+}) {
   const [telemetry, setTelemetry] = useState<RunnerTelemetryResponse | null>(null);
   const [stats, setStats] = useState<RunnerStatsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1440,9 +1456,19 @@ function RunnerTelemetryDetail({ projectId, runnerId }: { projectId: string; run
                       {o.exit_code != null ? ` (exit ${o.exit_code})` : ''}
                     </span>
                   )}
-                {o.task_id && (
-                  <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
-                )}
+                {o.task_id &&
+                  (onNavigateToTask ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToTask(o.task_id as string)}
+                      className="truncate text-left text-sky-300 hover:underline"
+                      data-testid="fleet-outcome-task-link"
+                    >
+                      task {o.task_id.slice(0, 8)}
+                    </button>
+                  ) : (
+                    <span className="truncate text-neutral-600">task {o.task_id.slice(0, 8)}</span>
+                  ))}
               </div>
               {(o.status === 'FAILED' || o.status === 'TIMED_OUT') && o.command_log_tail && (
                 <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900/60 px-2 py-1 font-mono text-ui-sm text-neutral-400">

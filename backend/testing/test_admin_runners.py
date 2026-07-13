@@ -21,6 +21,13 @@ from app.models import (
     Project,
     ProjectMember,
 )
+from app.routers.admin_runners import _normalize_gpus_per_job, _runner_config_view
+from app.runner_config import (
+    GPUS_PER_JOB_MAX,
+    GPUS_PER_JOB_MIN,
+    config_generation,
+    live_safe_config,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -478,3 +485,122 @@ class TestRunnerConfigView:
         # allowlist without SSH" flow the salvaged findings describe.
         caps["gpu_indices_allowed"] = [0, 1]
         assert _runner_config_view(caps)["config_pending"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-job GPU count as a LIVE-SAFE, operator-configurable runner-config knob.
+#
+# gpus_per_job completes the operator's enumerated live-config list: it is pushed
+# from the orchestrator via the heartbeat channel like gpu_indices_allowed, so an
+# operator can retune how many GPUs each compute job reserves on a mixed
+# multi-GPU box without SSHing in to edit an env var and restart the daemon.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestNormalizeGpusPerJob:
+    def test_accepts_bounds_and_coerces_numeric_strings(self):
+        assert _normalize_gpus_per_job(GPUS_PER_JOB_MIN) == GPUS_PER_JOB_MIN
+        assert _normalize_gpus_per_job(GPUS_PER_JOB_MAX) == GPUS_PER_JOB_MAX
+        assert _normalize_gpus_per_job(2) == 2
+        # A whole-valued float and a decimal string are both accepted.
+        assert _normalize_gpus_per_job(4.0) == 4
+        assert _normalize_gpus_per_job("3") == 3
+
+    def test_rejects_out_of_range(self):
+        with pytest.raises(ValueError):
+            _normalize_gpus_per_job(0)
+        with pytest.raises(ValueError):
+            _normalize_gpus_per_job(GPUS_PER_JOB_MAX + 1)
+        with pytest.raises(ValueError):
+            _normalize_gpus_per_job(-1)
+
+    def test_rejects_bool_and_junk(self):
+        # A bool is an int subclass — must not silently coerce to 1.
+        for bad in (True, False, "two", 1.5, None, ["1"], {}):
+            with pytest.raises(ValueError):
+                _normalize_gpus_per_job(bad)
+
+
+class TestGpusPerJobProjection:
+    def test_absent_defaults_to_min_and_present_projects_through(self):
+        # Backward compatible: a runner enrolled before this field existed
+        # projects the universal default rather than dropping the key.
+        assert live_safe_config({})["gpus_per_job"] == GPUS_PER_JOB_MIN
+        assert live_safe_config({"gpus_per_job": 4})["gpus_per_job"] == 4
+
+    def test_invalid_or_out_of_range_stored_value_is_clamped_not_raised(self):
+        # The generation hash must never raise on a legacy/oddly-shaped value.
+        assert live_safe_config({"gpus_per_job": "junk"})["gpus_per_job"] == GPUS_PER_JOB_MIN
+        assert live_safe_config({"gpus_per_job": 0})["gpus_per_job"] == GPUS_PER_JOB_MIN
+        assert (
+            live_safe_config({"gpus_per_job": GPUS_PER_JOB_MAX + 5})["gpus_per_job"]
+            == GPUS_PER_JOB_MAX
+        )
+
+    def test_generation_is_sensitive_to_gpus_per_job(self):
+        base = live_safe_config({"gpus_per_job": 1})
+        changed = live_safe_config({"gpus_per_job": 2})
+        assert config_generation(base) != config_generation(changed)
+
+
+class TestGpusPerJobPatchEndpoint:
+    @pytest.mark.asyncio
+    async def test_patch_pushes_gpus_per_job_into_desired_config(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator PATCH lands gpus_per_job in capabilities AND in the
+        desired live-safe config the daemon converges to (moving the generation)."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="e" * 64,
+            hostname="gpu-box",
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        before = _runner_config_view(runner.capabilities)
+        # Default projection before any operator input.
+        assert before["desired"]["gpus_per_job"] == GPUS_PER_JOB_MIN
+        assert before["gpus_per_job"] == GPUS_PER_JOB_MIN
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpus_per_job": 4},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["capabilities"]["gpus_per_job"] == 4
+        # The desired live-safe config surfaced to the Fleet UI reflects the push
+        # and the generation advanced, so the daemon sees config_pending.
+        cfg = body["config"]
+        assert cfg["desired"]["gpus_per_job"] == 4
+        assert cfg["gpus_per_job"] == 4
+        assert cfg["config_generation"] != before["config_generation"]
+
+        await db_session.refresh(runner)
+        assert runner.capabilities["gpus_per_job"] == 4
+        # Orthogonal to other operator fields — max_concurrent is untouched.
+        assert runner.capabilities["max_concurrent"] == 2
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_out_of_range_gpus_per_job(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="f" * 64, hostname="gpu-box2", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        for bad in (0, GPUS_PER_JOB_MAX + 1, -3):
+            rej = await client.patch(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+                json={"gpus_per_job": bad},
+            )
+            assert rej.status_code == 422, bad

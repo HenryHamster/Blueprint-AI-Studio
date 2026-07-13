@@ -437,6 +437,8 @@ class TestLiveSafeConfigProjection:
             "max_concurrent_compute": 4,
             "task_types": ["create", "fix"],
             "gpu_indices_allowed": "all",
+            # per-job GPU count defaults to 1 when unset (backward compatible).
+            "gpus_per_job": 1,
         }
         assert "has_gpu" not in cfg and "gpu_count" not in cfg
 
@@ -1549,6 +1551,58 @@ class TestRunnerConfigChannel:
         assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
         # The config block reflects the clamped values, not the requested ones.
         assert patch.json()["config"]["desired"]["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_gpus_per_job_pushed_via_heartbeat_and_applied_echo(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator PATCH of gpus_per_job flows down the heartbeat config block,
+        and the daemon's applied_gpus_per_job echo resolves config_pending."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+        )
+
+        # Operator pushes a per-job GPU count of 2.
+        patch = await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"gpus_per_job": 2},
+        )
+        assert patch.status_code == 200
+        assert patch.json()["capabilities"]["gpus_per_job"] == 2
+
+        # The daemon sees it in the heartbeat response config block.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200
+        config = hb.json()["config"]
+        assert config["gpus_per_job"] == 2
+        desired_gen = config["config_generation"]
+
+        # Before an applied echo, the view is pending.
+        view0 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view0["config"]["config_pending"] is True
+
+        # Daemon echoes the applied per-job count with the matching generation.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "applied_config_generation": desired_gen,
+                "applied_max_concurrent": 2,
+                "applied_gpu_indices_allowed": "all",
+                "applied_gpus_per_job": 2,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view1 = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert view1["config"]["applied"]["gpus_per_job"] == 2
+        assert view1["config"]["config_pending"] is False
 
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────

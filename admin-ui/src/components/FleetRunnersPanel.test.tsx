@@ -69,13 +69,18 @@ describe('FleetRunnersPanel — behavioral', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  async function mount(projectId = 'proj-test') {
+  async function mount(
+    projectId = 'proj-test',
+    opts: { onNavigateToTask?: (taskId: string) => void } = {},
+  ) {
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<FleetRunnersPanel projectId={projectId} />);
+      r.render(
+        <FleetRunnersPanel projectId={projectId} onNavigateToTask={opts.onNavigateToTask} />,
+      );
     });
     await act(async () => {});
     return host as HTMLDivElement;
@@ -1513,5 +1518,99 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(text).toContain('RuntimeError: boom');
     // A success row's tail (defensive) is never rendered.
     expect(text).not.toContain('this should never render');
+  });
+
+  test('recent-outcome task id is a keyboard-accessible link that fires onNavigateToTask', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 0,
+      jobs_success_rate: 0,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+      ],
+    });
+
+    const onNavigateToTask = vi.fn();
+    const el = await mount('proj-test', { onNavigateToTask });
+    await openTelemetry(el);
+
+    const link = el.querySelector<HTMLButtonElement>(
+      '[data-testid="fleet-outcome-task-link"]',
+    );
+    expect(link).not.toBeNull();
+    // Rendered as a real <button> so it is focusable/keyboard-activatable.
+    expect(link?.tagName).toBe('BUTTON');
+    expect(link?.textContent).toContain('task task-123');
+
+    await act(async () => { (link as HTMLButtonElement).click(); });
+    expect(onNavigateToTask).toHaveBeenCalledTimes(1);
+    expect(onNavigateToTask).toHaveBeenCalledWith('task-1234abcd');
+  });
+
+  test('recent-outcome task id degrades to plain text when no navigator is provided', async () => {
+    vi.mocked(fetchRunnerTelemetry).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      since_seconds: 3600,
+      count: 0,
+      snapshots: [],
+    });
+    vi.mocked(fetchRunnerStats).mockResolvedValue({
+      runner_id: 'runner-abc123',
+      jobs_run_count: 1,
+      jobs_terminal_count: 1,
+      jobs_succeeded_count: 0,
+      jobs_success_rate: 0,
+      cloud_cost_avoided_usd: 0,
+      cloud_cost_avoided_basis: 0,
+      claim_latency_ms_p50: null,
+      claim_latency_ms_p95: null,
+      claim_latency_ms_p99: null,
+      claim_latency_ms_max: null,
+      claim_latency_sample_count: 0,
+      last_n_outcomes: [
+        {
+          job_id: 'job-failed',
+          task_id: 'task-1234abcd',
+          status: 'FAILED',
+          outcome: null,
+          created_at: null,
+          completed_at: null,
+          terminal_reason: 'process exited non-zero',
+          exit_code: 137,
+        },
+      ],
+    });
+
+    const el = await mount();
+    await openTelemetry(el);
+
+    // No callback → no clickable link, but the id is still shown as plain text.
+    expect(el.querySelector('[data-testid="fleet-outcome-task-link"]')).toBeNull();
+    const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
+    expect(detail?.textContent).toContain('task task-123');
   });
 });

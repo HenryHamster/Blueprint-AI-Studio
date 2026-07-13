@@ -32,6 +32,8 @@ from app.models import (
 )
 from app.runner_config import (
     GPU_INDICES_ALL,
+    GPUS_PER_JOB_MAX,
+    GPUS_PER_JOB_MIN,
     config_generation,
     live_safe_config,
 )
@@ -123,6 +125,10 @@ class RunnerUpdateCapabilitiesRequest(BaseModel):
     # indices the runner may schedule onto. Part of the LIVE-SAFE config subset
     # pushed to the daemon via the heartbeat response.
     gpu_indices_allowed: str | list[int] | None = None
+    # Per-job GPU count: how many GPUs each compute job reserves on this runner.
+    # Part of the LIVE-SAFE config subset pushed to the daemon via the heartbeat
+    # response, so an operator can retune a mixed multi-GPU box without SSH.
+    gpus_per_job: int | None = None
 
 
 class RunnerStatusUpdateRequest(BaseModel):
@@ -247,6 +253,36 @@ def _normalize_gpu_indices_allowed(raw: Any) -> str | list[int]:
             normalized.append(value)
             seen.add(value)
     return sorted(normalized)
+
+
+def _normalize_gpus_per_job(raw: Any) -> int:
+    """Validate the per-job GPU count: a positive int within the fleet bounds.
+
+    Rejects bools and non-integer junk outright (an operator typo should 422,
+    not silently coerce), then requires a value in
+    ``[GPUS_PER_JOB_MIN, GPUS_PER_JOB_MAX]``.
+    """
+    if isinstance(raw, bool):
+        raise ValueError("capabilities.gpus_per_job must be a positive integer")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        if not raw.is_integer():
+            raise ValueError("capabilities.gpus_per_job must be a positive integer")
+        value = int(raw)
+    elif isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped.isdecimal():
+            raise ValueError("capabilities.gpus_per_job must be a positive integer")
+        value = int(stripped)
+    else:
+        raise ValueError("capabilities.gpus_per_job must be a positive integer")
+    if value < GPUS_PER_JOB_MIN or value > GPUS_PER_JOB_MAX:
+        raise ValueError(
+            f"capabilities.gpus_per_job must be between {GPUS_PER_JOB_MIN} "
+            f"and {GPUS_PER_JOB_MAX}"
+        )
+    return value
 
 
 def _runner_active_task_count(capabilities: Dict[str, Any] | None) -> int:
@@ -489,6 +525,7 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
         "applied_config_generation": applied_generation,
         "config_pending": applied_generation != desired_generation,
         "gpu_indices_allowed": desired["gpu_indices_allowed"],
+        "gpus_per_job": desired["gpus_per_job"],
     }
 
 
@@ -634,6 +671,11 @@ async def update_runner_capabilities(
             caps["gpu_indices_allowed"] = _normalize_gpu_indices_allowed(
                 payload.gpu_indices_allowed
             )
+
+        # Per-job GPU count is likewise orthogonal to the strategic clamps — it
+        # governs compute-job GPU reservation, not agent-task concurrency.
+        if payload.gpus_per_job is not None:
+            caps["gpus_per_job"] = _normalize_gpus_per_job(payload.gpus_per_job)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

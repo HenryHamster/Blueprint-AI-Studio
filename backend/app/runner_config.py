@@ -28,11 +28,19 @@ LIVE_SAFE_CONFIG_KEYS = (
     "max_concurrent_compute",
     "task_types",
     "gpu_indices_allowed",
+    "gpus_per_job",
 )
 
 # Sentinel meaning "no restriction" for the GPU-index allowlist (parallels the
 # "all" sentinel used for task_types).
 GPU_INDICES_ALL = "all"
+
+# Bounds for the per-job GPU count (how many GPUs a single compute job reserves).
+# 1 is the universal default; the upper bound is a sanity ceiling — the largest
+# operator box in the fleet (dgx-1) has 8 GPUs, and the daemon self-limits anyway
+# (a job simply waits when fewer than ``gpus_per_job`` GPUs are free).
+GPUS_PER_JOB_MIN = 1
+GPUS_PER_JOB_MAX = 8
 
 
 def _coerce_positive_int(raw: Any) -> Union[int, None]:
@@ -96,6 +104,21 @@ def _projected_gpu_indices(raw: Any) -> Union[str, List[int]]:
     return GPU_INDICES_ALL
 
 
+def _projected_gpus_per_job(raw: Any) -> int:
+    """Project a stored gpus_per_job value into the config block.
+
+    ``None``/absent/invalid means unset → the universal default of
+    ``GPUS_PER_JOB_MIN`` (1 GPU per job, backward compatible with runners
+    enrolled before this field existed). A valid value is clamped into
+    ``[GPUS_PER_JOB_MIN, GPUS_PER_JOB_MAX]`` so the generation hash is stable and
+    a bad legacy value can never push an out-of-range count to the daemon.
+    """
+    value = _coerce_positive_int(raw)
+    if value is None:
+        return GPUS_PER_JOB_MIN
+    return max(GPUS_PER_JOB_MIN, min(GPUS_PER_JOB_MAX, value))
+
+
 def live_safe_config(capabilities: Union[Dict[str, Any], None]) -> Dict[str, Any]:
     """Project the LIVE-SAFE server-authoritative config subset from capabilities.
 
@@ -114,6 +137,7 @@ def live_safe_config(capabilities: Union[Dict[str, Any], None]) -> Dict[str, Any
         "max_concurrent_compute": max_concurrent_compute,
         "task_types": _projected_task_types(caps.get("task_types", "all")),
         "gpu_indices_allowed": _projected_gpu_indices(caps.get("gpu_indices_allowed")),
+        "gpus_per_job": _projected_gpus_per_job(caps.get("gpus_per_job")),
     }
 
 
