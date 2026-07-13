@@ -7010,6 +7010,355 @@ class TestDirectComputeExperimentDispatch:
         assert "offline" in (task.latest_status_message or "")
         assert task.latest_status_message != first_message
 
+    # ── Transient vs terminal launch preconditions ────────────────────────────
+    # create_compute_job raises ComputeLaunchPreconditionFailed for a whole family
+    # of reasons. They are NOT all failures: the project's compute-job concurrency
+    # cap is pure back-pressure (active jobs only shrink absent new launches), so
+    # the N+1th experiment in a capped project used to be PERMANENTLY FAILED for a
+    # queueing decision the orchestrator itself made — burning the direction's
+    # failure budget and feeding the churn guardrail phantom failures.
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_defers_and_stays_retryable(self, db_session):
+        """At the project's compute-job cap → DEFER, never terminal-FAIL."""
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapDeferProject")
+        # Fill the project to its cap with an active job.
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            outcome = await orch._dispatch_compute_experiment_directly(
+                db_session, task, {}, {}
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        assert outcome == "deferred", f"expected 'deferred', got {outcome!r}"
+        await db_session.refresh(task)
+        # The task is RETRYABLE: still QUEUED, behind a retry_after backoff.
+        assert task.status == TaskStatus.QUEUED, (
+            "a transient cap must never leave the task FAILED — it launches "
+            "unchanged once a running job frees the cap"
+        )
+        assert task.retry_after_until is not None, (
+            "the deferral must stamp a retry_after backoff so the task re-enters "
+            "dispatch on its own"
+        )
+        ctx = task.context or {}
+        assert ctx.get("_infra_wait") is True
+        # The reason is SURFACED, not swallowed.
+        assert "cap" in (ctx.get("compute_launch_deferred_reason") or "").lower()
+        assert "cap" in (task.latest_status_message or "").lower()
+        # Crucially: no failure budget burned, and no billable job created.
+        assert "failure_category" not in ctx, (
+            "a deferral is not a failure and must not be classified as one"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_repeated_cap_deferrals_escalate_the_backoff(self, db_session):
+        """A project sitting at its cap for hours must back off, not re-probe every
+        cycle. The counter is owned by the deferral path precisely because the shared
+        `_retry_after_resets` is cleared whenever a backoff lapses."""
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapBackoffProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            for expected_count in (1, 2, 3):
+                # Mimic the candidate scan clearing the lapsed backoff each cycle.
+                task.retry_after_until = None
+                db_session.add(task)
+                await db_session.commit()
+
+                outcome = await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                assert outcome == "deferred"
+                await db_session.refresh(task)
+                assert (task.context or {}).get(
+                    "compute_launch_defer_count"
+                ) == expected_count
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+    @pytest.mark.asyncio
+    async def test_saturated_cap_deferral_raises_one_operator_alert(self, db_session):
+        """A deferral is unbounded BY DESIGN — so a saturated one needs a surface.
+
+        Deferring instead of terminal-FAILing removed a loud (wrong) signal. Without an
+        alert it is replaced by a SILENT one: the task parks behind the 15-min ceiling
+        forever, the defer counter only resets on a successful launch, and
+        operator_attention's stale-queued sweep filters on `depends_on` being non-empty,
+        so a dep-less compute_experiment never surfaces there.
+
+        Exactly ONE alert (deduplicated), and the task keeps deferring — the alert is a
+        surface, not an outcome: no failure_category, still QUEUED, still retryable.
+        """
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+        from app.shared_state import runtime_config
+        from app.orchestrator_runner_dispatch import (
+            _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS,
+            _COMPUTE_CAP_DEFER_ALERT_TITLE,
+        )
+
+        project = await _make_project(db_session, name="CapAlertProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        # One deferral short of the alert threshold.
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={
+                "compute_launch_defer_count": (
+                    _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS - 1
+                )
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            # This deferral crosses the threshold → alert.
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+            # …and the NEXT one must not raise a second.
+            task.retry_after_until = None
+            db_session.add(task)
+            await db_session.commit()
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        alerts = (
+            (
+                await db_session.execute(
+                    _select(Alert).where(
+                        Alert.task_id == task.id,
+                        Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1, (
+            "a saturated cap deferral must raise exactly ONE operator alert, "
+            f"deduplicated across every subsequent deferral; got {len(alerts)}"
+        )
+        assert alerts[0].severity == AlertSeverity.WARNING
+
+        # The alert is a SURFACE, not an outcome — the task keeps deferring cleanly.
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.retry_after_until is not None
+        assert (task.context or {}).get("failure_category") is None
+
+        # DISMISSAL must not silence the surface forever. A deferral is unbounded by
+        # design, so a task can keep deferring long after an operator dismisses the
+        # alert — if the dedup predicate ignored dismissed_at, that task would go
+        # permanently dark. Dismissing means "seen", not "never tell me again".
+        alerts[0].dismissed_at = _utcnow()
+        db_session.add(alerts[0])
+        task.retry_after_until = None
+        db_session.add(task)
+        await db_session.commit()
+
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            assert (
+                await orch._dispatch_compute_experiment_directly(
+                    db_session, task, {}, {}
+                )
+                == "deferred"
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        live = (
+            (
+                await db_session.execute(
+                    _select(Alert).where(
+                        Alert.task_id == task.id,
+                        Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(live) == 1, (
+            "after the operator DISMISSES the alert, a task that is still deferring "
+            "must be able to re-raise it — otherwise one dismissal silences an "
+            f"unbounded deferral forever; got {len(live)} live alert(s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_long_lived_deferral_does_not_overflow_and_quarantine_the_task(
+        self, db_session
+    ):
+        """A task that has been CORRECTLY deferring for a long time must keep deferring.
+
+        The backoff is ``base_minutes * (2 ** prior_defers)``. ``float * int`` raises
+        ``OverflowError: int too large to convert to float`` once ``prior_defers >= 1024``
+        — and that raise happens inside ``_dispatch_compute_experiment_directly``, i.e.
+        inside the dispatch loop's per-task containment, so the task would start crashing
+        every cycle and be QUARANTINED as a poison task. It is reachable: a project pinned
+        at its compute cap defers every ~15 min, so the counter passes 1024 after ~10.6
+        days. Clamping the EXPONENT keeps the arithmetic finite while the backoff has long
+        since saturated at its ceiling.
+
+        Negative control: with an unclamped ``2 ** prior_defers`` this raises OverflowError.
+        """
+        from app.shared_state import runtime_config
+
+        project = await _make_project(db_session, name="CapOverflowProject")
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                command="sleep 1",
+                status=ComputeJobStatus.RUNNING,
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                backend="local",
+            )
+        )
+        await db_session.commit()
+
+        # A task that has been deferring for well over a week at the 15-min ceiling.
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={"compute_launch_defer_count": 5000},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        orig = dict(runtime_config.get("max_concurrent_compute_jobs_by_project") or {})
+        runtime_config["max_concurrent_compute_jobs_by_project"] = {str(project.id): 1}
+        try:
+            outcome = await orch._dispatch_compute_experiment_directly(
+                db_session, task, {}, {}
+            )
+        finally:
+            runtime_config["max_concurrent_compute_jobs_by_project"] = orig
+
+        assert outcome == "deferred", (
+            "a long-lived deferral must keep DEFERRING, not raise out of the dispatch "
+            "path and get quarantined as a poison task"
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.retry_after_until is not None, (
+            "the task must still be stamped retryable after a saturated backoff"
+        )
+        assert (task.context or {}).get("compute_launch_defer_count") == 5001
+
+    @pytest.mark.asyncio
+    async def test_hardware_policy_violation_still_terminal_fails(self, db_session):
+        """Genuine misconfig must REMAIN terminal. A task asking for an accelerator
+        the project forbids never self-clears — deferring it would wedge it forever,
+        so it keeps burning the failure budget exactly as before."""
+        project = await _make_project(db_session, name="HwPolicyFailProject")
+        project.build_config = {
+            **(project.build_config or {}),
+            "resource_envelope": {"allowed_accelerator_types": ["T4"]},
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            # A100 is not in the project's allow-list → project_hardware_policy_violated
+            payloads=[_ce_payload(accelerator="A100")],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+
+        assert outcome == "failed", (
+            f"a hardware-policy violation is misconfig, not back-pressure; "
+            f"got {outcome!r}"
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert (task.context or {}).get("failure_category") == "compute_launch_failed"
+        assert task.retry_after_until is None, (
+            "a terminal misconfig must not be stamped retryable"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 

@@ -63,6 +63,10 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.strategic_runtime_work import (
+    CONTAINER_RUNNER_HOLD_CONTEXT_KEY,
+    LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -84,6 +88,64 @@ FORCED_RUNNER_TARGET_CONTEXT_KEY = "forced_runner_target_id"
 # the honest, operator-legible "waiting for dgx-1" signal, mirroring the
 # ``awaiting_local_runner_since`` / ``awaiting_container_runner_since`` holds.
 AWAITING_FORCED_RUNNER_CONTEXT_KEY = "awaiting_forced_runner_since"
+
+# Every task.context key that marks a compute_experiment HELD QUEUED at dispatch
+# because no runner could take it this cycle. This is the set the dispatch path STAMPS,
+# and the set it CLEARS on successful dispatch (the only place a stamp is cleared).
+#
+# COMPOSED from the canonical per-key constants rather than re-typing their string
+# literals: a third independent copy of "awaiting_local_runner_since" et al. is the
+# exact drift this aggregate exists to prevent.
+#
+# ⚠️ It is NOT (yet) in lockstep with the bounded hold-timeout sweep. The sweep's
+# predicate — ``strategic_runtime_work.local_runner_hold_task_filters`` — matches only
+# LOCAL_RUNNER_HOLD_CONTEXT_KEY and CONTAINER_RUNNER_HOLD_CONTEXT_KEY. So
+# AWAITING_FORCED_RUNNER_CONTEXT_KEY is STAMPED HERE BUT NEVER SWEPT: a forced-pin hold
+# whose target runner never returns is not bounded by the 6h timeout and waits
+# indefinitely. That is a PRE-EXISTING gap (this constant only names it; it did not
+# introduce it), and closing it belongs to the branch that extends the sweep — which
+# should widen `local_runner_hold_task_filters` to this full tuple, at which point the
+# lockstep invariant below actually holds:
+#
+#   a key that is stamped but never swept is an unbounded hold, and a key that dispatch
+#   stops stamping but the sweep still reads is dead code.
+COMPUTE_RUNNER_HOLD_CONTEXT_KEYS: tuple[str, ...] = (
+    LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    CONTAINER_RUNNER_HOLD_CONTEXT_KEY,
+    AWAITING_FORCED_RUNNER_CONTEXT_KEY,
+)
+
+# task.context marker stamped when a compute_experiment launch is deferred by a
+# TRANSIENT precondition (currently: the project's active-ComputeJob concurrency
+# cap). Distinct from the hold markers above — nothing is "awaited" here, the task
+# is simply re-queued behind a retry_after backoff and will launch unchanged once a
+# running job finishes and frees cap. Carries the human-readable reason so the
+# deferral is legible instead of looking like an idle QUEUED task.
+COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY = "compute_launch_deferred_reason"
+
+# Consecutive-deferral counter driving the backoff escalation below. Deliberately
+# NOT the shared ``_retry_after_resets``: the candidate scan clears that counter the
+# moment a backoff lapses, so escalation built on it would flatten to the base delay
+# forever. This key is owned by the deferral path and cleared only once the task
+# actually launches.
+COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY = "compute_launch_defer_count"
+
+# Backoff bounds (minutes) for the transient-cap deferral above. Escalates per
+# consecutive deferral so a project sitting at its cap for hours (long GPU jobs)
+# re-checks cheaply instead of re-probing every dispatch cycle. Both are well inside
+# set_retry_after's own [0, 30] clamp.
+_COMPUTE_CAP_DEFER_BASE_MINUTES = 2.0
+_COMPUTE_CAP_DEFER_MAX_MINUTES = 15.0
+
+# Raise ONE operator alert once a task has deferred this many consecutive times. The
+# backoff saturates at _COMPUTE_CAP_DEFER_MAX_MINUTES from the 3rd deferral, so by the
+# 8th the task has been waiting on a full compute-job cap for well over an hour with no
+# sign of it clearing. A deferral is correct and unbounded BY DESIGN (it self-clears
+# whenever a running job goes terminal) — which is exactly why a saturated one needs a
+# surface: nothing else will ever mention it.
+_COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS = 8
+
+_COMPUTE_CAP_DEFER_ALERT_TITLE = "Compute experiment stalled at project job cap"
 
 
 # A compute_experiment held for a require-local project is failed if no runner
@@ -618,8 +680,8 @@ async def _try_runner_dispatch(
     # A task that was held (enforce-local) and is now pinned must not carry the
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
-    new_ctx.pop("awaiting_local_runner_since", None)
-    new_ctx.pop("awaiting_container_runner_since", None)
+    new_ctx.pop(LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+    new_ctx.pop(CONTAINER_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     new_ctx.pop("runner_pin_hold", None)
     task.context = new_ctx
@@ -1228,6 +1290,193 @@ async def _fail_compute_experiment_task(
     return "failed"
 
 
+async def _defer_compute_experiment_task(
+    session: AsyncSession, task: Task, message: str
+) -> str:
+    """DEFER a ``compute_experiment`` whose launch hit a TRANSIENT precondition.
+
+    The project's compute-job concurrency cap is not a failure — it is back-pressure.
+    Active jobs are a strictly shrinking set absent new launches, so the very same
+    task launches unchanged once a running job reaches a terminal state. Terminal-
+    FAILing it (the old behaviour for every non-live-release precondition) burned the
+    direction's failure budget for a queueing decision the orchestrator itself made,
+    and fed the churn guardrail with phantom failures.
+
+    So: keep the task QUEUED and stamp the established ``retry_after_until`` backoff
+    (``set_retry_after`` + ``_infra_wait``) — the same convention the provisioner uses
+    for infrastructure back-pressure. The candidate scan at the top of the dispatch
+    cycle skips a task whose ``retry_after_until`` is in the future and clears the
+    marker once it lapses, so the task re-enters dispatch on its own with no sweep and
+    no retry-budget burn. Backoff escalates per consecutive deferral (2 → 15 min).
+
+    Deliberately does NOT call ``record_task_result`` — a deferral is not an outcome,
+    and recording one would recreate the exact failure-budget pollution this fixes.
+
+    Returns ``"deferred"``.
+    """
+    from app.broadcast import broadcast_to_project
+    from app.time_utils import set_retry_after
+
+    ctx = dict(task.context or {})
+    # _infra_wait marks this as back-pressure, not a rate-limit hold: it stops the
+    # candidate scan from releasing the backoff early on LLM-account recovery (an
+    # available account does nothing for a full compute-job cap).
+    ctx["_infra_wait"] = True
+    ctx[COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY] = message[:500]
+    try:
+        _prior_defers = int(ctx.get(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY) or 0)
+    except (TypeError, ValueError):
+        _prior_defers = 0
+    ctx[COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY] = _prior_defers + 1
+    task.context = ctx
+    # Clamp the EXPONENT, not just the product. `float * (2**n)` raises
+    # OverflowError("int too large to convert to float") once n >= 1024 — and the
+    # raise happens inside _dispatch_compute_experiment_directly, i.e. inside the
+    # dispatch loop's per-task containment, so a task that was CORRECTLY deferring
+    # would start crashing every cycle and get QUARANTINED as a poison task. That is
+    # reachable: a project pinned at its compute cap defers every ~15 min, so the
+    # counter passes 1024 after ~10.6 days. The backoff is already saturated at
+    # _COMPUTE_CAP_DEFER_MAX_MINUTES long before n=8, so clamping there is
+    # value-identical for every n and merely keeps the arithmetic finite.
+    backoff_minutes = min(
+        _COMPUTE_CAP_DEFER_BASE_MINUTES * (2 ** min(_prior_defers, 8)),
+        _COMPUTE_CAP_DEFER_MAX_MINUTES,
+    )
+    # set_retry_after rewrites task.context off the dict above, so the keys just set
+    # survive; it owns retry_after_until + the shared _retry_after_resets counter.
+    set_retry_after(task, backoff_minutes)
+    task.status = TaskStatus.QUEUED  # explicit: a deferral never leaves QUEUED
+    task.latest_status_message = message[:500]
+    session.add(task)
+    # Operator surface for a deferral that is never going to clear on its own.
+    #
+    # Deferring instead of terminal-FAILing removed a LOUD (but wrong) signal; without
+    # this it would be replaced by a SILENT one — the task parks behind a saturated
+    # 15-min backoff forever, and nothing surfaces it: the counter only resets on a
+    # successful launch, and operator_attention's stale-queued sweep filters on
+    # `jsonb_array_length(depends_on) > 0`, so a dep-less compute_experiment never
+    # appears there. Past the saturation point the cap is no longer transient
+    # back-pressure in any useful sense — it is a standing condition an operator
+    # should see. Staged BEFORE the commit below so it costs no extra transaction.
+    if _prior_defers + 1 >= _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS:
+        try:
+            await _maybe_alert_saturated_compute_cap_defer(
+                task, session, message, _prior_defers + 1
+            )
+        except Exception:
+            # An alerting failure must never turn a correct deferral into a crash
+            # (which the dispatch loop's containment would quarantine).
+            logger.exception(
+                "[ORCHESTRATOR] failed to stage saturated compute-cap defer alert "
+                "for task %s",
+                task.id,
+            )
+    # Snapshot broadcast scalars BEFORE commit — commit expires ORM state and a
+    # post-commit task.id/.project_id read lazy-loads from async context
+    # (MissingGreenlet on asyncpg), which would quarantine a correctly-deferred task.
+    _deferred_project_id = str(task.project_id)
+    _deferred_task_id = str(task.id)
+    await session.commit()
+    try:
+        await broadcast_to_project(
+            _deferred_project_id,
+            "task_updated",
+            {
+                "task_id": _deferred_task_id,
+                "status": TaskStatus.QUEUED,
+                "message": message[:200],
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] task_updated broadcast failed for deferred "
+            "compute_experiment %s",
+            _deferred_task_id,
+        )
+    logger.info(
+        "[ORCHESTRATOR] compute_experiment %s DEFERRED on transient launch "
+        "precondition (retry in %.1f min, still QUEUED): %s",
+        _deferred_task_id,
+        backoff_minutes,
+        message[:200],
+    )
+    return "deferred"
+
+
+async def _maybe_alert_saturated_compute_cap_defer(
+    task: Task,
+    session: AsyncSession,
+    message: str,
+    defer_count: int,
+) -> None:
+    """Stage ONE deduplicated WARNING alert for a compute_experiment stuck at the cap.
+
+    Deduplicates on (task, stable title) so the alert is raised once and does not
+    re-fire on each subsequent deferral. WARNING (not ERROR): the task is healthy and
+    correctly queued — the *project* is saturated, and that is an operator/capacity
+    decision (raise ``max_concurrent_compute_jobs_by_project``, or wait for the running
+    jobs). Never records a task result: a deferral is still not an outcome.
+
+    The dedup predicate excludes DISMISSED alerts (matching the sibling
+    retry_after "task stuck" alert). Without that, an operator dismissing this once
+    would silence it FOREVER for that task — and since a deferral is unbounded by
+    design, the task could keep deferring indefinitely with the operator's only
+    surface permanently suppressed. Dismissing means "I have seen this", not "never
+    tell me again"; if the condition persists past a dismissal it is allowed to
+    re-raise.
+
+    Mirrors ``_create_strategic_local_cloud_fallback_alert``: stages the row and
+    broadcasts; the CALLER owns the commit.
+    """
+    from app.models import Alert, AlertSeverity
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title == _COMPUTE_CAP_DEFER_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_COMPUTE_CAP_DEFER_ALERT_TITLE,
+        message=(
+            f"compute_experiment has been deferred {defer_count}x on the project's "
+            f"compute-job concurrency cap and is now at the maximum "
+            f"{_COMPUTE_CAP_DEFER_MAX_MINUTES:.0f}-minute backoff. It is still QUEUED "
+            "and will launch on its own as soon as a running job finishes — no action "
+            "is required if the current jobs are expected to complete. If they are "
+            "long-running or stuck, raise the project's compute-job cap "
+            "(max_concurrent_compute_jobs_by_project) or cancel a running job. "
+            f"Launch precondition: {message[:200]}"
+        ),
+        task_id=task.id,
+    )
+    session.add(alert)
+    _alert_project_id = str(task.project_id)
+    try:
+        from app.broadcast import broadcast_to_project
+
+        await broadcast_to_project(
+            _alert_project_id,
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": "WARNING",
+                "title": alert.title,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] alert_created broadcast failed for saturated compute-cap "
+            "defer on task %s",
+            task.id,
+        )
+
+
 async def _dispatch_compute_experiment_directly(
     session: AsyncSession,
     task: Task,
@@ -1251,22 +1500,27 @@ async def _dispatch_compute_experiment_directly(
     GCP/local backend as before.
 
     Returns:
-        ``"launched"`` — ComputeJob created, task PARKED on the job-terminal wake.
-        ``"failed"``   — launch misconfigured / non-recoverable precondition; task
-                         terminal-FAILED.
-        ``"blocked"``  — a recoverable live-release precondition (release not yet
-                         serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
-                         it once the deploy confirms (not a failure, no retry burn).
-        ``"held"``     — held QUEUED (``awaiting_local_runner_since`` stamped; the
-                         existing bounded sweep terminal-fails a hold that outlives
-                         the wait window). Two hold causes: ``require_local_runner``
-                         set and no live runner, or a strict ``runner_target`` pin
-                         whose runner is not currently eligible (the latter also
-                         stamps ``context['runner_pin_hold']`` with the
-                         machine-readable reason).
-    Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"``/``"held"``
-    leave the task waiting. The caller owns the dispatch loop; this function commits
-    its own outcome.
+        ``"launched"``  — ComputeJob created, task PARKED on the job-terminal wake.
+        ``"failed"``    — launch misconfigured / non-recoverable precondition; task
+                          terminal-FAILED.
+        ``"blocked"``   — a recoverable live-release precondition (release not yet
+                          serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
+                          it once the deploy confirms (not a failure, no retry burn).
+        ``"held"``      — held QUEUED (``awaiting_local_runner_since`` stamped; the
+                          existing bounded sweep terminal-fails a hold that outlives
+                          the wait window). Two hold causes: ``require_local_runner``
+                          set and no live runner, or a strict ``runner_target`` pin
+                          whose runner is not currently eligible (the latter also
+                          stamps ``context['runner_pin_hold']`` with the
+                          machine-readable reason).
+        ``"deferred"``  — a TRANSIENT launch precondition (the project's compute-job
+                          concurrency cap); task stays QUEUED behind a ``retry_after``
+                          backoff and re-enters dispatch on its own once the cap frees.
+                          NOT a failure — no failure budget burned.
+    Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"`` / ``"held"``
+    / ``"deferred"`` leave the task waiting and must NOT consume a dispatch-window slot
+    (see the backfill in the orchestrator's dispatch loop). The caller owns the dispatch
+    loop; this function commits its own outcome.
     """
     from app.broadcast import broadcast_to_project
     from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
@@ -1375,8 +1629,8 @@ async def _dispatch_compute_experiment_directly(
         )[:500]
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None  # drop stale pin
-        if not ctx.get("awaiting_local_runner_since"):
-            ctx["awaiting_local_runner_since"] = _utcnow().isoformat()
+        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
             changed = True
         hold_record = {
             "runner_id": pin_runner_id,
@@ -1457,8 +1711,8 @@ async def _dispatch_compute_experiment_directly(
     if runner is None and require_local:
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
-        if not ctx.get("awaiting_local_runner_since"):
-            ctx["awaiting_local_runner_since"] = _utcnow().isoformat()
+        if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+            ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
             changed = True
         if changed:
             task.context = ctx
@@ -1486,8 +1740,8 @@ async def _dispatch_compute_experiment_directly(
             )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
-            if not ctx.get("awaiting_container_runner_since"):
-                ctx["awaiting_container_runner_since"] = _utcnow().isoformat()
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
                 changed = True
             if task.latest_status_message != hold_msg:
                 task.latest_status_message = hold_msg
@@ -1509,12 +1763,16 @@ async def _dispatch_compute_experiment_directly(
         ctx = dict(task.context or {})
         ctx["runner_target_id"] = str(runner.id)
         ctx["runner_hostname"] = runner.hostname
-        ctx.pop("awaiting_local_runner_since", None)
+        # Successful dispatch is the ONLY place a compute runner-hold stamp clears.
+        # Clear every key in the aggregate so a task that was held under one hold
+        # class and dispatches under another cannot carry a stale stamp into the
+        # bounded hold-timeout sweep (which would terminal-fail a task that is
+        # already running on a runner).
+        for _hold_key in COMPUTE_RUNNER_HOLD_CONTEXT_KEYS:
+            ctx.pop(_hold_key, None)
         # A strict-pin hold that is now dispatching must drop its stale hold
         # reason — the pinned runner became eligible.
         ctx.pop("runner_pin_hold", None)
-        ctx.pop("awaiting_container_runner_since", None)
-        ctx.pop(AWAITING_FORCED_RUNNER_CONTEXT_KEY, None)
         task.context = ctx
         session.add(task)
     elif (task.context or {}).get("runner_target_id"):
@@ -1603,13 +1861,50 @@ async def _dispatch_compute_experiment_directly(
                 msg[:200],
             )
             return "blocked"
-        # Non-live-release preconditions (spend ceiling, hardware policy,
-        # concurrency, local_runner_required) are genuine launch failures, not
-        # recoverable blocks — label them ``compute_launch_failed`` exactly as the
-        # agent path did. Using ``BLOCKED_PRECONDITION`` on a terminal FAILED task
-        # would make a parent waiting on this child mis-read it as still in flight
-        # (blocked_task_unblock_sweeps treats failure_category BLOCKED_PRECONDITION
-        # as "waiting") and wedge.
+        # The project's compute-job concurrency cap is TRANSIENT back-pressure, not a
+        # launch failure: active jobs only shrink absent new launches, so this exact
+        # task launches unchanged once a running job goes terminal. Nothing upstream
+        # defers it (the cap is enforced nowhere else in dispatch — the task-level
+        # per-project cap counts active Tasks, and compute_experiments PARK after
+        # launch rather than staying active), so the N+1th experiment in a capped
+        # project reliably reached create_compute_job and was PERMANENTLY FAILED —
+        # burning the direction's failure budget on the orchestrator's own queueing
+        # decision and feeding the churn guardrail phantom failures. Defer instead.
+        if detail.get("error") == "compute_job_concurrency_limit_exceeded":
+            return await _defer_compute_experiment_task(session, task, msg)
+        # require_local_runner with no runner-pinned backend is an infrastructure
+        # AVAILABILITY condition, not misconfig — and this same function already HOLDS
+        # for exactly that condition above (the runner-is-None + require_local branch),
+        # so terminal-failing it here would contradict the established contract. Reached
+        # only if that pre-check and this chokepoint disagree (e.g. the selected runner
+        # lost its pin under the re-lock). Take the hold: the bounded 6h sweep
+        # (_fail_stale_local_runner_holds) still terminal-fails a hold nothing resolves,
+        # so this cannot wedge.
+        if detail.get("error") == "local_runner_required":
+            ctx = dict(task.context or {})
+            if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+            ctx.pop("runner_target_id", None)
+            task.context = ctx
+            task.latest_status_message = msg[:500]
+            session.add(task)
+            _held_task_id = str(task.id)
+            await session.commit()
+            logger.info(
+                "[ORCHESTRATOR] compute_experiment %s HELD on require-local launch "
+                "chokepoint (no runner-pinned backend): %s",
+                _held_task_id,
+                msg[:200],
+            )
+            return "held"
+        # Everything else is a genuine, non-self-clearing launch failure — spend
+        # ceiling (needs an operator to raise the budget; the rolling window only
+        # decays over DAYS, not dispatch cycles), spend-approval gate, hardware-policy
+        # violation, bad checkpoint-resume reference. Label them ``compute_launch_failed``
+        # exactly as the agent path did. Using ``BLOCKED_PRECONDITION`` on a terminal
+        # FAILED task would make a parent waiting on this child mis-read it as still in
+        # flight (blocked_task_unblock_sweeps treats failure_category
+        # BLOCKED_PRECONDITION as "waiting") and wedge.
         return await _fail_compute_experiment_task(
             session, task, "compute_launch_failed", msg
         )
@@ -1639,6 +1934,20 @@ async def _dispatch_compute_experiment_directly(
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
         )
+
+    # The launch succeeded, so any transient-deferral breadcrumbs from earlier cycles
+    # are now stale — drop them (including the escalation counter, so a LATER cap hit
+    # on this task restarts the backoff at the base delay rather than inheriting a
+    # maxed-out one). Rides the park_task commit below; `retry_after_until` itself was
+    # already cleared by the candidate scan when the backoff lapsed.
+    if (task.context or {}).get(COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY) or (
+        task.context or {}
+    ).get(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY):
+        _launched_ctx = dict(task.context or {})
+        _launched_ctx.pop(COMPUTE_LAUNCH_DEFERRED_REASON_CONTEXT_KEY, None)
+        _launched_ctx.pop(COMPUTE_LAUNCH_DEFER_COUNT_CONTEXT_KEY, None)
+        task.context = _launched_ctx
+        session.add(task)
 
     # ── Park the task on the job-terminal wake (releases its slot now) ─────────
     meta = job.polling_metadata or {}

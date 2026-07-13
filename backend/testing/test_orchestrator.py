@@ -3823,86 +3823,13 @@ class TestProjectFairness:
         assert _project_fairness_weight(-5) == 1  # negative → floor 1
 
 
-class TestProjectConcurrencyCap:
-    """Per-project concurrent-VM cap (Step 2.92).
+class _OrchDispatchCycleHarness:
+    """Full-cycle dispatch harness: in-memory DB + the mocks orchestrator_worker needs.
 
-    Tests two levels:
-    1. Pure helper ``apply_project_concurrency_cap`` — boundary cases, same-project
-       multi-candidate, missing caps.
-    2. Dispatch-level ``test_per_project_vm_cap_defers_over_cap_project`` — a full
-       orchestrator cycle that proves an over-cap project's QUEUED candidate stays
-       QUEUED while a second project's candidate dispatches into the free slot.
+    Not collected by pytest (no ``Test`` prefix). Holds the ``orch_cap_db`` fixture and
+    ``_run_one_cycle`` so more than one test class can drive a REAL dispatch cycle
+    end-to-end instead of re-testing the extracted pure transforms in isolation.
     """
-
-    # ── Pure-helper unit tests ────────────────────────────────────────────────
-
-    @staticmethod
-    def _cap(eligible, project_by_id, active_by_project_id, cap_by_project_id):
-        from app.orchestrator_filters import apply_project_concurrency_cap
-
-        return apply_project_concurrency_cap(
-            eligible, project_by_id, active_by_project_id, cap_by_project_id
-        )
-
-    def test_no_cap_passes_all_through(self):
-        """Empty cap dict → all candidates pass through unchanged (no-op)."""
-        ids = ["a", "b", "c"]
-        pbi = {"a": "P1", "b": "P1", "c": "P2"}
-        assert self._cap(ids, pbi, {"P1": 2}, {}) == ids
-
-    def test_project_at_cap_defers_its_candidate(self):
-        """Project with active==cap has its candidate deferred; other project passes."""
-        ids = ["p1_task", "p2_task"]
-        pbi = {"p1_task": "P1", "p2_task": "P2"}
-        active = {"P1": 1}
-        caps = {"P1": 1}  # P1 is at its cap
-        result = self._cap(ids, pbi, active, caps)
-        assert "p1_task" not in result
-        assert "p2_task" in result
-
-    def test_project_below_cap_admits_candidate(self):
-        """Project with active < cap admits the next candidate."""
-        ids = ["p1_task"]
-        pbi = {"p1_task": "P1"}
-        active = {"P1": 0}
-        caps = {"P1": 2}
-        result = self._cap(ids, pbi, active, caps)
-        assert result == ["p1_task"]
-
-    def test_count_equals_cap_minus_one_admits_exactly_one(self):
-        """active == cap-1: exactly ONE candidate is admitted, the second deferred."""
-        ids = ["p1_a", "p1_b"]
-        pbi = {"p1_a": "P1", "p1_b": "P1"}
-        active = {"P1": 1}
-        caps = {"P1": 2}  # cap=2, active=1 → one slot left
-        result = self._cap(ids, pbi, active, caps)
-        assert result == ["p1_a"]  # first admitted; second deferred (would push to 2)
-
-    def test_multiple_same_project_candidates_respect_cap_across_cycle(self):
-        """Two candidates from the same project in one cycle: admitted count
-        tracks within-cycle admissions so both can't slip past a cap of 1."""
-        ids = ["p1_a", "p1_b", "p2_x"]
-        pbi = {"p1_a": "P1", "p1_b": "P1", "p2_x": "P2"}
-        active = {"P1": 0}
-        caps = {"P1": 1}
-        result = self._cap(ids, pbi, active, caps)
-        # Only first P1 candidate admitted; second deferred; P2 never filtered.
-        assert "p1_a" in result
-        assert "p1_b" not in result
-        assert "p2_x" in result
-
-    def test_project_with_no_cap_never_filtered(self):
-        """A project absent from cap_by_project_id is never deferred."""
-        ids = ["uncapped_task"]
-        pbi = {"uncapped_task": "UNCAPPED"}
-        active = {"UNCAPPED": 99}
-        caps = {"OTHER": 1}
-        assert self._cap(ids, pbi, active, caps) == ["uncapped_task"]
-
-    def test_empty_eligible_returns_empty(self):
-        assert self._cap([], {}, {}, {"P1": 1}) == []
-
-    # ── Dispatch-level test ───────────────────────────────────────────────────
 
     @staticmethod
     def _naive_utcnow():
@@ -4063,6 +3990,88 @@ class TestProjectConcurrencyCap:
                 _orphan.cancel()
                 with contextlib.suppress(BaseException):
                     await _orphan
+
+
+class TestProjectConcurrencyCap(_OrchDispatchCycleHarness):
+    """Per-project concurrent-VM cap (Step 2.92).
+
+    Tests two levels:
+    1. Pure helper ``apply_project_concurrency_cap`` — boundary cases, same-project
+       multi-candidate, missing caps.
+    2. Dispatch-level ``test_per_project_vm_cap_defers_over_cap_project`` — a full
+       orchestrator cycle that proves an over-cap project's QUEUED candidate stays
+       QUEUED while a second project's candidate dispatches into the free slot.
+    """
+
+    # ── Pure-helper unit tests ────────────────────────────────────────────────
+
+    @staticmethod
+    def _cap(eligible, project_by_id, active_by_project_id, cap_by_project_id):
+        from app.orchestrator_filters import apply_project_concurrency_cap
+
+        return apply_project_concurrency_cap(
+            eligible, project_by_id, active_by_project_id, cap_by_project_id
+        )
+
+    def test_no_cap_passes_all_through(self):
+        """Empty cap dict → all candidates pass through unchanged (no-op)."""
+        ids = ["a", "b", "c"]
+        pbi = {"a": "P1", "b": "P1", "c": "P2"}
+        assert self._cap(ids, pbi, {"P1": 2}, {}) == ids
+
+    def test_project_at_cap_defers_its_candidate(self):
+        """Project with active==cap has its candidate deferred; other project passes."""
+        ids = ["p1_task", "p2_task"]
+        pbi = {"p1_task": "P1", "p2_task": "P2"}
+        active = {"P1": 1}
+        caps = {"P1": 1}  # P1 is at its cap
+        result = self._cap(ids, pbi, active, caps)
+        assert "p1_task" not in result
+        assert "p2_task" in result
+
+    def test_project_below_cap_admits_candidate(self):
+        """Project with active < cap admits the next candidate."""
+        ids = ["p1_task"]
+        pbi = {"p1_task": "P1"}
+        active = {"P1": 0}
+        caps = {"P1": 2}
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_task"]
+
+    def test_count_equals_cap_minus_one_admits_exactly_one(self):
+        """active == cap-1: exactly ONE candidate is admitted, the second deferred."""
+        ids = ["p1_a", "p1_b"]
+        pbi = {"p1_a": "P1", "p1_b": "P1"}
+        active = {"P1": 1}
+        caps = {"P1": 2}  # cap=2, active=1 → one slot left
+        result = self._cap(ids, pbi, active, caps)
+        assert result == ["p1_a"]  # first admitted; second deferred (would push to 2)
+
+    def test_multiple_same_project_candidates_respect_cap_across_cycle(self):
+        """Two candidates from the same project in one cycle: admitted count
+        tracks within-cycle admissions so both can't slip past a cap of 1."""
+        ids = ["p1_a", "p1_b", "p2_x"]
+        pbi = {"p1_a": "P1", "p1_b": "P1", "p2_x": "P2"}
+        active = {"P1": 0}
+        caps = {"P1": 1}
+        result = self._cap(ids, pbi, active, caps)
+        # Only first P1 candidate admitted; second deferred; P2 never filtered.
+        assert "p1_a" in result
+        assert "p1_b" not in result
+        assert "p2_x" in result
+
+    def test_project_with_no_cap_never_filtered(self):
+        """A project absent from cap_by_project_id is never deferred."""
+        ids = ["uncapped_task"]
+        pbi = {"uncapped_task": "UNCAPPED"}
+        active = {"UNCAPPED": 99}
+        caps = {"OTHER": 1}
+        assert self._cap(ids, pbi, active, caps) == ["uncapped_task"]
+
+    def test_empty_eligible_returns_empty(self):
+        assert self._cap([], {}, {}, {"P1": 1}) == []
+
+    # ── Dispatch-level test ───────────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_per_project_vm_cap_defers_over_cap_project(
@@ -4520,6 +4529,519 @@ class TestProjectConcurrencyCap:
             "Check that autonomous_enabled=False and bootstrap_completed_at are set "
             "on auto-created projects (admin.py create_compute_experiment_task), and "
             "that the direct compute_experiment dispatch path launches + parks."
+        )
+
+
+class TestDispatchWindowPreservesRank(_OrchDispatchCycleHarness):
+    """The dispatch window is now WIDER than ``slots_available`` and the loop stops
+    after N REAL dispatches — so whoever the loop reaches FIRST wins the slot.
+
+    That makes the ORDER of the dispatch loop load-bearing for the first time. It
+    was not before: the window used to be cut at exactly ``slots_available`` and the
+    loop ATTEMPTED every member, so the dispatch SET was fully determined by the
+    truncation and intra-loop order was cosmetic.
+
+    The re-read that materialises the window (``select(Task).where(Task.id.in_(...))``)
+    is UNORDERED — a SQL set has no order, so the DB returns rows in its own
+    (heap/rowid) order, NOT the rank order of ``eligible_ids``. That rank is the entire
+    output of the ranking pipeline: health reordering, project fairness, completion
+    priority, and the create/research reserved-slot minimums. Without an explicit
+    re-sort, ALL of it is silently discarded and the winners become whichever rows the
+    DB happened to return first.
+
+    Both tests below construct a queue whose RANK order deliberately differs from its
+    INSERTION order, so they FAIL against a dispatch loop that does not restore rank
+    (the unfixed code dispatches the wrong task) and pass once it does. They are real
+    negative controls, not assertions over a pure function.
+    """
+
+    @staticmethod
+    def _dispatch_mocks(mocker):
+        from app.max_plan_pool import LLMSelectionResult
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-rank-test",
+                    "name": "Rank Test Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_high_priority_task_below_the_insertion_head_still_wins_the_slot(
+        self, orch_cap_db, mocker
+    ):
+        """ONE slot. A LOW-priority task is inserted FIRST, a HIGH-priority task SECOND.
+
+        The candidate scan ranks by ``priority DESC, created_at ASC``, so the HIGH task
+        is rank 0 and is the one entitled to the single slot. But it has the LATER row
+        id, so the unordered window re-read returns the LOW task first. With the window
+        widened past one slot, BOTH tasks are now in the loop — and an unranked loop
+        dispatches the LOW task and breaks, silently inverting task priority.
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        low_id = None
+        high_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="RankProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Inserted FIRST (lower row id / earlier created_at) but LOW priority.
+            low = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base,
+                payloads=[{"type": "create", "prompt": "low priority"}],
+            )
+            session.add(low)
+            await session.commit()
+            await session.refresh(low)
+            low_id = low.id
+
+            # Inserted SECOND (higher row id) but HIGH priority → rank 0.
+            high = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=99,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "high priority"}],
+            )
+            session.add(high)
+            await session.commit()
+            await session.refresh(high)
+            high_id = high.id
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([low_id, high_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        assert rows[high_id].status == TaskStatus.PROVISIONING, (
+            "the HIGH-priority task is rank 0 and must win the single slot; got "
+            f"{rows[high_id].status}. The widened dispatch window puts the lower-ranked "
+            "task in the loop too, so the loop MUST iterate in rank order — otherwise "
+            "the DB's row order silently overrides task priority."
+        )
+        assert rows[low_id].status == TaskStatus.QUEUED, (
+            "the LOW-priority task must NOT consume the slot the high-priority task "
+            f"was ranked into; got {rows[low_id].status}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserved_type_promoted_from_below_the_cut_still_wins_its_slot(
+        self, orch_cap_db, mocker
+    ):
+        """ONE slot; the queue head is a wall of higher-priority NON-reserved work.
+
+        ``reserve_slots_for_types`` exists precisely for this: under queue pressure it
+        PROMOTES a reserved-type task (here ``create``) from beyond the cutoff into the
+        first ``slots_available`` positions, guaranteeing it a minimum share of slots so
+        review/fix chains cannot starve it. That promotion is expressed ONLY as a
+        reordering of ``eligible_ids`` — so if the dispatch loop does not iterate in
+        that order, the reserved minimum is silently discarded and the very starvation
+        it prevents happens anyway.
+
+        The promoted ``create`` task is inserted LAST (highest row id), so an unranked
+        loop reaches the review heads first, dispatches one, breaks, and the reserved
+        minimum is lost.
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        review_ids: list = []
+        create_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="ReserveProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Queue head: higher-priority, NON-reserved review work, inserted FIRST.
+            for i in range(3):
+                review = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=50,
+                    created_at=base + timedelta(seconds=i),
+                    payloads=[{"type": "review", "prompt": f"review {i}"}],
+                )
+                session.add(review)
+                await session.commit()
+                await session.refresh(review)
+                review_ids.append(review.id)
+
+            # The reserved type, ranked BELOW the cut (lowest priority, inserted LAST).
+            # reserve_slots_for_types must promote it into the single slot.
+            create = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "reserved create work"}],
+            )
+            session.add(create)
+            await session.commit()
+            await session.refresh(create)
+            create_id = create.id
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        # Neutralise the review/fix pipeline cap so it is the RESERVATION under test,
+        # not cap_pipeline_slots incidentally removing the review heads.
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        _orch_module._runtime_config["reserved_slots_for_types"] = {"create": 1}
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+            _orch_module._runtime_config.pop("reserved_slots_for_types", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([*review_ids, create_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        assert rows[create_id].status == TaskStatus.PROVISIONING, (
+            "reserve_slots_for_types promoted the reserved `create` task into the only "
+            f"slot, but it did not dispatch (got {rows[create_id].status}). The reserved "
+            "minimum is expressed purely as an eligible_ids reordering — the dispatch "
+            "loop must honour that order or the reservation is silently discarded."
+        )
+        dispatched_reviews = [
+            tid for tid in review_ids if rows[tid].status != TaskStatus.QUEUED
+        ]
+        assert not dispatched_reviews, (
+            "a non-reserved review task consumed the slot reserved for `create`: "
+            f"{dispatched_reviews}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_that_dispatches_nothing_does_not_consume_a_slot(
+        self, orch_cap_db, mocker
+    ):
+        """The headline bug, end-to-end through a real dispatch cycle.
+
+        ONE slot. The queue head is resource-DEFERRED inside the dispatch loop — it
+        `continue`s having dispatched NOTHING. A healthy task sits directly behind it.
+
+        Before the fix the window was cut at exactly ``slots_available``, so the window
+        was ``[deferred_head]``: the loop deferred it, dispatched nothing, and the
+        healthy task got ZERO slots — every cycle, for as long as the head kept
+        deferring, while the fleet sat idle. Several loop outcomes behave this way (a
+        failure-gated type, a compute hold, a recoverable BLOCKED launch, a transient
+        cap deferral, a lost lock race); the resource deferral is simply the one that is
+        cleanly injectable. The fix scans PAST ``slots_available`` and counts only REAL
+        dispatches, so a zero-dispatch head is backfilled over.
+
+        This is the negative control for the BACKFILL itself: it FAILS on the unfixed
+        code (the healthy task stays QUEUED behind a head that never dispatches).
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._dispatch_mocks(mocker)
+
+        deferred_id = None
+        healthy_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="BackfillProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            # Rank 0 (highest priority) — and it will dispatch NOTHING.
+            deferred = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=99,
+                created_at=base,
+                payloads=[{"type": "create", "prompt": "resource-deferred head"}],
+            )
+            session.add(deferred)
+            await session.commit()
+            await session.refresh(deferred)
+            deferred_id = deferred.id
+
+            healthy = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                priority=1,
+                created_at=base + timedelta(minutes=1),
+                payloads=[{"type": "create", "prompt": "healthy work behind the head"}],
+            )
+            session.add(healthy)
+            await session.commit()
+            await session.refresh(healthy)
+            healthy_id = healthy.id
+
+        # Defer ONLY the queue head, and ONLY from INSIDE the dispatch loop — that is
+        # the `continue` that historically burned the window slot.
+        #
+        # The pre-cutoff filter `_filter_project_resource_dispatch_eligible` calls the
+        # SAME `_project_resource_dispatch_defer_message` helper, so mocking the helper
+        # alone would drop the head from eligible_ids BEFORE the window ever forms — it
+        # would then never occupy a slot, and this test would pass on the unfixed code
+        # for entirely the wrong reason. Force the pre-cutoff filter to a pass-through so
+        # the head genuinely reaches the window and defers in-loop.
+        _deferred_id = deferred_id
+
+        async def _passthrough_prefilter(session, eligible_ids, *a, **kw):
+            return eligible_ids
+
+        mocker.patch(
+            "app.orchestrator._filter_project_resource_dispatch_eligible",
+            side_effect=_passthrough_prefilter,
+        )
+
+        async def _defer_only_the_head(session, task, *a, **kw):
+            if task.id == _deferred_id:
+                return "project resource envelope exhausted"
+            return None
+
+        mocker.patch(
+            "app.orchestrator._project_resource_dispatch_defer_message",
+            side_effect=_defer_only_the_head,
+        )
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+
+        async with orch_cap_db() as verify:
+            rows = {
+                r.id: r
+                for r in (
+                    (
+                        await verify.execute(
+                            _select(Task).where(Task.id.in_([deferred_id, healthy_id]))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            }
+
+        # Precondition: the head really did dispatch nothing.
+        assert rows[deferred_id].status == TaskStatus.QUEUED, (
+            "precondition: the queue head must be resource-DEFERRED (still QUEUED), "
+            f"not dispatched; got {rows[deferred_id].status}"
+        )
+        # …and the slot it did NOT use went to the healthy task behind it.
+        assert rows[healthy_id].status == TaskStatus.PROVISIONING, (
+            "the healthy task behind a zero-dispatch queue head must be backfilled into "
+            f"the free slot; got {rows[healthy_id].status}. A candidate that dispatches "
+            "NOTHING must never consume a dispatch-window slot."
+        )
+
+    @pytest.mark.asyncio
+    async def test_warm_pool_leases_are_counted_against_the_slot_limit(
+        self, orch_cap_db, mocker
+    ):
+        """`_cycle_dispatched` is now the SOLE enforcement of ``max_concurrent_vms``.
+
+        Before this PR the slot limit was STRUCTURAL: the window was cut at exactly
+        ``eligible_ids[:slots_available]``, so at most that many tasks entered the loop
+        and ``_cycle_dispatched`` was purely observational. Widening the window moved
+        enforcement entirely onto the counter's ``break`` — which means any dispatch path
+        that consumes a VM without incrementing it is a FREE dispatch that breaches the
+        cap, and the breach scales with the width of the window.
+
+        A warm-pool LEASE is exactly such a path: it is a real dispatch (the task is
+        pinned to the leased member and skips cold provisioning), and it genuinely
+        consumes a slot, because ``count_idle_pool_vms`` SUBTRACTS idle pool rows from
+        the dispatch budget — leasing one flips it IDLE -> LEASED so it starts being
+        charged against ``max_concurrent_vms``.
+
+        ONE slot, THREE queued tasks, a pool that can serve TWO leases. Unfixed, the two
+        leases dispatch without advancing the counter and the third then cold-provisions
+        on top: 3 VMs consumed against a cap of 1.
+
+        NOTE: this test deliberately does NOT stub `try_pool_dispatch` to return None.
+        Every other test in this class does — which is precisely why this cap breach
+        could ship green.
+        """
+        from types import SimpleNamespace
+        from sqlmodel import select as _select
+        from app.max_plan_pool import LLMSelectionResult
+        import app.orchestrator as _orch_module
+
+        # NOTE: `_dispatch_mocks` is deliberately NOT used here — it nulls out
+        # try_pool_dispatch, which is the very path under test.
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-sonnet-4-6",
+                quality_tier=None,
+                account={
+                    "id": "acct-warm-slot",
+                    "name": "Warm Slot Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        task_ids: list = []
+        async with orch_cap_db() as session:
+            project = make_project(name="WarmSlotProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            base = self._naive_utcnow() - timedelta(minutes=10)
+            for i in range(3):
+                t = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=50 - i,
+                    created_at=base + timedelta(seconds=i),
+                    payloads=[{"type": "create", "prompt": f"task {i}"}],
+                )
+                session.add(t)
+                await session.commit()
+                await session.refresh(t)
+                task_ids.append(t.id)
+
+        # A faithful stand-in for the real lease: the pool can serve TWO members, and
+        # each lease pins vm_instance_id on the task and leaves it QUEUED (warm_pool.py
+        # `try_pool_dispatch` contract). The orchestrator commits and skips cold provision.
+        _pool_remaining = [f"pool-vm-{i}" for i in range(2)]
+
+        async def _fake_pool_dispatch(session, task, **kwargs):
+            if not _pool_remaining:
+                return None
+            vm_id = _pool_remaining.pop(0)
+            task.vm_instance_id = vm_id
+            session.add(task)
+            return SimpleNamespace(vm_instance_id=vm_id)
+
+        # Patch at the SOURCE module: orchestrator_worker imports try_pool_dispatch
+        # function-locally, so `app.orchestrator.try_pool_dispatch` does not exist.
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            side_effect=_fake_pool_dispatch,
+        )
+
+        slots_available = 1
+        _orch_module._runtime_config["max_concurrent_vms"] = slots_available
+        _orch_module._runtime_config["max_pipeline_slots"] = 10
+        _orch_module._runtime_config["warm_pool_enabled"] = True
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("max_pipeline_slots", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            rows = (
+                (await verify.execute(_select(Task).where(Task.id.in_(task_ids))))
+                .scalars()
+                .all()
+            )
+
+        # A task consumed a VM if it was warm-leased (QUEUED but pinned to a pool VM)
+        # or cold-provisioned (PROVISIONING).
+        warm_leased = [
+            r for r in rows if str(r.vm_instance_id or "").startswith("pool-vm-")
+        ]
+        cold_provisioned = [r for r in rows if r.status == TaskStatus.PROVISIONING]
+        consumed = len(warm_leased) + len(cold_provisioned)
+
+        assert consumed <= slots_available, (
+            f"dispatch consumed {consumed} VM slot(s) against a cap of {slots_available} "
+            f"({len(warm_leased)} warm-pool lease(s) + {len(cold_provisioned)} cold "
+            "provision(s)). A warm-pool lease IS a dispatch and DOES charge a VM against "
+            "max_concurrent_vms — it must increment _cycle_dispatched, which is now the "
+            "sole slot enforcement behind the widened dispatch window."
         )
 
 

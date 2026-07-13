@@ -85,6 +85,8 @@ from app.orchestrator_filters import (
     apply_project_fairness,
     apply_project_concurrency_cap,
     reorder_by_completion_priority,
+    dispatch_window_size,
+    filter_failing_types,
     _project_fairness_weight,
     collect_dep_uuids,
 )
@@ -1492,6 +1494,10 @@ async def orchestrator_worker():
                                 time.monotonic() - cycle_start, 3
                             ),
                             "tasks_dispatched": 0,
+                            # No slots ⇒ no window was scanned. Keeps the
+                            # orchestrator_cycle_complete schema identical across both
+                            # emit sites so consumers never see a missing key.
+                            "dispatch_window_scanned": 0,
                             "tasks_recovered": tasks_recovered,
                             "slots_in_use": effective_count,
                             "slots_available": 0,
@@ -2270,6 +2276,36 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, _dep_by_id, session
                 )
 
+                # Step 2.45: Per-type failure gate — drop candidates whose task type is
+                # currently failing BEFORE they can occupy a dispatch-window position.
+                # The gate itself is enforced inside the dispatch loop below, but that
+                # loop runs AFTER `eligible_ids[:slots_available]` has already cut the
+                # window — so a failing-type task ranked above the cutoff consumed a slot
+                # and then `continue`d without dispatching anything. With a failing type
+                # at the head of the queue that silently zeroed out the whole cycle's
+                # dispatch while capacity sat idle. These tasks provably cannot dispatch
+                # this cycle (_failing_types is computed once, above, and is not mutated
+                # by the loop), so removing them here is behaviour-preserving for every
+                # task that *can* dispatch and purely frees the slots they were wasting.
+                # Filtering is a subsequence op: relative order — and therefore the
+                # fairness / completion-priority / slot-reservation permutations applied
+                # below — is untouched.
+                # `_withheld_failing_types` keeps the all-types-blocked stall detector
+                # below honest: it reasons over the types of tasks that WANTED to
+                # dispatch, and those are no longer present in the post-filter window.
+                _before_failing_gate = len(eligible_ids)
+                eligible_ids, _withheld_failing_types = filter_failing_types(
+                    eligible_ids, candidate_tasks, _failing_types
+                )
+                if _withheld_failing_types:
+                    logger.info(
+                        "[ORCHESTRATOR] Per-type failure gate: withheld %d candidate(s) "
+                        "from the dispatch window (failing type(s): %s) — slots freed "
+                        "for healthy types",
+                        _before_failing_gate - len(eligible_ids),
+                        ", ".join(sorted(_withheld_failing_types)),
+                    )
+
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 # Parked BLOCKED file-conflict tasks are absent from the QUEUED
                 # candidate scan, but they still hold a seniority reservation on
@@ -2513,8 +2549,25 @@ async def orchestrator_worker():
                 elif not budget_exhausted:
                     _shared_state.monthly_budget_gate_engaged = False
 
-                # Respect slot limit after conflict filtering
-                eligible_ids = eligible_ids[:slots_available]
+                # Respect the slot limit after conflict filtering — but scan PAST it so
+                # candidates that turn out to be non-dispatchable this cycle (held /
+                # blocked / deferred / approval-gated / lost-lock) are BACKFILLED
+                # instead of silently burning a slot each. The dispatch loop below is
+                # what actually enforces `slots_available`: it stops as soon as that
+                # many REAL dispatches have occurred. Widening is strictly additive —
+                # every task that would have been in the old window is still in this
+                # one, in the same order, so the fairness / completion-priority /
+                # slot-reservation permutations above keep their exact semantics.
+                _eligible_before_window = len(eligible_ids)
+                eligible_ids = eligible_ids[: dispatch_window_size(slots_available)]
+                if _eligible_before_window > slots_available:
+                    logger.info(
+                        "[ORCHESTRATOR] Dispatch window: %d slot(s), scanning up to %d "
+                        "candidate(s) of %d eligible (backfill for held/blocked/deferred)",
+                        slots_available,
+                        len(eligible_ids),
+                        _eligible_before_window,
+                    )
 
                 # Step 3: Re-read ONLY the tasks we're about to dispatch. This
                 # scan is read-only; the row is locked with task_lock() at the
@@ -2557,6 +2610,27 @@ async def orchestrator_worker():
                     queued_tasks = list(
                         (await session.execute(dispatch_stmt)).scalars().all()
                     )
+                    # Restore the dispatch RANK. `dispatch_stmt` is an unordered
+                    # `WHERE id IN (...)` — SQL sets have no order, so Postgres
+                    # returns these rows in whatever order it likes (heap/index
+                    # order), NOT the order of `eligible_ids`. That order is the
+                    # entire output of the ranking pipeline above: health
+                    # reordering, project fairness, completion priority, the
+                    # create/research reserved-slot minimums and the pipeline cap.
+                    #
+                    # This was harmless while the window was cut at exactly
+                    # `slots_available` and the loop ATTEMPTED every member —
+                    # the dispatch SET was fully determined by the truncation, so
+                    # intra-loop order was cosmetic. It is NOT harmless now: the
+                    # window is deliberately wider (see dispatch_window_size) and
+                    # the loop stops after `slots_available` REAL dispatches, so
+                    # whoever the loop reaches FIRST wins the slot. Without this
+                    # sort the winners would be whichever rows the DB happened to
+                    # return first, silently discarding priority, fairness and the
+                    # reserved minimums — exactly under queue pressure, which is
+                    # when those transforms are the only thing that engages.
+                    _rank = {tid: i for i, tid in enumerate(eligible_ids)}
+                    queued_tasks.sort(key=lambda t: _rank.get(t.id, len(_rank)))
 
                 logger.info(
                     f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts"
@@ -2590,8 +2664,18 @@ async def orchestrator_worker():
                     ).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
-                # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
-                if queued_tasks and not any_zone_available():
+                # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown.
+                # The flag is computed from zone state ALONE — never from `queued_tasks`.
+                # It exists to stop the all-types-blocked detector below from
+                # misattributing a zone outage to the per-type failure gate, and that
+                # detector now also reasons over `_withheld_failing_types` (tasks the
+                # pre-cutoff gate removed from `queued_tasks`). If the gate withheld
+                # EVERY candidate, `queued_tasks` is empty while the withheld set is not
+                # — so gating the flag on `queued_tasks` would leave it False during a
+                # zone outage and fire exactly the misattributed alert it was added to
+                # prevent. any_zone_available() is a pure in-memory cooldown check.
+                _zones_exhausted_this_cycle = not any_zone_available()
+                if queued_tasks and _zones_exhausted_this_cycle:
                     global _last_zone_exhaustion_log
                     # _last_zone_exhaustion_log is a module-level gauge written
                     # only here; keep it naive (_utcnow) for a consistent
@@ -2629,14 +2713,22 @@ async def orchestrator_worker():
                             )
                     queued_tasks = []  # Clear so the loop below is skipped
 
-                # All-types-blocked detection: if every queued task's type is in _failing_types,
-                # the pipeline is silently stalled — create an operator alert.
-                if _failing_types and queued_tasks:
+                # All-types-blocked detection: if every task that wanted to dispatch is of
+                # a failing type, the pipeline is silently stalled — create an operator
+                # alert. Reason over the surviving window UNION the failing-type tasks the
+                # pre-cutoff gate (Step 2.45) withheld: those tasks are exactly the ones
+                # this detector exists to notice, and they are no longer in `queued_tasks`.
+                # Without the union this alert would never fire again.
+                if (
+                    _failing_types
+                    and not _zones_exhausted_this_cycle
+                    and (queued_tasks or _withheld_failing_types)
+                ):
                     _queued_types = {
                         t.first_payload.get("type", "")
                         for t in queued_tasks
                         if t.first_payload.get("type", "")
-                    }
+                    } | _withheld_failing_types
                     if _queued_types and _queued_types.issubset(_failing_types):
                         _blocked_summary = ", ".join(sorted(_queued_types))
                         logger.warning(
@@ -2717,6 +2809,28 @@ async def orchestrator_worker():
                 # Track per-cycle counts so a full stall on Max-plan account exhaustion
                 # fires an alert+broadcast once, rather than only per-task retry_after.
                 _cycle_accounts_blocked = 0
+                # ⚠️ _cycle_dispatched is a SAFETY INVARIANT, not a log field.
+                #
+                # It used to be purely observational: the dispatch window was cut at
+                # exactly `eligible_ids[:slots_available]`, so the slot limit was enforced
+                # STRUCTURALLY — at most slots_available tasks could ever enter the loop.
+                # The window is now deliberately WIDER than slots_available (so candidates
+                # that dispatch nothing get backfilled instead of burning a slot), and the
+                # loop's `if _cycle_dispatched >= slots_available: break` is therefore the
+                # SOLE thing keeping the fleet under max_concurrent_vms.
+                #
+                # CONSEQUENCE: any dispatch path that consumes a VM but forgets to
+                # increment this is a FREE dispatch that silently breaches the cap — and
+                # the breach scales with how many such tasks the widened window contains.
+                # So: EVERY path that leaves the loop having consumed a VM slot MUST
+                # increment it exactly once. Today that is (1) the strategic-runner pin,
+                # (2) the direct compute_experiment launch, (3) _try_runner_dispatch,
+                # (4) the warm-pool LEASE (an IDLE pool VM is subtracted from the budget;
+                # leasing it flips it to LEASED and starts charging it), and (5) the
+                # PROVISIONING commit (cold provision + Cloud Run both route through it).
+                # Paths that consume NO new VM must NOT increment: the warm-PIN
+                # skip-provision reuses an agent VM that is already charged, and every
+                # defer/hold/block/rollback path launches nothing at all.
                 _cycle_dispatched = 0
                 _cycle_earliest_recovery: datetime | None = None
                 _cycle_blockage_reasons: set[str] = set()
@@ -2765,11 +2879,24 @@ async def orchestrator_worker():
                 _spend_cache_for_dispatch: dict[uuid.UUID, tuple[float, float, int]] = {}
 
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:
+                    # Slot enforcement lives HERE, not at the window cut above: the
+                    # window is deliberately wider than slots_available so that
+                    # candidates which dispatch nothing (held / blocked / deferred /
+                    # resource-deferred / approval-gated / lock-lost) are backfilled by
+                    # the next-ranked task instead of each burning a slot. _cycle_dispatched
+                    # is incremented at exactly the four real-dispatch sites below, so it
+                    # is the honest count of slots actually consumed this cycle.
+                    if _cycle_dispatched >= slots_available:
+                        break
+
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type).
                     # Use the snapshot tuple — never read .first_payload off a session-bound
                     # object inside this loop, since _lock_task_for_mutation's rollback would
                     # expire it and trigger a sync lazy-load that crashes the cycle.
+                    # NOTE: these tasks are already withheld from eligible_ids pre-cutoff
+                    # (Step 2.45), so this is now a defence-in-depth backstop rather than
+                    # the primary gate — it no longer silently eats a dispatch slot.
                     if _task_type_for_gate and _task_type_for_gate in _failing_types:
                         logger.info(
                             f"[ORCHESTRATOR] Skipping task {_qt_id} "
@@ -3280,6 +3407,27 @@ async def orchestrator_worker():
                                     # not release it past this point.
                                     _iter_preclaimed_account_id = None
                                     _iter_preclaimed_project_id = None
+                                    # A warm-pool lease IS a dispatch and DOES consume a
+                                    # VM slot, so it must be counted. The pool VM was
+                                    # IDLE, and `count_idle_pool_vms` SUBTRACTS idle pool
+                                    # rows from the dispatch budget (see slots_available)
+                                    # — leasing it flips IDLE -> LEASED, so it stops being
+                                    # subtracted and starts being charged against
+                                    # max_concurrent_vms. That is a net-new slot
+                                    # consumption, unlike the warm-PIN skip-provision path
+                                    # above (which reuses an agent VM that is already
+                                    # charged, and correctly does not increment).
+                                    #
+                                    # Missing this increment silently breaches
+                                    # max_concurrent_vms now that _cycle_dispatched is the
+                                    # SOLE slot enforcement (the window is deliberately
+                                    # wider than slots_available), because every uncounted
+                                    # dispatch is a FREE one: with N idle pool VMs the
+                                    # cycle would lease all N without advancing the
+                                    # counter, then cold-provision slots_available MORE on
+                                    # top. Bounded only by pool size — i.e. by the very
+                                    # GCE quota the cap exists to respect.
+                                    _cycle_dispatched += 1
                                     record_pool_lease_hit(
                                         account=(
                                             runtime_selection.account.get("id")
@@ -3810,6 +3958,13 @@ async def orchestrator_worker():
                             )
                         )
 
+                        # Count the slot BEFORE the broadcast: the dispatch is already
+                        # durable here (task committed PROVISIONING, provision coroutine
+                        # scheduled), so a websocket failure must not lose the count.
+                        # The dispatch loop's slot enforcement now reads this counter to
+                        # decide when to stop, so an undercount would over-provision past
+                        # max_concurrent_vms rather than merely skewing a log line.
+                        _cycle_dispatched += 1
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
@@ -3818,7 +3973,6 @@ async def orchestrator_worker():
                                 "status": TaskStatus.PROVISIONING,
                             },
                         )
-                        _cycle_dispatched += 1
                     except Exception as _dispatch_prep_exc:
                         # NEVER touch the loop's `task` ORM object in here — the
                         # rollback below expires every session-bound instance
@@ -4118,7 +4272,15 @@ async def orchestrator_worker():
                 "orchestrator_cycle_complete",
                 extra={
                     "cycle_duration_seconds": round(time.monotonic() - cycle_start, 3),
-                    "tasks_dispatched": len(queued_tasks),
+                    # ACTUAL dispatches, not the window size. These used to coincide
+                    # (the window was cut at exactly slots_available and the loop
+                    # attempted every member), but the window is now deliberately WIDER
+                    # — up to dispatch_window_size(slots_available) — so len(queued_tasks)
+                    # would over-report dispatches by up to 3x on an operator-facing
+                    # field. _cycle_dispatched is the honest count (it is what enforces
+                    # the slot limit); the scanned window is reported separately below.
+                    "tasks_dispatched": _cycle_dispatched,
+                    "dispatch_window_scanned": len(queued_tasks),
                     "tasks_recovered": tasks_recovered,
                     "slots_in_use": effective_count,
                     "slots_available": slots_available,

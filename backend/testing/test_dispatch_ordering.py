@@ -24,6 +24,8 @@ from app.orchestrator_filters import (
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
+    dispatch_window_size,
+    filter_failing_types,
     _project_fairness_weight,
 )
 from app.orchestrator_health import reorder_eligible_by_health
@@ -337,3 +339,94 @@ def test_fairness_weight_from_priority_gives_more_turns():
     assert sorted(out) == sorted(eligible)
     # Round 1: 3 P1 (weight 3) then 1 P2 (weight 1).
     assert out[:4] == ["p1_0", "p1_1", "p1_2", "p2_0"]
+
+
+# ── Dispatch-window backfill + per-type failure-gate withholding ───────────────
+# A dispatch-window position must only ever be spent on a task that can ACTUALLY
+# dispatch this cycle. Regression cover for: window slots consumed by candidates
+# that dispatch nothing (failure-gated types, compute holds) and never backfilled,
+# starving healthy tasks ranked just below the cutoff.
+
+
+class TestDispatchWindowSize:
+    def test_window_is_never_narrower_than_the_slot_count(self):
+        """Widening must never drop a task the old `[:slots_available]` cut kept."""
+        for slots in (1, 2, 5, 10, 50, 200):
+            assert dispatch_window_size(slots) >= slots
+
+    def test_window_scans_past_the_slot_count_to_allow_backfill(self):
+        """The whole point: there must be room BEHIND the slots for backfill."""
+        for slots in (1, 5, 25):
+            assert dispatch_window_size(slots) > slots
+
+    def test_zero_slots_scans_nothing(self):
+        assert dispatch_window_size(0) == 0
+        assert dispatch_window_size(-1) == 0
+
+    def test_overscan_is_bounded(self):
+        """A queue of non-dispatchable heads must not turn one cycle into an
+        unbounded scan — the window stays proportional to the slot count."""
+        assert dispatch_window_size(100) == 300
+
+    def test_healthy_task_behind_a_wall_of_held_heads_is_inside_the_window(self):
+        """The reported bug, at the seam.
+
+        5 slots; the 10 highest-ranked candidates are compute experiments held for
+        an offline runner (they dispatch NOTHING). Under the old cut the window was
+        exactly `eligible[:5]` — all held — so the healthy task at index 10 got ZERO
+        slots every cycle for up to 6h despite free capacity. It must now be inside
+        the scanned window so the dispatch loop can backfill onto it.
+        """
+        eligible = [f"held-{i}" for i in range(10)] + ["healthy"]
+        window = eligible[: dispatch_window_size(5)]
+        assert "healthy" in window
+        # …and the held heads keep their rank: order is preserved, not reshuffled.
+        assert window[:10] == [f"held-{i}" for i in range(10)]
+
+
+class TestFilterFailingTypes:
+    def test_failing_type_candidates_are_withheld_from_the_window(self):
+        tasks = [
+            _task("a", ttype="review"),
+            _task("b", ttype="research"),
+            _task("c", ttype="review"),
+        ]
+        kept, withheld = filter_failing_types(
+            ["a", "b", "c"], tasks, {"review"}
+        )
+        assert kept == ["b"], "failure-gated tasks must not occupy window slots"
+        assert withheld == {"review"}
+
+    def test_relative_order_of_survivors_is_preserved(self):
+        """Filtering is a subsequence op — it must not perturb the fairness /
+        completion-priority / slot-reservation permutations applied upstream."""
+        tasks = [_task(x, ttype=("bad" if x in ("b", "d") else "good")) for x in "abcde"]
+        kept, _ = filter_failing_types(list("abcde"), tasks, {"bad"})
+        assert kept == ["a", "c", "e"]
+
+    def test_no_failing_types_is_a_noop(self):
+        tasks = [_task("a", ttype="review"), _task("b", ttype="research")]
+        kept, withheld = filter_failing_types(["a", "b"], tasks, set())
+        assert kept == ["a", "b"]
+        assert withheld == set()
+
+    def test_withheld_types_are_reported_for_the_stall_detector(self):
+        """The all-types-blocked stall alert reasons over the types that WANTED to
+        dispatch. Withholding them from the window must not hide them from it, or
+        the alert would never fire again."""
+        tasks = [_task("a", ttype="review"), _task("b", ttype="fix")]
+        kept, withheld = filter_failing_types(["a", "b"], tasks, {"review", "fix"})
+        assert kept == []
+        assert withheld == {"review", "fix"}, (
+            "the detector must still see every type it just withheld"
+        )
+
+    def test_healthy_task_wins_the_slot_freed_by_a_gated_queue_head(self):
+        """End-to-end at the seam: a single slot, a failure-gated task at the head.
+
+        Before: window = ['gated'] → the gate skipped it → ZERO dispatches.
+        After:  'gated' is withheld pre-cut, so the healthy task takes the slot.
+        """
+        tasks = [_task("gated", ttype="review"), _task("healthy", ttype="research")]
+        kept, _ = filter_failing_types(["gated", "healthy"], tasks, {"review"})
+        assert kept[:1] == ["healthy"]

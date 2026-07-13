@@ -85,6 +85,69 @@ async def _make_held_task(
     return task
 
 
+class TestHeldTaskClearsItsStampOnDispatch:
+    """Successful dispatch is the ONLY place a compute runner-hold stamp is cleared.
+
+    The dispatch path stamps three hold keys (local / container / forced runner) and
+    clears them in one place: the ``runner is not None`` pin block, which now iterates
+    :data:`COMPUTE_RUNNER_HOLD_CONTEXT_KEYS` rather than popping hand-listed literals.
+    That single source of truth is shared with the bounded hold-timeout sweep, and the
+    two must stay in lockstep — a key that is STAMPED but never CLEARED means the sweep
+    terminal-FAILS a task that is already running happily on a runner.
+
+    This test is the regression cover for that clear-on-dispatch loop: break it and a
+    held task that finally gets its runner keeps a stale stamp and gets reaped.
+
+    (Note: it is NOT cover for excluding holds from the dispatch candidate query —
+    that exclusion was deliberately NOT implemented, because a stamp is cleared only on
+    successful dispatch, so an excluded task could never re-enter dispatch to notice its
+    runner returning. The window BACKFILL is what stops holds from burning slots, and
+    its regression cover lives in
+    ``test_orchestrator.py::TestDispatchWindowPreservesRank``.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_held_task_still_dispatches_when_its_runner_returns(self, db_session):
+        """A held task whose runner comes back must launch AND drop its hold stamp."""
+        project = await _make_project(db_session, require_local_runner=True)
+        task = await _make_held_task(db_session, project.id, held_ago_seconds=120)
+        assert (task.context or {}).get("awaiting_local_runner_since")
+
+        # The operator's runner comes back online this cycle.
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(
+                auth_mod.create_runner_token(uuid.uuid4())
+            ),
+            last_seen_at=_utcnow(),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        task.payloads = [
+            {
+                "type": "compute_experiment",
+                "command": "echo hi",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ]
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert "awaiting_local_runner_since" not in (task.context or {}), (
+            "the hold stamp must be cleared once the task finally dispatches"
+        )
+
+
 class TestFailStaleLocalRunnerHolds:
     @pytest.mark.asyncio
     async def test_fails_hold_older_than_timeout(self, db_session):
