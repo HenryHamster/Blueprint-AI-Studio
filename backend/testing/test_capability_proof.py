@@ -3341,8 +3341,21 @@ class TestReleaseGateLedgerCorroboration:
 
     def test_proof_exempt_does_not_clear_enforce(self):
         """An agent-set ``proof_exempt=True`` with no platform ledger entry is
-        BLOCKED once the ledger is supplied — self-declared exemption must never
-        clear the enforce gate on its own."""
+        BLOCKED — a self-declared exemption must never clear the enforce gate.
+
+        THE GUARANTEE (unchanged): blocked, and named in ``unproven``.
+
+        WHICH BUCKET it lands in changed, because the exemption is now rejected
+        EARLIER and more strongly.  A bare ``proof_exempt=True`` carries no
+        provenance, so ``_exemption_is_authorized`` refuses it and
+        ``working_capability_proof_status`` never grades it ``proven`` in the first
+        place (capability_registry.py:444) — it is unproven at the BASE map.  The
+        ``uncorroborated`` bucket is narrower: it holds capabilities the base map
+        DID treat as proven but the platform ledger failed to corroborate.  An
+        unauthorized exemption never reaches ``proven``, so it correctly never
+        enters that bucket — asserting it does would now be asserting a WEAKER
+        rejection path than the one that actually fires.
+        """
         model = {
             "capabilities": [
                 {
@@ -3356,7 +3369,11 @@ class TestReleaseGateLedgerCorroboration:
         blocked, detail = self._status(model, {})
         assert blocked is True
         assert "self-exempt" in detail["unproven"]
-        assert detail["uncorroborated"] == ["self-exempt"]
+        # Never cleared, by either route.
+        assert "self-exempt" not in detail["corroborated"]
+        assert detail["exempt_names"] == [], (
+            "an unattributed proof_exempt must not even count as an exemption"
+        )
 
     def test_platform_ledger_named_test_clears_enforce(self):
         """A capability corroborated by a machine-verified ``named_test`` entry in

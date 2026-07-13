@@ -13444,6 +13444,8 @@ class TestAcceptanceCriteriaRouter:
             "criteria": [],
             "failed_corroboration_keys": [],
             "merge_evidence_gaps": None,
+            # Probed tier: a lower-confidence, time-bounded coverage signal.
+            "probed": 0,
             # Phantom-bookkeeping drift signal (consumed by operator_attention):
             # a version with no criteria registers none and references none, so
             # there is nothing to drift.

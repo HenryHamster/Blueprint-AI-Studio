@@ -4583,7 +4583,12 @@ async def test_ledger_stores_post_reconciliation_audit_score(db_session, mocker)
     """
     from app import shared_state
 
-    shared_state.runtime_config["promotion_enabled"] = True
+    # DRY-RUN: _finalize_qualification RETURNS the composite dict on this path.
+    # With promotion_enabled=True it instead returns whatever the mocked promote()
+    # returns — a bare AsyncMock — so `result["sub_scores"]["audit"]` read back a
+    # MagicMock and the assertion could never be satisfied.  The reconciliation +
+    # per-dimension ledger write this test exercises both run on the dry-run path.
+    shared_state.runtime_config["promotion_enabled"] = False
     mocker.patch("app.release_qualifier.promote", new=AsyncMock())
 
     project, version = await _make_project_and_version(db_session)
@@ -4628,10 +4633,16 @@ async def test_ledger_stores_post_reconciliation_audit_score(db_session, mocker)
 
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
+    await db_session.refresh(version)
 
     # The composite must have scored the reconciled (refuted-removed) report: 1.0.
-    assert result["sub_scores"]["audit"] == pytest.approx(1.0), (
-        f"expected reconciled audit sub_score 1.0 but got {result['sub_scores']['audit']!r}"
+    # `_finalize_qualification`'s RETURN carries only status/confidence/blocker —
+    # the per-dimension sub_scores are persisted on last_qualification, which is
+    # where the reconciled audit score is actually observable.
+    assert result["status"] == "dry_run", result
+    _sub = (version.last_qualification or {}).get("sub_scores") or {}
+    assert _sub.get("audit") == pytest.approx(1.0), (
+        f"expected reconciled audit sub_score 1.0 but got {_sub.get('audit')!r}"
     )
 
     # The durable per-dimension ledger row must carry the POST-reconciliation
@@ -11739,6 +11750,8 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         # get_version_coverage_summary surfaces the open version's persisted
         # merge-evidence drop reasons (None when the version recorded none).
         "merge_evidence_gaps": None,
+        # Probed tier: a lower-confidence, time-bounded coverage signal.
+        "probed": 0,
         # Phantom-bookkeeping drift signal (consumed by operator_attention): a
         # version with no criteria registers none and references none, so there
         # is nothing to drift.
