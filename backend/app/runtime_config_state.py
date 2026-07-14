@@ -617,7 +617,12 @@ runtime_config: Dict = {
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
-    "task_type_model_preferences": {},
+    # The release smoke deliberately exercises the frontier Codex path and the
+    # CLI baked into the agent image, rather than whichever low-cost provider
+    # happens to lead the ops route.
+    "task_type_model_preferences": {
+        "smoketest": [{"provider": "openai", "model": "gpt-5.6-sol"}],
+    },
     # Provider selection mode — controls how the pool chooses across the
     # providers listed in category_routing / task_type_routing:
     #   "balanced"  — flatten all accounts across listed providers into one
@@ -1669,8 +1674,34 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
                 if not present_elsewhere and task_type not in initiative_members:
                     initiative_members.append(task_type)
 
+    openai_defaults_upgraded = False
     tier_map = config.setdefault("provider_tier_model_map", {})
     if isinstance(tier_map, dict):
+        # The live pre-5.6 config used gpt-5.5 for both upper tiers and
+        # gpt-5.4-mini for haiku. That shape was a rollout constraint (the old
+        # backend could not validate 5.6 ids), not an operator preference. Only
+        # rewrite the exact known shape so custom/partially pinned maps remain
+        # operator-owned.
+        openai_tiers = tier_map.get("openai")
+        old_openai_defaults = {
+            "opus": "gpt-5.5",
+            "sonnet": "gpt-5.5",
+            "haiku": "gpt-5.4-mini",
+        }
+        openai_defaults_upgraded = isinstance(openai_tiers, dict) and all(
+            openai_tiers.get(tier) == model
+            for tier, model in old_openai_defaults.items()
+        )
+        if openai_defaults_upgraded:
+            current_openai_defaults = runtime_config.get(
+                "provider_tier_model_map", {}
+            ).get("openai", {})
+            if isinstance(current_openai_defaults, dict):
+                for tier in ("opus", "sonnet", "haiku"):
+                    model = current_openai_defaults.get(tier)
+                    if isinstance(model, str) and model:
+                        openai_tiers[tier] = model
+
         for provider in ("zai", "deepseek"):
             defaults = runtime_config.get("provider_tier_model_map", {}).get(provider)
             if not isinstance(defaults, dict):
@@ -1687,6 +1718,34 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
 
     effort_matrix = config.setdefault("provider_settings_by_effort", {})
     if isinstance(effort_matrix, dict):
+        if openai_defaults_upgraded:
+            # Keep each effort cell's non-model knobs, but advance only models
+            # from the known old default family. A custom model in any cell is
+            # an explicit operator choice and is left untouched.
+            openai_matrix = effort_matrix.get("openai")
+            current_openai_matrix = runtime_config.get(
+                "provider_settings_by_effort", {}
+            ).get("openai", {})
+            known_old_by_effort = {
+                "low": {"gpt-5.4-mini"},
+                "medium": {"gpt-5.4-mini", "gpt-5.4", "gpt-5.5"},
+                "high": {"gpt-5.4", "gpt-5.5"},
+                "max": {"gpt-5.4", "gpt-5.5"},
+            }
+            if isinstance(openai_matrix, dict) and isinstance(
+                current_openai_matrix, dict
+            ):
+                for effort, old_models in known_old_by_effort.items():
+                    bag = openai_matrix.get(effort)
+                    default_bag = current_openai_matrix.get(effort)
+                    if (
+                        isinstance(bag, dict)
+                        and bag.get("model") in old_models
+                        and isinstance(default_bag, dict)
+                        and isinstance(default_bag.get("model"), str)
+                    ):
+                        bag["model"] = default_bag["model"]
+
         for provider in ("zai", "deepseek"):
             defaults = _copy_default_provider_matrix(provider)
             target = effort_matrix.setdefault(provider, {})
@@ -1695,6 +1754,21 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
                 continue
             for effort, bag in defaults.items():
                 target.setdefault(effort, dict(bag))
+
+    model_preferences = config.setdefault("task_type_model_preferences", {})
+    if isinstance(model_preferences, dict):
+        default_preferences = runtime_config.get("task_type_model_preferences", {})
+        smoke_default = (
+            default_preferences.get("smoketest")
+            if isinstance(default_preferences, dict)
+            else None
+        )
+        # Missing means this deployment predates the Codex compatibility smoke.
+        # An explicit smoketest entry (including []) is operator-owned.
+        if "smoketest" not in model_preferences and isinstance(smoke_default, list):
+            model_preferences["smoketest"] = [
+                dict(pref) for pref in smoke_default if isinstance(pref, dict)
+            ]
 
     category_routing = config.setdefault("category_routing", {})
     if isinstance(category_routing, dict):

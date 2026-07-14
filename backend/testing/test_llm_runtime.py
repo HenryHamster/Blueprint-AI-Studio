@@ -187,7 +187,7 @@ async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(
+async def test_select_llm_runtime_keeps_smoketest_gpt_5_6_pin_in_cli_translation(
     clean_runtime_pool,
 ):
     openai = {
@@ -224,30 +224,61 @@ async def test_select_llm_runtime_for_task_prefers_concrete_model_overrides(
                 "haiku": "claude-haiku-4-5-20251001",
             },
             "openai": {
-                "opus": "gpt-5.4",
-                "sonnet": "gpt-5.3-codex",
-                "haiku": "gpt-5.4-mini",
+                "opus": "gpt-5.6-sol",
+                "sonnet": "gpt-5.6-terra",
+                "haiku": "gpt-5.6-luna",
             },
         },
-        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+        "task_type_routing": {
+            "smoketest": {"providers": ["anthropic", "openai"], "effort": "low"}
+        },
         "task_type_model_preferences": {
-            "create": [
-                {"provider": "openai", "model": "gpt-5.4"},
+            "smoketest": [
+                {"provider": "openai", "model": "gpt-5.6-sol"},
                 {"provider": "anthropic", "model": "claude-opus-4-7"},
             ],
+        },
+        # The concrete preference must beat this low-effort default all the way
+        # through CLI translation, not only in LLMSelectionResult.model.
+        "provider_settings_by_effort": {
+            "openai": {
+                "low": {
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "low",
+                    "verbosity": "low",
+                }
+            }
         },
     }
 
     result = await select_llm_runtime_for_task(
         user_id=_TEST_USER,
-        task=_task(payload={"type": "create", "quality_tier": "opus"}),
+        task=_task(payload={"type": "smoketest", "quality_tier": "opus"}),
         runtime_config=runtime_config,
     )
 
     assert result is not None
     assert result.provider == "openai"
-    assert result.model == "gpt-5.4"
+    assert result.model == "gpt-5.6-sol"
     assert result.account_id == "acct-openai"
+    assert result.settings["model"] == "gpt-5.6-sol"
+    assert result.settings["reasoning_effort"] == "low"
+
+    from app.compute_manifest import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-gpt-5-6-smoke",
+        task_id=uuid.uuid4(),
+        oauth_token="sk-test",
+        provider=result.provider,
+        auth_mode=result.auth_mode,
+        model=result.model,
+        provider_settings=result.settings,
+    )
+    assert manifest["env"]["LLM_MODEL"] == "gpt-5.6-sol"
+    assert json.loads(manifest["env"]["LLM_SETTINGS"])["model"] == "gpt-5.6-sol"
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gpt-5.6-sol"
 
 
 @pytest.mark.asyncio
@@ -1375,6 +1406,65 @@ async def test_select_llm_runtime_records_no_account_fallback(clean_runtime_pool
     marker = task.context["routing_fallback"]
     assert marker["reason"] == "no_account"
     assert marker["effective_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_no_account_fallback_keeps_explicit_model_in_cli_translation(
+    clean_runtime_pool,
+):
+    runtime_config = {
+        "provider_selection_mode": "exclusive",
+        "provider_tier_model_map": {
+            "openai": {
+                "opus": "gpt-5.6-sol",
+                "sonnet": "gpt-5.6-terra",
+                "haiku": "gpt-5.6-luna",
+            },
+        },
+        "task_type_routing": {
+            "create": {"providers": ["openai"], "effort": "low"}
+        },
+        "provider_settings_by_effort": {
+            "openai": {
+                "low": {
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "low",
+                }
+            }
+        },
+    }
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(
+            payload={
+                "type": "create",
+                "quality_tier": "haiku",
+                "model": "gpt-5-custom-preview",
+            }
+        ),
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "openai"
+    assert result.account is None
+    assert result.model == "gpt-5-custom-preview"
+    assert result.settings["model"] == "gpt-5-custom-preview"
+
+    from app.compute_manifest import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-no-account-custom-model",
+        task_id=uuid.uuid4(),
+        oauth_token="oauth-test",
+        provider=result.provider,
+        auth_mode=result.auth_mode,
+        model=result.model,
+        provider_settings=result.settings,
+    )
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gpt-5-custom-preview"
 
 
 @pytest.mark.asyncio
