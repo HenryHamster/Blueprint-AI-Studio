@@ -7192,6 +7192,95 @@ async def hotfix_promote_current_version(
     return result
 
 
+async def check_hotfix_scope_preview(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    candidate_sha: str | None = None,
+) -> dict[str, Any]:
+    """Read-only preview: report whether the current open version's candidate diff
+    is hotfix-eligible WITHOUT promoting.
+
+    Returns a dict with keys:
+      ``status``         — one of 'eligible', 'ineligible', 'no_open_version',
+                           'no_credentials', 'sha_error', 'diff_unavailable'
+      ``eligible``       — bool (present when status is 'eligible' or 'ineligible')
+      ``changed_files``  — list of all changed file paths (present on success)
+      ``offending_files``— list of paths that failed the scope check (empty if eligible)
+      ``reason``         — human-readable verdict string (present on success)
+      ``candidate_sha``  — resolved candidate SHA (present on success)
+      ``prior_deployed_sha`` — promotion-target HEAD SHA (present on success)
+
+    This shares the credential-resolution and diff-fetch logic with
+    ``hotfix_promote_current_version`` but makes NO mutations: no branch is cut,
+    no PR is opened, no audit trail is written.
+    """
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {"status": "no_open_version"}
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {"status": "no_open_version"}
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return {"status": "no_credentials"}
+    token, owner, repo = resolved
+    integration_branch, promotion_target = _lts_branch_names(project)
+    if not candidate_sha:
+        try:
+            candidate_sha = await github.get_branch_sha(
+                token, owner, repo, integration_branch, live=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+    if not candidate_sha:
+        return {"status": "sha_error", "detail": "empty candidate sha"}
+    try:
+        prior_deployed_sha = await github.get_branch_sha(
+            token, owner, repo, promotion_target, live=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+    if not prior_deployed_sha:
+        return {"status": "sha_error", "detail": "empty promotion-target sha"}
+
+    from app import github_refs
+
+    changed = await github_refs.get_changed_files_with_patches_between_refs(
+        token, owner, repo, prior_deployed_sha, candidate_sha, project_id=str(project_id)
+    )
+    if changed is None:
+        return {
+            "status": "diff_unavailable",
+            "eligible": False,
+            "changed_files": [],
+            "offending_files": [],
+            "reason": (
+                "could not resolve the candidate diff against the promotion target "
+                "(GitHub compare failed)"
+            ),
+            "candidate_sha": candidate_sha,
+            "prior_deployed_sha": prior_deployed_sha,
+        }
+    changed_files = [f["filename"] for f in changed]
+    main_py_patch = next(
+        (f.get("patch") for f in changed if f["filename"] == hotfix_policy.MAIN_PY_PATH),
+        None,
+    )
+    verdict = hotfix_policy.evaluate_hotfix_scope(
+        changed_files, main_py_patch=main_py_patch
+    )
+    return {
+        "status": "eligible" if verdict.eligible else "ineligible",
+        "eligible": verdict.eligible,
+        "changed_files": changed_files,
+        "offending_files": verdict.offending_files,
+        "reason": verdict.reason,
+        "candidate_sha": candidate_sha,
+        "prior_deployed_sha": prior_deployed_sha,
+    }
+
+
 def _qualification_timeout_age_seconds(
     version: release_version.ReleaseVersion,
     qual: dict[str, Any],

@@ -456,6 +456,46 @@ async def trigger_hotfix_promote(
     return result
 
 
+@router.get("/projects/{project_id}/promote/hotfix/preview")
+async def get_hotfix_scope_preview(
+    project_id: uuid.UUID,
+    candidate_sha: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Read-only preview: report whether the current open version's candidate diff
+    is hotfix-eligible WITHOUT promoting.
+
+    OWNER-only.  Returns the scope verdict (eligible/ineligible), the list of all
+    changed files between the promotion target and the candidate, and the specific
+    files (if any) that would be rejected.  The optional ``candidate_sha`` query
+    parameter pins the check to a specific commit; when omitted the integration
+    branch HEAD is used (same default as ``POST /promote/hotfix``).
+
+    Maps: no_open_version → 404, no_credentials/sha_error → 503.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await release_qualifier.check_hotfix_scope_preview(
+        session,
+        project_id,
+        candidate_sha=candidate_sha,
+    )
+    status = result.get("status")
+    if status == "no_open_version":
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+    if status in ("no_credentials", "sha_error", "diff_unavailable"):
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("detail") or result.get("reason") or status,
+        )
+    return result
+
+
 # Blocker provenance sources that mark a depends_on edge as a real, structural
 # prerequisite rather than legacy queue-wave serialization.
 _PREREQUISITE_BLOCKER_SOURCES = {"research_prerequisite", "parent"}
