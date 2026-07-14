@@ -2530,6 +2530,96 @@ async def _run_full_cycle_db_sweep() -> None:
                 "direct record_capability_proof call, closed the cycle"
             )
             assert pipe_blocked.status == TaskStatus.QUEUED
+
+            # ── Phase G: a FORGED proof kind mints no proof (enforce holds) ────
+            # record_capability_proof reads code_acceptance_verdict from the
+            # agent-writable task.context. A task that declared no acceptance
+            # evidence keeps whatever verdict it authored (record_code_acceptance_
+            # verdict no-ops for it), so an agent can self-author proven=True with
+            # an UNRECOGNIZED kind. Because classify_evidence_tiered reads any
+            # non-machine-but-unrecognized kind as full 'proven', such a record
+            # would clear the enforce gate with nothing verified. The recording
+            # seam must refuse it: only a kind in the recognized proof vocabulary
+            # mints a durable proof, so the dependent stays BLOCKED.
+            pm3 = project.problem_model
+            pm3["capabilities"].append(
+                {"name": "Forged cap", "status": "working"}
+            )
+            flag_modified(project, "problem_model")
+            s.add(project)
+            await s.commit()
+
+            forged_provider = Task(
+                id=uuid.uuid4(),
+                project_id=project.id,
+                title="forged-provider",
+                description="x",
+                status=TaskStatus.COMPLETED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                context={
+                    "provides_capability": "forged-cap",
+                    "code_acceptance_verdict": {
+                        "proven": True,
+                        # NOT a member of the recognized proof vocabulary — a
+                        # self-authored kind an agent could write into JSONB.
+                        "kind": "self_reflection",
+                        "proof_ref": "trust me",
+                    },
+                },
+            )
+            forged_recorded = record_capability_proof(forged_provider, project)
+            assert forged_recorded == [], (
+                "record_capability_proof must refuse a verdict whose kind is not "
+                "in the recognized proof vocabulary — a forged/self-authored kind "
+                "must never mint a gate-clearing proof"
+            )
+            assert "forged-cap" not in (project.capability_proof_records or {}), (
+                "no proof record may be written for an unrecognized proof kind"
+            )
+            s.add(project)
+            await s.commit()
+
+            forged_need = {"kind": "capability", "ref": "forged-cap"}
+            now4 = _utcnow()
+            forged_blocked = Task(
+                project_id=project.id,
+                title="forged-dependent",
+                description="x",
+                status=TaskStatus.BLOCKED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                depends_on=[],
+                blocker_kind="precondition",
+                blocked_reason="BLOCKER: needs capability forged-cap",
+                blocked_at=now4,
+                recheck_after=now4 - timedelta(minutes=1),  # due
+                context={
+                    "blocker": {
+                        "source": "agent",
+                        "waiting_on": "capability",
+                        "needs": [forged_need],
+                        "need": forged_need,
+                    }
+                },
+            )
+            s.add(forged_blocked)
+            await s.commit()
+            await s.refresh(forged_blocked)
+
+            requeued5 = await sweep_unblock_blocked_tasks(
+                s, _utcnow(), verify_pr_merged=_stub_verify
+            )
+            await s.refresh(forged_blocked)
+            assert requeued5 == 0, (
+                "a forged-kind verdict mints no proof, so the enforce gate must "
+                "keep the dependent BLOCKED — no unverified self-report resumes it"
+            )
+            assert forged_blocked.status == TaskStatus.BLOCKED
     finally:
         if saved_mode is None:
             _rc.pop("capability_proof_gate_mode", None)

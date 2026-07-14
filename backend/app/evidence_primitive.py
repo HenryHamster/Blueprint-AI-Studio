@@ -76,6 +76,25 @@ ProofKind = Literal[
                             # but was NEVER executed (structural-only, path-tier)
 ]
 
+#: Every recognized :data:`ProofKind`, as a runtime-checkable set. The
+#: ``ProofKind`` Literal is the documented vocabulary but a type alias cannot be
+#: membership-tested at runtime, so recording seams that must refuse an
+#: unrecognized (e.g. agent-forged) proof kind before minting a proof check
+#: against this set. Keep in lockstep with the ``ProofKind`` Literal above.
+KNOWN_PROOF_KINDS: frozenset[str] = frozenset(
+    {
+        "named_test",
+        "downstream_artifact",
+        "visual",
+        "observable_behavior",
+        "reachability",
+        "operator_attestation",
+        "trial_adoption",
+        "backing_path",
+        "named_test_present",
+    }
+)
+
 #: The kinds whose ``ref`` names a repo file/test path and can therefore be
 #: re-verified against HEAD (file exists / was removed). Other kinds point at
 #: logical ids (criterion keys, artifact ids) that a path check cannot resolve.

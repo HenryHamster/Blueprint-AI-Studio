@@ -29,6 +29,7 @@ from app.capability_registry import (
     normalize_capability_name,
 )
 from app.evidence_primitive import (
+    KNOWN_PROOF_KINDS,
     EvidenceRef,  # noqa: F401 — imported for shape doc
     classify_evidence_tiered,
 )
@@ -256,8 +257,11 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
     """Record a proof entry on project for each capability the task provides.
 
     Reads the ``code_acceptance_verdict`` from ``task.context`` and, if it is
-    proven, stamps a bounded proof entry into
-    ``project.capability_proof_records[cap_name]``.
+    proven AND its ``kind`` is a recognized proof kind, stamps a bounded proof
+    entry into ``project.capability_proof_records[cap_name]``. A verdict whose
+    ``kind`` is unrecognized (e.g. a self-authored value on a task that declared
+    no acceptance evidence, so the platform never overwrote it) mints nothing —
+    it must never launder into a gate-clearing proof.
 
     Returns the list of normalized capability names that received a proof entry
     (empty when no proof was recorded).
@@ -291,6 +295,26 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
     task_id = str(getattr(task, "id", "") or "")
     proved_at = _utcnow().isoformat()
     proof_kind = _proof_kind_from_verdict(verdict)
+    # Refuse to mint a proof from an UNRECOGNIZED proof kind. ``verdict`` is read
+    # from ``task.context`` — agent-writable JSONB that the platform overwrites
+    # only when the task declared acceptance evidence (record_code_acceptance_
+    # verdict no-ops otherwise). A task that declares none can therefore carry a
+    # self-authored ``code_acceptance_verdict`` with ``proven=True`` and a forged
+    # ``kind`` (e.g. "self_reflection"); ``classify_evidence_tiered`` treats any
+    # non-machine-but-unrecognized kind as full ``proven`` (an unlabeled proof is
+    # never silently demoted), so such a record would clear the enforce gate with
+    # nothing verified behind it. Only a kind in the recognized proof vocabulary
+    # may mint a durable proof record. A missing/blank kind is NOT rejected here:
+    # ``_proof_kind_from_verdict`` already normalizes it to the ``named_test``
+    # default (preserving the legacy unlabeled-proof behavior).
+    if proof_kind not in KNOWN_PROOF_KINDS:
+        logger.warning(
+            "[CAPABILITY_PROOF] refusing proof for task %s: unrecognized "
+            "proof_kind=%r (not in the recognized proof vocabulary)",
+            task_id,
+            proof_kind,
+        )
+        return []
     proof_ref = _extract_proof_ref(verdict) or ""
     commit_sha = context.get("merge_commit_sha") or context.get("commit_sha") or ""
 

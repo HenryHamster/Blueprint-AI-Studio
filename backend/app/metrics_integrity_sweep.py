@@ -158,6 +158,12 @@ class CheckResult:
     severity: str = "info"  # info | warn | error
     subject: str | None = None  # e.g. project_id / direction_id / "global"
     detail: str = ""
+    # Count of gaps this check actively self-HEALED on the tick that produced it
+    # (e.g. capability proof gaps auto-resolved). None for checks that only
+    # recompute/flag and never mutate. Surfaced structured — not buried in
+    # ``detail`` prose — so the observability snapshot and dashboards can report
+    # self-heal throughput machine-readably.
+    auto_resolved: int | None = None
 
     @property
     def flagged(self) -> bool:
@@ -173,6 +179,7 @@ class CheckResult:
             "severity": self.severity,
             "subject": self.subject,
             "detail": self.detail,
+            "auto_resolved": self.auto_resolved,
         }
 
     def finding_key(self) -> str:
@@ -3619,7 +3626,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
       newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
       evidence, not enforce-gate-clearing ``proven`` status specifically.
-    * ``delta``         = unresolved gap: needs_backing_paths + failed verification.
+    * ``delta``         = unresolved gap: needs_backing_paths + backing_paths that
+      failed HEAD verification + caps that already carry only a path_proven proof.
 
     Bounded to ``ctx.max_projects`` projects.
     """
@@ -3742,7 +3750,18 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         auto_resolved: list[str] = []
         named_test_present_resolved: list[str] = []
         needs_backing_paths: list[str] = []
-        still_unproven: list[str] = []
+        # Distinct unresolved buckets — kept separate so the FLAGGED detail is
+        # truthful about WHY each cap is still a gap (a dedup no-op that already
+        # carries a path_proven proof is NOT the same as a declared backing path
+        # that fails HEAD verification):
+        #   verification_failed — declared file-like backing_paths that do not
+        #     resolve at HEAD (stale/moved paths) or a proof-recording exception;
+        #     genuinely unresolvable by self-heal, so these also enroll research.
+        #   already_recorded — a proof was already present (record was a dedup
+        #     no-op); the cap carries path_proven evidence and needs no research
+        #     (only a real green merge verdict reaches ``proven``).
+        verification_failed: list[str] = []
+        already_recorded: list[str] = []
 
         for cap_name in unproven_names:
             raw_name, backing_paths = cap_backing.get(cap_name, (cap_name, []))
@@ -3801,7 +3820,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                             named_test_present_resolved.append(cap_name)
                         else:
                             # Dedup: named_test_present proof already present.
-                            still_unproven.append(cap_name)
+                            already_recorded.append(cap_name)
                     else:
                         recorded = record_capability_backing_path_proof(
                             project, raw_name or cap_name
@@ -3811,7 +3830,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         else:
                             # Dedup: proof already present (path_proven tier, not
                             # fully proven).
-                            still_unproven.append(cap_name)
+                            already_recorded.append(cap_name)
                 except Exception:  # noqa: BLE001 — proof recording is non-fatal
                     logger.warning(
                         "[METRICS_INTEGRITY] capability_proof_gate_gap: "
@@ -3820,9 +3839,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         pid,
                         exc_info=True,
                     )
-                    still_unproven.append(cap_name)
+                    verification_failed.append(cap_name)
             else:
-                still_unproven.append(cap_name)
+                verification_failed.append(cap_name)
 
         # DISCOVERY pass: for caps with no declared file-like backing_paths, try
         # to discover candidate backing paths at HEAD by name. Apply the SAME
@@ -3912,8 +3931,10 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 )
                 with contextlib.suppress(Exception):
                     await ctx.session.rollback()
-                # Move auto_resolved to still_unproven since the commit failed.
-                still_unproven.extend(auto_resolved)
+                # The commit failed, so no proof was actually persisted — treat
+                # these as verification_failed (unresolved + needing research),
+                # NOT already_recorded (which implies a durable path_proven proof).
+                verification_failed.extend(auto_resolved)
                 auto_resolved.clear()
 
         # ENFORCE mode only: for caps that cannot be auto-proven (no file-like
@@ -3922,12 +3943,19 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # Never crashes the check: a per-enroll failure is logged + rolled back
         # and the sweep continues; enrolled rows are committed in their own
         # commit (the auto-resolve proofs, if any, already committed above).
+        # Both the no-backing-paths caps AND caps whose declared backing_paths
+        # fail HEAD verification are genuine gaps self-heal cannot close on its
+        # own — enroll research for both so a stale/moved backing path is
+        # investigated rather than flagged forever. already_recorded caps are
+        # excluded: they already carry a path_proven proof and only a real green
+        # merge verdict can advance them to ``proven``.
         enrolled_research: list[str] = []
-        if ctx.mode == "enforce" and needs_backing_paths:
+        research_needed = needs_backing_paths + verification_failed
+        if ctx.mode == "enforce" and research_needed:
             # Reconstruct the UUID from the captured pid string so we never touch
             # a (possibly commit-expired) ORM attribute after the auto-resolve commit.
             project_uuid = _uuid.UUID(pid)
-            for cap_name in needs_backing_paths:
+            for cap_name in research_needed:
                 try:
                     if await _enroll_capability_proof_research(
                         ctx.session,
@@ -3962,7 +3990,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         await ctx.session.rollback()
 
         new_proven = proven_count + len(auto_resolved)
-        unresolved = needs_backing_paths + still_unproven
+        unresolved = needs_backing_paths + verification_failed + already_recorded
 
         if unresolved:
             detail_parts: list[str] = []
@@ -3993,12 +4021,21 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         "path suggestion(s) folded into research obligations)"
                     )
                 detail_parts.append(_nb_part)
-            if still_unproven:
-                preview_su = ", ".join(sorted(still_unproven)[:3])
-                if len(still_unproven) > 3:
-                    preview_su += f" (+{len(still_unproven) - 3} more)"
+            if verification_failed:
+                preview_vf = ", ".join(sorted(verification_failed)[:3])
+                if len(verification_failed) > 3:
+                    preview_vf += f" (+{len(verification_failed) - 3} more)"
                 detail_parts.append(
-                    f"{len(still_unproven)} backing_paths failed verification: {preview_su}"
+                    f"{len(verification_failed)} backing_paths failed verification: "
+                    f"{preview_vf}"
+                )
+            if already_recorded:
+                preview_ir = ", ".join(sorted(already_recorded)[:3])
+                if len(already_recorded) > 3:
+                    preview_ir += f" (+{len(already_recorded) - 3} more)"
+                detail_parts.append(
+                    f"{len(already_recorded)} already carry a path_proven proof "
+                    f"(awaiting a real merge verdict to reach proven): {preview_ir}"
                 )
             _detail = (
                 f"{len(unresolved)} working capability(ies) remain unproven "
@@ -4021,6 +4058,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     severity="warn",
                     subject=pid,
                     detail=_detail,
+                    auto_resolved=len(auto_resolved),
                 )
             )
         else:
@@ -4056,6 +4094,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     delta=0,
                     subject=pid,
                     detail=_ok_detail,
+                    auto_resolved=len(auto_resolved),
                 )
             )
 

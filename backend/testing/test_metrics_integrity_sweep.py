@@ -4160,6 +4160,10 @@ async def test_capability_proof_gate_gap_triggers_self_heal(db):
     assert ok[0].delta == 0
     assert ok[0].ground_truth == 1  # auto-resolved from 0 proven to 1
     assert "auto-resolved" in ok[0].detail
+    # Self-heal throughput is surfaced structured (not just in the detail prose)
+    # so the observability snapshot / dashboards can report it machine-readably.
+    assert ok[0].auto_resolved == 1
+    assert ok[0].as_dict()["auto_resolved"] == 1
 
     # Proof must have been recorded in capability_proof_records.
     await db.refresh(project)
@@ -4338,6 +4342,81 @@ async def test_capability_proof_gate_gap_falls_back_to_backing_path_without_test
     assert entries[0].get("proof_kind") == "backing_path", (
         f"expected backing_path fallback, got {entries[0].get('proof_kind')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_stale_backing_path_enrolls_research(db):
+    """A working cap whose declared file-like backing_path does NOT resolve at
+    HEAD (stale/moved path) is a genuine gap self-heal cannot close. It must be:
+      * honestly labeled "backing_paths failed verification" in the detail
+        (NOT the path_proven-dedup wording),
+      * counted in delta with auto_resolved == 0 (nothing was healed), and
+      * enrolled for proof-earn research in enforce mode so a stale backing path
+        is investigated rather than flagged forever.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],  # unproven
+                "backing_paths": ["backend/app/does_not_exist_stale.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # Force HEAD verification to fail for the declared backing path.
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=False),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    detail = flagged[0].detail
+    assert "backing_paths failed verification" in detail, detail
+    # Not mislabeled as an already-recorded path_proven dedup.
+    assert "already carry a path_proven proof" not in detail, detail
+    assert flagged[0].delta == 1
+    assert flagged[0].auto_resolved == 0
+
+    # The stale-backing-path cap enrolled exactly one proof-earn research row.
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id,
+                EvergreenBacklogItem.finding_key.startswith(
+                    mis.CAPABILITY_PROOF_RESEARCH_KEY_PREFIX
+                ),
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1, (
+        f"expected one research obligation for the stale-path cap, got "
+        f"{[r.finding_key for r in rows]}"
+    )
+    assert rows[0].finding_key == mis._capability_proof_research_finding_key(
+        pid, "repo-map"
+    )
+    assert rows[0].provenance == mis.CAPABILITY_PROOF_RESEARCH_PROVENANCE
 
 
 @pytest.mark.asyncio
