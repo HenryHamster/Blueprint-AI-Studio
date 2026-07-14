@@ -19083,12 +19083,100 @@ def test_collect_viewable_candidates_keeps_multi_arm_same_basename_from_dir(tmp_
     # A root-level file keeps its bare name alongside the nested ones.
     (tmp_path / "summary.png").write_bytes(_VIEW_PNG_BYTES + b"-root")
 
-    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    cands, _size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
     names = sorted(c.filename for c in cands)
     assert names == ["arm1__reward.png", "arm2__reward.png", "summary.png"]
     by_name = {c.filename: c for c in cands}
     assert by_name["arm1__reward.png"].data == _VIEW_PNG_BYTES + b"arm1"
     assert by_name["arm2__reward.png"].data == _VIEW_PNG_BYTES + b"arm2"
+
+
+def test_collect_viewable_candidates_from_dir_streams_large_video(tmp_path):
+    """A local video over the in-memory image cap becomes a STREAMED candidate.
+
+    Instead of being read into memory (and rejected by the image cap), an
+    oversized local video yields a candidate carrying a ``source_path`` (the
+    on-disk original) with no in-memory ``data`` and the ``artifact_root`` set so
+    the upload path can re-verify symlink containment. A co-located image stays
+    on the in-memory ``data`` path.
+    """
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    big_video = os.urandom(image_cap + 256 * 1024)  # ~8.25 MiB > image cap
+    (tmp_path / "rollout.mp4").write_bytes(big_video)
+    (tmp_path / "frame.png").write_bytes(_VIEW_PNG_BYTES)
+
+    cands, _size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
+    by_name = {c.filename: c for c in cands}
+    assert set(by_name) == {"rollout.mp4", "frame.png"}
+
+    video = by_name["rollout.mp4"]
+    assert video.kind == "video"
+    assert video.data is None
+    assert video.source_path == str(tmp_path / "rollout.mp4")
+    assert video.source_is_temp is False
+    assert video.artifact_root == os.path.realpath(str(tmp_path))
+    assert video.size_bytes == len(big_video)
+
+    image = by_name["frame.png"]
+    assert image.data == _VIEW_PNG_BYTES
+    assert image.source_path is None
+
+
+@pytest.mark.asyncio
+async def test_persist_streams_local_video_via_nofollow_open(tmp_path, monkeypatch):
+    """A local job's oversized video is streamed to storage via an O_NOFOLLOW open.
+
+    End-to-end for the local backend: the streamed candidate's original file is
+    opened (not buffered) and handed to ``upload_compute_job_viewable_stream``;
+    the original artifact file is left in place (never unlinked as a temp).
+    """
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    big_video = os.urandom(image_cap + 256 * 1024)
+    video_path = tmp_path / "rollout.mp4"
+    video_path.write_bytes(big_video)
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+
+    streamed: list = []
+
+    async def _fake_stream_upload(job_id, basename, fileobj, content_type, *, size=None):
+        fileobj.seek(0, os.SEEK_END)
+        measured = fileobj.tell()
+        fileobj.seek(0)
+        streamed.append({"basename": basename, "size": measured, "size_kwarg": size})
+        return storage.compute_job_viewable_uri(job_id, basename)
+
+    async def _forbid_file_upload(*_a, **_k):
+        raise AssertionError("a large video must stream, not use the in-memory seam")
+
+    monkeypatch.setattr(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_stream",
+        _fake_stream_upload,
+    )
+    monkeypatch.setattr(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        _forbid_file_upload,
+    )
+
+    manifest, dropped = await compute_backends_module.persist_viewable_artifacts(job)
+
+    assert dropped == 0
+    assert [m["filename"] for m in manifest] == ["rollout.mp4"]
+    assert manifest[0]["size_bytes"] == len(big_video)
+    assert streamed == [
+        {"basename": "rollout.mp4", "size": len(big_video), "size_kwarg": len(big_video)}
+    ]
+    # The ORIGINAL artifact file must remain in place (not treated as a temp).
+    assert video_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -19115,8 +19203,11 @@ def test_collect_viewable_candidates_from_dir_collects_beyond_cap(tmp_path):
     """Dir walker collects ALL qualifying files (count cap removed from inner loop)."""
     for i in range(_MAX_COUNT + 3):
         (tmp_path / f"file{i:03d}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
-    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    cands, size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
     assert len(cands) == _MAX_COUNT + 3
+    assert size_dropped == 0
 
 
 @pytest.mark.asyncio
@@ -19427,6 +19518,30 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
                 "basename": basename,
                 "size": len(data),
                 "content_type": content_type,
+                "streamed": False,
+            }
+        )
+        return (
+            f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+        )
+
+    async def _fake_stream_upload(job_id, basename, fileobj, content_type, *, size=None):
+        if fail_on is not None and fail_on in basename:
+            raise RuntimeError("simulated GCS stream upload error")
+        # Measure the source WITHOUT reading it into memory (seek to end), so the
+        # mock itself never reintroduces the OOM the streaming path exists to avoid.
+        try:
+            fileobj.seek(0, os.SEEK_END)
+            measured = fileobj.tell()
+            fileobj.seek(0)
+        except OSError:
+            measured = size
+        calls["uploads"].append(
+            {
+                "basename": basename,
+                "size": measured if measured is not None else size,
+                "content_type": content_type,
+                "streamed": True,
             }
         )
         return (
@@ -19442,6 +19557,9 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
         storage, "download_compute_job_artifact_bundle", _forbid_whole_bundle_download
     )
     monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_upload)
+    monkeypatch.setattr(
+        storage, "upload_compute_job_viewable_stream", _fake_stream_upload
+    )
     return calls
 
 
@@ -19477,6 +19595,8 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
             "./diagram.svg": b"<svg></svg>",
             "./output.mp4": mp4_data,
             "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
+            # PDF is a first-class viewable kind (matplotlib savefig('*.pdf')).
+            "./report.pdf": b"%PDF-1.4\n" + b"\x00" * 100,
             # Non-viewable — must be skipped.
             "./terminal.json": b'{"status": "SUCCEEDED"}',
             "./command.log": b"all good\n",
@@ -19491,20 +19611,22 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
     )
     await db_session.commit()
 
-    # 7 viewable files (SVG excluded fail-closed), uploaded ONCE each.
-    assert len(manifest) == 7
+    # 8 viewable files (SVG excluded fail-closed), uploaded ONCE each.
+    assert len(manifest) == 8
     assert dropped == 0
-    assert len(calls["uploads"]) == 7
+    assert len(calls["uploads"]) == 8
     assert calls["downloads"] == 1, "the bundle must be downloaded exactly once"
 
     rows = await _job_files(db_session, job.id)
-    assert len(rows) == 7
+    assert len(rows) == 8
 
     by_name = {r.safe_relpath: r for r in rows}
     assert by_name["plot.png"].media_type == "image"
     assert by_name["plot.png"].content_type == "image/png"
     assert by_name["output.mp4"].media_type == "video"
     assert by_name["output.mp4"].content_type == "video/mp4"
+    assert by_name["report.pdf"].media_type == "pdf"
+    assert by_name["report.pdf"].content_type == "application/pdf"
 
     # SVG must NOT be persisted as a signable/viewable file — excluded fail-closed
     # on BOTH surfaces (script-execution risk when served from a signed URL).
@@ -19524,8 +19646,61 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
 
     # The manifest is stamped on the job for the admin UI / strategic context.
     meta = job.polling_metadata or {}
-    assert meta.get("viewable_file_count") == 7
-    assert len(meta.get("viewable_files") or []) == 7
+    assert meta.get("viewable_file_count") == 8
+    assert len(meta.get("viewable_files") or []) == 8
+
+
+@pytest.mark.asyncio
+async def test_pdf_is_viewable_artifact_kind(db_session, monkeypatch):
+    """A .pdf plot a compute job writes into $BLUEPRINT_ARTIFACT_DIR is persisted
+    as an individually-addressable, signable object carrying the NEW `kind`/
+    `media_type` value ``pdf`` — end to end from storage classifier through the
+    persistence pipeline and manifest — while SVG stays excluded fail-closed."""
+    # 1) The storage classifier maps .pdf to (application/pdf, "pdf") on BOTH
+    #    viewable surfaces, and the MIME->kind mapper agrees.
+    assert storage.viewable_content_type_for_filename("figure.pdf") == (
+        "application/pdf",
+        "pdf",
+    )
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
+    assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    assert storage._media_kind_for_mime("application/pdf") == "pdf"
+    # SVG must remain excluded from both surfaces — pdf is added alongside it.
+    assert storage.svg_is_viewable() is False
+
+    # 2) A bundle containing a .pdf (alongside an excluded .svg) yields a manifest
+    #    entry + ComputeJobFile row with kind/media_type "pdf".
+    job = await _create_bundle_compute_job(db_session)
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./savefig.pdf": b"%PDF-1.5\n" + b"\x00" * 200,
+            "./diagram.svg": b"<svg></svg>",  # excluded fail-closed
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert len(manifest) == 1
+    pdf_entry = manifest[0]
+    assert pdf_entry["filename"] == "savefig.pdf"
+    assert pdf_entry["kind"] == "pdf"
+    assert pdf_entry["content_type"] == "application/pdf"
+    assert len(calls["uploads"]) == 1
+
+    rows = await _job_files(db_session, job.id)
+    assert len(rows) == 1
+    assert rows[0].safe_relpath == "savefig.pdf"
+    assert rows[0].media_type == "pdf"
+    assert rows[0].content_type == "application/pdf"
+
+    # SVG was NOT persisted on either surface.
+    assert not any(e["filename"] == "diagram.svg" for e in manifest)
+    assert not any(r.safe_relpath == "diagram.svg" for r in rows)
 
 
 @pytest.mark.asyncio
@@ -19593,6 +19768,196 @@ async def test_viewable_pipeline_enforces_single_per_file_size_cap(
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 1
     assert rows[0].safe_relpath == "tiny_plot.png"
+
+
+@pytest.mark.asyncio
+async def test_viewable_pipeline_streams_large_video_over_image_cap(
+    db_session, monkeypatch
+):
+    """A video over the 8 MiB in-memory image cap is STREAMED, not dropped.
+
+    Rollout/training videos routinely exceed the per-file in-memory ceiling that
+    governs images. Rather than being silently dropped (locked inside the opaque
+    bundle), they are streamed member-by-member to storage through the dedicated
+    streaming seam (``upload_compute_job_viewable_stream``), while a co-resident
+    image keeps taking the in-memory path.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    # Incompressible so the archived member genuinely exceeds the image cap.
+    big_video = os.urandom(image_cap + 512 * 1024)  # ~8.5 MiB > image cap
+    small_png = b"\x89PNG\r\n\x1a\n" + b"Y" * 1024
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./rollout.mp4": big_video,
+            "./frame.png": small_png,
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    # Both persisted — the big video is NOT dropped for exceeding the image cap.
+    by_name = {m["filename"]: m for m in manifest}
+    assert set(by_name) == {"rollout.mp4", "frame.png"}
+    assert by_name["rollout.mp4"]["size_bytes"] == len(big_video)
+    assert by_name["rollout.mp4"]["kind"] == "video"
+    assert by_name["rollout.mp4"]["content_type"] == "video/mp4"
+
+    uploads = {u["basename"]: u for u in calls["uploads"]}
+    # The video went through the STREAMING seam; the image through the in-memory one.
+    assert uploads["rollout.mp4"]["streamed"] is True
+    assert uploads["rollout.mp4"]["size"] == len(big_video)
+    assert uploads["frame.png"]["streamed"] is False
+
+    rows = await _job_files(db_session, job.id)
+    names = {r.safe_relpath for r in rows}
+    assert names == {"rollout.mp4", "frame.png"}
+
+
+@pytest.mark.asyncio
+async def test_viewable_pipeline_enforces_video_ceiling(db_session, monkeypatch):
+    """A video over the (larger) streamed-video ceiling is still skipped.
+
+    Streaming raises the video ceiling far above the image cap, but it is not
+    unbounded: a video above ``_MAX_VIEWABLE_VIDEO_BYTES`` is skipped (stays in
+    the bundle) while one within the ceiling is streamed. The ceiling is
+    monkeypatched down so the test needn't materialize a half-gigabyte file.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    video_ceiling = image_cap + 4 * 1024 * 1024  # 12 MiB, above the image cap
+    monkeypatch.setattr(
+        compute_backends_module, "_MAX_VIEWABLE_VIDEO_BYTES", video_ceiling
+    )
+
+    within = os.urandom(image_cap + 1 * 1024 * 1024)  # ~9 MiB: streamed
+    over = os.urandom(video_ceiling + 1 * 1024 * 1024)  # ~13 MiB: skipped
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./ok_clip.mp4": within,
+            "./too_big.webm": over,
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    # Only the within-ceiling video is persisted; the oversized one is skipped
+    # (size rejections are not counted in the dropped/count-cap tally).
+    assert [m["filename"] for m in manifest] == ["ok_clip.mp4"]
+    assert dropped == 0
+    uploads = {u["basename"]: u for u in calls["uploads"]}
+    assert set(uploads) == {"ok_clip.mp4"}
+    assert uploads["ok_clip.mp4"]["streamed"] is True
+
+    rows = await _job_files(db_session, job.id)
+    assert {r.safe_relpath for r in rows} == {"ok_clip.mp4"}
+
+
+def test_viewable_pipeline_streams_large_video_and_peak_memory_is_bounded(
+    tmp_path, monkeypatch
+):
+    """A large video is uploaded WITHOUT ever holding it whole in RAM.
+
+    The whole point of streaming: a video far larger than the 8 MiB in-memory
+    image cap must reach storage while the orchestrator's peak allocation stays
+    bounded by the copy/stream buffer, not the video size. An implementation that
+    buffered the video (``upload_from_string``) would pay for its full size here
+    and trip the ceiling.
+    """
+    monkeypatch.setattr(
+        compute_backends_module, "_MAX_VIEWABLE_VIDEO_BYTES", 128 * 1024 * 1024
+    )
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+    # INCOMPRESSIBLE and well over the 8 MiB image cap (but under the video
+    # ceiling): the streamed bytes a buffering impl would hold are the full 40 MiB.
+    big_video = os.urandom(40 * 1024 * 1024)
+    src = tmp_path / "bundle.tar.gz"
+    with tarfile.open(str(src), mode="w:gz", compresslevel=1) as tar:
+        for name, payload in (
+            ("./rollout.mp4", big_video),
+            ("./plot.png", png),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    video_size = len(big_video)
+    del big_video
+    assert src.stat().st_size > 32 * 1024 * 1024, "the video must dwarf the ceiling"
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(str(src), dest_path)  # to disk; no Python-level buffer
+        return True
+
+    async def _forbid_whole_bundle_download(_job_id):
+        raise AssertionError("must stream the bundle to disk, never load it whole")
+
+    uploaded: list = []
+
+    async def _fake_file_upload(job_id, filename, data, content_type):
+        uploaded.append({"filename": filename, "streamed": False})
+        return storage.compute_job_viewable_uri(job_id, filename)
+
+    async def _fake_stream_upload(job_id, filename, fileobj, content_type, *, size=None):
+        # Measure via seek — reading the file whole here would defeat the test.
+        fileobj.seek(0, os.SEEK_END)
+        measured = fileobj.tell()
+        fileobj.seek(0)
+        uploaded.append({"filename": filename, "streamed": True, "size": measured})
+        return storage.compute_job_viewable_uri(job_id, filename)
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.GCP_BACKEND_NAME
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.storage,
+        "download_compute_job_artifact_bundle",
+        _forbid_whole_bundle_download,
+    ), patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        _fake_file_upload,
+    ), patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_stream",
+        _fake_stream_upload,
+    ):
+        tracemalloc.start()
+        try:
+            manifest, dropped = asyncio.run(
+                compute_backends_module.persist_viewable_artifacts(job)
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    assert sorted(m["filename"] for m in manifest) == ["plot.png", "rollout.mp4"]
+    assert dropped == 0
+    by_name = {u["filename"]: u for u in uploaded}
+    assert by_name["rollout.mp4"]["streamed"] is True
+    assert by_name["rollout.mp4"]["size"] == video_size
+    assert by_name["plot.png"]["streamed"] is False
+
+    # Peak stays bounded — well under the 40 MiB video — proving the video is
+    # streamed, not materialized in the orchestrator's heap.
+    ceiling = 16 * 1024 * 1024
+    assert peak < ceiling, (
+        f"the viewable pass peaked at {peak / 1024 / 1024:.1f} MiB streaming a "
+        f"{video_size / 1024 / 1024:.1f} MiB video — it is buffering the video "
+        "instead of streaming it (this is the OOM the task fixes)"
+    )
 
 
 @pytest.mark.asyncio

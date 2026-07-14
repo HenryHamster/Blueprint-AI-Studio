@@ -286,8 +286,41 @@ _MAX_TERMINAL_RECORD_DECODED_BYTES = 131072
 # Caps for the individually-persisted viewable-artifact substrate: per-file byte
 # ceiling and total object-count ceiling so a pathological run can't upload
 # unbounded per-file objects. Files over the size cap stay inside the bundle.
-_MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file
+_MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file (in-memory)
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive-int env override, falling back to ``default`` on absent/garbled."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (ValueError, AttributeError):
+        return default
+    return value if value > 0 else default
+
+
+# Videos (rollout/training footage — the artifact type the RL-witness direction
+# names) routinely exceed the 8 MiB in-memory ceiling. They are STREAMED member
+# by member to storage instead of buffered, so they get a much larger ceiling
+# without ever entering the orchestrator's heap. Kept well under Postgres int4
+# (~2.1 GiB) so ``file_size_bytes`` cannot overflow. Env-overridable.
+_MAX_VIEWABLE_VIDEO_BYTES = _positive_int_env(
+    "BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES", 512 * 1024 * 1024
+)  # 512 MiB per streamed video
+
+
+def _viewable_size_cap_for_kind(kind: str) -> int:
+    """Per-file byte ceiling for a viewable candidate, by media kind.
+
+    Videos are streamed (never buffered whole) so they get the larger
+    ``_MAX_VIEWABLE_VIDEO_BYTES`` ceiling; images stay at the in-memory
+    ``_MAX_VIEWABLE_FILE_BYTES`` cap. Reads the module globals dynamically so a
+    test can monkeypatch either ceiling.
+    """
+    return _MAX_VIEWABLE_VIDEO_BYTES if kind == "video" else _MAX_VIEWABLE_FILE_BYTES
 # Transfer chunk for STREAMING a durable artifact bundle to disk. A results
 # bundle has no size bound (checkpoints, videos, logs), so it is never pulled
 # into the orchestrator's heap: peak memory during the viewable pass is bounded
@@ -2061,15 +2094,29 @@ class ViewableArtifactCandidate:
     ``filename`` is the sanitized object name derived from the file's path
     *relative* to the artifact root (path-traversal safe, subdir context folded
     to ``__`` so multi-arm same-named plots stay distinct),
-    ``content_type`` / ``kind`` come from the extension classifier, ``data`` is
-    the in-memory bytes (already size-capped), and ``size_bytes`` is ``len(data)``.
+    ``content_type`` / ``kind`` come from the extension classifier, and
+    ``size_bytes`` is the file's byte length.
+
+    Exactly one payload source is set:
+
+      * ``data`` — the file's bytes held in memory (images, and small videos
+        within ``_MAX_VIEWABLE_FILE_BYTES``). Uploaded via ``upload_from_string``.
+      * ``source_path`` — an on-disk path to STREAM (large videos over the
+        in-memory cap). Uploaded via ``upload_from_file`` so the bytes never
+        enter the orchestrator's heap. ``source_is_temp`` marks a temp file this
+        pipeline owns and must unlink after upload; ``artifact_root`` (when set)
+        is the local job's artifact root, so the upload path re-verifies symlink
+        containment and opens the original file ``O_NOFOLLOW`` (TOCTOU guard).
     """
 
     filename: str
     content_type: str
     kind: str
-    data: bytes
     size_bytes: int
+    data: bytes | None = None
+    source_path: str | None = None
+    source_is_temp: bool = False
+    artifact_root: str | None = None
 
 
 def _classify_viewable_member(
@@ -2080,31 +2127,70 @@ def _classify_viewable_member(
 
     The single classification rule shared by every viewable selection pass (the
     in-memory extractor and the streaming two-pass selector): viewable extension,
-    positive size within the per-file cap, and a traversal-safe sanitized
-    *relative* path (an absolute/``..`` member path sanitizes to ``None`` and is
-    skipped).
+    positive size within the per-kind cap (images ≤ ``_MAX_VIEWABLE_FILE_BYTES``,
+    videos ≤ ``_MAX_VIEWABLE_VIDEO_BYTES`` since they stream), and a traversal-safe
+    sanitized *relative* path (an absolute/``..`` member path sanitizes to
+    ``None`` and is skipped).
     """
     classified = storage.viewable_content_type_for_filename(name)
     if classified is None:
         return None
-    if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+    content_type, kind = classified
+    if size <= 0 or size > _viewable_size_cap_for_kind(kind):
         return None
     relname = storage.sanitize_viewable_relpath(name)
     if relname is None:
         return None
-    content_type, kind = classified
     return relname, content_type, kind
 
 
-def _read_capped_member(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes | None:
-    """Read ONE archive member's bytes, refusing anything over the per-file cap."""
+def _read_capped_member(
+    tar: tarfile.TarFile, member: tarfile.TarInfo, cap: int = _MAX_VIEWABLE_FILE_BYTES
+) -> bytes | None:
+    """Read ONE archive member's bytes, refusing anything over ``cap``."""
     extracted = tar.extractfile(member)
     if extracted is None:
         return None
-    data = extracted.read(_MAX_VIEWABLE_FILE_BYTES + 1)
-    if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
+    data = extracted.read(cap + 1)
+    if not data or len(data) > cap:
         return None
     return data
+
+
+def _extract_member_to_tempfile(
+    tar: tarfile.TarFile, member: tarfile.TarInfo
+) -> str | None:
+    """STREAM one archive member's bytes to a fresh temp file; return its path.
+
+    For large videos that must never be materialized in the orchestrator's heap:
+    the member is decompressed and copied in bounded chunks (``copyfileobj``), so
+    peak memory is the copy buffer, not the file size. Returns the temp-file path
+    (caller owns it and must unlink), or ``None`` on any error (temp file is
+    cleaned up before returning).
+    """
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        return None
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-vid-", suffix=".bin")
+    try:
+        with os.fdopen(handle, "wb") as dest:
+            shutil.copyfileobj(extracted, dest)
+        return tmp_path
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
+def _unlink_temp_sources(paths: list[str]) -> None:
+    """Best-effort unlink of pipeline-owned temp files; never raises."""
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
@@ -2141,26 +2227,41 @@ def _select_viewable_candidates_from_bundle_path(
          bytes are read, so an archive with thousands of images costs nothing but
          its member headers. Yields the full qualifying set, sorted by sanitized
          name, which is then capped at ``_MAX_VIEWABLE_FILE_COUNT``.
-      2. **Data pass** — read the bytes of ONLY the selected members.
+      2. **Data pass** — materialize ONLY the selected members: images (and
+         small videos) are read into memory under the in-memory cap; large
+         videos over that cap are STREAMED member-by-member to a temp file so
+         they never enter the heap.
 
     Capping BEFORE reading is what bounds peak memory: the selected set can never
-    exceed ``_MAX_VIEWABLE_FILE_COUNT * _MAX_VIEWABLE_FILE_BYTES``, and nothing
-    else about the bundle (its total size, its non-viewable payload, its count of
-    rejected images) is ever resident. Returns ``(selected, dropped)`` with the
-    same contract as the in-memory extractor's caller.
+    exceed ``_MAX_VIEWABLE_FILE_COUNT`` objects, no in-memory member exceeds
+    ``_MAX_VIEWABLE_FILE_BYTES``, and streamed videos add only the copy buffer —
+    nothing else about the bundle (its total size, its non-viewable payload, its
+    count of rejected images) is ever resident. Returns ``(selected, dropped)``
+    with the same contract as the in-memory extractor's caller.
 
     Defensive by contract: a non-gzip/non-tar file or ANY parse error yields
-    ``([], 0)``.
+    ``([], 0)``; any temp files created for streamed videos are unlinked on error.
     """
+    tmp_video_paths: list[str] = []
     try:
         refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
         seen: set[str] = set()
+        size_dropped = 0
         with tarfile.open(path, mode="r:gz") as tar:
             for member in tar:
                 if not member.isfile():
                     continue
                 classified = _classify_viewable_member(member.name, member.size)
                 if classified is None:
+                    # Count a viewable-extension member omitted SOLELY for the
+                    # per-file size cap so the omitted tally is accurate; a plain
+                    # non-viewable member is not counted.
+                    if (
+                        storage.viewable_content_type_for_filename(member.name)
+                        is not None
+                        and member.size > _MAX_VIEWABLE_FILE_BYTES
+                    ):
+                        size_dropped += 1
                     continue
                 relname, content_type, kind = classified
                 if relname in seen:
@@ -2170,7 +2271,7 @@ def _select_viewable_candidates_from_bundle_path(
 
         refs.sort(key=lambda ref: ref[0])
         selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
-        dropped = len(refs) - len(selected_refs)
+        dropped = (len(refs) - len(selected_refs)) + size_dropped
         if not selected_refs:
             return [], dropped
 
@@ -2183,20 +2284,46 @@ def _select_viewable_candidates_from_bundle_path(
                 relname, _member_name, content_type, kind = wanted[member.name]
                 if relname in out:
                     continue  # first occurrence wins (matches the metadata pass)
-                data = _read_capped_member(tar, member)
-                if data is None:
-                    continue
-                out[relname] = ViewableArtifactCandidate(
-                    filename=relname,
-                    content_type=content_type,
-                    kind=kind,
-                    data=data,
-                    size_bytes=len(data),
-                )
+                if kind == "video" and member.size > _MAX_VIEWABLE_FILE_BYTES:
+                    tmp_path = _extract_member_to_tempfile(tar, member)
+                    if tmp_path is None:
+                        continue
+                    tmp_video_paths.append(tmp_path)
+                    try:
+                        streamed_size = os.path.getsize(tmp_path)
+                    except OSError:
+                        continue
+                    out[relname] = ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        size_bytes=streamed_size,
+                        source_path=tmp_path,
+                        source_is_temp=True,
+                    )
+                else:
+                    data = _read_capped_member(
+                        tar, member, _viewable_size_cap_for_kind(kind)
+                    )
+                    if data is None:
+                        continue
+                    out[relname] = ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        size_bytes=len(data),
+                        data=data,
+                    )
                 if len(out) == len(selected_refs):
                     break
     except (tarfile.TarError, OSError, EOFError, ValueError):
+        _unlink_temp_sources(tmp_video_paths)
         return [], 0
+    # Unlink any temp video that did NOT become a surviving candidate (e.g. a
+    # post-extract stat failed) so it can't leak; the rest are unlinked by
+    # persist_viewable_artifacts after upload.
+    kept = {c.source_path for c in out.values() if c.source_path is not None}
+    _unlink_temp_sources([p for p in tmp_video_paths if p not in kept])
     return sorted(out.values(), key=lambda c: c.filename), dropped
 
 
@@ -2279,7 +2406,11 @@ def _extract_viewable_candidates_from_bundle(
                 relname, content_type, kind = classified
                 if relname in seen:
                     continue
-                data = _read_capped_member(tar, member)
+                # The whole bundle is already resident here, so materializing one
+                # member (image or video) under its per-kind cap adds no new peak.
+                data = _read_capped_member(
+                    tar, member, _viewable_size_cap_for_kind(kind)
+                )
                 if data is None:
                     continue
                 seen.add(relname)
@@ -2288,8 +2419,8 @@ def _extract_viewable_candidates_from_bundle(
                         filename=relname,
                         content_type=content_type,
                         kind=kind,
-                        data=data,
                         size_bytes=len(data),
+                        data=data,
                     )
                 )
     except (tarfile.TarError, OSError, EOFError, ValueError):
@@ -2325,7 +2456,7 @@ def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
 
 def _collect_viewable_candidates_from_dir(
     artifact_dir: str,
-) -> list[ViewableArtifactCandidate]:
+) -> tuple[list[ViewableArtifactCandidate], int]:
     """Select viewable files by walking a local job's on-disk artifact dir.
 
     The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
@@ -2334,8 +2465,11 @@ def _collect_viewable_candidates_from_dir(
     ``artifact_dir`` (via :func:`storage.sanitize_viewable_relpath`), NOT the
     bare basename, so same-named plots under different arm subdirectories
     (``arm1/reward.png`` vs ``arm2/reward.png``) stay distinct instead of
-    collapsing to one. Returns ``[]`` for a missing/empty/unreadable dir or on
-    ANY OS error — never raises.
+    collapsing to one. Returns ``(candidates, size_dropped)`` where
+    ``size_dropped`` is the count of viewable-extension files skipped SOLELY for
+    exceeding the per-file byte cap (``_MAX_VIEWABLE_FILE_BYTES``) — so the
+    caller can surface an accurate omitted tally. Returns ``([], 0)`` for a
+    missing/empty/unreadable dir or on ANY OS error — never raises.
 
     SECURITY — symlink exfiltration guard: the artifact dir was writable by the
     experiment command, and this scan runs on the HOST after the run — a
@@ -2353,9 +2487,10 @@ def _collect_viewable_candidates_from_dir(
         or not os.path.isdir(artifact_dir)
         or os.path.islink(artifact_dir)
     ):
-        return []
+        return [], 0
     artifact_root = os.path.realpath(artifact_dir)
     out: list[ViewableArtifactCandidate] = []
+    size_dropped = 0
     seen: set[str] = set()
     try:
         for root, dirs, files in os.walk(artifact_dir, followlinks=False):
@@ -2377,29 +2512,53 @@ def _collect_viewable_candidates_from_dir(
                 relname = storage.sanitize_viewable_relpath(relpath)
                 if relname is None or relname in seen:
                     continue
+                content_type, kind = classified
                 try:
                     size = os.path.getsize(path)
                 except OSError:
                     continue
-                if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+                if size <= 0:
+                    continue
+                if size > _viewable_size_cap_for_kind(kind):
+                    # Viewable file omitted SOLELY for the per-file size cap —
+                    # tally it (deduped by relname) so the count reaches the UI.
+                    seen.add(relname)
+                    size_dropped += 1
+                    continue
+                if kind == "video" and size > _MAX_VIEWABLE_FILE_BYTES:
+                    # Large video: STREAM the original file at upload time (never
+                    # buffer it here). The upload path re-verifies containment and
+                    # opens O_NOFOLLOW via ``artifact_root`` to keep the symlink
+                    # TOCTOU guard closed.
+                    seen.add(relname)
+                    out.append(
+                        ViewableArtifactCandidate(
+                            filename=relname,
+                            content_type=content_type,
+                            kind=kind,
+                            size_bytes=size,
+                            source_path=path,
+                            source_is_temp=False,
+                            artifact_root=artifact_root,
+                        )
+                    )
                     continue
                 data = _read_viewable_file_nofollow(path, artifact_root)
                 if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
                     continue
-                content_type, kind = classified
                 seen.add(relname)
                 out.append(
                     ViewableArtifactCandidate(
                         filename=relname,
                         content_type=content_type,
                         kind=kind,
-                        data=data,
                         size_bytes=len(data),
+                        data=data,
                     )
                 )
     except OSError:
-        return out
-    return out
+        return out, size_dropped
+    return out, size_dropped
 
 
 async def _collect_viewable_artifact_candidates(
@@ -2416,26 +2575,29 @@ async def _collect_viewable_artifact_candidates(
 
     Candidates are sorted by sanitized filename for deterministic selection when
     the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
-    ``dropped`` is the count of qualifying files exceeding ``_MAX_VIEWABLE_FILE_COUNT``.
+    ``dropped`` is the total count of viewable files omitted from the manifest —
+    both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
+    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap).
     """
     if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
         meta = job.polling_metadata or {}
         artifact_dir = str(meta.get("artifact_dir") or "").strip()
         if not artifact_dir:
             artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
-        all_candidates = await asyncio.to_thread(
+        all_candidates, size_dropped = await asyncio.to_thread(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
     elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
-        # Already sorted + count-capped on disk (cap applied BEFORE any member
-        # bytes are read), so it returns the final (selected, dropped) directly.
+        # Already sorted + capped on disk (count cap applied BEFORE any member
+        # bytes are read; size-cap omissions folded into the returned count), so
+        # it returns the final (selected, dropped) directly.
         return await _stream_viewable_candidates_from_bundle(job.id)
     else:
         return [], 0
     all_candidates.sort(key=lambda c: c.filename)
     selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
-    dropped = len(all_candidates) - len(selected)
-    return selected, dropped
+    count_dropped = len(all_candidates) - len(selected)
+    return selected, count_dropped + size_dropped
 
 
 async def persist_viewable_artifacts(
@@ -2471,12 +2633,7 @@ async def persist_viewable_artifacts(
     manifest: list[dict[str, Any]] = []
     for candidate in candidates:
         try:
-            uri = await storage.upload_compute_job_viewable_file(
-                job.id,
-                candidate.filename,
-                candidate.data,
-                candidate.content_type,
-            )
+            uri = await _upload_viewable_candidate(job, candidate)
         except Exception:
             logger.warning(
                 "Viewable-artifact upload raised for compute job %s file %r",
@@ -2485,6 +2642,11 @@ async def persist_viewable_artifacts(
                 exc_info=True,
             )
             uri = None
+        finally:
+            # A temp file this pipeline created for a streamed video is only ours
+            # to remove; a local job's original artifact file must stay in place.
+            if candidate.source_is_temp and candidate.source_path:
+                _unlink_temp_sources([candidate.source_path])
         if not uri:
             continue
         manifest.append(
@@ -2497,6 +2659,71 @@ async def persist_viewable_artifacts(
             }
         )
     return manifest, dropped
+
+
+def _open_viewable_source_nofollow(path: str, artifact_root: str | None):
+    """Open a streamed video candidate's source for upload; ``None`` on refusal.
+
+    For a temp file this pipeline owns (``artifact_root is None``) a plain open is
+    safe. For a local job's ORIGINAL artifact file, re-verify symlink containment
+    and open with ``O_NOFOLLOW`` so an entry swapped for a symlink between the
+    selection scan and the upload (TOCTOU) is refused by the kernel — the same
+    guard :func:`_read_viewable_file_nofollow` applies to in-memory reads.
+    """
+    if artifact_root is None:
+        try:
+            return open(path, "rb")
+        except OSError:
+            return None
+    if os.path.islink(path):
+        return None
+    if not _is_under_artifact_root(os.path.realpath(path), artifact_root):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        return os.fdopen(fd, "rb")
+    except OSError:
+        return None
+
+
+async def _upload_viewable_candidate(
+    job: ComputeJob, candidate: ViewableArtifactCandidate
+) -> str | None:
+    """Upload one candidate, choosing the in-memory or streaming storage seam.
+
+    Images (and small videos) carry their bytes in ``data`` and go through the
+    in-memory ``upload_compute_job_viewable_file``. Large videos carry a
+    ``source_path`` and are STREAMED via ``upload_compute_job_viewable_stream``,
+    so their bytes never enter the orchestrator's heap. Returns the durable URI
+    or ``None`` (never raises for a missing/unreadable source).
+    """
+    if candidate.source_path is not None:
+        fileobj = await asyncio.to_thread(
+            _open_viewable_source_nofollow,
+            candidate.source_path,
+            candidate.artifact_root,
+        )
+        if fileobj is None:
+            return None
+        try:
+            return await storage.upload_compute_job_viewable_stream(
+                job.id,
+                candidate.filename,
+                fileobj,
+                candidate.content_type,
+                size=candidate.size_bytes,
+            )
+        finally:
+            try:
+                fileobj.close()
+            except OSError:
+                pass
+    return await storage.upload_compute_job_viewable_file(
+        job.id,
+        candidate.filename,
+        candidate.data,
+        candidate.content_type,
+    )
 
 
 def _count_files_in_tree(path: str) -> int:

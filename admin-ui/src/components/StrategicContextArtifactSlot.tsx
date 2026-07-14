@@ -1,5 +1,5 @@
-import { useState, useEffect, type ReactNode } from 'react';
-import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Network, Table2 } from 'lucide-react';
+import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Maximize2, Network, RefreshCw, Table2, X } from 'lucide-react';
 import type {
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
@@ -28,6 +28,7 @@ function formatCompactNumber(value: number | string | null | undefined): string 
 function descriptorLabel(kind: string): string {
   if (kind === 'context_map') return 'context map';
   if (kind === 'metric_cards') return 'metrics';
+  if (kind === 'pdf') return 'pdf';
   if (kind === 'task_detail') return 'task';
   if (kind === 'direction_detail') return 'direction';
   if (kind === 'message_detail') return 'message';
@@ -69,6 +70,7 @@ function descriptorIcon(kind: string): ReactNode {
   if (kind === 'table') return <Table2 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'image') return <FileImage className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'video') return <FileVideo className="h-3.5 w-3.5" aria-hidden="true" />;
+  if (kind === 'pdf') return <FileText className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'chart' || kind === 'plot') return <BarChart3 className="h-3.5 w-3.5" aria-hidden="true" />;
   if (kind === 'unsupported') return <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />;
   return <FileText className="h-3.5 w-3.5" aria-hidden="true" />;
@@ -84,35 +86,177 @@ function safeImageUrl(value?: string | null): string | null {
   }
 }
 
+type MediaStatus = 'loading' | 'ready' | 'error';
+
+interface FreshMedia {
+  /** Best usable URL — the freshly minted signed URL when available, else the baked one. */
+  url: string | null;
+  status: MediaStatus;
+  /** Re-mint the signed URL (or, for baked-only media, re-attempt the current URL). */
+  retry: () => void;
+  /** Call from the media element's `onError` when the loaded URL turns out to be dead. */
+  onMediaError: () => void;
+}
+
 /**
- * Resolve the freshest usable media URL. When `projectId` and `storageUri` are
- * present, mint a fresh signed URL from the stable `gs://` ref on mount (and
- * whenever they change) so the preview survives baked-URL expiry on a long-idle
- * canvas. Until that resolves — or if resolution fails, or when no ref exists —
- * fall back to the baked URL. Returns null when nothing is renderable.
+ * Resolve the freshest usable media URL and expose a small state machine so the
+ * canvas can render a loading skeleton, an error+retry affordance, and a live
+ * preview — instead of a bare (possibly broken) `<img>`.
+ *
+ * When `projectId` and `storageUri` are present, mint a fresh signed URL from
+ * the stable `gs://` ref on mount (and whenever they change, or on `retry()`)
+ * so the preview survives baked-URL expiry on a long-idle canvas. Until that
+ * resolves — or if resolution fails, or when no ref exists — fall back to the
+ * baked URL. `onMediaError()` flips to the error state when even the resolved
+ * URL is dead (e.g. an expired signed link), and `retry()` re-mints it.
  */
 function useFreshMediaUrl(
   projectId: string | null | undefined,
   storageUri: string | null | undefined,
   bakedUrl: string | null | undefined,
-): string | null {
+): FreshMedia {
   // Key the resolved URL by the ref it was minted for, so a stale resolution
   // from a previous storage_uri is ignored once the ref changes (rather than
   // resetting state synchronously inside the effect, which cascades renders).
   const [resolved, setResolved] = useState<{ uri: string; url: string } | null>(null);
+  // Records the terminal result of the sign attempt, keyed by the attempt it
+  // belongs to. Derived (rather than a synchronous `resolving` flag set inside
+  // the effect) so the effect only mutates state from its async callbacks.
+  const [outcome, setOutcome] = useState<{ attempt: number; failed: boolean } | null>(null);
+  // Set when the rendered media element itself fails to load its URL.
+  const [loadError, setLoadError] = useState(false);
+  // Bumped by retry() to force the resolver effect to re-run for the same ref.
+  const [attempt, setAttempt] = useState(0);
+
+  const canResolve = Boolean(projectId && storageUri);
 
   useEffect(() => {
     if (!projectId || !storageUri) return;
     const controller = new AbortController();
     let cancelled = false;
+    const thisAttempt = attempt;
     resolveArtifactDownloadUrl(projectId, storageUri, controller.signal)
-      .then(url => { if (!cancelled) setResolved({ uri: storageUri, url }); })
-      .catch(() => { /* keep the baked-URL fallback below */ });
+      .then(url => {
+        if (cancelled) return;
+        setResolved({ uri: storageUri, url });
+        // A fresh URL supersedes any prior element-load failure.
+        setLoadError(false);
+        setOutcome({ attempt: thisAttempt, failed: false });
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        if (e instanceof Error && e.name === 'AbortError') return;
+        setOutcome({ attempt: thisAttempt, failed: true });
+      });
     return () => { cancelled = true; controller.abort(); };
-  }, [projectId, storageUri]);
+  }, [projectId, storageUri, attempt]);
 
   const fresh = resolved && storageUri && resolved.uri === storageUri ? resolved.url : null;
-  return safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
+  const url = safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
+
+  // The current sign attempt is still in flight until an outcome is recorded
+  // for it; a bumped `attempt` (from retry) resets this to "resolving".
+  const resolving = canResolve && outcome?.attempt !== attempt;
+
+  let status: MediaStatus;
+  if (loadError) {
+    status = 'error';
+  } else if (url) {
+    status = 'ready';
+  } else if (resolving) {
+    // Still signing — show a skeleton rather than an empty box.
+    status = 'loading';
+  } else {
+    // No usable URL and nothing left to try (no ref, or the sign attempt failed).
+    status = 'error';
+  }
+
+  const retry = useCallback(() => {
+    setLoadError(false);
+    if (canResolve) {
+      setAttempt(a => a + 1);
+    }
+  }, [canResolve]);
+
+  const onMediaError = useCallback(() => { setLoadError(true); }, []);
+
+  return { url, status, retry, onMediaError };
+}
+
+/** Full-screen overlay for viewing a single image at full size. Esc / backdrop close. */
+function MediaLightbox({ url, alt, onClose }: { url: string; alt: string; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${alt} — full size`}
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/85 p-4"
+      data-testid="strategic-artifact-lightbox"
+    >
+      <img
+        src={url}
+        alt={alt}
+        onClick={e => e.stopPropagation()}
+        className="max-h-[82vh] max-w-full rounded object-contain"
+      />
+      <div
+        className="flex max-w-full items-center gap-3"
+        onClick={e => e.stopPropagation()}
+      >
+        <span className="min-w-0 truncate text-xs text-neutral-300" title={alt}>{alt}</span>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex min-h-11 shrink-0 items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 text-xs font-semibold text-sky-300 transition-colors hover:border-sky-500/50 hover:text-sky-200"
+          data-testid="strategic-artifact-lightbox-newtab"
+        >
+          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+          Open in new tab
+        </a>
+        <button
+          type="button"
+          onClick={onClose}
+          className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-700 bg-neutral-900 text-neutral-300 transition-colors hover:border-neutral-500 hover:text-neutral-100"
+          aria-label="Close full-size preview"
+          data-testid="strategic-artifact-lightbox-close"
+        >
+          <X className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MediaSkeleton({ className }: { className: string }) {
+  return (
+    <div
+      className={`${className} animate-pulse rounded bg-neutral-800/70`}
+      data-testid="strategic-artifact-loading"
+      aria-hidden="true"
+    />
+  );
+}
+
+function MediaRetry({ label, onRetry }: { label: string; onRetry: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onRetry}
+      className="flex min-h-11 w-full items-center justify-center gap-1.5 px-2 py-2 text-xs text-neutral-400 transition-colors hover:text-neutral-100"
+      data-testid="strategic-artifact-retry"
+    >
+      <RefreshCw className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      {label} — retry
+    </button>
+  );
 }
 
 function ResolvedImage({
@@ -121,16 +265,36 @@ function ResolvedImage({
   bakedUrl,
   alt,
   className,
+  onExpand,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
   bakedUrl?: string | null;
   alt: string;
   className: string;
+  onExpand: (url: string, alt: string) => void;
 }) {
-  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
-  if (!url) return null;
-  return <img src={url} alt={alt} className={className} />;
+  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (status === 'loading') return <MediaSkeleton className={className} />;
+  if (status === 'error' || !url) return <MediaRetry label="Image preview unavailable" onRetry={retry} />;
+  return (
+    <button
+      type="button"
+      onClick={() => onExpand(url, alt)}
+      title={`Open ${alt} full size`}
+      aria-label={`Open ${alt} full size`}
+      className="group relative block cursor-zoom-in overflow-hidden rounded"
+      data-testid="strategic-artifact-image"
+      // The hit area is the rendered image itself (content-sized), so it is
+      // exempt from the 44px minimum-touch-target viewport assertion.
+      data-viewport-allow-small-target=""
+    >
+      <img src={url} alt={alt} loading="lazy" onError={onMediaError} className={className} />
+      <span className="pointer-events-none absolute right-1 top-1 rounded bg-black/60 p-1 text-neutral-200 opacity-0 transition-opacity group-hover:opacity-100">
+        <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
+      </span>
+    </button>
+  );
 }
 
 function ResolvedVideo({
@@ -146,13 +310,158 @@ function ResolvedVideo({
   ariaLabel: string;
   className: string;
 }) {
-  const url = useFreshMediaUrl(projectId, storageUri, bakedUrl);
-  if (!url) return null;
+  const { url, status, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (status === 'loading') return <MediaSkeleton className={className} />;
+  if (status === 'error' || !url) return <MediaRetry label="Video preview unavailable" onRetry={retry} />;
+  // Bind the URL directly to <video src> (not a nested <source>) so `onError`
+  // fires reliably when the signed URL is dead — matching ComputeJobsPanel.
   return (
-    <video controls className={className} aria-label={ariaLabel}>
-      <source src={url} />
+    <video controls preload="metadata" src={url} onError={onMediaError} className={className} aria-label={ariaLabel} data-testid="strategic-artifact-video">
       Your browser does not support the video element.
     </video>
+  );
+}
+
+function ResolvedPdf({
+  projectId,
+  storageUri,
+  bakedUrl,
+  label,
+  className,
+}: {
+  projectId?: string | null;
+  storageUri?: string | null;
+  bakedUrl?: string | null;
+  label: string;
+  className: string;
+}) {
+  // PDFs are never embedded inline on the app origin. Resolve a fresh signed URL
+  // (re-minted from storage_uri, falling back to the baked url) and open it in a
+  // new tab so the browser renders it in its own sandboxed viewer on the storage
+  // origin.
+  const { url, status, retry } = useFreshMediaUrl(projectId, storageUri, bakedUrl);
+  if (status === 'loading') return <MediaSkeleton className={className} />;
+  if (status === 'error' || !url) return <MediaRetry label="PDF preview unavailable" onRetry={retry} />;
+  return (
+    <button
+      type="button"
+      onClick={() => window.open(url, '_blank', 'noopener,noreferrer')}
+      title={`Open ${label} in a new tab`}
+      className={className}
+      data-testid="strategic-context-pdf-open"
+    >
+      <FileText className="h-4 w-4 shrink-0 text-sky-400" aria-hidden="true" />
+      <span className="min-w-0 break-words">{label}</span>
+      <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-500" aria-hidden="true" />
+    </button>
+  );
+}
+
+type MediaItem = { url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null };
+
+function ImageDescriptorBlock({
+  descriptor,
+  projectId,
+}: {
+  descriptor: StrategicContextRenderableDescriptor;
+  projectId?: string | null;
+}) {
+  const [lightbox, setLightbox] = useState<{ url: string; alt: string } | null>(null);
+  const onExpand = useCallback((url: string, alt: string) => setLightbox({ url, alt }), []);
+  const closeLightbox = useCallback(() => setLightbox(null), []);
+
+  // A preview is renderable if it has EITHER a baked URL or a stable
+  // storage_uri we can re-resolve — do not filter on url alone, or an
+  // expired baked URL would drop a still-resolvable image.
+  const listed = (descriptor.images ?? []).filter(img => img.url || img.storage_uri);
+  const fallback = descriptor.image;
+  const items: MediaItem[] =
+    listed.length > 0
+      ? listed
+      : fallback && (fallback.url || fallback.storage_uri)
+        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+        : [];
+
+  return (
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+      {items.length > 1 ? (
+        <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+          {items.map((img, i) => (
+            <ResolvedImage
+              key={img.storage_uri || img.url || i}
+              projectId={projectId}
+              storageUri={img.storage_uri}
+              bakedUrl={img.url}
+              alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
+              className="h-40 w-auto flex-shrink-0 object-contain"
+              onExpand={onExpand}
+            />
+          ))}
+        </div>
+      ) : items.length === 1 ? (
+        <ResolvedImage
+          projectId={projectId}
+          storageUri={items[0].storage_uri}
+          bakedUrl={items[0].url}
+          alt={descriptor.image?.alt || items[0].alt || descriptor.title}
+          className="max-h-80 w-full object-contain"
+          onExpand={onExpand}
+        />
+      ) : (
+        <div className="px-2 py-2 text-xs text-neutral-500">
+          Image preview unavailable. Open the artifact for the source.
+        </div>
+      )}
+      {lightbox && <MediaLightbox url={lightbox.url} alt={lightbox.alt} onClose={closeLightbox} />}
+    </div>
+  );
+}
+
+function VideoDescriptorBlock({
+  descriptor,
+  projectId,
+}: {
+  descriptor: StrategicContextRenderableDescriptor;
+  projectId?: string | null;
+}) {
+  const listed = (descriptor.videos ?? []).filter(v => v.url || v.storage_uri);
+  const fallback = descriptor.video;
+  const items: MediaItem[] =
+    listed.length > 0
+      ? listed
+      : fallback && (fallback.url || fallback.storage_uri)
+        ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
+        : [];
+
+  return (
+    <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
+      {items.length > 1 ? (
+        <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
+          {items.map((v, i) => (
+            <ResolvedVideo
+              key={v.storage_uri || v.url || i}
+              projectId={projectId}
+              storageUri={v.storage_uri}
+              bakedUrl={v.url}
+              ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
+              className="h-40 w-auto flex-shrink-0"
+            />
+          ))}
+        </div>
+      ) : items.length === 1 ? (
+        <ResolvedVideo
+          projectId={projectId}
+          storageUri={items[0].storage_uri}
+          bakedUrl={items[0].url}
+          ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
+          className="max-h-80 w-full"
+        />
+      ) : (
+        <div className="px-2 py-2 text-xs text-neutral-500">
+          Video preview unavailable. Open the artifact for the source.
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -303,53 +612,16 @@ function DescriptorCard({
         )
       )}
 
-      {descriptor.kind === 'image' && (() => {
-        // A preview is renderable if it has EITHER a baked URL or a stable
-        // storage_uri we can re-resolve — do not filter on url alone, or an
-        // expired baked URL would drop a still-resolvable image.
-        const listed = (descriptor.images ?? []).filter(img => img.url || img.storage_uri);
-        const fallback = descriptor.image;
-        const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
-          listed.length > 0
-            ? listed
-            : fallback && (fallback.url || fallback.storage_uri)
-              ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
-              : [];
-        return (
-          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-            {items.length > 1 ? (
-              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
-                {items.map((img, i) => (
-                  <ResolvedImage
-                    key={img.storage_uri || img.url || i}
-                    projectId={projectId}
-                    storageUri={img.storage_uri}
-                    bakedUrl={img.url}
-                    alt={img.alt || img.filename || `${descriptor.title} ${i + 1}`}
-                    className="h-36 w-auto flex-shrink-0 object-contain"
-                  />
-                ))}
-              </div>
-            ) : items.length === 1 ? (
-              <ResolvedImage
-                projectId={projectId}
-                storageUri={items[0].storage_uri}
-                bakedUrl={items[0].url}
-                alt={descriptor.image?.alt || items[0].alt || descriptor.title}
-                className="max-h-48 w-full object-contain"
-              />
-            ) : (
-              <div className="px-2 py-2 text-xs text-neutral-500">
-                Image preview unavailable. Open the artifact for the source.
-              </div>
-            )}
-          </div>
-        );
-      })()}
+      {descriptor.kind === 'image' && <ImageDescriptorBlock descriptor={descriptor} projectId={projectId} />}
 
-      {descriptor.kind === 'video' && (() => {
-        const listed = (descriptor.videos ?? []).filter(v => v.url || v.storage_uri);
-        const fallback = descriptor.video;
+      {descriptor.kind === 'video' && <VideoDescriptorBlock descriptor={descriptor} projectId={projectId} />}
+
+      {descriptor.kind === 'pdf' && (() => {
+        // A pdf tile is renderable from EITHER a baked url or a re-resolvable
+        // storage_uri — never filter on url alone, or an expired baked url would
+        // drop a still-resolvable document.
+        const listed = (descriptor.pdfs ?? []).filter(d => d.url || d.storage_uri);
+        const fallback = descriptor.pdf;
         const items: Array<{ url?: string | null; alt?: string | null; filename?: string | null; storage_uri?: string | null }> =
           listed.length > 0
             ? listed
@@ -357,31 +629,23 @@ function DescriptorCard({
               ? [{ url: fallback.url, alt: fallback.alt, filename: null, storage_uri: fallback.storage_uri }]
               : [];
         return (
-          <div className="mt-2 overflow-hidden rounded border border-neutral-800 bg-neutral-950/45">
-            {items.length > 1 ? (
-              <div className="flex gap-1 overflow-x-auto p-1 custom-scrollbar">
-                {items.map((v, i) => (
-                  <ResolvedVideo
-                    key={v.storage_uri || v.url || i}
+          <div className="mt-2 rounded border border-neutral-800 bg-neutral-950/45 p-1">
+            {items.length > 0 ? (
+              <div className="flex flex-col gap-1">
+                {items.map((doc, i) => (
+                  <ResolvedPdf
+                    key={doc.storage_uri || doc.url || i}
                     projectId={projectId}
-                    storageUri={v.storage_uri}
-                    bakedUrl={v.url}
-                    ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
-                    className="h-36 w-auto flex-shrink-0"
+                    storageUri={doc.storage_uri}
+                    bakedUrl={doc.url}
+                    label={doc.alt || doc.filename || (items.length > 1 ? `${descriptor.title} ${i + 1}` : descriptor.title)}
+                    className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-neutral-900"
                   />
                 ))}
               </div>
-            ) : items.length === 1 ? (
-              <ResolvedVideo
-                projectId={projectId}
-                storageUri={items[0].storage_uri}
-                bakedUrl={items[0].url}
-                ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
-                className="max-h-48 w-full"
-              />
             ) : (
               <div className="px-2 py-2 text-xs text-neutral-500">
-                Video preview unavailable. Open the artifact for the source.
+                PDF unavailable. Open the artifact for the source.
               </div>
             )}
           </div>

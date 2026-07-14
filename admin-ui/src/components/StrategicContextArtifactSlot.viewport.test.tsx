@@ -145,6 +145,57 @@ describe('StrategicContextArtifactSlot — viewport regression', () => {
     );
   });
 
+  test('renders image + video media previews at 1280px without overflow (full-size affordance present)', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art-image',
+          kind: 'image',
+          title: 'Reward-over-time plot for the long-running rollout experiment',
+          summary: 'Reward over training steps for every arm in the sweep.',
+          status: 'ready',
+          image: { url: 'https://storage.example.com/plot.png?sig=baked', alt: 'Reward over time' },
+          images: [
+            { url: 'https://storage.example.com/a.png?sig=baked', alt: 'plot-a.png', filename: 'plot-a.png' },
+            { url: 'https://storage.example.com/b.png?sig=baked', alt: 'plot-b.png', filename: 'plot-b.png' },
+          ],
+        },
+        {
+          schema_version: 1,
+          id: 'art-video',
+          kind: 'video',
+          title: 'Rollout episode recording',
+          summary: 'Captured from the compute job bundle.',
+          status: 'ready',
+          video: { url: 'https://storage.example.com/rollout.mp4?sig=baked', alt: 'Rollout' },
+          videos: [
+            { url: 'https://storage.example.com/rollout.mp4?sig=baked', alt: 'rollout.mp4', filename: 'rollout.mp4' },
+          ],
+        },
+      ],
+    });
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '16px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<StrategicContextArtifactSlot contextPackage={pkg} />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
+        // The image is now a click-to-expand full-size control.
+        const thumbs = host.querySelectorAll('[data-testid="strategic-artifact-image"]');
+        expect(thumbs.length).toBeGreaterThanOrEqual(2);
+        expect(host.querySelectorAll('video').length).toBeGreaterThanOrEqual(1);
+      },
+      { waitMs: 40 },
+    );
+  });
+
   test('renders image descriptor without URL (stub) at 900px', async () => {
     const pkg = makePackage({
       descriptors: [

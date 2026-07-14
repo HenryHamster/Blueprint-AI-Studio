@@ -604,6 +604,60 @@ def test_artifact_descriptor_video_no_preview():
     assert "unsupported_reason" in desc
 
 
+def test_artifact_renderable_kind_pdf():
+    """Artifact with pdf tokens yields kind='pdf' (matplotlib savefig('*.pdf'))."""
+    assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "figure.pdf"}) == "pdf"
+    assert _artifact_renderable_kind({"kind": "report.pdf", "label": "run"}) == "pdf"
+    assert _artifact_renderable_kind({"label": "pdf export"}) == "pdf"
+
+
+def test_artifact_descriptor_pdf_with_preview_url():
+    """PDF artifact with a viewable_preview renders kind='pdf' with a resolvable
+    url/storage_uri and drops unsupported_reason."""
+    item = {
+        "id": "art-pdf-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "report.pdf",
+        "label": "Report",
+        "task_title": "Plotting run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/report.pdf?sig=xyz",
+                "kind": "pdf",
+                "filename": "report.pdf",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "pdf"
+    assert desc["pdf"]["url"] == "https://signed.example.com/report.pdf?sig=xyz"
+    assert desc["pdf"]["storage_uri"] == (
+        "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf"
+    )
+    assert desc["pdfs"][0]["filename"] == "report.pdf"
+    assert "unsupported_reason" not in desc
+
+
+def test_artifact_descriptor_pdf_no_preview():
+    """PDF-looking artifact without a signable preview renders the fail-soft stub."""
+    item = {
+        "id": "art-pdf-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "report.pdf",
+        "label": "Report",
+        "task_title": "Plotting run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "pdf"
+    assert desc["pdf"]["url"] is None
+    assert "unsupported_reason" in desc
+
+
 def test_artifact_descriptor_multi_image_populates_images_list():
     """Image artifact with multiple viewable_previews populates both image (first) and images (all)."""
     item = {

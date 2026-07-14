@@ -304,9 +304,11 @@ _VIEWABLE_ARTIFACT_SUBDIR = "viewable"
 
 # Viewable file extension (lowercase, no dot) -> (content_type, kind). Only these
 # extensions are ever persisted as individual objects; everything else stays
-# inside the opaque bundle. Deliberately conservative: raster images and the two
-# browser-native video containers. NO svg — an SVG served from a signed URL can
-# execute script in the viewer's browsing context.
+# inside the opaque bundle. Deliberately conservative: raster images, the two
+# browser-native video containers, and pdf. NO svg — an SVG served from a signed
+# URL can execute script in the viewer's browsing context. PDF is safe because it
+# is opened as a top-level new-tab navigation and renders in the browser's
+# sandboxed PDF viewer on the storage origin, not the app origin.
 _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
@@ -315,6 +317,7 @@ _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "gif": ("image/gif", "image"),
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
+    "pdf": ("application/pdf", "pdf"),
 }
 
 # Any char outside the safe object-name subset (mirrors the object class in
@@ -331,9 +334,9 @@ _VIEWABLE_RELPATH_JOINER = "__"
 def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
     """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
 
-    ``kind`` is ``"image"`` or ``"video"``. Classification is by the lowercased
-    extension only; a filename with no recognised viewable extension yields
-    ``None`` so the caller skips it (it stays inside the opaque bundle).
+    ``kind`` is ``"image"``, ``"video"``, or ``"pdf"``. Classification is by the
+    lowercased extension only; a filename with no recognised viewable extension
+    yields ``None`` so the caller skips it (it stays inside the opaque bundle).
     """
     if not isinstance(filename, str) or "." not in filename:
         return None
@@ -443,6 +446,59 @@ async def upload_compute_job_viewable_file(
     except Exception:
         logger.warning(
             "Failed to upload viewable artifact %r for compute job %s",
+            basename,
+            job_id,
+            exc_info=True,
+        )
+        return None
+    return compute_job_viewable_uri(job_id, basename)
+
+
+# Chunk size for STREAMING a large viewable file (video) to GCS via a resumable
+# upload. Must be a multiple of 256 KiB per the GCS resumable-upload contract.
+# Bounds the orchestrator's peak memory during a large-video upload to this
+# window rather than the file's full size.
+_VIEWABLE_STREAM_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+
+async def upload_compute_job_viewable_stream(
+    job_id,
+    basename: str,
+    fileobj,
+    content_type: str,
+    *,
+    size: int | None = None,
+) -> str | None:
+    """Best-effort STREAMING upload of one viewable file from an open binary
+    file object, for large videos that must never be buffered whole in memory.
+
+    The memory-safe counterpart of :func:`upload_compute_job_viewable_file`
+    (which takes the file's bytes in memory — fine for an 8 MiB image, an OOM
+    risk for a multi-hundred-MiB rollout video). ``blob.upload_from_file``
+    reads ``fileobj`` through in a resumable upload bounded by
+    ``blob.chunk_size``, so the orchestrator's peak memory is bounded by that
+    chunk, not by the file. ``fileobj`` is read from its current position;
+    ``size`` (when known) lets the client skip a seek/stat. Returns the durable
+    ``gs://`` URI on success, or ``None`` on ANY error — NEVER raises, so
+    viewable-artifact persistence can never block a job's terminal completion.
+    The caller owns ``fileobj`` and is responsible for closing it.
+    """
+    if not basename or fileobj is None:
+        return None
+    object_name = compute_job_viewable_object_name(job_id, basename)
+
+    def _upload() -> None:
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        blob.chunk_size = _VIEWABLE_STREAM_CHUNK_BYTES
+        blob.upload_from_file(fileobj, content_type=content_type, size=size)
+
+    try:
+        await asyncio.to_thread(_upload)
+    except Exception:
+        logger.warning(
+            "Failed to stream viewable artifact %r for compute job %s",
             basename,
             job_id,
             exc_info=True,
@@ -740,13 +796,17 @@ async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
 
 
 # Mapping of file extensions (lowercase, with leading dot) to MIME types for
-# viewable compute-job artifacts extracted from the durable bundle.
+# viewable compute-job artifacts extracted from the durable bundle. Raster
+# images, the two browser-native video containers, and pdf.
 #
 # Deliberately NO ``.svg``: an SVG served from a signed URL / the viewable
 # canvas can execute script in the viewer's browsing context, so SVG is
 # excluded fail-closed. This MUST stay in agreement with
 # ``_VIEWABLE_CONTENT_TYPES`` above — both surfaces exclude SVG so no path
 # ever renders untrusted SVG executably (see :func:`svg_is_viewable`).
+# ``.pdf`` IS included: it renders in the browser's sandboxed PDF viewer as a
+# top-level new-tab navigation on the storage origin, carrying no same-origin
+# script-execution risk.
 VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -755,6 +815,7 @@ VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
     ".gif": "image/gif",
     ".mp4": "video/mp4",
     ".webm": "video/webm",
+    ".pdf": "application/pdf",
 }
 
 
@@ -774,11 +835,13 @@ def svg_is_viewable() -> bool:
 
 
 def _media_kind_for_mime(mime_type: str) -> str:
-    """Map a MIME type to ``"image"`` or ``"video"`` for the media_kind column."""
+    """Map a MIME type to ``"image"``, ``"video"``, or ``"pdf"`` for the media_kind column."""
     if mime_type.startswith("image/"):
         return "image"
     if mime_type.startswith("video/"):
         return "video"
+    if mime_type == "application/pdf":
+        return "pdf"
     # Unknown types should never enter this path because we only extract
     # files whose extension is in VIEWABLE_COMPUTE_JOB_EXTENSIONS.
     return "unknown"

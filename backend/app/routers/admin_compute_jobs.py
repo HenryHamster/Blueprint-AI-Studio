@@ -157,7 +157,7 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
                 "size_bytes": int(size_bytes)
                 if isinstance(size_bytes, int) and not isinstance(size_bytes, bool)
                 else None,
-                "kind": kind if kind in ("image", "video") else None,
+                "kind": kind if kind in ("image", "video", "pdf") else None,
             }
         )
     return out
@@ -353,6 +353,13 @@ async def _build_compute_job_payload(
         # image/video references alongside the opaque bundle `artifact`.
         data["viewable_artifacts"] = _viewable_artifacts_descriptor(
             pm.get("viewable_files")
+        )
+        # Additive, backward-compatible job-level aggregate: how many viewable
+        # files were omitted from the manifest for exceeding the count cap (25)
+        # or the per-file size cap (8 MiB). Stamped only when > 0; defaults to 0
+        # for legacy/absent rows so existing clients keep working.
+        data["viewable_artifacts_dropped_count"] = int(
+            pm.get("viewable_files_dropped") or 0
         )
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None

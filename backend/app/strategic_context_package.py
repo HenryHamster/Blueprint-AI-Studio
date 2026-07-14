@@ -1249,6 +1249,8 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         for token in ["video", ".mp4", ".webm", ".mov"]
     ):
         return "video"
+    if any(token in fingerprint for token in ["pdf", ".pdf"]):
+        return "pdf"
     if any(token in fingerprint for token in ["chart", "plot", "graph"]):
         return "chart"
     if any(
@@ -1279,10 +1281,13 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     ]
     image_url = next((p.get("url") for p in previews if p.get("kind") == "image"), None)
     video_url = next((p.get("url") for p in previews if p.get("kind") == "video"), None)
+    pdf_url = next((p.get("url") for p in previews if p.get("kind") == "pdf"), None)
     if image_url:
         kind = "image"
     elif video_url:
         kind = "video"
+    elif pdf_url:
+        kind = "pdf"
     else:
         kind = _artifact_renderable_kind(artifact)
     title = (
@@ -1360,6 +1365,29 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             descriptor[
                 "unsupported_reason"
             ] = "Video artifact previews require a signed preview URL."
+    elif kind == "pdf":
+        # OUR filtered ``previews`` (signed-URL-only) + a parallel gallery list
+        # for multiple pdfs. A PDF is opened as a top-level new-tab navigation
+        # (never an inline app-origin iframe), so it renders in the browser's
+        # sandboxed PDF viewer on the storage origin. url/alt/filename only,
+        # never a raw storage_uri in the gallery entries.
+        pdf_previews = [p for p in previews if p.get("kind") == "pdf"] or previews
+        url = pdf_url or (pdf_previews[0].get("url") if pdf_previews else None)
+        primary_storage_uri = pdf_previews[0].get("storage_uri") if pdf_previews else None
+        descriptor["pdf"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
+        descriptor["pdfs"] = [
+            {
+                "url": p.get("url"),
+                "alt": p.get("filename") or title,
+                "filename": p.get("filename"),
+                "storage_uri": p.get("storage_uri"),
+            }
+            for p in pdf_previews
+        ]
+        if not url and not primary_storage_uri:
+            descriptor[
+                "unsupported_reason"
+            ] = "PDF artifact previews require a signed preview URL."
     elif kind == "chart":
         descriptor["chart"] = {
             "kind": "bar",

@@ -142,6 +142,7 @@ export interface StrategicContextRenderableDescriptor {
     | 'text'
     | 'image'
     | 'video'
+    | 'pdf'
     | 'chart'
     | 'plot'
     | 'task_detail'
@@ -183,6 +184,21 @@ export interface StrategicContextRenderableDescriptor {
     storage_uri?: string | null;
   }> | null;
   videos?: Array<{
+    url?: string | null;
+    alt?: string | null;
+    filename?: string | null;
+    storage_uri?: string | null;
+  }> | null;
+  // PDFs are never rendered inline on the app origin — the descriptor carries a
+  // storage_uri (and/or a baked signed url) that the frontend resolves fresh and
+  // opens in a new browser tab (the PDF renders in the browser's sandboxed viewer
+  // on the storage origin). Mirrors the image/video singular+list shape.
+  pdf?: {
+    url?: string | null;
+    alt?: string | null;
+    storage_uri?: string | null;
+  } | null;
+  pdfs?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;

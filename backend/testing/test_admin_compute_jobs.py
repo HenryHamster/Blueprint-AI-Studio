@@ -120,6 +120,31 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     # the descriptor explicitly as null so operators can tell the two apart.
     assert jobs[0]["artifact"] is None
     assert "command" not in jobs[0]["polling_metadata"]
+    # No viewable_files_dropped stamped -> aggregate defaults cleanly to 0.
+    assert jobs[0]["viewable_artifacts_dropped_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_exposes_viewable_dropped_count(
+    client: AsyncClient, db_session
+):
+    """A job whose polling_metadata records omitted viewable files exposes the
+    additive job-level ``viewable_artifacts_dropped_count`` aggregate."""
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project)
+    job.polling_metadata = {
+        "zone": "us-central1-a",
+        "viewable_files_dropped": 4,
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["viewable_artifacts_dropped_count"] == 4
 
 
 @pytest.mark.asyncio
@@ -2945,3 +2970,41 @@ async def test_list_compute_jobs_task_id_bypasses_time_window(
     assert scoped_ids == [str(old_job.id)], f"expected stale job, got {scoped_ids}"
     # Per-task summary counts the returned jobs (aggregate is not meaningful here).
     assert scoped_body["summary"]["total_jobs"] == 1
+
+
+def test_viewable_artifacts_descriptor_preserves_pdf_kind():
+    """The operator-facing manifest normalizer preserves the pdf kind alongside
+    image/video, and still coerces an unknown/unsafe kind (e.g. svg) to None."""
+    from app.routers.admin_compute_jobs import _viewable_artifacts_descriptor
+
+    out = _viewable_artifacts_descriptor(
+        [
+            {
+                "filename": "report.pdf",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 2048,
+                "kind": "pdf",
+            },
+            {
+                "filename": "plot.png",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/plot.png",
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            },
+            {
+                "filename": "diagram.svg",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/diagram.svg",
+                "content_type": "image/svg+xml",
+                "size_bytes": 64,
+                "kind": "svg",
+            },
+        ]
+    )
+    by_name = {e["filename"]: e for e in out}
+    assert by_name["report.pdf"]["kind"] == "pdf"
+    assert by_name["report.pdf"]["content_type"] == "application/pdf"
+    assert by_name["plot.png"]["kind"] == "image"
+    # An svg (or any non-allowlisted kind) is coerced to None fail-closed.
+    assert by_name["diagram.svg"]["kind"] is None

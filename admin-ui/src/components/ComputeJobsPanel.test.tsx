@@ -332,6 +332,63 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     });
   });
 
+  test('renders omitted-file note when viewable artifacts were dropped', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      viewable_artifacts: [
+        {
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/jobs/job-1/plot.png',
+          content_type: 'image/png',
+          size_bytes: 1024,
+          kind: 'image',
+        },
+      ],
+      viewable_artifacts_dropped_count: 3,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const note = await findByTestId('compute-artifact-omitted-note');
+    expect(note.textContent).toContain('3 files omitted');
+  });
+
+  test('renders no omitted-file note when dropped count is zero', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      viewable_artifacts: [
+        {
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/jobs/job-1/plot.png',
+          content_type: 'image/png',
+          size_bytes: 1024,
+          kind: 'image',
+        },
+      ],
+      viewable_artifacts_dropped_count: 0,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Gallery renders (artifact present) but no omitted note.
+    await findByTestId('compute-artifact-gallery');
+    expect(
+      document.querySelector('[data-testid="compute-artifact-omitted-note"]'),
+    ).toBeNull();
+  });
+
   test('renders Mutable image badge for a job whose image lacks a digest', async () => {
     const job = makeJob({
       backend: 'gcp',
@@ -3917,6 +3974,45 @@ describe('ComputeJobsPanel — viewable artifact gallery', () => {
       const thumb = await findByTestId('compute-artifact-thumbnail');
       expect(thumb.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/retried.png');
     });
+  });
+
+  test('renders a pdf artifact as a click-to-open tile (no inline img/video) that opens a new tab', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(
+      { opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never,
+    );
+    const pdfUri = 'gs://bucket/compute-jobs/job-1/artifacts/viewable/2-report.pdf';
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [
+          { filename: 'report.pdf', storage_uri: pdfUri, content_type: 'application/pdf', kind: 'pdf' as const, size_bytes: 88_000 },
+        ],
+      }),
+    ]));
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example/2-report.pdf');
+    const { findByTestId, queryByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    expect(toggle.textContent).toContain('Show previews (1)');
+    await act(async () => { toggle.click(); });
+
+    // A pdf tile renders — never an inline <img>/<video>, and not resolved eagerly.
+    const tile = await findByTestId('compute-artifact-pdf');
+    expect(tile.tagName).toBe('BUTTON');
+    expect(tile.textContent).toContain('Open PDF');
+    expect(container.querySelector('img')).toBeNull();
+    expect(queryByTestId('compute-artifact-video')).toBeNull();
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalled();
+    // Caption carries the filename + size.
+    const gallery = await findByTestId('compute-artifact-gallery');
+    expect(gallery.textContent).toContain('report.pdf · 86 KB');
+
+    // Clicking resolves a fresh signed URL and opens it in a new tab.
+    await act(async () => { tile.click(); });
+    await waitFor(() => expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', pdfUri));
+    expect(openSpy).toHaveBeenCalled();
+    openSpy.mockRestore();
   });
 
   test('no gallery section when viewable_artifacts is absent or malformed', async () => {

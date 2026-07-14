@@ -55,7 +55,8 @@ class TestViewableSelectionPolicy:
             "noext",
         ):
             (art / name).write_bytes(b"x" * 16)
-        selected = _collect_viewable_candidates_from_dir(str(art))
+        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        assert size_dropped == 0
         by_name = {c.filename: c.kind for c in selected}
         assert by_name == {
             "plot.png": "image",
@@ -69,14 +70,54 @@ class TestViewableSelectionPolicy:
         assert "chart.svg" not in by_name
 
     def test_empty_zero_byte_and_missing_dir(self, tmp_path):
-        assert _collect_viewable_candidates_from_dir("") == []
+        assert _collect_viewable_candidates_from_dir("") == ([], 0)
         assert (
-            _collect_viewable_candidates_from_dir(str(tmp_path / "missing")) == []
+            _collect_viewable_candidates_from_dir(str(tmp_path / "missing"))
+            == ([], 0)
         )
         art = tmp_path / "artifacts"
         art.mkdir()
         (art / "empty.png").write_bytes(b"")
-        assert _collect_viewable_candidates_from_dir(str(art)) == []
+        # A zero-byte viewable file is skipped but NOT counted as a size-cap
+        # omission (it was not omitted for being too large).
+        assert _collect_viewable_candidates_from_dir(str(art)) == ([], 0)
+
+    def test_oversize_viewable_file_counted_as_dropped(self, tmp_path):
+        """A viewable file over the 8 MiB per-file cap is excluded from the
+        candidates AND increments the size-dropped tally, while an
+        under-cap viewable file and a plain non-viewable file do not."""
+        from app.compute_backends import _MAX_VIEWABLE_FILE_BYTES
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "small.png").write_bytes(b"\x89PNG" + b"x" * 32)
+        (art / "huge.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
+        (art / "notes.txt").write_bytes(b"z" * (_MAX_VIEWABLE_FILE_BYTES + 1))
+        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        assert [c.filename for c in selected] == ["small.png"]
+        assert size_dropped == 1
+
+    def test_count_and_size_cap_both_reflected(self, tmp_path):
+        """When files exceed BOTH the 25-file count cap and the size cap, the
+        dropped tally reported by ``_collect_viewable_artifact_candidates`` is
+        the sum of both (via the size-dropped signal returned here)."""
+        from app.compute_backends import (
+            _MAX_VIEWABLE_FILE_BYTES,
+            _MAX_VIEWABLE_FILE_COUNT,
+        )
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        # count-cap overflow: (count + 3) small viewable files
+        for i in range(_MAX_VIEWABLE_FILE_COUNT + 3):
+            (art / f"plot_{i:03d}.png").write_bytes(b"\x89PNG" + b"x" * 16)
+        # size-cap omissions: 2 oversize viewable files
+        (art / "big_a.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
+        (art / "big_b.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
+        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        # oversize files never appear in candidates
+        assert len(selected) == _MAX_VIEWABLE_FILE_COUNT + 3
+        assert size_dropped == 2
 
 
 class TestSymlinkExclusion:
@@ -92,7 +133,7 @@ class TestSymlinkExclusion:
         (art / "real.png").write_bytes(b"\x89PNG real")
         _make_symlink_or_skip(str(secret), str(art / "loss_curve.png"))
 
-        selected = _collect_viewable_candidates_from_dir(str(art))
+        selected, _ = _collect_viewable_candidates_from_dir(str(art))
         assert [c.filename for c in selected] == ["real.png"], (
             "symlinked file must not be collected"
         )
@@ -106,7 +147,7 @@ class TestSymlinkExclusion:
         (art / "ok.png").write_bytes(b"y" * 10)
         _make_symlink_or_skip(str(outside), str(art / "plots"))
 
-        selected = _collect_viewable_candidates_from_dir(str(art))
+        selected, _ = _collect_viewable_candidates_from_dir(str(art))
         assert [c.filename for c in selected] == ["ok.png"], (
             "walk must not descend through a symlinked dir"
         )
@@ -117,7 +158,7 @@ class TestSymlinkExclusion:
         (outside / "leak.png").write_bytes(b"x" * 10)
         link = tmp_path / "artifacts"
         _make_symlink_or_skip(str(outside), str(link))
-        assert _collect_viewable_candidates_from_dir(str(link)) == []
+        assert _collect_viewable_candidates_from_dir(str(link)) == ([], 0)
 
     def test_read_nofollow_refuses_symlink_planted_after_scan(self, tmp_path):
         # TOCTOU: the entry could be a regular file at scan time and a symlink

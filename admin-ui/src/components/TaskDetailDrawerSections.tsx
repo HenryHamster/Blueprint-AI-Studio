@@ -7,6 +7,7 @@ import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting
 import { fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { isComputeJobActive, computeJobTerminalLabel, computeJobExecutionLocation, computeJobEvidenceTier } from './ComputeJobsPanel.utils';
+import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { EvidenceTierBadge } from './EvidenceTierBadge';
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
@@ -230,6 +231,7 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
                 </ResolvedReferenceLink>
               </DetailRow>
             )}
+            <ComputeArtifactGallery projectId={projectId} job={job} />
           </div>
         );
       })}

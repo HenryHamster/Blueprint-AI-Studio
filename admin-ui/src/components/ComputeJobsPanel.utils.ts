@@ -177,7 +177,7 @@ export function computeJobExecutionLocation(backend: string): {
 export interface GalleryViewableArtifact {
   name: string;
   storage_uri: string;
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'pdf';
   bytes: number;
 }
 
@@ -195,7 +195,7 @@ export function computeJobViewableArtifacts(job: ComputeJob): GalleryViewableArt
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const e = entry as Record<string, unknown>;
     if (typeof e.storage_uri !== 'string' || e.storage_uri.length === 0) continue;
-    if (e.kind !== 'image' && e.kind !== 'video') continue;
+    if (e.kind !== 'image' && e.kind !== 'video' && e.kind !== 'pdf') continue;
     const fallbackName = e.storage_uri.split('/').pop() || 'artifact';
     items.push({
       name: typeof e.filename === 'string' && e.filename.length > 0 ? e.filename : fallbackName,

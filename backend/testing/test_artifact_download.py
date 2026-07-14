@@ -468,9 +468,25 @@ def test_viewable_content_type_classifies_images_and_videos():
     assert storage.viewable_content_type_for_filename("a.JPG") == ("image/jpeg", "image")
     assert storage.viewable_content_type_for_filename("clip.mp4") == ("video/mp4", "video")
     assert storage.viewable_content_type_for_filename("v.webm") == ("video/webm", "video")
+    # PDF is a first-class viewable kind (matplotlib savefig('*.pdf')).
+    assert storage.viewable_content_type_for_filename("report.pdf") == (
+        "application/pdf",
+        "pdf",
+    )
+    assert storage.viewable_content_type_for_filename("PLOT.PDF") == (
+        "application/pdf",
+        "pdf",
+    )
     # Non-viewable / no extension.
     assert storage.viewable_content_type_for_filename("data.bin") is None
     assert storage.viewable_content_type_for_filename("noext") is None
+
+
+def test_media_kind_for_mime_maps_pdf():
+    assert storage._media_kind_for_mime("image/png") == "image"
+    assert storage._media_kind_for_mime("video/mp4") == "video"
+    assert storage._media_kind_for_mime("application/pdf") == "pdf"
+    assert storage._media_kind_for_mime("application/octet-stream") == "unknown"
 
 
 def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
@@ -485,6 +501,10 @@ def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
     assert ".svg" not in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
     # Both surfaces agree, and they agree on exclusion.
     assert storage.svg_is_viewable() is False
+    # PDF, by contrast, is present on BOTH surfaces (added alongside the SVG
+    # exclusion, not replacing it) — the two allowlists stay in agreement.
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
+    assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
 
 
 def test_sanitize_viewable_basename_strips_traversal():

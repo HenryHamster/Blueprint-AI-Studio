@@ -744,7 +744,7 @@ export interface ViewableArtifact {
   filename: string | null;
   content_type?: string | null;
   size_bytes?: number | null;
-  kind: 'image' | 'video' | null;
+  kind: 'image' | 'video' | 'pdf' | null;
 }
 
 export interface ComputeJob {
@@ -877,6 +877,11 @@ export interface ComputeJob {
    *  videos) as individually-addressable storage objects. Absent on legacy rows
    *  or jobs without viewable output. */
   viewable_artifacts?: ViewableArtifact[] | null;
+  /** Job-level aggregate: number of viewable files omitted from
+   *  `viewable_artifacts` for exceeding the 25-file count cap or the 8 MiB
+   *  per-file size cap. Additive/backward-compatible — absent or 0 on legacy
+   *  rows and jobs where nothing was omitted. */
+  viewable_artifacts_dropped_count?: number | null;
   /** Bounded time-series of intermediate progress samples emitted during the
    *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
    *  Absent on legacy rows or jobs that did not emit progress. */

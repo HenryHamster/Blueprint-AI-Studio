@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { computeJobEvidenceTier } from './ComputeJobsPanel.utils';
+import { computeJobEvidenceTier, computeJobViewableArtifacts } from './ComputeJobsPanel.utils';
+import type { ComputeJob } from '../api';
 
 /**
  * `covered` is the tier EvidenceTierBadge renders as "Machine verified".
@@ -73,5 +74,33 @@ describe('computeJobEvidenceTier', () => {
 
   it('no backend and no result is uncovered', () => {
     expect(computeJobEvidenceTier(job({}))).toBe('uncovered');
+  });
+});
+
+describe('computeJobViewableArtifacts', () => {
+  const withArtifacts = (viewable: unknown): ComputeJob =>
+    ({ viewable_artifacts: viewable } as unknown as ComputeJob);
+
+  it('keeps a kind:"pdf" entry (previously dropped) alongside image/video', () => {
+    const artifacts = computeJobViewableArtifacts(
+      withArtifacts([
+        { filename: 'loss.png', storage_uri: 'gs://b/0-loss.png', kind: 'image', size_bytes: 10 },
+        { filename: 'report.pdf', storage_uri: 'gs://b/1-report.pdf', kind: 'pdf', size_bytes: 88_000 },
+        { filename: 'rollout.mp4', storage_uri: 'gs://b/2-rollout.mp4', kind: 'video', size_bytes: 20 },
+      ]),
+    );
+    expect(artifacts.map(a => a.kind)).toEqual(['image', 'pdf', 'video']);
+    const pdf = artifacts.find(a => a.kind === 'pdf');
+    expect(pdf).toMatchObject({ name: 'report.pdf', storage_uri: 'gs://b/1-report.pdf', bytes: 88_000 });
+  });
+
+  it('still drops entries with an unknown kind or missing storage_uri', () => {
+    const artifacts = computeJobViewableArtifacts(
+      withArtifacts([
+        { filename: 'x.bin', storage_uri: 'gs://b/x.bin', kind: 'binary', size_bytes: 5 },
+        { filename: 'no-uri.pdf', kind: 'pdf', size_bytes: 5 },
+      ]),
+    );
+    expect(artifacts).toEqual([]);
   });
 });
