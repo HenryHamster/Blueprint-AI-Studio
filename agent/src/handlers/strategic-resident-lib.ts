@@ -1809,6 +1809,7 @@ export function serializeLedger(
   records: ExamRecord[],
   tick: number,
   corrective: boolean,
+  operatorDecisionCorrective: boolean = false,
 ): string {
   const truncated = records.slice(-EXAM_RECORDS_CAP).map(r => ({
     ...r,
@@ -1817,13 +1818,13 @@ export function serializeLedger(
   // Drop oldest records until the serialized byte length fits the budget.
   let start = 0;
   while (start < truncated.length) {
-    const candidate = JSON.stringify({ records: truncated.slice(start), tick, corrective });
+    const candidate = JSON.stringify({ records: truncated.slice(start), tick, corrective, operatorDecisionCorrective });
     if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) {
       return candidate;
     }
     start++;
   }
-  return JSON.stringify({ records: [], tick, corrective });
+  return JSON.stringify({ records: [], tick, corrective, operatorDecisionCorrective });
 }
 
 /**
@@ -1833,7 +1834,7 @@ export function serializeLedger(
  */
 export function restoreLedger(
   value: string | undefined | null,
-): { records: ExamRecord[]; tick: number; corrective: boolean } | null {
+): { records: ExamRecord[]; tick: number; corrective: boolean; operatorDecisionCorrective: boolean } | null {
   if (!value || typeof value !== 'string') return null;
   try {
     const parsed: unknown = JSON.parse(value);
@@ -1854,7 +1855,11 @@ export function restoreLedger(
       }));
     const tick = typeof p.tick === 'number' && Number.isFinite(p.tick) ? p.tick : 0;
     const corrective = typeof p.corrective === 'boolean' ? p.corrective : false;
-    return { records, tick, corrective };
+    // Legacy blobs (written before this field existed) lack the key and restore
+    // to false so an old checkpoint never spuriously raises the corrective frame.
+    const operatorDecisionCorrective = typeof p.operatorDecisionCorrective === 'boolean'
+      ? p.operatorDecisionCorrective : false;
+    return { records, tick, corrective, operatorDecisionCorrective };
   } catch {
     return null;
   }

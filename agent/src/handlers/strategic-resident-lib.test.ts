@@ -1742,6 +1742,32 @@ describe('serializeLedger / restoreLedger', () => {
     expect(restored.records).toHaveLength(0);
   });
 
+  it('round-trips the operatorDecisionCorrective flag when set true', () => {
+    const serialized = serializeLedger([], 7, false, true);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.operatorDecisionCorrective).toBe(true);
+    expect(restored.tick).toBe(7);
+    // The two corrective flags are independent — corrective stays false here.
+    expect(restored.corrective).toBe(false);
+  });
+
+  it('defaults operatorDecisionCorrective to false when the 4th arg is omitted', () => {
+    const serialized = serializeLedger([makeRecord('qualification', 1)], 1, false);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.operatorDecisionCorrective).toBe(false);
+  });
+
+  it('restores operatorDecisionCorrective as false from a legacy blob lacking the field', () => {
+    // A blob written before this field existed (only records/tick/corrective).
+    const legacy = JSON.stringify({ records: [], tick: 3, corrective: true });
+    const restored = restoreLedger(legacy);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.operatorDecisionCorrective).toBe(false);
+    expect(restored.corrective).toBe(true);
+  });
+
   it('round-trips an interrupted verdict without coercing it to unevidenced', () => {
     const records: ExamRecord[] = [{
       surfaceKey: 'code:backend',

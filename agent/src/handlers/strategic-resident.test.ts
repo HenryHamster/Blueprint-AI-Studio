@@ -459,6 +459,59 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(opLatency?.pickupLagMs as number).toBeGreaterThanOrEqual(0);
   });
 
+  it('restores operatorDecisionCorrectiveNext from the persisted ledger so a full restart still fires the corrective reminder on the next autonomous turn', async () => {
+    // Full-restart durability: a marker-less operator correction set
+    // operatorDecisionCorrectiveNext=true and it was serialized into the durable
+    // exam-ledger blob (task.context._exam_ledger) on the last heartbeat. After a
+    // VM recycle / crash the fresh session must restore that flag and open the
+    // FIRST autonomous tick with the OPERATOR-DECISION CORRECTIVE reminder — before
+    // the fix the flag reset to false and the reminder was silently dropped.
+    let autonomousPrompt = '';
+    let alive = true;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      (text) => {
+        // First (and only) turn is the autonomous tick with the bootstrap prompt
+        // prepended (runTurn prepends it on the first turn). Capture it, then let
+        // the session die so the loop exits on the next iteration.
+        autonomousPrompt = typeof text === 'string' ? text : JSON.stringify(text);
+        alive = false;
+        return Promise.resolve(turnResult({ resultText: 'looked around', inputTokens: 0 }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockImplementation(() => session1);
+
+    await handleStrategicResident(
+      'task-restore',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-1' },
+        // The durable blob a prior session persisted after a marker-less operator
+        // correction: operatorDecisionCorrective=true rides the same channel as the
+        // exam ledger's records/tick/corrective fields.
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [], tick: 4, corrective: false, operatorDecisionCorrective: true,
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The restored flag drove the corrective frame into the first autonomous prompt.
+    expect(autonomousPrompt).toContain('OPERATOR-DECISION CORRECTIVE');
+  });
+
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
     // WORKSPACE is stubbed to '' so `${WORKSPACE}/.git` never exists → the per-turn
     // "workspace vanished" guard fires on the first iteration. This pins the CALL

@@ -21671,3 +21671,58 @@ def test_local_container_watchdog_actually_kills_containerized_workload(
             proc.wait(timeout=10)
         except Exception:
             pass
+
+
+def test_no_blocking_time_sleep_in_async_functions():
+    """Regression: async coroutines must not call the blocking builtin
+    time.sleep(), which freezes the entire event loop. Cooldown waits and any
+    other in-coroutine delays must use `await asyncio.sleep(...)` instead.
+
+    This walks the AST of app/compute.py and fails if any `time.sleep(...)`
+    call is lexically nested inside an `async def`.
+    """
+    import ast
+    import inspect
+
+    source = inspect.getsource(compute)
+    tree = ast.parse(source)
+
+    def _is_time_sleep(call_node):
+        func = call_node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "sleep"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+        )
+
+    offenders = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.async_stack = []
+
+        def visit_AsyncFunctionDef(self, node):
+            self.async_stack.append(node.name)
+            self.generic_visit(node)
+            self.async_stack.pop()
+
+        def visit_FunctionDef(self, node):
+            # A sync def nested inside an async def breaks the async context;
+            # blocking sleeps there are acceptable, so clear the stack.
+            saved = self.async_stack
+            self.async_stack = []
+            self.generic_visit(node)
+            self.async_stack = saved
+
+        def visit_Call(self, node):
+            if self.async_stack and _is_time_sleep(node):
+                offenders.append((self.async_stack[-1], node.lineno))
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+
+    assert not offenders, (
+        "Blocking time.sleep() found inside async function(s) in compute.py "
+        f"(use await asyncio.sleep instead): {offenders}"
+    )

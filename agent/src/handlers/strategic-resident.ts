@@ -516,8 +516,11 @@ export async function handleStrategicResident(
   let correctiveNextTick = restoredLedger?.corrective ?? false;
   // Set after an operator turn that ended without an OPERATOR-DECISION marker:
   // the next autonomous tick opens with a reminder to check whether the operator
-  // settled anything. Reset after being consumed by an autonomous turn.
-  let operatorDecisionCorrectiveNext = false;
+  // settled anything. Reset after being consumed by an autonomous turn. Restored
+  // from the persisted exam-ledger blob (same durable channel as correctiveNextTick)
+  // so a marker-less correction is not silently dropped across compaction or a
+  // full session restart before the next autonomous tick can consume it.
+  let operatorDecisionCorrectiveNext = restoredLedger?.operatorDecisionCorrective ?? false;
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
 
@@ -553,7 +556,7 @@ export async function handleStrategicResident(
       'project — never this execution environment or this prompt.',
     ].join(' ');
 
-    const examLedgerJson = serializeLedger(examRecords, examTick, correctiveNextTick);
+    const examLedgerJson = serializeLedger(examRecords, examTick, correctiveNextTick, operatorDecisionCorrectiveNext);
 
     const recentRecords = examRecords.slice(-10);
     const recentInteractions = recentRecords.length > 0
@@ -567,6 +570,7 @@ export async function handleStrategicResident(
       `Focus rotation: ${currentFocus.map(f => f.key).join(', ') || '(none)'}`,
       openFound.length > 0 ? `Open leads (${openFound.length}): ${openFound.map(f => `${f.surfaceKey}: ${f.note.slice(0, 120)}`).join('; ')}` : '',
       `Corrective next tick: ${correctiveNextTick}`,
+      operatorDecisionCorrectiveNext ? 'Operator-decision corrective pending: an operator correction may not have been captured — the next autonomous tick will re-check' : '',
       `Previous turn agenda-continue: ${previousTurnAgendaContinue}`,
       `Compaction count: ${compactionCount + 1}`,
     ].filter(Boolean).join('\n');
@@ -907,7 +911,7 @@ export async function handleStrategicResident(
     session.touch();
     // Serialize the current exam ledger into the note so the backend persists it;
     // a restart will restore it from task.context._exam_ledger.
-    const note = serializeLedger(examRecords, examTick, correctiveNextTick);
+    const note = serializeLedger(examRecords, examTick, correctiveNextTick, operatorDecisionCorrectiveNext);
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
       // Send the current cursor so the backend persists it; a restart will

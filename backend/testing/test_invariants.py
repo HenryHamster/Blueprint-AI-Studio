@@ -5659,6 +5659,9 @@ class TestFailureClassificationInvariants:
                 SCOPE_EMPTY,
                 REASSIGNED,
                 NO_PROGRESS_TIMEOUT,
+                # Repo never initialized (empty/near-empty upstream) — the task
+                # could not clone through no code defect of its own.
+                REPO_UNINITIALIZED,
                 # Park/wake orchestration outcomes are budget-exempt infra faults
                 # (the wake source never fired, or the registration was lost) —
                 # not code defects. See feat: surface park/wake health.
