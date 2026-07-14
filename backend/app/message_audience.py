@@ -139,6 +139,12 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "efficiency.provider_routing_verdict": STRATEGIST_INTERNAL,
     # === Back-merge / hotfix alerts (no existing policy entry) ============
     "hotfix_backmerge.size_violation": STRATEGIST_INTERNAL,
+    # Resident strategist self-observability. A chronically-low operator-decision
+    # capture rate means operator corrections are silently failing to reach the
+    # durable decisions register. This is internal strategist bookkeeping — the
+    # strategist acts on it (re-emit the marker) but it must NEVER reach the
+    # operator chat or the alert channel.
+    "operator_decision.capture_rate_low": STRATEGIST_INTERNAL,
 }
 
 # Set of audiences that reach the operator through normal channels.

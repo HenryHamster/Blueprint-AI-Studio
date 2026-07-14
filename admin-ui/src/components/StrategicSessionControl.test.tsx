@@ -644,4 +644,58 @@ describe('StrategicSessionControl', () => {
     // The device dropdown remains so a new device can be chosen for the restart.
     expect(screen.getByRole('combobox', { name: /workday device/i })).toBeInTheDocument();
   });
+
+  it('renders the operator-decision capture chip when a summary is present', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        operatorDecisionSummary={{ total: 8, captured: 7, missed: 1, capture_rate: 88 }}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/op-decision capture: 7\/8 \(88%\)/i)).toBeInTheDocument();
+    // Healthy rate: chip reports corrections are captured (neutral, not a warning).
+    expect(
+      screen.getByRole('status', { name: /op-decision capture: 7\/8 \(88%\).*captured into the durable decisions register/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('warns on the capture chip when the rate is chronically low', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        operatorDecisionSummary={{ total: 6, captured: 2, missed: 4, capture_rate: 33 }}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/op-decision capture: 2\/6 \(33%\)/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole('status', {
+        name: /op-decision capture: 2\/6 \(33%\).*chronically low/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('hides the operator-decision capture chip when no summary is present', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        operatorDecisionSummary={null}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/op-decision capture/i)).toBeNull();
+  });
 });

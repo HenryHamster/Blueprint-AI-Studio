@@ -805,6 +805,22 @@ export interface StrategicResidentSessionSnapshot {
   ended_at?: string | null;
   last_progress_at?: string | null;
   last_operator_interaction_at?: string | null;
+  compaction_count?: number | null;
+  last_compaction_at?: string | null;
+  /**
+   * Operator-decision capture telemetry for this session (mirrors
+   * `_operator_decision_summary` on the backend session blob, projected by
+   * `resident_session_snapshot`). `capture_rate` is an integer percent (0–100)
+   * of operator turns that ended with a valid OPERATOR-DECISION marker; `null`
+   * when no operator turns have been processed yet. The whole field is optional
+   * and `null` on legacy sessions / before any operator turn.
+   */
+  operator_decision_summary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
 }
 
 /**

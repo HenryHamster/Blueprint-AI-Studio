@@ -203,6 +203,64 @@ _ADOPTABLE_TASK_STATUSES = frozenset(
 STATUS_ACTIVE = "active"
 STATUS_ENDED = "ended"
 
+# ── Operator-decision capture enforcement ──────────────────────────────────
+# The resident agent ships an ``operator_decision_summary`` telemetry blob on
+# the heartbeat: ``{total, captured, missed, capture_rate}`` where ``total`` is
+# the number of operator turns seen and ``capture_rate`` is the integer percent
+# of those turns that ended with a valid OPERATOR-DECISION marker. A chronically
+# low rate means operator corrections are silently failing to reach the durable
+# decisions register. We emit a strategist-internal notice when the rate is low
+# AND the session has enough operator turns to judge it — a single early miss
+# must NOT fire this. The dedup flag on the session blob keeps it to one notice
+# per low-capture crossing; a recovery above the floor re-arms it.
+#
+# Minimum operator turns before the capture rate is judged (avoid firing on an
+# early one-off miss on a fresh session).
+OPERATOR_DECISION_CAPTURE_MIN_SAMPLE = 4
+# capture_rate (integer percent) strictly below this is treated as chronically low.
+OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT = 60
+# Dedup flag persisted on the session blob so the notice fires at most once per
+# low-capture crossing.
+OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY = "_operator_decision_low_capture_notified"
+
+
+def _operator_decision_capture_chronically_low(summary: Any) -> bool:
+    """True when the operator-decision capture rate is chronically low.
+
+    Requires at least ``OPERATOR_DECISION_CAPTURE_MIN_SAMPLE`` operator turns
+    (so a single early miss can't trip it) and a ``capture_rate`` strictly below
+    ``OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT``. Malformed / absent summaries and
+    a null capture_rate (no turns yet) return False.
+    """
+    if not isinstance(summary, dict):
+        return False
+    total = summary.get("total")
+    rate = summary.get("capture_rate")
+    if not isinstance(total, int) or total < OPERATOR_DECISION_CAPTURE_MIN_SAMPLE:
+        return False
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        return False
+    return rate < OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT
+
+
+def _operator_decision_capture_recovered(summary: Any) -> bool:
+    """True when the capture rate has recovered to/above the low-rate floor.
+
+    Symmetric to :func:`_operator_decision_capture_chronically_low`: a genuine
+    recovery (enough samples AND rate at/above the floor) clears the dedup flag
+    so a later low-capture crossing can re-fire. A dip below the sample floor is
+    NOT a recovery — it leaves the flag untouched.
+    """
+    if not isinstance(summary, dict):
+        return False
+    total = summary.get("total")
+    rate = summary.get("capture_rate")
+    if not isinstance(total, int) or total < OPERATOR_DECISION_CAPTURE_MIN_SAMPLE:
+        return False
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        return False
+    return rate >= OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT
+
 
 # ---------------------------------------------------------------------------
 # Session-state helpers (Project.vision blob)
@@ -2150,6 +2208,10 @@ async def renew_resident_session_lease(
         "stopped": False,
         "capped": False,
         "lapsed": False,
+        # Set in-lock when this heartbeat crosses into chronically-low operator-
+        # decision capture and no prior notice was posted; drives the single
+        # strategist-internal emit after the lease commits.
+        "emit_low_capture_notice": False,
     }
 
     def _end_session(vision: dict[str, Any], current: dict[str, Any]) -> None:
@@ -2287,6 +2349,16 @@ async def renew_resident_session_lease(
         # visibility into capture rate across a full session.
         if isinstance(operator_decision_summary, dict):
             updated["_operator_decision_summary"] = operator_decision_summary
+            # Enforce: cross into a strategist-internal notice when the capture
+            # rate is chronically low. De-dupe on a persisted flag so the notice
+            # fires at most once per low-capture crossing; a genuine recovery
+            # above the floor re-arms it for the next crossing.
+            already_notified = bool(fresh.get(OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY))
+            if _operator_decision_capture_chronically_low(operator_decision_summary) and not already_notified:
+                updated[OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY] = True
+                holder["emit_low_capture_notice"] = True
+            elif _operator_decision_capture_recovered(operator_decision_summary) and already_notified:
+                updated[OPERATOR_DECISION_LOW_CAPTURE_NOTIFIED_KEY] = False
         # Persist compaction metadata reported by the agent. These are
         # opaque agent-reported values — the backend never derives them.
         if isinstance(compaction_count, int) and compaction_count > 0:
@@ -2375,6 +2447,36 @@ async def renew_resident_session_lease(
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] handled_message_ids update failed for session %s — ignored",
+                session_id,
+                exc_info=True,
+            )
+    # Emit the strategist-internal low-capture notice decided in-lock. Posts the
+    # ledger row into THIS transaction so it commits atomically with the dedup
+    # flag; failure to post is non-fatal (the flag is already set, so the notice
+    # simply won't repeat — better than blocking the heartbeat).
+    if holder["emit_low_capture_notice"] and isinstance(operator_decision_summary, dict):
+        try:
+            from app.notification_dispatch import (
+                post_operator_decision_capture_low_message,
+            )
+
+            try:
+                _notice_task_id: uuid.UUID | None = uuid.UUID(str(task_id))
+            except (ValueError, TypeError):
+                _notice_task_id = None
+            await post_operator_decision_capture_low_message(
+                session,
+                project.id,
+                total=int(operator_decision_summary.get("total") or 0),
+                captured=int(operator_decision_summary.get("captured") or 0),
+                missed=int(operator_decision_summary.get("missed") or 0),
+                capture_rate=int(operator_decision_summary.get("capture_rate") or 0),
+                session_id=session_id,
+                task_id=_notice_task_id,
+            )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] operator-decision low-capture notice failed for session %s — ignored",
                 session_id,
                 exc_info=True,
             )

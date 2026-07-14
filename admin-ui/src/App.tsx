@@ -438,6 +438,7 @@ export default function App() {
     strategicInteractionMode,
     strategicSessionActive,
     strategicSessionStatus,
+    residentStrategicSession,
     residentStrategicSessionAvailable,
     strategicSessionState,
     strategicSessionReason,
@@ -457,6 +458,7 @@ export default function App() {
     strategicWorkbenchOperatorSurfaceTouchedRef,
     strategicWorkbenchRestoreProjectRef,
   } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
+  const strategicOperatorDecisionSummary = residentStrategicSession?.operator_decision_summary ?? null;
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -1185,6 +1187,7 @@ export default function App() {
         sessionBusy={strategicSessionBusy}
         sessionRunners={residentStrategicSessionRunners}
         sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+        operatorDecisionSummary={strategicOperatorDecisionSummary}
         projectId={selectedProjectId}
         onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
@@ -1267,6 +1270,7 @@ export default function App() {
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+                operatorDecisionSummary={strategicOperatorDecisionSummary}
                 onSelectRunner={handleSelectStrategicRunner}
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}

@@ -1,6 +1,13 @@
 {
   "event_types": [
     {
+      "name": "operator_decision.capture_rate_low",
+      "classification": "routine",
+      "message_type": "NOTE",
+      "source_fn": "post_operator_decision_capture_low_message",
+      "audience": "strategist-internal"
+    },
+    {
       "name": "pr_merged",
       "classification": "routine",
       "message_type": "NOTE",

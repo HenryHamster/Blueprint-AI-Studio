@@ -97,6 +97,7 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   issue_implementation_spawned: 'issue spawns',
   review_feedback: 'review feedback',
   feedback_acknowledgment: 'feedback acks',
+  'operator_decision.capture_rate_low': 'op-decision capture rate',
 };
 
 export type EventPref = 'mute' | 'routine' | 'surfaced';

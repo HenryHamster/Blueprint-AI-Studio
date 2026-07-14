@@ -703,6 +703,133 @@ async def test_heartbeat_helper_renews_lease(db_session):
     assert blob["last_progress_at"] is not None
 
 
+async def _operator_decision_notices(db_session, project_id):
+    """All operator-decision low-capture strategist-internal notices for a project."""
+    res = await db_session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+    )
+    return [
+        m
+        for m in res.scalars().all()
+        if (m.context or {}).get("event_type") == "operator_decision.capture_rate_low"
+    ]
+
+
+def test_operator_decision_capture_chronically_low_predicate():
+    """The chronic-low predicate requires enough samples AND a below-floor rate."""
+    # Below the sample floor — never chronic, even at 0%.
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 3, "captured": 0, "missed": 3, "capture_rate": 0}
+    ) is False
+    # Enough samples, rate below floor — chronic.
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 2, "missed": 3, "capture_rate": 40}
+    ) is True
+    # Enough samples, rate at/above floor — not chronic (and a recovery).
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 3, "missed": 2, "capture_rate": 60}
+    ) is False
+    assert srs._operator_decision_capture_recovered(
+        {"total": 5, "captured": 3, "missed": 2, "capture_rate": 60}
+    ) is True
+    # Malformed / null-rate summaries are neither low nor recovered.
+    assert srs._operator_decision_capture_chronically_low(None) is False
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 0, "missed": 5, "capture_rate": None}
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_surfaces_operator_decision_summary(db_session):
+    """A heartbeat's operator_decision_summary round-trips through the snapshot."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+
+    summary = {"total": 6, "captured": 5, "missed": 1, "capture_rate": 83}
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        progress=True,
+        operator_decision_summary=summary,
+    )
+    fresh = await db_session.get(Project, project.id)
+    snap = resident_session_snapshot(fresh.vision)
+    assert snap["operator_decision_summary"] == summary
+    # A healthy rate emits NO strategist-internal notice.
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_operator_decision_capture_low_rate_emits_strategist_internal_notice(
+    db_session,
+):
+    """A chronically-low capture rate emits exactly one STRATEGIST_INTERNAL notice.
+
+    Asserts the full policy: no emit below the sample floor, no emit above the
+    low-rate threshold, exactly one emit on the low crossing (with a
+    strategist-internal / non-operator-visible audience), dedup across repeated
+    low heartbeats, and re-arming after a recovery.
+    """
+    from app.message_audience import STRATEGIST_INTERNAL, is_operator_visible
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+
+    async def _beat(summary):
+        proj = await db_session.get(Project, project.id)
+        return await renew_resident_session_lease(
+            db_session,
+            proj,
+            session_id=snapshot["session_id"],
+            task_id=snapshot["task_id"],
+            progress=True,
+            operator_decision_summary=summary,
+        )
+
+    # Below the sample floor: low rate but too few turns → no notice.
+    await _beat({"total": 2, "captured": 0, "missed": 2, "capture_rate": 0})
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+    # Enough samples but above the threshold → no notice.
+    await _beat({"total": 6, "captured": 5, "missed": 1, "capture_rate": 83})
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+    # Chronic low: enough samples AND below the threshold → exactly one notice.
+    await _beat({"total": 6, "captured": 2, "missed": 4, "capture_rate": 33})
+    notices = await _operator_decision_notices(db_session, project.id)
+    assert len(notices) == 1
+    notice = notices[0]
+    # Strategist-internal: bookkeeping only, must NOT reach the operator.
+    assert notice.from_type == "system"
+    assert notice.context.get("audience") == STRATEGIST_INTERNAL
+    assert is_operator_visible(notice.context["audience"]) is False
+    assert notice.context.get("capture_rate") == 33
+    assert notice.context.get("session_id") == snapshot["session_id"]
+
+    # Still low on the next heartbeat → deduped, no second notice.
+    await _beat({"total": 8, "captured": 2, "missed": 6, "capture_rate": 25})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 1
+
+    # Recovery above the floor re-arms the notice for a later crossing …
+    await _beat({"total": 10, "captured": 9, "missed": 1, "capture_rate": 90})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 1
+    # … a new low crossing fires a second, distinct notice.
+    await _beat({"total": 12, "captured": 4, "missed": 8, "capture_rate": 33})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 2
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_helper_mismatch_rejected(db_session):
     from fastapi import HTTPException

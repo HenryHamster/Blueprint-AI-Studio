@@ -51,6 +51,12 @@ interface StrategicContextWorkspaceProps {
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
+  operatorDecisionSummary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
   projectId?: string | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
@@ -595,6 +601,7 @@ export function StrategicContextWorkspace({
   sessionBusy = false,
   sessionRunners = null,
   sessionSelectedRunnerId = null,
+  operatorDecisionSummary = null,
   projectId,
   onSelectRunner,
   onStartSession,
@@ -846,6 +853,7 @@ export function StrategicContextWorkspace({
                   sessionBusy={sessionBusy}
                   sessionRunners={sessionRunners}
                   sessionSelectedRunnerId={sessionSelectedRunnerId}
+                  operatorDecisionSummary={operatorDecisionSummary}
                   onSelectRunner={onSelectRunner}
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}

@@ -828,6 +828,51 @@ async def post_pr_merged_message(
     )
 
 
+async def post_operator_decision_capture_low_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    total: int,
+    captured: int,
+    missed: int,
+    capture_rate: int,
+    session_id: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Strategist-internal notice that operator-decision capture is chronically low.
+
+    Fired by the resident-session heartbeat when a session accumulates enough
+    operator turns and its capture rate stays below the low-rate floor — a signal
+    that the OPERATOR-DECISION marker is being systematically forgotten and that
+    operator corrections may not be reaching the durable decisions register. The
+    event routes ``strategist-internal`` so it is bookkeeping the strategist can
+    act on (re-emit the marker) WITHOUT surfacing to the operator chat or the
+    alert channel. The caller de-dupes so it fires at most once per session per
+    low-capture crossing.
+    """
+    summary = (
+        f"Operator-decision capture chronically low this session: "
+        f"{captured}/{total} captured ({capture_rate}%) — {missed} operator "
+        f"correction(s) may not have reached the durable decisions register. "
+        f"End operator turns with the OPERATOR-DECISION marker so settled "
+        f"corrections survive compaction and restart."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="operator_decision.capture_rate_low",
+        summary=summary,
+        context={
+            "session_id": session_id,
+            "total": total,
+            "captured": captured,
+            "missed": missed,
+            "capture_rate": capture_rate,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_direction_milestone_message(
     session: AsyncSession,
     project_id: uuid.UUID,

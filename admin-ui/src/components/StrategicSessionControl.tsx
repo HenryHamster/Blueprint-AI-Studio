@@ -182,6 +182,20 @@ export interface StrategicSessionControlProps {
    */
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
+  /**
+   * Operator-decision capture telemetry for the live resident session (mirrors
+   * `operator_decision_summary` on the session snapshot). When present, a small
+   * "op-decision capture: N/M (X%)" chip renders in Workday mode so the operator
+   * can see whether operator corrections are reaching the durable decisions
+   * register; a chronically-low rate is toned as a warning. Absent/null hides
+   * the chip entirely (no operator turns processed / legacy session).
+   */
+  operatorDecisionSummary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -832,6 +846,46 @@ function residentSessionView(
   };
 }
 
+/**
+ * capture_rate (integer percent) below this is toned as a warning in the chip.
+ * Mirrors the backend enforcement floor (`OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT`
+ * in `strategic_resident_session.py`) so the operator-visible signal and the
+ * strategist-internal notice agree on what "chronically low" means.
+ */
+const OPERATOR_DECISION_LOW_RATE_PCT = 60;
+
+interface OperatorDecisionCaptureView {
+  tone: Tone;
+  label: string;
+  detail: string;
+}
+
+/**
+ * Build the operator-decision capture chip view from the session summary, or
+ * `null` when there is nothing to show (absent summary, or no operator turns
+ * measured yet). The chip is warning-toned when the rate is at/below the low
+ * floor and neutral otherwise.
+ */
+function operatorDecisionCaptureView(
+  summary:
+    | { total: number; captured: number; missed: number; capture_rate: number | null }
+    | null
+    | undefined,
+): OperatorDecisionCaptureView | null {
+  if (!summary || typeof summary.total !== 'number' || summary.total <= 0) return null;
+  const { total, captured, capture_rate } = summary;
+  const rate = typeof capture_rate === 'number' ? capture_rate : null;
+  const low = rate !== null && rate < OPERATOR_DECISION_LOW_RATE_PCT;
+  const ratePart = rate !== null ? ` (${rate}%)` : '';
+  return {
+    tone: low ? 'warning' : 'neutral',
+    label: `Op-decision capture: ${captured}/${total}${ratePart}`,
+    detail: low
+      ? 'Capture chronically low — operator corrections may not be reaching the durable decisions register'
+      : 'Operator corrections captured into the durable decisions register',
+  };
+}
+
 function StatusDot({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClasses[tone].dot}`} aria-hidden="true" />;
 }
@@ -852,6 +906,7 @@ export function StrategicSessionControl({
   sessionBusy = false,
   sessionRunners = null,
   sessionSelectedRunnerId = null,
+  operatorDecisionSummary = null,
   onSelectRunner,
   onStartSession,
   onStopSession,
@@ -909,6 +964,7 @@ export function StrategicSessionControl({
     Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState)) || showDevicePicker
   );
   const SessionIcon = sessionView.Icon;
+  const captureView = operatorDecisionCaptureView(operatorDecisionSummary);
 
   const runner = runnerStatus
     ? (() => {
@@ -1008,6 +1064,23 @@ export function StrategicSessionControl({
                 </span>
               )}
             </span>
+            {captureView && (
+              <span
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                } ${toneClasses[captureView.tone].border} ${toneClasses[captureView.tone].bg}`}
+                role="status"
+                aria-label={`${captureView.label} — ${captureView.detail}`}
+                title={`${captureView.label} — ${captureView.detail}`}
+              >
+                <StatusDot tone={captureView.tone} />
+                {!compact && (
+                  <span className={`truncate text-xs font-semibold ${toneClasses[captureView.tone].text}`}>
+                    {captureView.label}
+                  </span>
+                )}
+              </span>
+            )}
             {showDevicePicker && (
               <label
                 className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border border-neutral-800 bg-neutral-950/70 px-2 ${
