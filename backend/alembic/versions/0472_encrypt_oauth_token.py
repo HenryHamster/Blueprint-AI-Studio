@@ -30,7 +30,24 @@ depends_on = None
 def upgrade() -> None:
     bind = op.get_bind()
 
-    from app.field_encryption import decrypt_field, encrypt_field
+    from app.field_encryption import decrypt_field, encrypt_field, is_encryption_active
+
+    # GRACEFUL NO-OP when encryption is not configured — matches migration 0468,
+    # which guards the same column with `if _get_fernet() is None: return`.
+    #
+    # The prod migrate job runs WITHOUT GITHUB_PAT_ENCRYPTION_KEY (and without
+    # ALLOW_PLAINTEXT_CREDENTIALS), so `encrypt_field` / `decrypt_field` RAISE
+    # (_require_encryption_available). The original 0472 called `encrypt_field`
+    # directly and therefore ALSO crashed the deploy's migrate step here — 0468
+    # survived only because it no-ops when the key is absent. Mirror that: if
+    # encryption is inactive there is nothing to encrypt, so leave oauth_token
+    # untouched rather than crashing `alembic upgrade head`.
+    if not is_encryption_active():
+        logger.warning(
+            "0472: field encryption not configured (no GITHUB_PAT_ENCRYPTION_KEY) "
+            "— leaving oauth_token unchanged, matching migration 0468's no-op guard"
+        )
+        return
 
     column = "oauth_token"
     rows = bind.execute(

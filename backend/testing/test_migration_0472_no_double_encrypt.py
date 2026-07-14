@@ -98,6 +98,31 @@ def test_0472_after_0468_does_not_double_encrypt(monkeypatch):
     assert after_0472 == after_0468, "0472 must not rewrite an already-encrypted value"
 
 
+def test_0472_no_ops_when_encryption_is_not_configured(monkeypatch):
+    """The prod deploy condition: the migrate job runs with NO encryption key.
+
+    In that environment `encrypt_field`/`decrypt_field` RAISE
+    (_require_encryption_available), which crashed `alembic upgrade head` at 0472
+    and blocked the entire deploy. 0472 must instead no-op gracefully (matching
+    0468), leaving the column untouched.
+
+    Reverting the `is_encryption_active()` guard makes this raise RuntimeError.
+    """
+    import app.field_encryption as fe
+
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+    assert fe.is_encryption_active() is False
+
+    mig_0472 = _load_migration("0472", "0472_encrypt_oauth_token.py")
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        _create_account(conn, _TOKEN)
+        monkeypatch.setattr(mig_0472.op, "get_bind", lambda: conn)
+        mig_0472.upgrade()  # must NOT raise
+        assert _stored(conn) == _TOKEN, "no-key migrate must leave the value untouched"
+
+
 def test_0472_still_encrypts_a_genuinely_plaintext_value(monkeypatch):
     """The guard must not disable the migration's actual job.
 
