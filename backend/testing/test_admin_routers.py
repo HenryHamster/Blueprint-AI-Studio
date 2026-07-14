@@ -6657,6 +6657,99 @@ class TestMessages:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_list_messages_needs_action_scope(
+        self, client: AsyncClient, db_session
+    ):
+        """needs_action scope returns only QUESTION/BLOCKER with non-resolved status."""
+        project = await _make_project(db_session)
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.QUESTION,
+                from_type="user",
+                content="Open question",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Open blocker",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Resolved blocker",
+                status="resolved",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="Open note",
+                status="open",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=needs_action"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        returned_types = {m["message_type"] for m in data["messages"]}
+        assert returned_types == {"QUESTION", "BLOCKER"}
+        returned_contents = {m["content"] for m in data["messages"]}
+        assert "Resolved blocker" not in returned_contents
+        assert "Open note" not in returned_contents
+
+    @pytest.mark.asyncio
+    async def test_list_messages_needs_action_linked_included(
+        self, client: AsyncClient, db_session
+    ):
+        """needs_action scope includes BLOCKER in 'linked' status (linked != resolved)."""
+        project = await _make_project(db_session)
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Linked blocker",
+                status="linked",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=needs_action"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["messages"][0]["content"] == "Linked blocker"
+        assert data["messages"][0]["status"] == "linked"
+
+    @pytest.mark.asyncio
+    async def test_list_messages_needs_action_invalid_still_rejects(
+        self, client: AsyncClient, db_session
+    ):
+        """Unrecognized status values still return 400 after needs_action was added."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=foobar"
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_list_messages_guarantees_high_signal_with_routine_flood(
         self, client: AsyncClient, db_session
     ):

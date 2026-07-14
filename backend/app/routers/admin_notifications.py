@@ -39,7 +39,7 @@ from app.admin import (
     _user_project_ids,
 )
 from app.task_locking import lock_project_or_429
-from app.message_convergence import LINKED_STATUS
+from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
 from app.message_audience import STRATEGIST_INTERNAL, PIPELINE_LOG
 from app.project_message_creation import (
     create_operator_project_message,
@@ -715,12 +715,18 @@ async def list_messages(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid project_id format")
     if status and status != "all":
-        if status not in ("open", LINKED_STATUS, "resolved"):
+        if status == "needs_action":
+            filters.append(
+                ProjectMessage.message_type.in_(list(NEEDS_ACTION_MESSAGE_TYPES))
+            )
+            filters.append(ProjectMessage.status != RESOLVED_STATUS)
+        elif status not in ("open", LINKED_STATUS, "resolved"):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid status filter. Must be 'open', 'linked', 'resolved', or 'all'",
+                detail="Invalid status filter. Must be 'open', 'linked', 'resolved', 'needs_action', or 'all'",
             )
-        filters.append(ProjectMessage.status == status)
+        else:
+            filters.append(ProjectMessage.status == status)
     q_stripped = (q or "").strip()
     if q_stripped:
         q_escaped = q_stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
