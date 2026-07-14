@@ -4823,6 +4823,17 @@ class TaskWakeRegistration(SQLModel, table=True):
             "delivery_state",
             "deadline_at",
         ),
+        # Firing hot path: fire_task_wakes() point-looks-up PENDING registrations
+        # by (wake_source_kind, wake_source_ref) on every compute-job terminal
+        # transition. A (wake_source_kind, wake_source_ref, delivery_state)
+        # composite keeps that lookup off a full table scan as parked-task
+        # registrations accumulate.
+        Index(
+            "ix_taskwakeregistration_source_state",
+            "wake_source_kind",
+            "wake_source_ref",
+            "delivery_state",
+        ),
     )
 
 
