@@ -369,6 +369,7 @@ def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] |
         "last_operator_interaction_at": blob.get("last_operator_interaction_at"),
         "compaction_count": blob.get("compaction_count"),
         "last_compaction_at": blob.get("last_compaction_at"),
+        "operator_decision_summary": blob.get("_operator_decision_summary"),
     }
 
 
@@ -1995,6 +1996,7 @@ async def renew_resident_session_lease(
     message_cursor: str | None = None,
     handled_message_ids: list[str] | None = None,
     turn_latency_summary: dict | None = None,
+    operator_decision_summary: dict | None = None,
     compaction_count: int | None = None,
     last_compaction_at: str | None = None,
     decisions_reg: str | None = None,
@@ -2278,6 +2280,10 @@ async def renew_resident_session_lease(
         # observability. Bounded to a simple dict; ignored when absent/None.
         if isinstance(turn_latency_summary, dict):
             updated["_turn_latency_summary"] = turn_latency_summary
+        # Persist the operator-decision capture telemetry so a restart retains
+        # visibility into capture rate across a full session.
+        if isinstance(operator_decision_summary, dict):
+            updated["_operator_decision_summary"] = operator_decision_summary
         # Persist compaction metadata reported by the agent. These are
         # opaque agent-reported values — the backend never derives them.
         if isinstance(compaction_count, int) and compaction_count > 0:
@@ -2490,6 +2496,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
     turn_latency_summary: dict | None = None
+    operator_decision_summary: dict | None = None
     compaction_count: int | None = None
     last_compaction_at: str | None = None
     decisions_reg: str | None = None
@@ -2524,6 +2531,7 @@ async def resident_session_heartbeat(
         message_cursor=payload.message_cursor,
         handled_message_ids=payload.handled_message_ids,
         turn_latency_summary=payload.turn_latency_summary,
+        operator_decision_summary=payload.operator_decision_summary,
         compaction_count=payload.compaction_count,
         last_compaction_at=payload.last_compaction_at,
         decisions_reg=payload.decisions_reg,

@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
   apiGet, apiPost, persistAndPostStatus, resolveBaseBranch,
   recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture, getOperatorDecisionCaptureTelemetry,
 } from '../index.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
@@ -504,6 +505,10 @@ export async function handleStrategicResident(
   // Set after an unevidenced idle claim (CLEAR with no tool use, or a missing/
   // garbled marker): the next tick opens with an examine-before-CLEAR correction.
   let correctiveNextTick = restoredLedger?.corrective ?? false;
+  // Set after an operator turn that ended without an OPERATOR-DECISION marker:
+  // the next autonomous tick opens with a reminder to check whether the operator
+  // settled anything. Reset after being consumed by an autonomous turn.
+  let operatorDecisionCorrectiveNext = false;
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
 
@@ -826,7 +831,13 @@ export async function handleStrategicResident(
   // it is serialized into task.context._decisions_reg on that same heartbeat.
   const recordOperatorDecision = (r: ResidentTurnResult): void => {
     const note = parseOperatorDecision(r.resultText);
-    if (!note) return;
+    const captured = note !== null;
+    recordOperatorDecisionCapture(captured);
+    if (!captured) {
+      operatorDecisionCorrectiveNext = true;
+      streamer.status('operator turn ended without OPERATOR-DECISION marker — correction may not have been captured');
+      return;
+    }
     decisionsReg.push({
       atTick: examTick,
       at: new Date().toISOString(),
@@ -903,6 +914,10 @@ export async function handleStrategicResident(
     const latencySummary = getResidentTurnLatencyTelemetry();
     if (latencySummary !== null) {
       body.turn_latency_summary = latencySummary;
+    }
+    const opDecisionSummary = getOperatorDecisionCaptureTelemetry();
+    if (opDecisionSummary !== null) {
+      body.operator_decision_summary = opDecisionSummary;
     }
     try {
       const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, body) as SessionHeartbeatResponse;
@@ -1173,8 +1188,10 @@ export async function handleStrategicResident(
       const recentRecords = examRecords.slice(-6);
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
+      const operatorDecisionMissing = operatorDecisionCorrectiveNext;
+      operatorDecisionCorrectiveNext = false; // consumed
       lastAutonomousTurnAt = Date.now();
-      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn, decisionsRegisterText(decisionsReg)), false);
+      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn, decisionsRegisterText(decisionsReg), operatorDecisionMissing), false);
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
 

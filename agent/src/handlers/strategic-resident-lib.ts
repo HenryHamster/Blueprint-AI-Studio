@@ -1642,12 +1642,24 @@ export function buildAutonomousPrompt(
   corrective: boolean,
   maxOpsPerTurn = 3,
   decisionsRegisterText = '',
+  operatorDecisionMissing = false,
 ): string {
   const lines: string[] = [];
 
   if (corrective && focus.length > 0) {
     lines.push(
       `CORRECTION: your last idle conclusion examined nothing (no fetch/read ran, or the verdict marker was missing). Examine ${focus[0].key} now — ${focus[0].hint} — and cite what you actually read BEFORE you may conclude CLEAR.`,
+      '',
+    );
+  }
+
+  if (operatorDecisionMissing) {
+    lines.push(
+      'OPERATOR-DECISION CORRECTIVE: the last operator turn may have contained a',
+      'settlement or correction without the OPERATOR-DECISION marker. Review the',
+      'most recent operator exchange and, if the operator settled or corrected a',
+      "course, re-state it as a durable decision via OPERATOR-DECISION: <fact>. If",
+      'nothing was settled, ignore this reminder.',
       '',
     );
   }

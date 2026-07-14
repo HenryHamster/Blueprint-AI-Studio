@@ -4346,6 +4346,84 @@ async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session)
     assert stored["operator"]["count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_persists_operator_decision_summary(db_session):
+    """A heartbeat carrying ``operator_decision_summary`` stores it on the session blob."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    op_summary = {
+        "total": 4,
+        "captured": 3,
+        "missed": 1,
+        "capture_rate": 75,
+    }
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        operator_decision_summary=op_summary,
+    )
+
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_operator_decision_summary")
+    assert isinstance(stored, dict), f"Expected dict, got {stored!r}"
+    assert stored["total"] == 4
+    assert stored["captured"] == 3
+    assert stored["missed"] == 1
+    assert stored["capture_rate"] == 75
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_operator_decision_summary_leaves_blob_unchanged(db_session):
+    """A heartbeat without ``operator_decision_summary`` succeeds and leaves any
+    pre-existing ``_operator_decision_summary`` on the blob untouched."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat: persist a summary.
+    op_summary = {"total": 2, "captured": 1, "missed": 1, "capture_rate": 50}
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        operator_decision_summary=op_summary,
+    )
+
+    # Second heartbeat: no summary (liveness only).
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+    )
+    assert result["stop_requested"] is False
+
+    # The blob still has the first summary (liveness heartbeat did not erase it).
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_operator_decision_summary")
+    assert isinstance(stored, dict)
+    assert stored["total"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Restart continuity — memory notes and session summary survive into the
 # NEXT resident session's bootstrap.

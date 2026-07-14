@@ -1035,6 +1035,24 @@ describe('decisionsRegisterText decisions register', () => {
     });
     expect(noReg).not.toContain('Decisions register');
   });
+
+  it('includes OPERATOR-DECISION CORRECTIVE section when operatorDecisionMissing is true', () => {
+    const focus: ExamSurface[] = [
+      { key: 'direction:d-1', kind: 'direction', label: 'direction d-1', hint: 'check it' },
+    ];
+    const p = buildAutonomousPrompt(focus, [], [], false, 3, '', true);
+    expect(p).toContain('OPERATOR-DECISION CORRECTIVE');
+    expect(p).toContain('settlement or correction');
+    expect(p).toContain('re-state it as a durable decision');
+  });
+
+  it('omits OPERATOR-DECISION CORRECTIVE section when operatorDecisionMissing is false (default)', () => {
+    const focus: ExamSurface[] = [
+      { key: 'direction:d-1', kind: 'direction', label: 'direction d-1', hint: 'check it' },
+    ];
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    expect(p).not.toContain('OPERATOR-DECISION CORRECTIVE');
+  });
 });
 
 describe('isSettledDecisionVerdict (durable register admission)', () => {

@@ -569,3 +569,43 @@ export function getResidentTurnLatencyTelemetry(): {
 export function resetResidentTurnLatencyTelemetry(): void {
   _residentTurnStats = { operator: _emptyKindStats(), autonomous: _emptyKindStats() };
 }
+
+// ── Operator-decision capture telemetry ─────────────────────────────────────
+// Tracks how often the operator decision marker is present vs absent on
+// operator turns, so we can measure capture rate and detect silent drops.
+
+interface OperatorDecisionCaptureStats {
+  total: number;
+  captured: number;
+}
+
+let _operatorDecisionCaptureStats: OperatorDecisionCaptureStats = { total: 0, captured: 0 }; // @per-role
+
+/** Record whether an operator turn's result contained a valid OPERATOR-DECISION marker. */
+export function recordOperatorDecisionCapture(captured: boolean): void {
+  _operatorDecisionCaptureStats.total += 1;
+  if (captured) _operatorDecisionCaptureStats.captured += 1;
+}
+
+/** Snapshot the current operator-decision capture telemetry for heartbeat / status
+ *  posts. Returns null when no operator turns have been processed yet. */
+export function getOperatorDecisionCaptureTelemetry(): {
+  total: number;
+  captured: number;
+  missed: number;
+  capture_rate: number | null;
+} | null {
+  if (_operatorDecisionCaptureStats.total === 0) return null;
+  const { total, captured } = _operatorDecisionCaptureStats;
+  return {
+    total,
+    captured,
+    missed: total - captured,
+    capture_rate: total > 0 ? Math.round((captured / total) * 100) : null,
+  };
+}
+
+/** Reset operator-decision capture accumulators between roles. */
+export function resetOperatorDecisionCaptureTelemetry(): void {
+  _operatorDecisionCaptureStats = { total: 0, captured: 0 };
+}

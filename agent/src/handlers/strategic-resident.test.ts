@@ -22,6 +22,8 @@ vi.mock('../index.js', () => ({
   resolveBaseBranch: vi.fn(() => 'main'),
   recordResidentTurnLatency: vi.fn(),
   getResidentTurnLatencyTelemetry: vi.fn(() => null),
+  recordOperatorDecisionCapture: vi.fn(),
+  getOperatorDecisionCaptureTelemetry: vi.fn(() => null),
 }));
 vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn(),
@@ -77,7 +79,9 @@ import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
   recloneResidentWorkspace,
 } from './strategic-resident.js';
-import { apiGet, apiPost, recordResidentTurnLatency } from '../index.js';
+import {
+  apiGet, apiPost, recordOperatorDecisionCapture, recordResidentTurnLatency,
+} from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
@@ -588,6 +592,114 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     // 8-minute background refresh cannot update — fetches break at the next TTL.
     expect(mockWriteGitTokenFile).toHaveBeenCalledWith('fresh-read-token');
     expect(mockSetupGitCredentialHelper).toHaveBeenCalledWith('o', 'r', expect.anything());
+  });
+
+  it('calls recordOperatorDecisionCapture(true) when operator turn has OPERATOR-DECISION marker', async () => {
+    const OPERATOR_MSG = {
+      id: 'msg-captured',
+      content: 'Use approach Y instead.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({ problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '' });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      if (url.includes('strategic')) {
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'I agree, approach Y is better.\nOPERATOR-DECISION: use approach Y, not X',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-cap', {}, { project_metadata: { project_id: 'proj-cap' } },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(mockApiPost).toHaveBeenLastCalledWith(
+      expect.stringContaining('heartbeat'),
+      expect.objectContaining({ handled_message_ids: ['msg-captured'] }),
+    );
+    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith(true);
+  });
+
+  it('calls recordOperatorDecisionCapture(false) and emits status when operator turn has no marker', async () => {
+    const OPERATOR_MSG = {
+      id: 'msg-nomarker',
+      content: 'Try approach Z.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({ problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '' });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      if (url.includes('strategic')) {
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'OK, will use approach Z.',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+
+    await handleStrategicResident(
+      'task-nm', {}, { project_metadata: { project_id: 'proj-nm' } },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith(false);
+  });
+});
+
+describe('recloneResidentWorkspace', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockPrepareWorkspaceForRole.mockReset();
+    mockWriteGitTokenFile.mockReset();
+    mockSetupGitCredentialHelper.mockReset();
   });
 
   it('throws rather than re-cloning when no read token can be minted', async () => {

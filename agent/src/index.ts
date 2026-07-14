@@ -2123,6 +2123,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   clearFileTreeCache();
   // Per-task resident-session turn-latency telemetry.
   resetResidentTurnLatencyTelemetry();
+  // Per-task operator-decision capture telemetry.
+  resetOperatorDecisionCaptureTelemetry();
   // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
   // df reading rather than reusing the prior task's cached values.
   _dfCacheTimestamp = 0;
@@ -3197,6 +3199,9 @@ import {
   recordResidentTurnLatency,
   getResidentTurnLatencyTelemetry,
   resetResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture,
+  getOperatorDecisionCaptureTelemetry,
+  resetOperatorDecisionCaptureTelemetry,
 } from './telemetry.js';
 export {
   errorFingerprint,
@@ -3219,6 +3224,9 @@ export {
   recordResidentTurnLatency,
   getResidentTurnLatencyTelemetry,
   resetResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture,
+  getOperatorDecisionCaptureTelemetry,
+  resetOperatorDecisionCaptureTelemetry,
 };
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
