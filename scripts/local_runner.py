@@ -3412,10 +3412,9 @@ def _download_input_artifact(
     so they cannot contaminate this run.
 
     Returns a provenance dict (``ok`` plus ``file_count`` / ``bytes`` on success,
-    or ``reason`` on failure) describing what actually happened. Best-effort by
-    contract: a failed fetch/extract returns ``ok=False`` (the command still runs,
-    from scratch) and NEVER raises — but the failure is surfaced honestly, never
-    claimed as a successful resume.
+    or ``reason`` on failure) describing what actually happened. NEVER raises —
+    failures are signalled via ``ok=False`` so the caller can fail-close the job
+    rather than silently restarting from scratch.
     """
     url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/input-artifact"
     req = urllib.request.Request(
@@ -3783,9 +3782,9 @@ def _run_compute_job(
         # Cross-job checkpoint resume: hydrate the predecessor's durable bundle
         # into the artifact dir BEFORE any command runs (mirrors the repo-clone
         # window below), so the resumed command sees the prior checkpoint already
-        # present. Best-effort + honest: provenance (success OR failure) is
-        # reported so the operator can see exactly what happened — a failed
-        # hydration is never claimed as a successful resume.
+        # present. Fail-closed: a failed hydration aborts the job rather than
+        # silently restarting from scratch (which would discard weeks of progress
+        # and burn a full deadline on an unintended from-scratch run).
         if input_artifact_job_id:
             provenance = _download_input_artifact(
                 orchestrator_url, token, job_id, artifact_dir
@@ -3798,20 +3797,35 @@ def _run_compute_job(
                     f"{provenance.get('bytes')} bytes hydrated)",
                     flush=True,
                 )
+                _report_compute_job(
+                    orchestrator_url,
+                    token,
+                    job_id,
+                    exec_status="running",
+                    resume_hydration=provenance,
+                )
             else:
+                reason = provenance.get("reason", "unknown")
                 print(
                     f"[compute] job {job_id}: checkpoint resume from "
-                    f"{input_artifact_job_id} FAILED "
-                    f"({provenance.get('reason')}); running from scratch",
+                    f"{input_artifact_job_id} FAILED ({reason}); aborting job",
                     flush=True,
                 )
-            _report_compute_job(
-                orchestrator_url,
-                token,
-                job_id,
-                exec_status="running",
-                resume_hydration=provenance,
-            )
+                outcome = "failure"
+                _report_compute_job(
+                    orchestrator_url,
+                    token,
+                    job_id,
+                    exec_status="failed",
+                    exit_code=1,
+                    command_log={
+                        "text": f"[runner] input_artifact_rehydration_failed: {reason}; "
+                        "command never started",
+                        "truncated": False,
+                    },
+                    resume_hydration=provenance,
+                )
+                return
 
         # Reserve a disjoint GPU subset when the host has GPUs (16 GB V100 → 1/job).
         if caps.has_gpu:
