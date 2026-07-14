@@ -163,6 +163,23 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenActivityFeed).not.toHaveBeenCalled();
   });
 
+  test('autonomy control mounts once and is present on desktop (no md:hidden gating)', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+
+    // Single responsive instance shared by desktop + mobile — no duplicate mount.
+    const controls = host.querySelectorAll('[data-testid="header-autonomy-control"]');
+    expect(controls).toHaveLength(1);
+    const statuses = host.querySelectorAll('[data-testid="autonomous-status"]');
+    expect(statuses).toHaveLength(1);
+    // Wrapper must NOT be gated behind md:hidden (which hid it on desktop before).
+    expect(controls[0].className).not.toContain('md:hidden');
+  });
+
   test('desktop settings and sign-out actions use header callbacks', async () => {
     const onOpenSettings = vi.fn();
     const onSignOut = vi.fn();

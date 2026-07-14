@@ -309,6 +309,26 @@ export default function App() {
   const selectedProjectRepoLabel = selectedProject
     ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
     : null;
+  const selectedProjectAutonomous = selectedProject?.autonomous_enabled ?? false;
+  // Command-palette action: flip the selected project's autonomous mode. Reuses
+  // the existing PATCH endpoint (no new API) and refreshes the projects list so
+  // the header AutonomousStatus and the command's own label stay in sync.
+  const toggleSelectedProjectAutonomy = useCallback(async () => {
+    const pid = s.selectedProjectId;
+    if (!pid) return;
+    const next = !(selectedProject?.autonomous_enabled ?? false);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/autonomous`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) throw new Error('Failed to toggle autonomous mode');
+      s.addToast(`Autonomous mode ${next ? 'enabled' : 'paused'}`, 'success');
+      void s.fetchProjects(true);
+    } catch {
+      s.addToast('Failed to toggle autonomous mode', 'error');
+    }
+  }, [s, selectedProject]);
   // Fetch project members when panel opens or project changes
   const { fetchProjectMembers } = s;
   useEffect(() => {
@@ -849,6 +869,8 @@ export default function App() {
     selectedProjectId: s.selectedProjectId,
     selectedProjectRepoLabel,
     hasVersionLifecycle,
+    autonomousEnabled: selectedProjectAutonomous,
+    toggleAutonomousMode: toggleSelectedProjectAutonomy,
     directionsCount: directions.length,
     filteredTaskCount: filteredTasks.length,
     visibleActiveCount: visibleActiveTasks.length,

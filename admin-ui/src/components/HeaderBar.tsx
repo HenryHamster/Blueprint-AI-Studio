@@ -337,8 +337,12 @@ export function HeaderBar(props: HeaderBarProps) {
             onSignOutAll={props.onSignOutAll ?? props.onSignOut}
           />
 
-          {/* Mobile-only autonomy control */}
-          <div className="md:hidden flex items-center mr-1">
+          {/* Autonomy status + control — a single responsive instance shared by
+              desktop and mobile (one source of truth). Previously this was gated
+              behind `md:hidden`, so desktop (>=768px) never mounted it and lost
+              the control entirely; rendering it here restores a first-class,
+              discoverable home at every width. */}
+          <div className="flex items-center mr-1 md:mr-0" data-testid="header-autonomy-control">
             <AutonomousStatus
               onRefreshTasks={onRefresh}
               wsRef={wsRef}

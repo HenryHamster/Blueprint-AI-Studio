@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { ChevronDown, Plus, ToggleLeft, ToggleRight, X } from 'lucide-react';
+import { ChevronDown, Plus, X } from 'lucide-react';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
 import RunningUpdatePanel from './RunningUpdatePanel';
@@ -346,16 +346,10 @@ export function DirectionsPanel({
           <div className="px-5 py-3 border-b border-neutral-800 space-y-3 shrink-0">
             {selectedProjectId && (
               <>
-                <div className="flex items-center justify-between">
-                  <span className="text-ui-md font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
-                  <button onClick={data.toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors min-h-[44px] md:min-h-auto">
-                    {data.autonomousEnabled ? (
-                      <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>
-                    ) : (
-                      <><ToggleLeft className="w-6 h-6 text-neutral-600" /><span className="text-neutral-500 text-xs font-medium">Off</span></>
-                    )}
-                  </button>
-                </div>
+                {/* The bare On/Off toggle that used to live here is superseded by
+                    the first-class AutonomousStatus control in the header (which
+                    also surfaces lifecycle, circuit-breaker and blocking-guard
+                    status). Only the autonomy *configuration* remains here. */}
                 <p className="text-xs text-neutral-500 leading-relaxed">
                   Active directions guide the research agent. Only Active directions are included in new tasks.
                 </p>

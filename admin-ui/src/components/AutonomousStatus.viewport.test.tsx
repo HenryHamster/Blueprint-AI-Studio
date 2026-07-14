@@ -82,6 +82,28 @@ describe('AutonomousStatus — viewport regression', () => {
     }
   });
 
+  test('collapsed control renders without overflow at 1280px (desktop home)', async () => {
+    // Desktop first-class placement: AutonomousStatus now mounts in the header at
+    // >=768px (previously md:hidden). Capture it at the acceptance viewport width.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ projects: [PROJECT] }), { status: 200 }),
+    ));
+
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<AutonomousStatus />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
   test('collapsed pill renders without horizontal overflow at 375px', async () => {
     // Stub fetch so the background poll on mount doesn't throw.
     vi.stubGlobal('fetch', vi.fn(async () =>
