@@ -349,6 +349,7 @@ async def trigger_force_promote(
         project_id,
         candidate_sha=_body.candidate_sha,
         actor=str(current_user["user_id"]),
+        reason=_body.reason,
     )
     await session.commit()
     status = result.get("status")
