@@ -3208,7 +3208,10 @@ async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_sessio
     assert resp.status_code == 200
     assert resp.json()["repo_is_empty"] is True
 
-    # A project without the signal (older onboarding / detected source) → False.
+    # A project without the signal (older onboarding / detected source) → None.
+    # The tri-state signal (true / false / null) lets the agent distinguish
+    # "determined empty" from "never determined", falling through to a live
+    # scan rather than treating an absent determination as definitive non-empty.
     project_mature = Project(
         name="Mature Repo",
         user_id="test-user-123",
@@ -3233,7 +3236,7 @@ async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_sessio
     token2 = create_agent_token(str(task_mature.id), "agent-vm-mature-1")
     resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
     assert resp2.status_code == 200
-    assert resp2.json()["repo_is_empty"] is False
+    assert resp2.json()["repo_is_empty"] is None
 
 
 @pytest.mark.asyncio

@@ -2494,8 +2494,8 @@ async def claim_task(
         # (build_config.repo_is_empty). Distinct from first_task_on_repo (a
         # playbook-count proxy): this reflects actual source presence, so the
         # research prompt can gate bootstrap-from-goal guidance on real code.
-        response["repo_is_empty"] = bool(
-            (project_for_playbook.build_config or {}).get("repo_is_empty")
+        response["repo_is_empty"] = (project_for_playbook.build_config or {}).get(
+            "repo_is_empty"
         )
         # The authoritative real-source count persisted at onboarding (same
         # bounded walk that set repo_is_empty). Echoed so the agent's clone-time
