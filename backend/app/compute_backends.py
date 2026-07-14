@@ -267,6 +267,16 @@ ARTIFACT_DIR_ENV = "BLUEPRINT_ARTIFACT_DIR"
 # within that window, the job is killed early with terminal reason
 # ``no_progress_timeout`` and exit code 125.
 PROGRESS_FILE_ENV = "BLUEPRINT_PROGRESS_FILE"
+# Reserved exit code the no-progress watchdog writes when it kills a stalled job.
+# This value is a CONTRACT with three distinct producers — the local-subprocess
+# wrapper (``_build_local_wrapper_command`` below), the GCP startup script, and
+# the self-hosted runner (``scripts/local_runner.py``) — and one consumer,
+# ``RunnerSubprocessBackend.poll_status``, which maps it to terminal reason
+# ``no_progress_timeout`` (→ ``NO_PROGRESS_TIMEOUT``). Naming the value so the
+# emitter and the detector share a single source of truth: were the two literals
+# to silently drift, the platform kill would collapse to ``CODE_ERROR`` — burning
+# retry budget and misattributing blame to the operator's command.
+NO_PROGRESS_WATCHDOG_EXIT_CODE = 125
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
@@ -1257,7 +1267,7 @@ class RunnerSubprocessBackend:
             )
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
-            elif exit_code == 125:
+            elif exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE:
                 # No-progress watchdog kill on the runner. The runner /report
                 # endpoint carries only exec_status/exit_code (no reason field),
                 # so translate the reserved exit code here into a terminal reason
@@ -1695,7 +1705,7 @@ touch {progress_file} 2>/dev/null || true
       FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
       cat > {terminal_path} <<NP_EOF
 STATUS=FAILED
-EXIT_CODE=125
+EXIT_CODE={NO_PROGRESS_WATCHDOG_EXIT_CODE}
 FINISHED_AT=$FINISHED_AT
 REASON=no_progress_timeout
 METRICS=

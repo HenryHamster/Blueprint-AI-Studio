@@ -48,9 +48,11 @@ from app.compute_backends import (
     LocalSubprocessComputeBackend,
     ComputeStatusResult,
     RunnerSubprocessBackend,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
     TerminalArtifactReference,
     OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
 )
+from app import auth as auth_mod
 from app.database import resolve_async_engine
 from testing.conftest import TestingSessionLocal, USE_POSTGRES
 from app.models import (
@@ -63,6 +65,7 @@ from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
     KnowledgeDocument,
+    LocalRunner,
     Project,
     ProjectComputeImage,
     ProjectMember,
@@ -1661,6 +1664,204 @@ async def test_runner_subprocess_poll_status_generic_failure_not_no_progress():
     assert result.status == ComputeJobStatus.FAILED
     assert result.message == "compute job failed"
     assert "no_progress_timeout" not in result.message
+
+
+# ── End-to-end: runner /report endpoint → monitor → failure classification ────
+#
+# The unit tests above cover RunnerSubprocessBackend.poll_status in isolation.
+# The three tests below drive the WHOLE runner-job terminal pipeline: a real HTTP
+# POST to /api/runner/compute-job/{id}/report (runner Bearer auth), which stamps
+# polling_metadata, then process_compute_jobs_once (the monitor) polls that state,
+# finalizes the ComputeJob, and the durable terminal_reason is fed through
+# classify_compute_terminal_reason. This is the seam the client-side watchdog kill
+# (exit 125) and the runtime-deadline kill (exit 124) traverse in production;
+# nothing between the report endpoint and the classified outcome is mocked.
+
+
+async def _make_project_owner(session, *, name):
+    """A committed Project. The runner /report endpoint authenticates the runner
+    (not a user), and ``allowed_project_ids`` always includes the runner's
+    enrollment project, so no ProjectMember row is needed here."""
+    project = Project(name=name, user_id="test-user")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+async def _make_runner_subprocess_job(
+    session, project, runner, *, status=ComputeJobStatus.RUNNING
+):
+    """A runner-subprocess ComputeJob pinned to ``runner`` and ready for /report.
+
+    The pin (``polling_metadata['runner_target_id']``) is exactly what the report
+    endpoint's runner-scoping filter requires, mirroring the claim path in
+    /next-compute-job.
+    """
+    job = ComputeJob(
+        project_id=project.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=status,
+        started_at=_utcnow() - timedelta(seconds=30),
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "command": "python train.py",
+        },
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def _register_runner(session, project):
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+    )
+    session.add(runner)
+    await session.commit()
+    await session.refresh(runner)
+    return runner, token
+
+
+@pytest.mark.asyncio
+async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_monitor(
+    client, db_session
+):
+    """END-TO-END: a runner no-progress watchdog kill (exit 125) reported over the
+    HTTP /report endpoint is finalized by the monitor as a FAILURE whose durable
+    terminal_reason classifies to NO_PROGRESS_TIMEOUT — NOT CODE_ERROR.
+
+    This is the full pipeline the unit test only samples at poll_status: the
+    reserved exit code produced by scripts/local_runner.py's watchdog must survive
+    the report endpoint, poll_status' exit-125 translation, and the monitor's
+    finalize path, so the platform kill is never misattributed to the operator's
+    command (which would burn retry budget)."""
+    from app.failure_classification import (
+        NO_PROGRESS_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner NoProgress E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    # 1) Runner reports the no-progress watchdog kill over the real HTTP endpoint.
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 125},
+    )
+    assert report.status_code == 200, report.text
+
+    # 2) The monitor polls the stamped state and finalizes the job.
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert (job.polling_metadata or {}).get("exit_code") == 125
+    assert job.terminal_reason == "no_progress_timeout"
+    # 3) The classifier keys the terminal reason to a platform kill, not a defect.
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None)
+        == NO_PROGRESS_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_report_exit_124_finalizes_runtime_deadline_through_monitor(
+    client, db_session
+):
+    """END-TO-END: a runner runtime-deadline kill (exit 124) reported over the HTTP
+    /report endpoint is finalized as a TIMED_OUT deadline outcome that classifies
+    to AGENT_TIMEOUT — the other client-side watchdog, and NOT a CODE_ERROR.
+
+    Guards the sibling of the exit-125 path: exit 124 is recognised as a runtime
+    timeout by the monitor (_status_is_runtime_timeout), so the platform deadline
+    kill is attributed to the deadline, not to the command."""
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner Deadline E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 124},
+    )
+    assert report.status_code == 200, report.text
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Runtime-deadline kills terminalize as TIMED_OUT (matching the server-side
+    # runtime_deadline enforcement), not FAILED.
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "runtime deadline" in (job.terminal_reason or "")
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None) == AGENT_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_report_generic_failure_finalizes_code_error_through_monitor(
+    client, db_session
+):
+    """CONTROL: a runner report of a plain non-watchdog failure (exit 1) finalizes
+    as a FAILURE that classifies to CODE_ERROR.
+
+    Proves the 124/125 special-casing is SPECIFIC — an ordinary command failure is
+    still attributed to the command, so the watchdog reasons are not over-applied."""
+    from app.failure_classification import (
+        CODE_ERROR,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner CodeError E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 1},
+    )
+    assert report.status_code == 200, report.text
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert (job.polling_metadata or {}).get("exit_code") == 1
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None) == CODE_ERROR
+    )
 
 
 @pytest.mark.asyncio
@@ -14807,6 +15008,85 @@ def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
         if k != "declared_metric"
     }
     assert _no_progress_stalled(no_metric, now=now) is False
+
+
+def test_no_progress_stalled_respects_per_job_timeout():
+    """_no_progress_stalled honours no_progress_timeout_seconds from polling_metadata.
+
+    A per-job timeout of 300s should fire (stalled) when the plateau spans 300s,
+    even when the global window constant is much larger.  A job whose plateau is
+    shorter than the per-job window must be spared, even if it already exceeds
+    the global default.
+    """
+    from app.compute_jobs import append_progress_sample, _no_progress_stalled
+
+    min_samples = compute_jobs.COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES
+    per_job_timeout = 300  # seconds — well below the 1800s global default
+
+    now = datetime(2026, 1, 2, 0, 0, 0)
+    # Job has been running longer than per_job_timeout (grace) + per_job_timeout (window).
+    started = now - timedelta(seconds=per_job_timeout * 2 + 60)
+
+    def build_job(values, *, window_seconds):
+        meta = {
+            "declared_metric": "loss",
+            "no_progress_timeout_seconds": per_job_timeout,
+        }
+        n = len(values)
+        for i, v in enumerate(values):
+            t = now - timedelta(seconds=window_seconds * (n - 1 - i) / (n - 1))
+            meta = append_progress_sample(meta, metric="loss", value=v, t=t.isoformat())
+        return ComputeJob(
+            command="true",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            status=ComputeJobStatus.RUNNING,
+            started_at=started,
+            polling_metadata=meta,
+        )
+
+    # Plateau spanning exactly the per-job window → stalled → should fire.
+    stalled = build_job([0.5] * (min_samples + 1), window_seconds=per_job_timeout)
+    assert _no_progress_stalled(stalled, now=now) is True, (
+        "expected stalled=True for plateau spanning per-job window"
+    )
+
+    # Plateau spanning only half the per-job window → NOT enough history → spared.
+    too_short = build_job([0.5] * (min_samples + 1), window_seconds=per_job_timeout / 2)
+    assert _no_progress_stalled(too_short, now=now) is False, (
+        "expected stalled=False when plateau history is shorter than per-job window"
+    )
+
+    # Advancing metric within the per-job window → NOT stalled.
+    advancing = build_job(
+        [0.9 - 0.1 * i for i in range(min_samples + 1)],
+        window_seconds=per_job_timeout,
+    )
+    assert _no_progress_stalled(advancing, now=now) is False, (
+        "expected stalled=False for advancing metric"
+    )
+
+    # Without per-job timeout (global 1800s default), the 300s plateau is NOT stalled.
+    global_job_meta: dict = {
+        "declared_metric": "loss",
+    }
+    n = min_samples + 1
+    for i, v in enumerate([0.5] * n):
+        t = now - timedelta(seconds=per_job_timeout * (n - 1 - i) / (n - 1))
+        global_job_meta = append_progress_sample(
+            global_job_meta, metric="loss", value=v, t=t.isoformat()
+        )
+    global_job = ComputeJob(
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        started_at=started,
+        polling_metadata=global_job_meta,
+    )
+    assert _no_progress_stalled(global_job, now=now) is False, (
+        "expected stalled=False when plateau is shorter than global window (no per-job override)"
+    )
 
 
 def test_local_backend_live_tail_read_on_poll(tmp_path):

@@ -1245,24 +1245,42 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
 
     Direction-agnostic: a flat metric is "no progress" whether higher or lower
     is better, so the check never needs to know the metric's polarity.
+
+    Per-job override: if ``no_progress_timeout_seconds`` is stored in the job's
+    ``polling_metadata`` (set at job-creation time from the experiment contract),
+    it is used as both the grace period and the plateau-detection window instead
+    of the global env-var defaults.
     """
-    if COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS <= 0:
+    meta = job.polling_metadata or {}
+    raw_per_job = meta.get("no_progress_timeout_seconds")
+    if raw_per_job is not None:
+        try:
+            per_job_seconds = float(raw_per_job)
+        except (TypeError, ValueError):
+            per_job_seconds = None
+    else:
+        per_job_seconds = None
+
+    window_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+    grace_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
+
+    if window_seconds <= 0:
         return False
     metric = _declared_progress_metric(job)
     if metric is None:
         return False
     if job.started_at is None:
         return False
-    if (now - job.started_at).total_seconds() < COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS:
+    if (now - job.started_at).total_seconds() < grace_seconds:
         return False
     samples = _watched_progress_samples(job, metric)
     if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
     # Enough history: the oldest recorded sample must be at least a full window
     # old, else we have not yet observed a window's worth of the metric.
-    if (now - samples[0][0]).total_seconds() < COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS:
+    if (now - samples[0][0]).total_seconds() < window_seconds:
         return False
-    window_start = now - timedelta(seconds=COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
+    window_start = now - timedelta(seconds=window_seconds)
     window = [(t, v) for (t, v) in samples if t >= window_start]
     if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
@@ -2833,7 +2851,7 @@ async def _process_single_compute_job(
             terminal_reason=(
                 "compute job made no measurable progress on declared metric "
                 f"{watched_metric!r} over "
-                f"{int(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
+                f"{int((job.polling_metadata or {}).get('no_progress_timeout_seconds') or COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
                 "cut early to reclaim compute"
             ),
             terminal_kind=NO_PROGRESS_TERMINAL_REASON,
