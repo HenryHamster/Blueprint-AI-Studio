@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchProjectTools,
   createProjectTool,
@@ -16,6 +16,7 @@ import {
 import { getToolComponent } from '../toolRegistry';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { ProjectToolIframe } from './ProjectToolIframe';
+import { loadHiddenManifestSlugs, saveHiddenManifestSlugs } from './projectToolHidden';
 
 interface Props {
   projectId: string;
@@ -83,7 +84,25 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
-  const [hiddenManifestSlugs, setHiddenManifestSlugs] = useState<Set<string>>(new Set());
+  // Hidden manifest-tool slugs are persisted per-project in localStorage so the
+  // "Hide" control survives a reload instead of resetting on every mount.
+  //
+  // The persisted set is derived (via useMemo) from the current project, so a
+  // project switch automatically shows that project's own hidden state. Hides
+  // and un-hides made in this session are layered on top as an override, which
+  // is discarded when the project changes (its stored projectId no longer
+  // matches). This keeps the derivation pure — no setState during render / in
+  // an effect, which the React Compiler lint forbids.
+  const persistedHiddenSlugs = useMemo(
+    () => loadHiddenManifestSlugs(projectId),
+    [projectId],
+  );
+  const [hiddenOverride, setHiddenOverride] =
+    useState<{ projectId: string; slugs: Set<string> } | null>(null);
+  const hiddenManifestSlugs =
+    hiddenOverride && hiddenOverride.projectId === projectId
+      ? hiddenOverride.slugs
+      : persistedHiddenSlugs;
 
   // Per-tool configure/rename panel state
   const [configuringId, setConfiguringId] = useState<string | null>(null);
@@ -140,6 +159,22 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     void loadManifest();
     return () => { controller.abort(); };
   }, [projectId]);
+
+  // Hide a manifest tool and persist the choice.
+  function hideManifestTool(slug: string) {
+    const next = new Set(hiddenManifestSlugs);
+    next.add(slug);
+    setHiddenOverride({ projectId, slugs: next });
+    saveHiddenManifestSlugs(projectId, next);
+  }
+
+  // Clear all hidden manifest tools — the escape hatch so Hide is never a
+  // permanent dead-end (mirrors the disabled-tool Enable affordance).
+  function unhideAllManifestTools() {
+    const next = new Set<string>();
+    setHiddenOverride({ projectId, slugs: next });
+    saveHiddenManifestSlugs(projectId, next);
+  }
 
   async function refresh() {
     try {
@@ -467,11 +502,15 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
     const allManifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
     const manifestTools = allManifestTools.filter(t => !hiddenManifestSlugs.has(t.slug));
+    const hiddenManifestCount = allManifestTools.length - manifestTools.length;
     const manifestSkills = manifestState.status === 'ok' ? manifestState.skills : [];
     const hasAnyTool =
       registeredTools.length > 0 ||
       disabledTools.length > 0 ||
       manifestTools.length > 0 ||
+      // Keep the section alive when every manifest tool is hidden so the
+      // "Show hidden" restore affordance remains reachable.
+      hiddenManifestCount > 0 ||
       manifestSkills.length > 0;
 
     if (!hasAnyTool) {
@@ -511,7 +550,11 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                       onClick={() => handleToggleEnabled(tool)}
                       className="text-xs text-neutral-500 hover:text-neutral-300"
                     >
-                      {tool.enabled ? 'Disable' : 'Enable'}
+                      {/* Always "Disable" here: this list is filtered to enabled
+                          tools. Disabled tools move to the "Disabled" section
+                          below, which carries its own Enable control — so a
+                          disabled tool is never stranded. */}
+                      Disable
                     </button>
                     <button
                       type="button"
@@ -546,7 +589,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                 <button
                   type="button"
                   data-viewport-allow-small-target
-                  onClick={() => setHiddenManifestSlugs(prev => new Set([...prev, tool.slug]))}
+                  onClick={() => hideManifestTool(tool.slug)}
                   className="text-xs text-neutral-500 hover:text-neutral-300"
                 >
                   Hide
@@ -559,6 +602,24 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
           {manifestState.status === 'ok' && manifestState.warning && (
             <div className="col-span-full rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
               Manifest warning: {manifestState.warning}
+            </div>
+          )}
+
+          {/* Escape hatch: restore any hidden project-declared tools so Hide is
+              never a permanent dead-end. */}
+          {hiddenManifestCount > 0 && (
+            <div className="col-span-full flex items-center gap-2 text-xs text-neutral-500">
+              <span>
+                {hiddenManifestCount} project-declared tool{hiddenManifestCount === 1 ? '' : 's'} hidden
+              </span>
+              <button
+                type="button"
+                data-viewport-allow-small-target
+                onClick={unhideAllManifestTools}
+                className="text-neutral-400 underline hover:text-neutral-200"
+              >
+                Show hidden
+              </button>
             </div>
           )}
         </div>

@@ -14,6 +14,7 @@ vi.mock('../api/projectTools', async () => {
     fetchToolKinds: vi.fn(),
     updateProjectTool: vi.fn(),
     seedProjectTools: vi.fn(),
+    fetchAssetToken: vi.fn(),
   };
 });
 
@@ -22,10 +23,13 @@ import {
   fetchProjectToolManifest,
   fetchToolKinds,
   updateProjectTool,
+  fetchAssetToken,
   type FetchProjectToolsResult,
   type ProjectTool,
+  type ProjectToolManifestEntry,
   type ToolKindConfig,
 } from '../api/projectTools';
+import { loadHiddenManifestSlugs } from './projectToolHidden';
 
 function MockWidget({ tool }: ToolComponentProps) {
   return <div className="p-2 text-xs">{tool.title} content</div>;
@@ -188,5 +192,66 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     // Save button is disabled for blank titles.
     expect((findButton('Save') as HTMLButtonElement).disabled).toBe(true);
     expect(vi.mocked(updateProjectTool)).not.toHaveBeenCalled();
+  });
+});
+
+const MANIFEST_TOOL: ProjectToolManifestEntry = {
+  slug: 'custom-viewer',
+  title: 'Custom Viewer',
+  description: 'A project-declared viewer',
+  placement: 'project_section',
+  entry: 'index.html',
+  kind: 'project',
+  source: 'project',
+};
+
+describe('ProjectToolHost — manifest tool Hide persistence', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [MANIFEST_TOOL], skills: [], error: null });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    // The iframe mints an asset token on mount; resolve it so no unhandled
+    // rejection leaks into the test (the Hide button lives outside the iframe).
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-11T12:00:00Z' });
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  test('Hide persists the slug to localStorage and hides the tool', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(h().textContent).toContain('Custom Viewer');
+
+    await act(async () => { requireButton('Hide').click(); });
+
+    // Tool is gone from the visible grid...
+    expect(findButton('Hide')).toBeUndefined();
+    // ...persisted so a reload keeps it hidden...
+    expect([...loadHiddenManifestSlugs('proj-a')]).toEqual(['custom-viewer']);
+    // ...and the restore affordance is reachable.
+    expect(findButton('Show hidden')).toBeTruthy();
+  });
+
+  test('a persisted hidden slug is respected on mount', async () => {
+    localStorage.setItem('project_tools_hidden:proj-a', JSON.stringify(['custom-viewer']));
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    // The tool starts hidden; only the restore affordance shows.
+    expect(findButton('Hide')).toBeUndefined();
+    expect(findButton('Show hidden')).toBeTruthy();
+  });
+
+  test('Show hidden restores the tool and clears storage', async () => {
+    localStorage.setItem('project_tools_hidden:proj-a', JSON.stringify(['custom-viewer']));
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => { requireButton('Show hidden').click(); });
+    expect(findButton('Hide')).toBeTruthy();
+    expect(loadHiddenManifestSlugs('proj-a').size).toBe(0);
   });
 });
