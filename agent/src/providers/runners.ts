@@ -80,6 +80,10 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       '5-hour limit reached',
       'api error: rate limit reached',
       "this request would exceed your account's rate limit",
+      // Org billing cap: "You've hit your org's monthly spend limit · ask your
+      // admin to raise it at claude.ai/settings/usage". Matched on the
+      // apostrophe-free tail so a curly-quote "org's" can't break the match.
+      'monthly spend limit',
     ],
     api_key: [
       "you've hit your limit",
@@ -92,6 +96,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       '5-hour limit reached',
       'api error: rate limit reached',
       "this request would exceed your account's rate limit",
+      'monthly spend limit',
     ],
   },
   openai: {

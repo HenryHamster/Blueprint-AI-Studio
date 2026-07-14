@@ -1584,6 +1584,22 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit("this request would exceed your account's rate limit")).toBe(true);
   });
 
+  it('detects the org monthly spend-limit banner (curly apostrophes)', () => {
+    expect(matchesRateLimit(
+      'You’ve hit your org’s monthly spend limit · ask your admin to raise it at claude.ai/settings/usage',
+    )).toBe(true);
+  });
+
+  it('detects the org monthly spend-limit banner (ascii apostrophes)', () => {
+    expect(matchesRateLimit(
+      "You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage",
+    )).toBe(true);
+  });
+
+  it('detects the org monthly spend-limit banner for anthropic/api_key', () => {
+    expect(matchesRateLimit("you've hit your org's monthly spend limit", 'anthropic', 'api_key')).toBe(true);
+  });
+
   it('matches case-insensitively (uppercase)', () => {
     expect(matchesRateLimit('API ERROR: RATE LIMIT REACHED')).toBe(true);
   });
