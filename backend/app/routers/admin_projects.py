@@ -808,6 +808,172 @@ async def detect_project_build_config(
     }
 
 
+class CapabilityExemptionGrant(BaseModel):
+    """Operator request to grant a proof exemption for a ``working`` capability.
+
+    ``reason`` is the audit trail persisted alongside the operator's identity in
+    the platform ledger — WHY this capability is being cleared without machine
+    proof (e.g. "frontend-visual-verification-loop cannot be machine-verified").
+    """
+
+    capability_name: str = Field(..., min_length=1)
+    reason: str | None = None
+
+
+@router.post("/projects/{project_id}/capability-exemptions")
+@limiter.limit("20/minute")
+async def grant_capability_proof_exemption(
+    request: Request,
+    project_id: uuid.UUID,
+    body: CapabilityExemptionGrant,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Grant an OPERATOR proof exemption for a named ``working`` capability.
+
+    This is the only authorized way to write the enforce-gate carve-out set: it
+    appends a :func:`build_operator_exemption_record` (carrying the granting
+    operator's identity — provenance the agent cannot forge) to the project's
+    platform-only ``capability_proof_records`` ledger. An exempted capability
+    clears every proof-gate seam WITHOUT machine proof and is excluded from the
+    auto-graduation coverage denominator, so a genuinely unprovable capability no
+    longer stalls the gate at ``observe`` forever.
+
+    OWNER-guarded. Validates the capability name resolves to a declared ``working``
+    capability in the project's problem_model (404 otherwise); a blank/unnormalizable
+    name is rejected 400. Idempotent — a second grant for the same capability does
+    not append a duplicate record.
+    """
+    from app.capability_registry import (
+        CAPABILITY_EXEMPTION_PROOF_KIND,
+        build_operator_exemption_record,
+        normalize_capability_name,
+        platform_exempt_capability_names,
+        working_capability_names,
+    )
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    normalized = normalize_capability_name(body.capability_name)
+    if not normalized:
+        raise HTTPException(
+            status_code=400, detail="capability_name is blank or unnormalizable"
+        )
+    working = working_capability_names(project.problem_model or {})
+    if normalized not in working:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"'{normalized}' is not a declared 'working' capability in this "
+                "project's problem_model"
+            ),
+        )
+
+    project = await lock_project_or_429(session, project.id)
+    records = project.capability_proof_records
+    records = dict(records) if isinstance(records, dict) else {}
+    entries = records.get(normalized)
+    entries = list(entries) if isinstance(entries, list) else []
+    already_exempt = any(
+        isinstance(e, dict)
+        and str(e.get("proof_kind", "")).strip().lower()
+        == CAPABILITY_EXEMPTION_PROOF_KIND
+        for e in entries
+    )
+    if not already_exempt:
+        entries.append(
+            build_operator_exemption_record(
+                normalized,
+                authorized_by=current_user.get("email") or current_user["user_id"],
+                reason=body.reason,
+            )
+        )
+        records[normalized] = entries
+        project.capability_proof_records = records
+        flag_modified(project, "capability_proof_records")
+        await session.commit()
+        await session.refresh(project)
+
+    return {
+        "status": "granted",
+        "capability_name": normalized,
+        "already_exempt": already_exempt,
+        "exempt_capabilities": sorted(
+            platform_exempt_capability_names(project.capability_proof_records)
+        ),
+    }
+
+
+@router.delete("/projects/{project_id}/capability-exemptions/{capability_name}")
+@limiter.limit("20/minute")
+async def revoke_capability_proof_exemption(
+    request: Request,
+    project_id: uuid.UUID,
+    capability_name: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Revoke the OPERATOR proof exemption for a named capability.
+
+    Removes every operator-exemption record for the capability from the project's
+    platform ledger, so it once again counts against the auto-graduation coverage
+    denominator and must earn a real machine proof to clear the enforce gate.
+    OWNER-guarded. Idempotent — revoking a capability with no exemption record
+    returns ``removed: 0``. Does NOT require the capability to still be ``working``
+    (an operator may revoke an exemption for a capability that was since removed).
+    """
+    from app.capability_registry import (
+        CAPABILITY_EXEMPTION_PROOF_KIND,
+        normalize_capability_name,
+        platform_exempt_capability_names,
+    )
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    normalized = normalize_capability_name(capability_name)
+    if not normalized:
+        raise HTTPException(
+            status_code=400, detail="capability_name is blank or unnormalizable"
+        )
+
+    project = await lock_project_or_429(session, project.id)
+    records = project.capability_proof_records
+    records = dict(records) if isinstance(records, dict) else {}
+    entries = records.get(normalized)
+    removed = 0
+    if isinstance(entries, list):
+        kept = [
+            e
+            for e in entries
+            if not (
+                isinstance(e, dict)
+                and str(e.get("proof_kind", "")).strip().lower()
+                == CAPABILITY_EXEMPTION_PROOF_KIND
+            )
+        ]
+        removed = len(entries) - len(kept)
+        if removed:
+            if kept:
+                records[normalized] = kept
+            else:
+                records.pop(normalized, None)
+            project.capability_proof_records = records
+            flag_modified(project, "capability_proof_records")
+            await session.commit()
+            await session.refresh(project)
+
+    return {
+        "status": "revoked",
+        "capability_name": normalized,
+        "removed": removed,
+        "exempt_capabilities": sorted(
+            platform_exempt_capability_names(project.capability_proof_records)
+        ),
+    }
+
+
 @router.post("/projects/{project_id}/running-update/acknowledge")
 @limiter.limit("30/minute")
 async def acknowledge_running_update(

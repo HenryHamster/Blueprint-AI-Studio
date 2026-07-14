@@ -265,6 +265,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "criterion_retracted",
         "criterion_superseded",
         "question_answer",
+        "capability_proof_gate_graduated_observe",
+        "capability_proof_gate_graduated_enforce",
     }
 )
 

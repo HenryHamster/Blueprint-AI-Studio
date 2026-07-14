@@ -89,6 +89,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "criterion_retracted",  # post_criterion_retracted_message
         "criterion_superseded",  # post_criterion_superseded_message
         "question_answer",  # post_question_answer
+        "capability_proof_gate_graduated_observe",  # post_capability_proof_gate_graduated_message
+        "capability_proof_gate_graduated_enforce",  # post_capability_proof_gate_graduated_message
     }
 )
 
@@ -751,6 +753,76 @@ async def post_criterion_superseded_message(
             "release_version_id": str(release_version_id),
             "superseded_by_key": superseded_by_key,
             "retracted_by": retracted_by,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_capability_proof_gate_graduated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    from_mode: str,
+    to_mode: str,
+    coverage: float,
+    threshold: float,
+    projects_contributing: int,
+    total_non_exempt: int,
+    total_proven: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE when the capability-proof gate auto-graduates.
+
+    The metrics-integrity sweep advances the gate mode ``off → observe → enforce``
+    autonomously once fleet-wide proof coverage crosses the configured thresholds.
+    Previously this significant behavior change was recorded only in an INFO log —
+    the operator learned about it by reading logs or noticing the settings mode
+    flipped. This routes an operator-visible message through the unified audience
+    system on every advance.
+
+    The event type (and hence audience) is split by target mode:
+
+    * ``→ observe`` → ``capability_proof_gate_graduated_observe`` (``operator-fyi``):
+      the gate now records unproven-capability blocks but does not enforce them.
+    * ``→ enforce`` → ``capability_proof_gate_graduated_enforce``
+      (``operator-action-needed``): the gate now BLOCKS task spawning and release
+      promotion for capabilities lacking proof — a change the operator should act
+      on (raise proof coverage or relax the thresholds).
+
+    Both event types are registered in ``HIGH_SIGNAL_NOTE_EVENT_TYPES`` so the
+    NOTE survives paging. Best-effort: the in-session message rides the caller's
+    commit.
+    """
+    to_mode_norm = (to_mode or "").strip().lower()
+    if to_mode_norm == "enforce":
+        event_type = "capability_proof_gate_graduated_enforce"
+        impact = (
+            "gate now BLOCKS task spawning and release promotion for "
+            "capabilities lacking proof"
+        )
+    else:
+        event_type = "capability_proof_gate_graduated_observe"
+        impact = "gate now records unproven-capability blocks (no blocking yet)"
+
+    summary = (
+        f"Capability-proof gate auto-graduated {from_mode} → {to_mode_norm} "
+        f"(fleet coverage={coverage:.1%} ≥ threshold={threshold:.1%}, "
+        f"{total_proven}/{total_non_exempt} proven across "
+        f"{projects_contributing} project(s)) — {impact}."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type=event_type,
+        summary=summary,
+        context={
+            "from_mode": from_mode,
+            "to_mode": to_mode_norm,
+            "coverage": round(float(coverage), 4),
+            "threshold": round(float(threshold), 4),
+            "projects_contributing": projects_contributing,
+            "total_non_exempt": total_non_exempt,
+            "total_proven": total_proven,
         },
         task_id=task_id,
     )

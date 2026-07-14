@@ -11,6 +11,7 @@ import {
   apiFetch,
   type EvergreenFillSettings,
   type CapabilityProofGateMode,
+  type CapabilityProofGateCoverage,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
 import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
@@ -196,6 +197,7 @@ export function SettingsOrchestratorSection({
   const [proofEnforceThreshold, setProofEnforceThreshold] = useState(0.95);
   const [proofObserveThresholdInput, setProofObserveThresholdInput] = useState('0.5');
   const [proofEnforceThresholdInput, setProofEnforceThresholdInput] = useState('0.95');
+  const [proofCoverage, setProofCoverage] = useState<CapabilityProofGateCoverage | null>(null);
 
   const loadFillSettings = useCallback(async () => {
     try {
@@ -234,6 +236,12 @@ export function SettingsOrchestratorSection({
         setProofEnforceThreshold(safeEnforce);
         setProofObserveThresholdInput(String(safeObserve));
         setProofEnforceThresholdInput(String(safeEnforce));
+        const cov = data?.capability_proof_gate_coverage;
+        setProofCoverage(
+          cov && typeof cov === 'object'
+            ? (cov as CapabilityProofGateCoverage)
+            : null,
+        );
       }
     } catch {
       // silently ignore — defaults remain
@@ -854,6 +862,36 @@ export function SettingsOrchestratorSection({
           resolution. Auto-graduation advances the mode (off&nbsp;→&nbsp;observe&nbsp;→&nbsp;enforce, forward-only)
           automatically once fleet proof coverage crosses the thresholds below.
         </p>
+        <div className="mb-3" data-testid="proof-gate-fleet-coverage-meter">
+          {(() => {
+            const cov = proofCoverage;
+            if (!cov || cov.coverage_ratio === null) {
+              return (
+                <p className="text-xs text-neutral-500">
+                  Current fleet coverage <span className="text-neutral-400">n/a</span>
+                  <span className="text-neutral-600"> — no non-exempt working capabilities</span>
+                </p>
+              );
+            }
+            const pct = Math.round(cov.coverage_ratio * 100);
+            const enforcePct = Math.round(proofEnforceThreshold * 100);
+            const observePct = Math.round(proofObserveThreshold * 100);
+            return (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500 shrink-0">Current fleet coverage</span>
+                <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden min-w-[3rem] max-w-[10rem]">
+                  <div
+                    className={`h-full rounded-full ${pct >= enforcePct ? 'bg-emerald-500' : pct >= observePct ? 'bg-amber-500' : 'bg-neutral-600'}`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <span className="text-xs font-mono text-neutral-400 shrink-0" data-testid="proof-gate-fleet-coverage-value">
+                  {cov.total_proven}/{cov.total_non_exempt_working} ({pct}%)
+                </span>
+              </div>
+            );
+          })()}
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div className="md:col-span-2 lg:col-span-3">
             <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>

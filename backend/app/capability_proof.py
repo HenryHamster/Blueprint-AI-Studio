@@ -237,6 +237,16 @@ def enrich_problem_model_capability_proofs(
     if not isinstance(capabilities, list):
         return dict(problem_model)
 
+    # Canonical names of ``working`` capabilities carrying an AUTHORIZED (platform-
+    # recorded) operator exemption — the only exemption the agent cannot forge (a
+    # bare agent-writable ``proof_exempt`` flag does NOT authorize). Surface it on
+    # each matching capability so the display path (coverage meter denominator,
+    # Exempt badge, Revoke-exemption button) agrees with the ledger-aware auto-
+    # graduation coverage rather than diverging after a page reload. Uses the same
+    # alias-aware gate carve-out set as coverage (:func:`exempt_capability_names`),
+    # so an exemption recorded against an absorbed name marks the survivor exempt.
+    ledger_exempt = exempt_capability_names(problem_model, proof_records)
+
     annotated = dict(problem_model)
     annotated_caps: list[Any] = []
     for entry in capabilities:
@@ -245,6 +255,16 @@ def enrich_problem_model_capability_proofs(
             continue
         entry2 = dict(entry)
         cap_name = entry2.get("name")
+        # Drive proof_exempt AUTHORITATIVELY from the ledger, not the agent-writable
+        # flag. Set it True for a ledger-backed exemption AND False otherwise, so an
+        # unauthorized agent-written ``proof_exempt: true`` (no platform record) is
+        # cleared rather than surfaced. Leaving a forged flag in place would diverge
+        # the coverage-meter denominator (ProblemModelViewer.tsx:481, which excludes
+        # proof_exempt caps) from the ledger-aware backend auto-graduation rule
+        # (audit finding #9 ignores the agent flag) and render a dead-end Revoke-
+        # exemption button whose revoke returns removed:0.
+        if isinstance(cap_name, str):
+            entry2["proof_exempt"] = normalize_capability_name(cap_name) in ledger_exempt
         entries = (
             _proof_entries_for_capability(proof_records, cap_name)
             if isinstance(cap_name, str)

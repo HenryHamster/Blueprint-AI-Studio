@@ -388,6 +388,41 @@ async def get_settings(
     max_plan_accounts = await list_authoritative_max_plan_accounts(
         session, current_user["user_id"]
     )
+
+    # Surface the current fleet-wide capability-proof coverage ratio that the
+    # auto-graduation observe/enforce thresholds are compared against, so the
+    # operator can see where the gate stands rather than setting thresholds
+    # blind. Best-effort: a failure here must never break the settings load.
+    capability_proof_gate_coverage: dict = {
+        "coverage_ratio": None,
+        "total_proven": 0,
+        "total_non_exempt_working": 0,
+        "projects_contributing": 0,
+        "num_projects": 0,
+    }
+    try:
+        from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+        _cov = await compute_fleet_proof_coverage(
+            session,
+            int(_runtime_config.get("metrics_integrity_sweep_max_projects", 25)),
+        )
+        # Expose only the scalar coverage summary — the internal
+        # ``contributing_project_ids`` list (UUIDs, used by the graduation
+        # notifier) is not part of the operator-facing settings surface.
+        capability_proof_gate_coverage = {
+            "coverage_ratio": _cov["coverage_ratio"],
+            "total_proven": _cov["total_proven"],
+            "total_non_exempt_working": _cov["total_non_exempt_working"],
+            "projects_contributing": _cov["projects_contributing"],
+            "num_projects": _cov["num_projects"],
+        }
+    except Exception:
+        logger.warning(
+            "failed to compute fleet capability-proof coverage for settings",
+            exc_info=True,
+        )
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -457,6 +492,7 @@ async def get_settings(
                 "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
             )
         ),
+        "capability_proof_gate_coverage": capability_proof_gate_coverage,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
         ),

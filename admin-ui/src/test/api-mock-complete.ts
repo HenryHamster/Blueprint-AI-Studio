@@ -110,6 +110,8 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     fetchMetricsIntegrityObservability: vi.fn(),
     patchMetricsIntegritySettings: vi.fn(),
     patchCapabilityProofGateSettings: vi.fn(),
+    grantCapabilityProofExemption: vi.fn(),
+    revokeCapabilityProofExemption: vi.fn(),
     fetchCompletionDebts: vi.fn(),
     dismissCompletionDebt: vi.fn(),
     resolveCompletionDebt: vi.fn(),

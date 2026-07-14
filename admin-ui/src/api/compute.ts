@@ -1675,6 +1675,20 @@ export async function patchMetricsIntegritySettings(patch: { metrics_integrity_s
 
 export type CapabilityProofGateMode = 'off' | 'observe' | 'enforce';
 
+/**
+ * Fleet-wide capability-proof coverage that the auto-graduation observe/enforce
+ * thresholds are compared against. Surfaced read-only in settings so the
+ * operator can see where the gate stands. `coverage_ratio` is null when the
+ * denominator (non-exempt working capabilities) is zero.
+ */
+export interface CapabilityProofGateCoverage {
+  coverage_ratio: number | null;
+  total_proven: number;
+  total_non_exempt_working: number;
+  projects_contributing: number;
+  num_projects: number;
+}
+
 export interface CapabilityProofGateSettings {
   capability_proof_gate_mode: CapabilityProofGateMode;
   capability_proof_gate_auto_graduation_enabled: boolean;
@@ -1697,6 +1711,64 @@ export async function patchCapabilityProofGateSettings(
     const msg = data?.detail || `Failed to update capability proof gate settings: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to update capability proof gate settings: ${res.status}`);
   }
+}
+
+// Shape returned by both the grant (POST) and revoke (DELETE) capability-exemption
+// endpoints. `exempt_capabilities` is the full normalized set of operator-exempt
+// capability names AFTER the mutation, so the caller can reconcile local state.
+export interface CapabilityExemptionResponse {
+  status: 'granted' | 'revoked';
+  capability_name: string;
+  exempt_capabilities: string[];
+  // Present only on grant — true when the capability was already exempt (no-op).
+  already_exempt?: boolean;
+  // Present only on revoke — number of exemption records removed (0 when none).
+  removed?: number;
+}
+
+// Grants an OPERATOR proof exemption for a named `working` capability, clearing
+// the enforce gate for it WITHOUT machine proof and excluding it from the
+// auto-graduation coverage denominator. OWNER-guarded server-side (403 otherwise);
+// 404 if the name is not a declared `working` capability. Idempotent.
+export async function grantCapabilityProofExemption(
+  projectId: string,
+  capabilityName: string,
+  reason?: string,
+): Promise<CapabilityExemptionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-exemptions`,
+    {
+      method: 'POST',
+      body: JSON.stringify(
+        reason ? { capability_name: capabilityName, reason } : { capability_name: capabilityName },
+      ),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to grant capability exemption: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to grant capability exemption: ${res.status}`);
+  }
+  return res.json();
+}
+
+// Revokes the OPERATOR proof exemption for a named capability, so it once again
+// counts against the coverage denominator and must earn a real proof to clear
+// the enforce gate. OWNER-guarded server-side. Idempotent (removed: 0 when none).
+export async function revokeCapabilityProofExemption(
+  projectId: string,
+  capabilityName: string,
+): Promise<CapabilityExemptionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-exemptions/${encodeURIComponent(capabilityName)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to revoke capability exemption: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to revoke capability exemption: ${res.status}`);
+  }
+  return res.json();
 }
 
 

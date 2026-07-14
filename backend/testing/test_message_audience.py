@@ -61,6 +61,16 @@ def test_route_event_criterion_mutations_maps_to_operator_action_needed():
     assert route_event("criterion_superseded") == OPERATOR_ACTION_NEEDED
 
 
+def test_route_event_capability_proof_gate_graduation_split_by_mode():
+    """Gate auto-graduation splits audience by target mode: observe is FYI,
+    enforce (which begins blocking spawns/promotion) needs operator attention."""
+    assert route_event("capability_proof_gate_graduated_observe") == OPERATOR_FYI
+    assert (
+        route_event("capability_proof_gate_graduated_enforce")
+        == OPERATOR_ACTION_NEEDED
+    )
+
+
 def test_route_event_alert_types_mapped():
     """Alert event types from alert_policy.ALERT_EVENT_POLICIES are registered."""
     assert route_event("task.failed") == OPERATOR_FYI

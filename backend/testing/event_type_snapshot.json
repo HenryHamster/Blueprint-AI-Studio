@@ -286,6 +286,20 @@
       "message_type": "NOTE",
       "source_fn": "post_criterion_superseded_message",
       "audience": "operator-action-needed"
+    },
+    {
+      "name": "capability_proof_gate_graduated_observe",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_capability_proof_gate_graduated_message",
+      "audience": "operator-fyi"
+    },
+    {
+      "name": "capability_proof_gate_graduated_enforce",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_capability_proof_gate_graduated_message",
+      "audience": "operator-action-needed"
     }
   ]
 }

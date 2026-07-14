@@ -597,6 +597,35 @@ class TestCapabilityProofViews:
         # no proof records → unproven
         assert caps["cap-empty"]["proof_status"] == "unproven"
 
+    def test_enrich_drives_proof_exempt_authoritatively_from_ledger(self):
+        """enrich must set proof_exempt from the ledger, not the agent-writable flag.
+
+        A working capability whose exemption is recorded in the platform ledger
+        becomes proof_exempt=True; a working capability with a FORGED
+        ``proof_exempt: true`` and NO ledger record is cleared to False. Otherwise
+        the coverage-meter denominator (which excludes proof_exempt caps) would
+        diverge from the ledger-aware auto-graduation rule (finding #9), and the
+        Revoke-exemption button would dead-end (revoke removes nothing).
+        """
+        problem_model = {
+            "capabilities": [
+                # Ledger-backed exemption → must surface proof_exempt=True.
+                {"name": "ledger-exempt", "status": "working"},
+                # Forged agent flag, NO ledger record → must be cleared to False.
+                {"name": "forged-exempt", "status": "working", "proof_exempt": True},
+            ]
+        }
+        enriched = enrich_problem_model_capability_proofs(
+            problem_model, _platform_exemption_ledger("ledger-exempt")
+        )
+        caps = {c["name"]: c for c in enriched["capabilities"]}
+        assert caps["ledger-exempt"]["proof_exempt"] is True, (
+            "a ledger-recorded exemption must surface proof_exempt=True"
+        )
+        assert caps["forged-exempt"]["proof_exempt"] is False, (
+            "an agent-written proof_exempt with no ledger record must be cleared"
+        )
+
     def test_enrich_empty_evidence_refs_falls_back_to_proof_records(self):
         """enrich with evidence_refs=[] must fall through to proof_records, not 'unproven'.
 

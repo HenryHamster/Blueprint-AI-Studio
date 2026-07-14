@@ -4158,6 +4158,101 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     return results
 
 
+async def compute_fleet_proof_coverage(
+    session: Any, max_projects: int
+) -> Dict[str, Any]:
+    """Compute the fleet-wide capability-proof coverage ratio.
+
+    This is the exact quantity the auto-graduation thresholds
+    (``capability_proof_gate_auto_graduation_observe_threshold`` /
+    ``..._enforce_threshold``) are compared against, extracted so it can be
+    surfaced read-only to the operator (e.g. the settings endpoint) as well as
+    driving :func:`check_capability_proof_gate_auto_graduation`.
+
+    Coverage = total proven working caps / total non-exempt working caps.
+    Exempt capabilities are excluded from BOTH numerator and denominator, and a
+    project with working caps that are all exempt does not contribute.
+
+    Bounded by ``max_projects`` (mirrors the sweep's ``ctx.max_projects``).
+
+    Returns a dict with:
+
+    * ``num_projects`` — projects examined (bounded by ``max_projects``)
+    * ``projects_contributing`` — projects with >=1 non-exempt working cap
+    * ``contributing_project_ids`` — ids of those contributing projects (used by
+      the auto-graduation check to notify each contributing project's operator)
+    * ``total_non_exempt_working`` — coverage denominator
+    * ``total_proven`` — coverage numerator
+    * ``coverage_ratio`` — ``total_proven / total_non_exempt_working`` as a
+      float, or ``None`` when the denominator is zero (ratio undefined)
+    """
+    from app.capability_registry import (
+        exempt_capability_names,
+        working_capability_proof_status,
+    )
+    from app.models import Project
+
+    # ``capability_proof_records`` (the platform-only ledger) is loaded alongside
+    # the problem_model so an operator-recorded exemption is honored here: without
+    # it, ``exempt_capability_names`` defaults ``proof_records`` to None (an EMPTY
+    # ledger) and a genuinely unprovable-but-exempted working capability counts
+    # against the denominator forever, so fleet coverage can never reach the enforce
+    # threshold and the gate stalls. Threading the ledger in grades a platform-
+    # exempted capability ``proven`` AND drops it from the denominator, matching the
+    # every-other gate seam (:func:`exempt_capability_names`). A bare agent-writable
+    # ``proof_exempt`` flag still does NOT exclude — only the platform ledger does.
+    projects = (
+        await session.execute(
+            select(
+                Project.id,
+                Project.problem_model,
+                Project.capability_proof_records,
+            ).limit(max_projects)
+        )
+    ).all()
+
+    total_non_exempt_working = 0
+    total_proven = 0
+    projects_contributing = 0
+    contributing_project_ids: list = []
+
+    for project_id, raw_pm, raw_records in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_records = raw_records if isinstance(raw_records, dict) else {}
+        proof_by_name = working_capability_proof_status(pm, proof_records=proof_records)
+        if not proof_by_name:
+            continue
+        exempt_set = exempt_capability_names(pm, proof_records)
+        # Exclude exempt capabilities from both numerator and denominator.
+        non_exempt = {
+            name: status
+            for name, status in proof_by_name.items()
+            if name not in exempt_set
+        }
+        if not non_exempt:
+            # Project has working caps but all are exempt — exclude from aggregate.
+            continue
+        projects_contributing += 1
+        contributing_project_ids.append(project_id)
+        total_non_exempt_working += len(non_exempt)
+        total_proven += sum(1 for s in non_exempt.values() if s == "proven")
+
+    coverage_ratio = (
+        total_proven / total_non_exempt_working
+        if total_non_exempt_working > 0
+        else None
+    )
+
+    return {
+        "num_projects": len(projects),
+        "projects_contributing": projects_contributing,
+        "contributing_project_ids": contributing_project_ids,
+        "total_non_exempt_working": total_non_exempt_working,
+        "total_proven": total_proven,
+        "coverage_ratio": coverage_ratio,
+    }
+
+
 @register_check(
     "capability_proof_gate_auto_graduation",
     "Compute fleet-wide capability proof coverage and automatically advance the "
@@ -4183,11 +4278,7 @@ async def check_capability_proof_gate_auto_graduation(
     Returns a CheckResult with coverage ratio, threshold, and whether advancement
     occurred. Idempotent — running twice with the same coverage advances at most once.
     """
-    from app.capability_registry import (
-        exempt_capability_names,
-        working_capability_proof_status,
-    )
-    from app.models import DeploymentState, Project
+    from app.models import DeploymentState
     from app.shared_state import runtime_config as _runtime_config
 
     # Read auto-graduation config from runtime_config.
@@ -4229,13 +4320,9 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    # Compute fleet-wide proof coverage.
-    projects = (
-        await ctx.session.execute(
-            select(Project.id, Project.problem_model).limit(ctx.max_projects)
-        )
-    ).all()
-    if not projects:
+    # Compute fleet-wide proof coverage (shared with the settings endpoint).
+    coverage = await compute_fleet_proof_coverage(ctx.session, ctx.max_projects)
+    if coverage["num_projects"] == 0:
         return [
             CheckResult(
                 check="capability_proof_gate_auto_graduation",
@@ -4245,28 +4332,10 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    total_non_exempt_working = 0
-    total_proven = 0
-    projects_contributing = 0
-
-    for _project_id, raw_pm in projects:
-        pm = raw_pm if isinstance(raw_pm, dict) else {}
-        proof_by_name = working_capability_proof_status(pm)
-        if not proof_by_name:
-            continue
-        exempt_set = exempt_capability_names(pm)
-        # Exclude exempt capabilities from both numerator and denominator.
-        non_exempt = {
-            name: status
-            for name, status in proof_by_name.items()
-            if name not in exempt_set
-        }
-        if not non_exempt:
-            # Project has working caps but all are exempt — exclude from aggregate.
-            continue
-        projects_contributing += 1
-        total_non_exempt_working += len(non_exempt)
-        total_proven += sum(1 for s in non_exempt.values() if s == "proven")
+    total_non_exempt_working = coverage["total_non_exempt_working"]
+    total_proven = coverage["total_proven"]
+    projects_contributing = coverage["projects_contributing"]
+    contributing_project_ids: list = coverage["contributing_project_ids"]
 
     if total_non_exempt_working == 0:
         return [
@@ -4278,7 +4347,7 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    coverage_ratio = total_proven / total_non_exempt_working
+    coverage_ratio = coverage["coverage_ratio"]
 
     # Determine if advancement is warranted.
     advance_to: str | None = None
@@ -4338,6 +4407,44 @@ async def check_capability_proof_gate_auto_graduation(
         logger.warning(
             "[METRICS-INTEGRITY] failed to persist capability proof gate "
             "auto-graduation to DB; in-memory value is %s",
+            advance_to,
+            exc_info=True,
+        )
+
+    # Notify the operator of this autonomous gate-mode change. The advance
+    # (especially → enforce, which begins BLOCKING task spawning and release
+    # promotion pipeline-wide) was previously visible only in an INFO log.
+    # Route one operator-visible message per contributing project through the
+    # unified message-audience system. Best-effort — a post failure must never
+    # abort the check or roll back the already-persisted gate advancement.
+    try:
+        from app.notification_dispatch import (
+            post_capability_proof_gate_graduated_message,
+        )
+
+        advance_threshold = (
+            observe_threshold if current_mode == "off" else enforce_threshold
+        )
+        for pid in contributing_project_ids:
+            await post_capability_proof_gate_graduated_message(
+                ctx.session,
+                pid,
+                from_mode=current_mode,
+                to_mode=advance_to,
+                coverage=coverage_ratio,
+                threshold=advance_threshold,
+                projects_contributing=projects_contributing,
+                total_non_exempt=total_non_exempt_working,
+                total_proven=total_proven,
+            )
+        if contributing_project_ids:
+            await ctx.session.commit()
+    except Exception:
+        logger.warning(
+            "[METRICS-INTEGRITY] failed to post operator notification for "
+            "capability proof gate auto-graduation (%s → %s); gate advancement "
+            "itself is unaffected",
+            current_mode,
             advance_to,
             exc_info=True,
         )

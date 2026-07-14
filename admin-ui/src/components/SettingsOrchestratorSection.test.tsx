@@ -6,6 +6,7 @@ import {
   fetchMetricsIntegrityObservability,
   patchMetricsIntegritySettings,
   patchCapabilityProofGateSettings,
+  apiFetch,
 } from '../api';
 
 vi.mock('../api', () => ({
@@ -170,6 +171,59 @@ describe('SettingsOrchestratorSection', () => {
     const panel = screen.getByTestId('metrics-integrity-observability-panel');
     expect(await within(panel).findByText('No metrics integrity sweep ticks recorded yet.')).toBeInTheDocument();
     expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
+  });
+
+  it('renders the live fleet proof-coverage meter from the settings payload', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        structural_health_audit_mode: 'off',
+        metrics_integrity_sweep_mode: 'off',
+        capability_proof_gate_mode: 'off',
+        capability_proof_gate_auto_graduation_enabled: false,
+        capability_proof_gate_auto_graduation_observe_threshold: 0.5,
+        capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
+        capability_proof_gate_coverage: {
+          coverage_ratio: 0.5,
+          total_proven: 1,
+          total_non_exempt_working: 2,
+          projects_contributing: 1,
+          num_projects: 1,
+        },
+      }),
+    } as unknown as Response);
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const value = await screen.findByTestId('proof-gate-fleet-coverage-value');
+    expect(value).toHaveTextContent('1/2 (50%)');
+  });
+
+  it('renders n/a in the coverage meter when the ratio is undefined', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        structural_health_audit_mode: 'off',
+        metrics_integrity_sweep_mode: 'off',
+        capability_proof_gate_mode: 'off',
+        capability_proof_gate_auto_graduation_enabled: false,
+        capability_proof_gate_auto_graduation_observe_threshold: 0.5,
+        capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
+        capability_proof_gate_coverage: {
+          coverage_ratio: null,
+          total_proven: 0,
+          total_non_exempt_working: 0,
+          projects_contributing: 0,
+          num_projects: 1,
+        },
+      }),
+    } as unknown as Response);
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const meter = await screen.findByTestId('proof-gate-fleet-coverage-meter');
+    expect(meter).toHaveTextContent('n/a');
+    expect(screen.queryByTestId('proof-gate-fleet-coverage-value')).not.toBeInTheDocument();
   });
 
   it('patches the metrics integrity sweep mode when a mode button is clicked', async () => {

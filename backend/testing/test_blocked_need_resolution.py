@@ -2838,15 +2838,20 @@ def _clean_grad_config():
 
 
 async def _create_project_with_caps(
-    db: AsyncSession, caps: list[dict]
+    db: AsyncSession, caps: list[dict], proof_records: dict | None = None
 ) -> str:
-    """Insert a project with the given capability list in problem_model and return its id."""
+    """Insert a project with the given capability list in problem_model and return its id.
+
+    ``proof_records`` seeds the platform-only ``capability_proof_records`` ledger —
+    the operator-recorded carve-out set the graduation sweep must honor.
+    """
     from app.models import Project
 
     p = Project(
         name="grad-test",
         user_id="u1",
         problem_model={"capabilities": caps},
+        capability_proof_records=proof_records or {},
     )
     db.add(p)
     await db.commit()
@@ -2866,6 +2871,61 @@ def _make_sweep_ctx(db: AsyncSession):
         sample_limit=200,
         window_days=14,
     )
+
+
+# ── compute_fleet_proof_coverage helper (shared with settings surface) ──────
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_ratio_excludes_exempt(_grad_db):
+    """The extracted coverage helper returns the same numerator/denominator the
+    graduation sweep grades on: proven / non-exempt-working, with a mixed fleet
+    yielding a fractional ratio."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": []},
+        ],
+    )
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["total_proven"] == 1
+    assert cov["total_non_exempt_working"] == 2
+    assert cov["coverage_ratio"] == 0.5
+    assert cov["projects_contributing"] == 1
+    assert cov["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_null_ratio_when_no_denominator(_grad_db):
+    """A fleet with no non-exempt working capabilities has an undefined ratio —
+    the helper returns ``coverage_ratio=None`` rather than dividing by zero."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    await _create_project_with_caps(
+        _grad_db,
+        [{"name": "Planned only", "status": "planned", "evidence_refs": []}],
+    )
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["coverage_ratio"] is None
+    assert cov["total_non_exempt_working"] == 0
+    assert cov["projects_contributing"] == 0
+    assert cov["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_empty_fleet(_grad_db):
+    """No projects at all → undefined ratio and zero counts (num_projects=0)."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["coverage_ratio"] is None
+    assert cov["num_projects"] == 0
+    assert cov["total_non_exempt_working"] == 0
 
 
 # ── Core acceptance-evidence test ──────────────────────────────────────────
@@ -2924,6 +2984,92 @@ async def test_capability_proof_gate_graduation(_grad_db):
     assert results3[0].status == CheckStatus.OK
     assert "already at enforce" in results3[0].detail
     assert _rc["capability_proof_gate_mode"] == "enforce"
+
+
+# ── Operator notification on advance (ACCEPTANCE EVIDENCE) ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_emits_operator_message_on_advance(_grad_db):
+    """ACCEPTANCE EVIDENCE. Each auto-graduation advance routes an
+    operator-visible ProjectMessage through the unified message-audience system:
+
+    - off → observe emits ``capability_proof_gate_graduated_observe`` (operator-fyi)
+    - observe → enforce emits ``capability_proof_gate_graduated_enforce``
+      (operator-action-needed, since enforce begins blocking)
+    - a no-op run (already enforce) emits nothing new
+    """
+    from sqlalchemy import select as _select
+
+    from app.message_audience import (
+        OPERATOR_ACTION_NEEDED,
+        OPERATOR_FYI,
+    )
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.models import ProjectMessage
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": [_proven_ref()]},
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+
+    async def _messages() -> list[ProjectMessage]:
+        rows = (await _grad_db.execute(_select(ProjectMessage))).scalars().all()
+        return list(rows)
+
+    # Step 1: off → observe posts an operator-fyi FYI message.
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results[0].status == CheckStatus.FLAGGED
+    msgs = await _messages()
+    observe_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type")
+        == "capability_proof_gate_graduated_observe"
+    ]
+    assert len(observe_msgs) == 1
+    om = observe_msgs[0]
+    assert om.from_type == "system"
+    assert (om.context or {}).get("audience") == OPERATOR_FYI
+    assert (om.context or {}).get("from_mode") == "off"
+    assert (om.context or {}).get("to_mode") == "observe"
+    assert "off → observe" in om.content
+
+    # Step 2: observe → enforce posts an operator-action-needed message that
+    # names the new blocking behavior.
+    results2 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results2[0].status == CheckStatus.FLAGGED
+    enforce_msgs = [
+        m
+        for m in await _messages()
+        if (m.context or {}).get("event_type")
+        == "capability_proof_gate_graduated_enforce"
+    ]
+    assert len(enforce_msgs) == 1
+    em = enforce_msgs[0]
+    assert (em.context or {}).get("audience") == OPERATOR_ACTION_NEEDED
+    assert (em.context or {}).get("to_mode") == "enforce"
+    assert "BLOCKS" in em.content
+
+    # Step 3: already at enforce — no-op, no new graduation messages.
+    total_before = len(await _messages())
+    results3 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results3[0].status == CheckStatus.OK
+    assert len(await _messages()) == total_before
 
 
 # ── Disabled flag ──────────────────────────────────────────────────────────
@@ -3166,6 +3312,77 @@ async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_
     assert results[0].status == CheckStatus.FLAGGED
     assert "off → observe" in results[0].detail
     assert _rc["capability_proof_gate_mode"] == "observe"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_honors_operator_platform_exemption(_grad_db):
+    """ACCEPTANCE EVIDENCE (bug fix). A PLATFORM-recorded operator exemption is
+    honored by the graduation sweep: an unprovable-but-exempted working capability
+    is excluded from the coverage denominator, so a fleet of {1 proven + 1 exempted}
+    reaches 100% non-exempt coverage and graduates all the way to ENFORCE.
+
+    Before the fix, ``check_capability_proof_gate_auto_graduation`` selected only
+    ``Project.problem_model`` and called ``exempt_capability_names(pm)`` with the
+    ledger defaulting to None (an EMPTY ledger), so the operator's exemption was
+    invisible: the unprovable cap graded ``unproven`` and counted against the
+    denominator, pinning coverage at 50% and stalling the gate at ``observe``
+    forever. The fix loads ``Project.capability_proof_records`` and threads it into
+    both ``working_capability_proof_status`` and ``exempt_capability_names``.
+
+    The exempted capability carries NO agent-writable ``proof_exempt`` flag and NO
+    evidence — the ONLY thing clearing it is the platform-ledger operator-exemption
+    record. This is what distinguishes the fix from the pre-existing self-declared
+    path (``test_auto_graduation_does_not_exclude_a_self_declared_exemption``).
+    """
+    from app.capability_registry import build_operator_exemption_record
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            # A genuinely unprovable working cap: no evidence, no proof_exempt flag.
+            # Only the platform ledger exempts it.
+            {"name": "Human Review Cap", "status": "working"},
+        ],
+        proof_records={
+            "human-review-cap": [
+                build_operator_exemption_record(
+                    "human-review-cap",
+                    authorized_by="operator@example.com",
+                    reason="cannot be machine-verified",
+                )
+            ]
+        },
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+
+    # Step 1: off → observe. Coverage = 1 proven / 1 non-exempt = 100% (the exempt
+    # cap is excluded). Without the fix coverage would be 1/2 = 50%.
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.FLAGGED
+    assert "off → observe" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "observe"
+
+    # Step 2: observe → enforce. Coverage still 100% >= 0.95. This step is the
+    # discriminator: without the ledger threaded in, coverage is 50% < 0.95 and the
+    # gate would stall at observe forever — the exact stall this fix removes.
+    results2 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results2) == 1
+    assert results2[0].status == CheckStatus.FLAGGED
+    assert "observe → enforce" in results2[0].detail
+    assert _rc["capability_proof_gate_mode"] == "enforce"
 
 
 # ---------------------------------------------------------------------------

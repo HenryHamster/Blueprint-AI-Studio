@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch, Plus } from 'lucide-react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch, Plus, ShieldCheck, ShieldOff } from 'lucide-react';
 import { timeAgo, formatAbsolute } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
 import { PendingConfirmationList } from './ProblemModelAttention';
 import type { CurrentVersion } from '../api';
+import { grantCapabilityProofExemption, revokeCapabilityProofExemption } from '../api';
 import type {
   ProblemModel,
   Gap,
@@ -120,11 +121,44 @@ function SectionHeader({ children, icon, count, amberCount }: { children: React.
   );
 }
 
-function CapabilityBar({ capability }: { capability: Capability }) {
+function CapabilityBar({
+  capability,
+  onToggleExempt,
+}: {
+  capability: Capability;
+  // When provided, `working` capabilities render a grant/revoke exemption control.
+  // Returns a promise so the button can show a pending state until it settles.
+  onToggleExempt?: (capability: Capability, nextExempt: boolean) => Promise<void>;
+}) {
   const status = capability.status || 'planned';
   const proofRecords = Array.isArray(capability.proof_records) ? capability.proof_records : [];
   const evidenceRefs = Array.isArray(capability.evidence_refs) ? capability.evidence_refs : [];
   const isExempt = !!capability.proof_exempt;
+  const [busy, setBusy] = useState(false);
+  // Only `working` capabilities are eligible for a proof exemption — the backend
+  // rejects a grant for anything not declared `working` (404).
+  const canToggleExempt = !!onToggleExempt && status === 'working';
+
+  async function handleToggle() {
+    if (!onToggleExempt || busy) return;
+    if (!isExempt) {
+      // Granting clears the enforce gate for this capability WITHOUT machine
+      // proof — confirm the destructive-ish action before proceeding.
+      const ok = window.confirm(
+        `Grant a proof exemption for "${capability.name}"?\n\n` +
+          'This clears the enforce gate for this capability without any machine ' +
+          'proof and removes it from the proof-coverage denominator. Use only for ' +
+          'capabilities that genuinely cannot be machine-verified.',
+      );
+      if (!ok) return;
+    }
+    setBusy(true);
+    try {
+      await onToggleExempt(capability, !isExempt);
+    } finally {
+      setBusy(false);
+    }
+  }
   // Exempt working capabilities show "Exempt" instead of "Claimed only"
   // — they are exempt from proof requirements and do not count as unproven.
   // Derive proofStatus from the backend-enriched proof_status field;
@@ -201,6 +235,23 @@ function CapabilityBar({ capability }: { capability: Capability }) {
           </div>
         )}
       </div>
+      {canToggleExempt && (
+        <button
+          type="button"
+          onClick={handleToggle}
+          disabled={busy}
+          data-testid={`capability-exempt-toggle-${capability.name}`}
+          title={
+            isExempt
+              ? 'Revoke this proof exemption — the capability must earn a real proof again'
+              : 'Grant a proof exemption — clears the enforce gate without machine proof'
+          }
+          className="shrink-0 inline-flex items-center gap-1 px-1.5 py-1 min-h-[44px] md:min-h-auto text-ui-sm rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isExempt ? <ShieldOff size={10} /> : <ShieldCheck size={10} />}
+          {busy ? '…' : isExempt ? 'Revoke exemption' : 'Grant exemption'}
+        </button>
+      )}
       {capability.source && <SourceBadge source={capability.source} />}
     </div>
   );
@@ -445,6 +496,35 @@ export default function ProblemModelViewer({
 
   const hasIntent = Boolean(intent.purpose || intent.user_purpose || intent.current_focus);
 
+  // Grant/revoke an operator proof exemption for a working capability, then
+  // optimistically flip its `proof_exempt` in the local model so the coverage
+  // meter (which recomputes from `proof_exempt`) updates without a refetch.
+  async function handleToggleExempt(capability: Capability, nextExempt: boolean) {
+    try {
+      if (nextExempt) {
+        await grantCapabilityProofExemption(projectId, capability.name);
+      } else {
+        await revokeCapabilityProofExemption(projectId, capability.name);
+      }
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to update exemption', 'error');
+      return;
+    }
+    const patched: ProblemModel = {
+      ...problemModel,
+      capabilities: capabilities.map(c =>
+        c.name === capability.name ? { ...c, proof_exempt: nextExempt } : c,
+      ),
+    };
+    onUpdated(patched);
+    addToast(
+      nextExempt
+        ? `Granted proof exemption for "${capability.name}"`
+        : `Revoked proof exemption for "${capability.name}"`,
+      'success',
+    );
+  }
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -622,7 +702,9 @@ export default function ProblemModelViewer({
                     </h4>
                     <div className="divide-y divide-neutral-800/70 border border-neutral-800/70 rounded-md">
                       {caps.map((c, i) => (
-                        <div key={i} className="px-2"><CapabilityBar capability={c} /></div>
+                        <div key={i} className="px-2">
+                          <CapabilityBar capability={c} onToggleExempt={handleToggleExempt} />
+                        </div>
                       ))}
                     </div>
                   </div>

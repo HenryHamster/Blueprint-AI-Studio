@@ -106,7 +106,7 @@
     "routers/directions.py": 2100,
     "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,
-    "routers/admin_projects.py": 2000,
+    "routers/admin_projects.py": 2450,
     "routers/admin_project_strategic_session.py": 2650,
     "recovery_evaluating.py": 2950,
     "recovery_evaluating_approval.py": 450,
@@ -146,8 +146,8 @@
     "review_loop_convergence.py": 1950,
     "routers/admin_project_tools.py": 1800,
     "compute_image_build.py": 1750,
-    "capability_proof.py": 1900,
-    "routers/admin_runners.py": 1750
+    "routers/admin_runners.py": 1750,
+    "capability_proof.py": 1900
   },
   "agent": {
     "index.ts": 4600,

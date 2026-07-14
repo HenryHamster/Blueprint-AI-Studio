@@ -1041,6 +1041,151 @@ class TestGetProject:
         assert "proof_records" not in caps[1]
 
 
+class TestCapabilityProofExemption:
+    """Operator grant/revoke of the capability-proof exemption carve-out."""
+
+    async def _make_proof_project(self, db_session, role="owner"):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Exempt Test", role=role)
+        project.problem_model = {
+            "capabilities": [
+                {"name": "Frontend Visual Verification", "status": "working"},
+                {"name": "Some Planned Cap", "status": "planned"},
+            ]
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_grant_writes_authorized_exemption_record(
+        self, client: AsyncClient, db_session
+    ):
+        """Grant appends an operator-attributed exemption to the platform ledger
+        and it is recognized by platform_exempt_capability_names."""
+        from app.capability_registry import (
+            CAPABILITY_EXEMPTION_PROOF_KIND,
+            platform_exempt_capability_names,
+        )
+
+        project = await self._make_proof_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={
+                "capability_name": "Frontend Visual Verification",
+                "reason": "cannot be machine-verified",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "granted"
+        assert data["capability_name"] == "frontend-visual-verification"
+        assert data["already_exempt"] is False
+        assert "frontend-visual-verification" in data["exempt_capabilities"]
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        entry = records["frontend-visual-verification"][0]
+        assert entry["proof_kind"] == CAPABILITY_EXEMPTION_PROOF_KIND
+        assert entry["authorized_by"] == "test@example.com"
+        assert entry["proof_ref"] == "cannot be machine-verified"
+        assert "frontend-visual-verification" in platform_exempt_capability_names(
+            records
+        )
+
+    @pytest.mark.asyncio
+    async def test_grant_is_idempotent(self, client: AsyncClient, db_session):
+        """A second grant for the same capability does not append a duplicate."""
+        project = await self._make_proof_project(db_session)
+        url = f"/api/admin/projects/{project.id}/capability-exemptions"
+        body = {"capability_name": "Frontend Visual Verification"}
+
+        r1 = await client.post(url, json=body)
+        assert r1.status_code == 200
+        r2 = await client.post(url, json=body)
+        assert r2.status_code == 200
+        assert r2.json()["already_exempt"] is True
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        assert len(records["frontend-visual-verification"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_revoke_removes_exemption_record(
+        self, client: AsyncClient, db_session
+    ):
+        """Revoke removes the operator-exemption record for the named capability."""
+        from app.capability_registry import platform_exempt_capability_names
+
+        project = await self._make_proof_project(db_session)
+        url = f"/api/admin/projects/{project.id}/capability-exemptions"
+        await client.post(url, json={"capability_name": "Frontend Visual Verification"})
+
+        resp = await client.delete(f"{url}/frontend-visual-verification")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "revoked"
+        assert data["removed"] == 1
+        assert data["exempt_capabilities"] == []
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        assert "frontend-visual-verification" not in platform_exempt_capability_names(
+            records
+        )
+
+    @pytest.mark.asyncio
+    async def test_revoke_absent_exemption_is_noop(
+        self, client: AsyncClient, db_session
+    ):
+        """Revoking a capability with no exemption returns removed=0, not an error."""
+        project = await self._make_proof_project(db_session)
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/capability-exemptions/frontend-visual-verification"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_grant_unknown_capability_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A name that is not a declared 'working' capability is rejected 404."""
+        project = await self._make_proof_project(db_session)
+        # 'Some Planned Cap' exists but is status=planned, not working.
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "Some Planned Cap"},
+        )
+        assert resp.status_code == 404
+        resp2 = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "does-not-exist"},
+        )
+        assert resp2.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_grant_requires_owner_role(self, client: AsyncClient, db_session):
+        """A member (below owner) cannot grant an exemption — 403."""
+        project = await self._make_proof_project(db_session, role="member")
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "Frontend Visual Verification"},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_revoke_requires_owner_role(self, client: AsyncClient, db_session):
+        """A member (below owner) cannot revoke an exemption — 403."""
+        project = await self._make_proof_project(db_session, role="member")
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/capability-exemptions/frontend-visual-verification"
+        )
+        assert resp.status_code == 403
+
+
 class TestGetProjectSummary:
     @pytest.mark.asyncio
     async def test_summary_excludes_design_doc_and_self_reflection_log(
@@ -10173,6 +10318,93 @@ class TestNotificationConfigSettings:
         finally:
             _app.dependency_overrides.pop(_gcu, None)
             _app.dependency_overrides.pop(_ra, None)
+
+
+class TestCapabilityProofGateCoverageSurface:
+    """GET /api/admin/settings surfaces the live fleet-wide capability-proof
+    coverage ratio the auto-graduation observe/enforce thresholds are compared
+    against, so the operator no longer sets those thresholds blind."""
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_coverage_endpoint_matches_sweep(
+        self, client: AsyncClient, db_session
+    ):
+        """The settings payload's ``capability_proof_gate_coverage`` is exactly
+        what the auto-graduation sweep computes from the same ground truth — the
+        same helper backs both, so the operator sees the number the gate acts on.
+        """
+        from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+        proven_ref = {
+            "kind": "named_test",
+            "ref": "testing/test_x.py::test_x",
+            "proven": True,
+        }
+        # One project, one proven + one unproven non-exempt working cap → 1/2.
+        db_session.add(
+            Project(
+                name="cov-proj",
+                user_id="u-cov",
+                problem_model={
+                    "capabilities": [
+                        {
+                            "name": "Cap A",
+                            "status": "working",
+                            "evidence_refs": [proven_ref],
+                        },
+                        {
+                            "name": "Cap B",
+                            "status": "working",
+                            "evidence_refs": [],
+                        },
+                    ]
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        payload = resp.json()["capability_proof_gate_coverage"]
+
+        # Endpoint value equals the sweep's own computation (the shared seam),
+        # minus the internal contributing_project_ids list (UUIDs) which the
+        # settings surface intentionally does not expose.
+        full = await compute_fleet_proof_coverage(db_session, 25)
+        expected = {k: v for k, v in full.items() if k != "contributing_project_ids"}
+        assert payload == expected
+        assert "contributing_project_ids" not in payload
+
+        # And it reflects the fleet we built: 1 proven of 2 non-exempt → 0.5.
+        assert payload["total_proven"] == 1
+        assert payload["total_non_exempt_working"] == 2
+        assert payload["coverage_ratio"] == 0.5
+        assert payload["projects_contributing"] == 1
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_coverage_null_when_no_non_exempt(
+        self, client: AsyncClient, db_session
+    ):
+        """With no non-exempt working capabilities the ratio is undefined and the
+        endpoint reports ``coverage_ratio: null`` (not a divide-by-zero / 0.0)."""
+        db_session.add(
+            Project(
+                name="planned-only",
+                user_id="u-planned",
+                problem_model={
+                    "capabilities": [
+                        {"name": "Planned", "status": "planned", "evidence_refs": []},
+                    ]
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        payload = resp.json()["capability_proof_gate_coverage"]
+        assert payload["coverage_ratio"] is None
+        assert payload["total_non_exempt_working"] == 0
 
 
 class TestEvergreenFillSettingsPersist:
