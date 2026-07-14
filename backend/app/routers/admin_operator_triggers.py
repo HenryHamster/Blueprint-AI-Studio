@@ -369,6 +369,154 @@ async def trigger_force_promote(
     return result
 
 
+class _HotfixPromoteRequest(BaseModel):
+    candidate_sha: str | None = None
+    # REQUIRED, non-empty: this narrower lane's reason IS the audit justification.
+    reason: str = Field(..., min_length=1)
+    # The operator's DECLARED scope — cross-checked/audited against the actual
+    # diff, NEVER the authorization source (the diff allowlist is).
+    scope_modules: List[str] = Field(default_factory=list)
+    # The operator must affirm they understand the self-reference gap: the fix
+    # stays inert until the deploy lands the promoted content.
+    ack_inert_until_deploy: bool = False
+
+
+@router.post("/projects/{project_id}/promote/hotfix")
+async def trigger_hotfix_promote(
+    project_id: uuid.UUID,
+    body: _HotfixPromoteRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """HOTFIX-PROMOTE the project's open version — a NARROW, audited force-promote.
+
+    Fast-tracks a release-machinery fix ahead of the normal qualification gate,
+    but STRICTLY narrower than ``/promote/force``: it can only ship allowlisted
+    release-machinery files (never product code or migrations), the allowlist is
+    enforced fail-closed against the candidate's ACTUAL changed files, and every
+    hotfix is recorded as owed completion debt + an operator Alert.  Skips the
+    AUDIT/scoring gate ONLY — CI and promote()'s merge-time migration-chain
+    backstop still gate the merge.
+
+    OWNER-only.  ``reason`` is mandatory (it is the audit justification) and
+    ``ack_inert_until_deploy`` must be true.  Maps: scope_rejected → 400 (with the
+    offending files), no_open_version → 404, promotion_in_flight → 409.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="A non-empty 'reason' is required — it is the hotfix audit justification.",
+        )
+    if not body.ack_inert_until_deploy:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "ack_inert_until_deploy must be true — affirm you understand the "
+                "hotfix fix stays inert until the deploy lands the promoted content."
+            ),
+        )
+    result = await release_qualifier.hotfix_promote_current_version(
+        session,
+        project_id,
+        candidate_sha=body.candidate_sha,
+        actor=str(current_user["user_id"]),
+        reason=body.reason.strip(),
+        scope_modules=list(body.scope_modules),
+    )
+    await session.commit()
+    status = result.get("status")
+    if status == "scope_rejected":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Hotfix scope rejected — the candidate diff is not a "
+                    "release-machinery-only change: " + str(result.get("reason") or "")
+                ),
+                "offending_files": result.get("offending_files") or [],
+            },
+        )
+    if status == "no_open_version":
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+    if status == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before hotfix-promoting"
+        )
+        pr_number = result.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number})"
+        raise HTTPException(status_code=409, detail=detail)
+    return result
+
+
+@router.post("/projects/{project_id}/ack-env-will-be-bound")
+async def trigger_ack_env_will_be_bound(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """OWNER-only: acknowledge that the missing boot env/secret will be bound in
+    the SAME deploy revision, overriding exactly the ``boot_prereq_missing`` block.
+
+    Slice 4 of design 245212a4.  The deployed-side env-preflight judge compares a
+    candidate's declared boot prerequisites against THIS deployed process's own
+    environ.  When the operator intends to bind the missing secret as part of the
+    same deploy, the current environ does not yet reflect it and the judge would
+    false-block.  This arms a ONE-SHOT acknowledgment on the open version so the
+    NEXT qualification treats ``boot_prereq_missing`` as an explicit, audited
+    override (recorded in the qualification blob — who/when/that it was overridden,
+    NAMES only, never a value) rather than a silent bypass.
+
+    Scoped strictly to ``boot_prereq_missing``: the ack never suppresses any other
+    blocker.  It stays armed across re-qualification until it actually overrides a
+    block once, then clears.  OWNER-only — the most privileged deploy-safety lever.
+    Returns 404 when there is no open version.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    open_version = await release_version.current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    acknowledged_at = _utcnow().isoformat()
+    # Read-modify-write on the JSONB column: preserve every other field of the
+    # existing qualification record and only add/replace the ack marker.  A None
+    # last_qualification (no qualification yet) becomes a minimal dict carrying
+    # just the ack, which run_qualification's prior_qual read tolerates.
+    qual = dict(open_version.last_qualification or {})
+    qual["ack_env_will_be_bound"] = {
+        "actor": str(current_user["user_id"]),
+        # Presence-only: who + when, never any env value.
+        "acknowledged_at": acknowledged_at,
+    }
+    open_version.last_qualification = qual
+    flag_modified(open_version, "last_qualification")
+    session.add(open_version)
+    await session.commit()
+
+    return {
+        "status": "acknowledged",
+        "scope": "boot_prereq_missing",
+        "acknowledged_at": acknowledged_at,
+        "note": (
+            "one-shot override of the boot_prereq_missing block; clears once it "
+            "overrides that block or stays armed until it fires"
+        ),
+    }
+
+
 # Blocker provenance sources that mark a depends_on edge as a real, structural
 # prerequisite rather than legacy queue-wave serialization.
 _PREREQUISITE_BLOCKER_SOURCES = {"research_prerequisite", "parent"}
