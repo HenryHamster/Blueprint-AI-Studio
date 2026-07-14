@@ -1339,6 +1339,7 @@ export default function App() {
             rail={(
               <Suspense fallback={null}>
               <StrategicContextRail
+                projectId={s.selectedProjectId}
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
                 error={strategicReadModel.error}

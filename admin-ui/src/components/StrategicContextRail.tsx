@@ -28,6 +28,7 @@ import { StrategicActivityStrip } from './StrategicLiveTurn';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { RailMiniCanvas } from './RailMiniCanvas';
+import { WhiteboardRailSection } from './WhiteboardRailSection';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -62,6 +63,8 @@ interface StrategicContextRailProps {
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
+  /** Project whose whiteboard/canvas the strategic sidebar surfaces. */
+  projectId?: string | null;
 }
 
 function formatCost(value: number | undefined): string {
@@ -801,6 +804,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   accountSpend = null,
   savingSessionRefs = false,
   onUpdateSessionRefs,
+  projectId = null,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -1166,6 +1170,8 @@ export const StrategicContextRail = memo(function StrategicContextRail({
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />
       </WorkbenchPanel>
+
+      <WhiteboardRailSection projectId={projectId} />
 
       <TaskFocusBlock
         focus={state?.tasks.focus ?? null}
