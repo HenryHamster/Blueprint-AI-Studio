@@ -3940,6 +3940,36 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         continue
                     # Dedup/failure: fall through and keep the cap as a gap, but
                     # still surface the candidates as research suggestions.
+                else:
+                    # Candidates present at HEAD (guaranteed by
+                    # _discover_candidate_backing_paths) but no covering test
+                    # file: apply the SAME backing_path fallback as the
+                    # declared-backing_paths self-heal above. The confidence bar
+                    # is identical — the discovered paths already passed
+                    # _path_exists_at_head — so record a ``backing_path`` proof
+                    # (graded ``path_proven``, NOT ``proven``). A successful
+                    # record auto-resolves the cap; a dedup no-op means a
+                    # path_proven proof already exists, so keep it in the gap
+                    # with the candidates folded into the research obligation.
+                    try:
+                        recorded = record_capability_backing_path_proof(
+                            project, raw_name or cap_name
+                        )
+                    except Exception:  # noqa: BLE001 — proof recording is non-fatal
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                            "backing-path proof recording failed for discovered "
+                            "cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        recorded = False
+                    if recorded:
+                        auto_resolved.append(cap_name)
+                        continue
+                    # Dedup/failure: fall through and keep the cap as a gap, but
+                    # still surface the candidates as research suggestions.
 
                 # Candidates found but not test-covered (or record was a no-op):
                 # keep the cap in the gap and remember the suggestions so the

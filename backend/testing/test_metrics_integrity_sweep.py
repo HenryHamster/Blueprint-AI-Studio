@@ -4514,14 +4514,20 @@ async def test_capability_proof_gate_gap_stale_backing_path_enrolls_research(db)
 @pytest.mark.asyncio
 async def test_capability_proof_gate_gap_proposes_backing_paths(db):
     """A working capability with NO declared backing_paths whose name-derived
-    discovery surfaces candidate files splits two ways by the test-presence bar:
+    discovery surfaces candidate files resolves along the SAME two-tier fallback
+    as the declared-backing_paths self-heal:
 
-    * A capability whose discovered candidate has a convention test file present
-      at HEAD is auto-resolved to a ``named_test_present`` (path_proven) proof —
-      recorded and counted resolved by the sweep, no research obligation needed.
-    * A capability whose discovered candidate is NOT test-covered stays flagged,
-      and the concrete candidate paths are folded into the enrolled research
-      obligation's ``detail`` (proposing backing paths) instead of a blank ask.
+    * A discovered candidate with a convention test file present at HEAD is
+      auto-resolved to a ``named_test_present`` (path_proven) proof.
+    * A discovered candidate present at HEAD but NOT test-covered is auto-resolved
+      to a ``backing_path`` (path_proven) proof — the discovery pass now records
+      the backing_path fallback rather than merely folding the candidate into a
+      research obligation.
+    * A discovered candidate that already carries a path_proven ``backing_path``
+      proof records a dedup no-op, so the cap stays flagged and its candidate is
+      folded into the enrolled research obligation's ``detail``.
+    * A capability whose discovery surfaces NO candidate at all stays flagged with
+      NO proof recorded and a blank (candidate-less) research obligation.
 
     This exercises the enforce-gated production path in
     ``check_capability_proof_gate_gap`` end-to-end against a real
@@ -4537,29 +4543,53 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
             # Discovery finds a test-covered candidate → auto-resolve
             # (named_test_present, path_proven tier).
             {"name": "runner-dispatch", "status": "working", "evidence_refs": []},
-            # Discovery finds a candidate that is NOT test-covered → suggestion
-            # folded into the research obligation, cap stays flagged.
+            # Discovery finds a candidate present at HEAD but NOT test-covered →
+            # backing_path proof recorded, auto-resolve (the behavior under test).
             {"name": "audit-sweep", "status": "working", "evidence_refs": []},
+            # Discovery finds a candidate but the cap already carries a path_proven
+            # backing_path proof → dedup no-op, stays flagged with the suggestion.
+            {"name": "dedup-sweep", "status": "working", "evidence_refs": []},
+            # Discovery finds NO candidate → stays flagged, no proof recorded.
+            {"name": "orphan-cap", "status": "working", "evidence_refs": []},
         ]
     }
     flag_modified(project, "problem_model")
+    # Pre-seed a path_proven backing_path proof for dedup-sweep so the discovery
+    # pass's record_capability_backing_path_proof is a dedup no-op (path_proven
+    # already present) and the cap stays in the gap.
+    project.capability_proof_records = {
+        "dedup-sweep": [
+            {
+                "task_id": "backing:dedup-sweep",
+                "proved_at": _utcnow().isoformat(),
+                "proof_kind": "backing_path",
+                "proof_ref": "dedup-sweep",
+                "commit_sha": "",
+            }
+        ]
+    }
+    flag_modified(project, "capability_proof_records")
     db.add(project)
     await db.commit()
 
     covered_candidate = "backend/app/local_runner.py"
     uncovered_candidate = "backend/app/some_audit_sweep_module.py"
+    dedup_candidate = "backend/app/some_dedup_sweep_module.py"
 
     async def _fake_discover(cap_name, **_kwargs):
         if cap_name == "runner-dispatch":
             return [covered_candidate]
         if cap_name == "audit-sweep":
             return [uncovered_candidate]
+        if cap_name == "dedup-sweep":
+            return [dedup_candidate]
         return []
 
     # The covered candidate's conventional test resolves at HEAD and imports the
-    # module → named_test_present tier. The uncovered candidate's test read returns None
-    # → no coverage → falls to the suggestion path. We drive this purely through
-    # _read_file_at_head keyed by path (test file for the covered candidate only).
+    # module → named_test_present tier. The other candidates' test reads return
+    # None → no coverage → fall to the backing_path fallback. We drive this purely
+    # through _read_file_at_head keyed by path (test file for the covered candidate
+    # only).
     covered_test_path = "backend/testing/test_local_runner.py"
     test_body = "from app.local_runner import LocalRunner\n\ndef test_it():\n    assert LocalRunner\n"
 
@@ -4600,22 +4630,44 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
         f"expected named_test_present proof_kind from discovery, got "
         f"{rd_entries[0].get('proof_kind')!r}"
     )
-    # audit-sweep did NOT get a proof (candidate not test-covered).
-    assert "audit-sweep" not in proof_records, (
-        "audit-sweep must NOT be auto-proven from an unverified candidate"
+
+    # audit-sweep: present-but-not-test-covered candidate now records a
+    # backing_path (path_proven) proof and auto-resolves.
+    assert "audit-sweep" in proof_records, (
+        "audit-sweep must be auto-resolved with a backing_path proof for a "
+        f"discovered candidate present at HEAD, got {proof_records}"
+    )
+    as_entries = proof_records["audit-sweep"]
+    assert as_entries[0].get("proof_kind") == "backing_path", (
+        f"expected backing_path proof_kind from discovery fallback, got "
+        f"{as_entries[0].get('proof_kind')!r}"
     )
 
-    # Still flagged: audit-sweep remains an unresolved gap.
+    # orphan-cap: no candidate found → no proof recorded.
+    assert "orphan-cap" not in proof_records, (
+        "orphan-cap must NOT be auto-proven when discovery surfaces no candidate"
+    )
+
+    # Still flagged: dedup-sweep (dedup no-op) and orphan-cap (no candidate)
+    # remain unresolved gaps; audit-sweep and runner-dispatch auto-resolved.
     flagged = [r for r in results if r.flagged and r.subject == pid]
     assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
-    assert "audit-sweep" in flagged[0].detail
+    assert "dedup-sweep" in flagged[0].detail
+    assert "orphan-cap" in flagged[0].detail
+    # audit-sweep is reported as auto-resolved (via backing_paths), not as an
+    # unresolved gap needing backing_paths.
+    assert "1 via backing_paths" in flagged[0].detail, (
+        f"expected audit-sweep counted as a backing_paths auto-resolve, got "
+        f"{flagged[0].detail!r}"
+    )
     assert "discovered candidate" in flagged[0].detail, (
         f"expected detail to mention discovered candidate suggestions, got "
         f"{flagged[0].detail!r}"
     )
 
-    # The research obligation for audit-sweep carries the concrete candidate path
-    # as a proposed backing path; runner-dispatch (auto-resolved) enrolls none.
+    # Research obligations: dedup-sweep (dedup no-op, keeps the candidate
+    # suggestion) and orphan-cap (no candidate) each enroll one; audit-sweep and
+    # runner-dispatch auto-resolved and enroll none.
     rows = (
         await db.execute(
             select(EvergreenBacklogItem).where(
@@ -4627,14 +4679,21 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
         )
     ).scalars().all()
     keys = {r.finding_key for r in rows}
-    assert keys == {mis._capability_proof_research_finding_key(pid, "audit-sweep")}, (
-        f"expected exactly the audit-sweep research obligation, got {keys}"
-    )
-    audit_row = rows[0]
-    assert uncovered_candidate in audit_row.detail, (
+    assert keys == {
+        mis._capability_proof_research_finding_key(pid, "dedup-sweep"),
+        mis._capability_proof_research_finding_key(pid, "orphan-cap"),
+    }, f"expected dedup-sweep + orphan-cap research obligations, got {keys}"
+
+    # The dedup-sweep obligation carries its discovered candidate path (the full
+    # discovery→suggestion pipeline); orphan-cap's obligation has no candidate.
+    by_key = {r.finding_key: r for r in rows}
+    dedup_row = by_key[mis._capability_proof_research_finding_key(pid, "dedup-sweep")]
+    assert dedup_candidate in dedup_row.detail, (
         f"expected discovered candidate path folded into obligation detail, got "
-        f"{audit_row.detail!r}"
+        f"{dedup_row.detail!r}"
     )
+    orphan_row = by_key[mis._capability_proof_research_finding_key(pid, "orphan-cap")]
+    assert dedup_candidate not in orphan_row.detail
 
 
 @pytest.mark.asyncio
