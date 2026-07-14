@@ -92,34 +92,60 @@ def _is_safe_tar_member(name: str) -> bool:
     return ".." not in parts
 
 
-def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
-    """Extract a ``.tar.gz`` artifact bundle into ``dest_dir``, path-traversal-safe.
+def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
+    """Extract every path-traversal-safe regular member of an OPEN archive.
 
-    Members with absolute paths or ``..`` traversal are SKIPPED (never extracted),
-    so a malicious or corrupt predecessor bundle can only ever write inside
+    Shared core of the bytes- and path-based extractors below. Members with
+    absolute paths or ``..`` traversal are SKIPPED (never extracted), so a
+    malicious or corrupt predecessor bundle can only ever write inside
     ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
     could point outside the destination even when the member name itself is safe.
     Returns the count of members actually extracted.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    extracted = 0
+    for member in tar.getmembers():
+        if member.islnk() or member.issym():
+            continue
+        if not _is_safe_tar_member(member.name):
+            logger.warning(
+                "Skipping unsafe artifact-bundle member %r during rehydration",
+                member.name,
+            )
+            continue
+        tar.extract(member, path=dest_dir)
+        extracted += 1
+    return extracted
+
+
+def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
+    """Extract an IN-MEMORY ``.tar.gz`` artifact bundle into ``dest_dir``.
+
+    Path-traversal-safe (see :func:`_extract_safe_members`). Prefer
+    :func:`_safe_extract_artifact_bundle_path` for a durable results bundle whose
+    size is unbounded — this variant materializes the whole archive as ``bytes``
+    and is an OOM risk on a multi-GB checkpoint bundle.
 
     Raises ``tarfile.TarError`` (or ``OSError``) on an unreadable/corrupt archive
     so the caller can fail the job with a clear reason rather than proceeding
     against a half-populated workspace.
     """
-    os.makedirs(dest_dir, exist_ok=True)
-    extracted = 0
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
-        for member in tar.getmembers():
-            if member.islnk() or member.issym():
-                continue
-            if not _is_safe_tar_member(member.name):
-                logger.warning(
-                    "Skipping unsafe artifact-bundle member %r during rehydration",
-                    member.name,
-                )
-                continue
-            tar.extract(member, path=dest_dir)
-            extracted += 1
-    return extracted
+        return _extract_safe_members(tar, dest_dir)
+
+
+def _safe_extract_artifact_bundle_path(path: str, dest_dir: str) -> int:
+    """Extract an ON-DISK ``.tar.gz`` artifact bundle into ``dest_dir``.
+
+    The memory-bounded counterpart of :func:`_safe_extract_artifact_bundle`: the
+    archive is read from *path* (a seekable file) and each member is streamed to
+    disk by ``tarfile``, so peak memory is a tar block — NOT the bundle size. This
+    is what a multi-GB RL checkpoint bundle must go through so rehydration cannot
+    OOM the leader. Same path-traversal / symlink safety and return contract, and
+    raises the same ``tarfile.TarError`` / ``OSError`` on a corrupt archive.
+    """
+    with tarfile.open(path, mode="r:gz") as tar:
+        return _extract_safe_members(tar, dest_dir)
 
 
 async def _rehydrate_input_artifact_bundle(
@@ -127,25 +153,50 @@ async def _rehydrate_input_artifact_bundle(
 ) -> int:
     """Fetch a predecessor's durable bundle and extract it into ``dest_dir``.
 
+    The bundle is STREAMED to a temp file on disk (never materialized whole in
+    the orchestrator heap) and extracted from there, so peak memory during a
+    cross-job checkpoint resume is bounded by the download chunk size, not by the
+    bundle size — a multi-GB RL checkpoint bundle cannot OOM the leader. This
+    mirrors the viewable pass's streaming seam
+    (:func:`_download_artifact_bundle_to_path`); the whole-object
+    ``storage.download_compute_job_artifact_bundle`` stays reserved for the tiny
+    ``terminal.json`` recovery read.
+
     Raises ``RuntimeError`` when the predecessor bundle is missing or unreadable
     so the job fails LOUDLY with a clear reason instead of silently running
     against an empty workspace. Returns the number of files rehydrated.
     """
-    bundle = await storage.download_compute_job_artifact_bundle(input_artifact_job_id)
-    if bundle is None:
-        raise RuntimeError(
-            "input_artifact_rehydration_failed: predecessor compute job "
-            f"{input_artifact_job_id} has no durable artifact bundle to resume from"
-        )
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
+    os.close(handle)
     try:
-        return await asyncio.to_thread(
-            _safe_extract_artifact_bundle, bundle, dest_dir
-        )
-    except (tarfile.TarError, OSError) as exc:
-        raise RuntimeError(
-            "input_artifact_rehydration_failed: predecessor bundle for "
-            f"{input_artifact_job_id} could not be extracted: {exc}"
-        ) from exc
+        try:
+            downloaded = await asyncio.to_thread(
+                _download_artifact_bundle_to_path, input_artifact_job_id, tmp_path
+            )
+        except Exception as exc:  # surface as a loud, typed failure (re-raised)
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} could not be downloaded: {exc}"
+            ) from exc
+        if not downloaded:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor compute job "
+                f"{input_artifact_job_id} has no durable artifact bundle to resume from"
+            )
+        try:
+            return await asyncio.to_thread(
+                _safe_extract_artifact_bundle_path, tmp_path, dest_dir
+            )
+        except (tarfile.TarError, OSError) as exc:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} could not be extracted: {exc}"
+            ) from exc
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -1361,8 +1412,9 @@ def _build_container_run_prefix(
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str]] | None = None,
     workdir: str | None = None,
+    name: str | None = None,
 ) -> str:
-    """Return a shell prefix: ``docker run --rm [--gpus all] -v … -e … IMAGE``.
+    """Return a shell prefix: ``docker run --rm [--name N] [--gpus all] -v … -e … IMAGE``.
 
     The caller appends ``bash -lc <quoted-command>`` after this prefix.
     ``host_out_dir`` must exist on the host before docker run is called;
@@ -1370,11 +1422,17 @@ def _build_container_run_prefix(
     result.json and artifacts land at the same host paths the terminal-status
     reader already uses. ``extra_mounts`` adds further ``host:container`` bind
     mounts (e.g. the cloned repo) and ``workdir`` sets the in-container cwd.
+    ``name`` sets a deterministic ``--name`` so an out-of-band killer (the
+    no-progress watchdog) can ``docker kill`` the container: a containerized
+    trainer is parented by dockerd, NOT a member of the wrapper's process group,
+    so a group signal never reaches it — reaching it needs the container id/name.
     """
     result_file = f"{container_out_dir}/result.json"
     artifact_dir = f"{container_out_dir}/artifacts"
     progress_file = f"{container_out_dir}/progress.json"
     parts = ["docker", "run", "--rm"]
+    if name:
+        parts += ["--name", shlex.quote(name)]
     if gpus:
         parts += ["--gpus", "all"]
     parts += [
@@ -1428,7 +1486,12 @@ def _build_local_wrapper_command(
     # reason (container_image_pull_failed) instead of falling through as a
     # generic command failure.
     container_setup_block = ""
+    # Deterministic container name so the no-progress watchdog can ``docker kill``
+    # the dockerd-parented workload (which the group SIGKILL can never reach).
+    # None for a bare (non-containerized) job — the group kill suffices there.
+    container_name: str | None = None
     if container_image:
+        container_name = _local_container_name_for_external_id(external_id)
         host_out_dir = _local_state_dir_for_external_id(external_id)
         gpus = detect_local_gpu() is not None
         # When the contract includes a repo checkout, bind-mount the repo root
@@ -1455,6 +1518,7 @@ def _build_local_wrapper_command(
             extra_env=_container_extra_env,
             extra_mounts=_container_extra_mounts,
             workdir=_container_workdir,
+            name=container_name,
         )
         effective_command = f"{prefix} bash -lc {shlex.quote(command)}"
         auth = container_registry_auth or {}
@@ -1528,6 +1592,22 @@ fi"""
     _np_watchdog_cleanup = ""
     if no_progress_timeout_seconds is not None and no_progress_timeout_seconds > 0:
         _np_seconds = int(no_progress_timeout_seconds)
+        # For a CONTAINERIZED job the trainer runs as a child of dockerd, NOT a
+        # member of this wrapper's process group, so the group SIGKILL below can
+        # never reach it — a TERM-ignoring trainer would keep running (and keep
+        # billing) after the job was recorded FAILED. `docker kill <name>`
+        # (SIGKILL to the container's PID 1) is the only signal path that actually
+        # stops the dockerd-parented workload. Emitted on its own line so the
+        # shared kill-ordering guard still sees the bare `kill -TERM`/`kill -KILL`
+        # lines intact; a no-op (empty) for a bare job where the group kill reaches
+        # everything. `|| true` tolerates a container that never started (e.g. the
+        # window fired mid-`docker pull`).
+        if container_name is not None:
+            _np_container_kill = (
+                f"      docker kill {shlex.quote(container_name)} 2>/dev/null || true\n"
+            )
+        else:
+            _np_container_kill = ""
         _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file is untouched
 # for {_np_seconds}s. Runs in parallel with the command as a SLIDING window —
 # each interval that advances the progress mtime resets the deadline, so a job
@@ -1566,7 +1646,7 @@ NP_EOF
       trap '' TERM
       kill -TERM -$$ 2>/dev/null || true
       sleep 2
-      kill -KILL -$$ 2>/dev/null || true
+{_np_container_kill}      kill -KILL -$$ 2>/dev/null || true
       exit 0
     fi
     _NP_START=$_NP_NOW
@@ -1636,6 +1716,24 @@ exit "$EXIT_CODE"
 def _local_state_dir_for_external_id(external_id: str | None) -> str:
     suffix = str(external_id or "unassigned")
     return os.path.join(_LOCAL_STATE_ROOT, suffix)
+
+
+def _local_container_name_for_external_id(external_id: str | None) -> str:
+    """Deterministic docker ``--name`` for a local containerized job's container.
+
+    The no-progress watchdog needs a stable handle to ``docker kill`` the
+    container: the trainer inside runs as a child of dockerd, NOT a member of the
+    wrapper's process group, so the watchdog's group SIGKILL can never reach it —
+    a TERM-ignoring trainer would keep running (and keep billing) after the job
+    was recorded FAILED. Naming the container lets the watchdog reach the real,
+    dockerd-parented workload. Sanitized to the docker name grammar
+    (``[a-zA-Z0-9][a-zA-Z0-9_.-]*``) so any external_id yields a valid name.
+    """
+    raw = f"blueprint-compute-{external_id or 'unassigned'}"
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw)
+    # docker requires the first char to be alphanumeric; the constant prefix
+    # already guarantees that, but stay defensive.
+    return safe if safe[:1].isalnum() else f"c{safe}"
 
 
 def _local_pid_path_for_external_id(external_id: str | None) -> str:

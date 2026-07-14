@@ -1916,11 +1916,21 @@ async def test_input_artifact_job_id_rehydrates_checkpoint_bundle(monkeypatch):
         tar.add(first_artifact_dir, arcname=".")
     bundle_bytes = buf.getvalue()
 
-    async def fake_download(job_id):
-        return bundle_bytes if str(job_id) == str(first_id) else None
+    # Rehydration STREAMS the predecessor bundle to a temp file on disk (never
+    # buffers it whole in the orchestrator heap), so the seam it goes through is
+    # ``_download_artifact_bundle_to_path`` — mock that, writing the bundle to the
+    # destination path exactly as a real streaming download would.
+    def fake_stream_to_path(job_id, dest_path):
+        if str(job_id) != str(first_id):
+            return False
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle_bytes)
+        return True
 
     monkeypatch.setattr(
-        storage, "download_compute_job_artifact_bundle", fake_download
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
     )
 
     # ── Second job: launched WITH the predecessor reference; its command copies the
@@ -1966,11 +1976,15 @@ async def test_input_artifact_rehydration_fails_loudly_when_bundle_missing(monke
     letting the command run against an empty workspace."""
     backend = LocalSubprocessComputeBackend()
 
-    async def fake_download(job_id):
-        return None
+    # The streaming seam reports a missing object by returning False (no bundle to
+    # resume from) — rehydration must convert that into a loud, typed failure.
+    def fake_stream_to_path(job_id, dest_path):
+        return False
 
     monkeypatch.setattr(
-        storage, "download_compute_job_artifact_bundle", fake_download
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
     )
 
     spec = ComputeLaunchSpec(
@@ -20002,6 +20016,93 @@ def test_viewable_pipeline_streams_bundle_and_peak_memory_is_bounded(tmp_path):
     )
 
 
+def test_checkpoint_resume_streams_predecessor_bundle_and_peak_memory_is_bounded(
+    tmp_path,
+):
+    """Cross-job checkpoint resume must never hold the predecessor bundle in RAM.
+
+    The resume path rehydrates a predecessor compute job's DURABLE artifact bundle
+    into the new job's artifact dir before the command runs. A results bundle is
+    unbounded (multi-GB RL checkpoints), so pulling the whole object into the
+    orchestrator (``download_compute_job_artifact_bundle`` -> ``download_as_bytes``
+    + ``io.BytesIO``) is the same leader-OOM class the viewable pass already fixed.
+    It must stream the bundle to a temp file and extract from disk.
+
+    Both transports are modelled HONESTLY so the assertion means something:
+
+    * the streaming seam (``_download_artifact_bundle_to_path``) copies the object
+      to its destination file — nothing passes through Python memory;
+    * the whole-bundle seam (``storage.download_compute_job_artifact_bundle``) does
+      what it really does — materialize the object as ``bytes``. That allocation
+      lands inside the measurement window, so an implementation that reaches for it
+      to resume is caught paying for it.
+    """
+    # INCOMPRESSIBLE, like a real checkpoint: the wire bytes a whole-object
+    # download would hold are the full 48 MiB, not a gzip artefact of it.
+    big_checkpoint = os.urandom(48 * 1024 * 1024)
+    src = tmp_path / "bundle.tar.gz"
+    # Written straight to disk (compresslevel=1) so the TEST never holds the
+    # archive either — only the resume path's own allocations land in the window.
+    with tarfile.open(str(src), mode="w:gz", compresslevel=1) as tar:
+        for name, payload in (
+            ("./checkpoint/model.pt", big_checkpoint),
+            ("./config.json", b'{"lr": 0.001}'),
+            ("./logs/train.log", b"step 1000 loss 0.5\n"),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    del big_checkpoint
+    bundle_size = src.stat().st_size
+    assert bundle_size > 32 * 1024 * 1024, (
+        f"the bundle ({bundle_size} bytes) must dwarf the memory ceiling"
+    )
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(str(src), dest_path)  # to disk; no Python-level buffer
+        return True
+
+    async def _fake_whole_bundle_download(_job_id):
+        return src.read_bytes()  # a real whole-object fetch: 48+ MiB resident
+
+    dest_dir = tmp_path / "artifacts"
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.storage,
+        "download_compute_job_artifact_bundle",
+        _fake_whole_bundle_download,
+    ):
+        tracemalloc.start()
+        try:
+            extracted = asyncio.run(
+                compute_backends_module._rehydrate_input_artifact_bundle(
+                    "predecessor-job-id", str(dest_dir)
+                )
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    # The resume still WORKS: every member is rehydrated onto disk under the
+    # artifact dir, checkpoint included.
+    assert extracted == 3
+    assert (dest_dir / "checkpoint" / "model.pt").stat().st_size == 48 * 1024 * 1024
+    assert (dest_dir / "config.json").read_bytes() == b'{"lr": 0.001}'
+    assert (dest_dir / "logs" / "train.log").exists()
+
+    # And it did not pay for the bundle's size in RAM. The ceiling is generous
+    # (well under half the archive), pinning the SHAPE — bounded, not proportional.
+    ceiling = 16 * 1024 * 1024
+    assert peak < ceiling, (
+        f"checkpoint resume peaked at {peak / 1024 / 1024:.1f} MiB on a "
+        f"{bundle_size / 1024 / 1024:.1f} MiB bundle — it is buffering the whole "
+        "predecessor bundle in the orchestrator heap instead of streaming it to "
+        "disk (this is the leader OOM on multi-GB checkpoints)"
+    )
+
+
 def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
     tmp_path, monkeypatch
 ):
@@ -20128,3 +20229,241 @@ def test_no_progress_watchdog_shields_itself_from_its_own_group_term():
     )
     assert lines.index("trap '' TERM") < lines.index(term_line)
     assert lines.index(term_line) < lines.index(kill_line)
+
+
+def test_local_container_watchdog_names_and_docker_kills_the_container(monkeypatch):
+    """Shape guard: a CONTAINERIZED job's watchdog must docker-kill the container.
+
+    The trainer inside runs as a child of dockerd, NOT a member of the wrapper's
+    process group, so the watchdog's group SIGKILL can never reach it. The emitted
+    wrapper must therefore (a) give the container a deterministic ``--name`` and
+    (b) ``docker kill`` THAT name in the watchdog escalation, and do so BEFORE the
+    group KILL reaps the watchdog (otherwise the escalation is dead code). A bare
+    (non-container) job must NOT gain a docker kill — the group kill reaches it.
+    """
+    monkeypatch.setattr(compute_backends_module, "detect_local_gpu", lambda: None)
+    external_id = "np-container-shape"
+    name = compute_backends_module._local_container_name_for_external_id(external_id)
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/pytorch:24.01-py3",
+        no_progress_timeout_seconds=30,
+    )
+    assert f"--name {shlex.quote(name)}" in wrapper
+    lines = [line.strip() for line in wrapper.splitlines()]
+    docker_kill_line = f"docker kill {shlex.quote(name)} 2>/dev/null || true"
+    kill_group_line = "kill -KILL -$$ 2>/dev/null || true"
+    assert docker_kill_line in lines, (
+        "the containerized watchdog must docker kill the container by name — a "
+        "group SIGKILL cannot reach the dockerd-parented trainer"
+    )
+    assert lines.index(docker_kill_line) < lines.index(kill_group_line), (
+        "docker kill must run BEFORE the group KILL reaps the watchdog, else the "
+        "container-reaching escalation never executes"
+    )
+    # Bare job: no container, no docker kill (group kill reaches everything).
+    bare = compute_backends_module._build_local_wrapper_command(
+        "echo ok", external_id="np-bare", no_progress_timeout_seconds=30
+    )
+    assert "docker kill" not in bare
+    assert "--name" not in bare
+
+
+def test_local_container_watchdog_actually_kills_containerized_workload(
+    tmp_path, monkeypatch
+):
+    """END-TO-END: a TERM-ignoring CONTAINERIZED trainer must be reaped by the
+    no-progress watchdog.
+
+    A containerized trainer runs as a child of dockerd, NOT a member of the
+    wrapper's process group, so the watchdog's group SIGKILL cannot touch it — a
+    TERM-ignoring trainer kept running (and kept billing) after the job was
+    recorded FAILED. Only reaching the container directly (``docker kill <name>``)
+    stops it.
+
+    Modelled HONESTLY with a fake ``docker`` on PATH that reparents the trainer
+    OUT of the wrapper's process group (``start_new_session``), exactly as dockerd
+    does: the group signals then genuinely cannot reach the trainer, and ONLY a
+    ``docker kill`` targeting the recorded container can. If the wrapper does not
+    docker-kill the container, the trainer survives and this test fails.
+    """
+    import subprocess
+    import textwrap
+    import time
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("process-group signalling + `/proc` state target the Linux substrate")
+
+    monkeypatch.setattr(compute_backends_module, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "np-container-e2e"
+    container_name = compute_backends_module._local_container_name_for_external_id(
+        external_id
+    )
+
+    # Fake-docker state dir: name -> container (session) pid, so `docker kill
+    # <name>` can reach the reparented trainer.
+    fake_state = tmp_path / "fakedocker"
+    fake_state.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env python3\n"
+        + textwrap.dedent(
+            f"""
+            import os, sys, signal, subprocess
+            STATE = {str(fake_state)!r}
+            argv = sys.argv[1:]
+            if not argv:
+                sys.exit(0)
+            verb = argv[0]
+            if verb in ("pull", "login"):
+                sys.exit(0)
+            if verb == "run":
+                name = None
+                for i, a in enumerate(argv):
+                    if a == "--name" and i + 1 < len(argv):
+                        name = argv[i + 1]
+                # The container command is everything from the first `bash` token.
+                try:
+                    bidx = argv.index("bash")
+                except ValueError:
+                    sys.exit(0)
+                inner = argv[bidx:]
+                # start_new_session: the trainer runs in its OWN session/group,
+                # NOT the caller's process group. This models the dockerd-parenting
+                # that makes the wrapper's group SIGKILL unable to reach it.
+                child = subprocess.Popen(inner, start_new_session=True)
+                if name:
+                    with open(os.path.join(STATE, name + ".pid"), "w") as fh:
+                        fh.write(str(child.pid))
+                # If WE (the docker client) are signalled, the container keeps
+                # running — just like a real container detached from a dead CLI.
+                child.wait()
+                sys.exit(0)
+            if verb == "kill":
+                name = None
+                for a in argv[1:]:
+                    if not a.startswith("-"):
+                        name = a
+                if name:
+                    try:
+                        with open(os.path.join(STATE, name + ".pid")) as fh:
+                            pid = int(fh.read().strip())
+                        os.killpg(pid, signal.SIGKILL)
+                    except (OSError, ValueError):
+                        pass
+                sys.exit(0)
+            sys.exit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(fake_docker, 0o755)
+
+    # A login shell may reset PATH (Debian's /etc/profile does). Re-prepend the
+    # fake-docker dir from ~/.bash_profile so every `bash -lc` in the wrapper
+    # resolves `docker` to the fake regardless of profile behaviour.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    (home_dir / ".bash_profile").write_text(
+        f'export PATH={shlex.quote(str(fake_bin))}:"$PATH"\n', encoding="utf-8"
+    )
+
+    pid_file = tmp_path / "trainer.pid"
+    stubborn = tmp_path / "trainer.py"
+    stubborn.write_text(
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "    fh.flush()\n"
+        "time.sleep(600)\n",
+        encoding="utf-8",
+    )
+
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        f"python3 {shlex.quote(str(stubborn))} {shlex.quote(str(pid_file))}",
+        external_id=external_id,
+        container_image="fake/trainer:latest",
+        no_progress_timeout_seconds=5,  # the command never touches the progress file
+    )
+    # Setup sanity: the container is named so the fake can record + target it.
+    assert f"--name {shlex.quote(container_name)}" in wrapper
+
+    env = dict(os.environ)
+    env["HOME"] = str(home_dir)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    def _alive(pid: int) -> bool:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return False
+        return state != "Z"
+
+    proc = subprocess.Popen(
+        ["bash", "-lc", wrapper],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    trainer_pid = None
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            raw = pid_file.read_text().strip() if pid_file.exists() else ""
+            if raw:
+                trainer_pid = int(raw)
+                break
+            time.sleep(0.1)
+        assert trainer_pid, (
+            "the containerized trainer never started (fake docker not on PATH?)"
+        )
+
+        # It really is OUTSIDE the wrapper's process group (dockerd-parented) — the
+        # precondition that makes the group SIGKILL unable to reach it.
+        assert os.getpgid(trainer_pid) != os.getpgid(proc.pid), (
+            "the trainer must be in a different process group than the wrapper for "
+            "this to model a dockerd-parented workload"
+        )
+
+        # The watchdog fires ~5s (no progress), group-TERMs (futile), then must
+        # `docker kill` the container ~2s later.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and _alive(trainer_pid):
+            time.sleep(0.2)
+
+        assert not _alive(trainer_pid), (
+            "the TERM-ignoring CONTAINERIZED trainer SURVIVED the no-progress "
+            "watchdog — the group SIGKILL cannot reach a dockerd-parented process, "
+            "so without a `docker kill <name>` escalation a stalled containerized "
+            "job keeps running, and keeps billing, after being reported FAILED"
+        )
+
+        terminal_path = compute_backends_module._local_terminal_path_for_external_id(
+            external_id
+        )
+        assert os.path.exists(terminal_path), "no terminal record written"
+        raw = open(terminal_path, encoding="utf-8").read()
+        assert "REASON=no_progress_timeout" in raw, raw
+    finally:
+        if trainer_pid and _alive(trainer_pid):
+            try:
+                os.killpg(os.getpgid(trainer_pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass

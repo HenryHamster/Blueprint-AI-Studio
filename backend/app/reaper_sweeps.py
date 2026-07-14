@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.blocked_task_unblock_sweeps import (
@@ -1826,17 +1827,52 @@ async def sweep_protect_referenced_compute_image_digests(
     cutoff = _now - timedelta(seconds=_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS)
     referenced = await referenced_compute_image_digests(session, since=cutoff)
 
+    # ORDER BY recency is load-bearing, not cosmetic. This query is capped at
+    # ``max_images`` rows; WITHOUT an order the cap silently drops an arbitrary
+    # subset, and a recently-rebuilt digest beyond the (arbitrary) window would
+    # lose its ``inuse-`` protection tag — actively pruned below and then GC-able
+    # out from under the project default that still points at it. Ordering by
+    # ``updated_at`` DESC guarantees the cap keeps the MOST RECENT rows (exactly
+    # the ones inside the protection window that need protecting); older rows that
+    # fall off are, by definition, outside the window and not protection-eligible.
+    # Digests referenced by a LIVE/recent job are protected independently via
+    # ``_referenced_compute_image_repo_digests`` below, so the cap can only ever
+    # drop rows that need no protection.
+    image_where = ProjectComputeImage.digest.is_not(None)
+    total_images = (
+        await session.scalar(
+            select(func.count()).select_from(ProjectComputeImage).where(image_where)
+        )
+        or 0
+    )
     images = (
         (
             await session.execute(
                 select(ProjectComputeImage)
-                .where(ProjectComputeImage.digest.is_not(None))
+                .where(image_where)
+                .order_by(ProjectComputeImage.updated_at.desc())
                 .limit(max_images)
             )
         )
         .scalars()
         .all()
     )
+    # Truncation must never be silent: if the cap dropped rows, say so (which
+    # rows, how many) so an operator can raise ``max_images`` / paginate rather
+    # than discover the GC trap only after a digest was reclaimed.
+    dropped = total_images - len(images)
+    if dropped > 0:
+        logger.warning(
+            "sweep_protect_referenced_compute_image_digests: %d of %d "
+            "ProjectComputeImage rows (with a digest) exceeded the max_images=%d "
+            "cap and were NOT considered for protection this pass; protected the "
+            "%d most-recently-updated (ORDER BY updated_at DESC). Raise max_images "
+            "or paginate if referenced rows are being dropped.",
+            dropped,
+            total_images,
+            max_images,
+            len(images),
+        )
 
     # A freshly-(re)built image is protected even before its first job lands, so
     # the current project default is never GC'd between bake and first use.

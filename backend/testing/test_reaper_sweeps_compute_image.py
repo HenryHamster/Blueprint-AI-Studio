@@ -694,3 +694,75 @@ def test_split_pinned_ref_parses_repo_and_digest():
     assert _split_pinned_ref(f"{_FULL_REPO}:latest") is None
     assert _split_pinned_ref("") is None
     assert _split_pinned_ref(f"{_FULL_REPO}@notadigest") is None
+
+
+# ── Row-cap must not silently drop recent digests ─────────────────────────────
+#
+# The image query is capped at ``max_images`` rows. WITHOUT an ORDER BY, a
+# project with more rows than the cap drops an arbitrary subset — and if a
+# recently-rebuilt digest falls off, its ``inuse-`` protection tag is (actively)
+# pruned and the digest becomes GC-able out from under the project default that
+# still points at it. Ordering by ``updated_at`` DESC keeps the recent set.
+
+
+@pytest.mark.asyncio
+async def test_recent_digests_protected_when_image_rows_exceed_cap(db):
+    """With >max_images image rows, the RECENT digests must still be protected.
+
+    Insertion order is adversarial: the 505 OLD rows are written FIRST (lowest
+    rowids) and the 5 RECENT rows LAST, so an unordered ``LIMIT 500`` returns the
+    old rows and drops the recent ones — precisely the GC trap. Only an
+    ``ORDER BY updated_at DESC`` keeps the recent digests inside the cap and
+    protects them.
+    """
+    project = await _make_project(db)
+    old_date = _NOW - timedelta(days=60)  # outside the ~30-day protection window
+    old_count = 505  # exceeds the default max_images=500 cap on its own
+    recent_digests = [f"sha256:{900000 + i:064x}" for i in range(5)]
+
+    def _row(digest: str, updated_at: datetime) -> ProjectComputeImage:
+        return ProjectComputeImage(
+            project_id=project.id,
+            image_name=_IMAGE_NAME,
+            registry_repo=_REGISTRY_REPO,
+            dep_hash=uuid.uuid4().hex,
+            tag="latest",
+            pinned_ref=f"{_REGISTRY_REPO}/{_IMAGE_NAME}@{digest}",
+            digest=digest,
+            built=True,
+            updated_at=updated_at,
+        )
+
+    # OLD rows first (fill the cap), committed before the RECENT rows so the
+    # recent rows get the highest rowids — an unordered LIMIT would drop them.
+    for i in range(old_count):
+        db.add(_row(f"sha256:{i:064x}", old_date))
+    await db.commit()
+    for digest in recent_digests:
+        db.add(_row(digest, _NOW))
+    await db.commit()
+
+    protected: list[str] = []
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: protected.append(digest) or "inuse-tag",
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    missing = [d for d in recent_digests if d not in protected]
+    assert not missing, (
+        f"{len(missing)} of {len(recent_digests)} recently-rebuilt digests beyond "
+        f"the 500-row cap lost protection (e.g. {missing[:2]}): the image query "
+        "dropped them instead of ORDER BY updated_at DESC keeping the recent set — "
+        "a GC trap that would let a live project default be reclaimed"
+    )
+    # Only the 5 recent digests are protection-eligible (the 505 old rows are
+    # outside the window and referenced by no job).
+    assert result["applied"] == len(recent_digests)
