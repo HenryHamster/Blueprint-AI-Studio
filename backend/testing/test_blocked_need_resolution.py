@@ -2149,6 +2149,45 @@ def test_capability_proof_gate_full_cycle():
     assert q_blocked_none is False
     assert q_detail_none["error"] == "no problem_model"
 
+    # ── Phase F: spawn-time enforcement point (the FIRST consumer seam) ────────
+    # The spawn-time resolver (research_completion) grades an explicit capability
+    # prerequisite through ``spawn_capability_gate_disposition`` — the single
+    # source of truth for its three-way branch. Assert the same tiered proof map
+    # yields the same block/surface/ok decision the blocked-resume sweep (Phase 5)
+    # and the release qualifier (Phase 4) derive, so the three seams cannot drift.
+    from app.research_completion import spawn_capability_gate_disposition
+
+    _cr_need = {"kind": "capability", "ref": "container-runtime"}
+    _unproven_map = {"container-runtime": "unproven"}
+    _proven_map = {"container-runtime": "proven"}
+
+    # ENFORCE + unproven → block (dependent parks BLOCKED, matching the sweep).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="enforce"
+    ) == ("block", "unproven")
+
+    # ENFORCE + proven → ok (no gate, matching the sweep's resume in Phase 5/2).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _proven_map, mode="enforce"
+    ) == ("ok", "proven")
+
+    # OBSERVE + unproven → surface: the need still resolves, but the unverified
+    # status is surfaced (never gated) while enforce is off.
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="observe"
+    ) == ("surface", "unproven")
+
+    # OFF + unproven → surface too (any non-enforce mode surfaces, never blocks).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="off"
+    ) == ("surface", "unproven")
+
+    # A need matching NO working registry capability → ok with proof_status None
+    # (normal resolution applies; the gate never fabricates a block).
+    assert spawn_capability_gate_disposition(
+        {"kind": "capability", "ref": "nonexistent-cap"}, _unproven_map, mode="enforce"
+    ) == ("ok", None)
+
     # ── Phase 5: DB-backed end-to-end sweep (enforce holds, then resumes) ──────
     # Drive the REAL blocked-resume sweep (sweep_unblock_blocked_tasks) against a
     # live in-memory DB across the full enforcement cycle:

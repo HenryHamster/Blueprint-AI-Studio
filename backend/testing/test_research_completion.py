@@ -7820,10 +7820,11 @@ async def _spawn_child_under_enforce(
     direction_key: str,
     capabilities: list[dict],
     proof_records: dict | None,
+    mode: str = "enforce",
 ):
     """Spawn one finding whose prerequisite names ``budgeted-compute-job-substrate``
-    through the REAL research-completion path with the proof gate in ENFORCE mode,
-    and return the spawned child task.
+    through the REAL research-completion path with the proof gate in ``mode``
+    (default ``"enforce"``), and return the spawned child task.
 
     ``capabilities`` is written to ``project.problem_model`` (AGENT-WRITABLE) and
     ``proof_records`` to ``project.capability_proof_records`` (the PLATFORM-ONLY
@@ -7853,7 +7854,7 @@ async def _spawn_child_under_enforce(
 
     saved_mode = _rc.get("capability_proof_gate_mode")
     try:
-        _rc["capability_proof_gate_mode"] = "enforce"
+        _rc["capability_proof_gate_mode"] = mode
         _patch_research_externals(mocker)
         mocker.patch(
             "app.research_completion._parse_research_findings", return_value=[finding]
@@ -8107,6 +8108,52 @@ async def test_bare_proof_exempt_blocks_spawn_under_enforce(db_session, mocker):
 
     assert child.status == TaskStatus.BLOCKED, (
         "an unattributed proof_exempt must never clear the gate"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_observe_mode_surfaces_unverified_capability_on_spawn(
+    db_session, mocker
+):
+    """OBSERVE mode, spawn-time seam. A prerequisite naming a ``working``
+    capability with NO proven evidence resolves as satisfied-by-the-codebase (the
+    dependent is NOT gated), but the unproven status is surfaced DURABLY on the
+    spawned child's context — not merely logged — so an operator can see the
+    unproven foundation without re-deriving it from logs.
+
+    This exercises ``spawn_capability_gate_disposition``'s ``"surface"`` branch
+    end-to-end through the real research-completion path.
+    """
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq-observe",
+        capabilities=[_self_declared_working_cap()],
+        proof_records={},  # empty ledger — the self-report is unproven
+        mode="observe",
+    )
+
+    # OBSERVE never gates: the dependent spawns (not BLOCKED on the capability).
+    assert child.status != TaskStatus.BLOCKED, (
+        "observe mode must never gate the dependent — it only surfaces the "
+        "unverified status"
+    )
+
+    # The unverified status is durably surfaced on the child's context.
+    surfaced = (child.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []
+    assert surfaced, (
+        "observe mode must surface the unverified capability on the spawned "
+        "dependent's context, not only in a log line"
+    )
+    entry = surfaced[0]
+    assert entry["kind"] == "capability"
+    assert entry["ref"] == "budgeted-compute-job-substrate"
+    # A self-declared-only proof grades ``unverified`` under corroboration (no
+    # platform ledger entry), so the surfaced status is a non-``proven`` tier.
+    assert entry["proof_status"] not in (None, "proven"), (
+        f"surfaced proof_status must be a non-proven tier, got {entry['proof_status']!r}"
     )
 
 

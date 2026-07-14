@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import uuid
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -95,6 +96,8 @@ from app.task_evaluators import (
 )
 from app.capability_registry import (
     annotate_capability_proof_status,
+    capability_need_blocked_by_proof_gate,
+    capability_need_proof_status,
     off_registry_capability_refs,
     registry_capability_evidence_refs_map,
     registry_capability_names,
@@ -1493,6 +1496,50 @@ def _build_salvage_payload(
         ],
         "total_discarded": len(salvage_candidates),
     }
+
+
+#: Durable context key on a spawned dependent recording capability prerequisites
+#: that resolved as satisfied-by-the-codebase but whose ``working`` capability
+#: carries no ``proven`` evidence — the SPAWN-time surfacing of the unverified
+#: status (observe/off modes). Each entry: ``{kind, ref, proof_status}``.
+SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY = "_spawn_capability_proof_unverified"
+
+
+def spawn_capability_gate_disposition(
+    need: Mapping[str, Any],
+    proof_status_by_name: Mapping[str, Any],
+    *,
+    mode: str,
+) -> tuple[str, Any]:
+    """Classify how the spawn-time resolver must treat a capability prerequisite
+    that already resolved as satisfied-by-the-codebase.
+
+    Returns ``(disposition, proof_status)`` where ``disposition`` is one of:
+
+    * ``"block"`` — ENFORCE mode and the capability is not ``proven``: the
+      prerequisite does NOT satisfy the dependent, which must park BLOCKED (the
+      need is wired as blocking). Mirrors
+      :func:`capability_need_blocked_by_proof_gate` exactly, so this seam cannot
+      drift from the blocked-resume sweep or the release-qualifier seam.
+    * ``"surface"`` — non-ENFORCE mode (off/observe) and a KNOWN non-``proven``
+      status (``unproven`` / ``partial`` / ``unverified`` / ``contradicted``):
+      the need still resolves as satisfied-by-the-codebase, but the unverified
+      status is surfaced durably on the dependent (see
+      :data:`SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY`) so an operator can see the
+      unproven foundation instead of it living only in a log line.
+    * ``"ok"`` — the capability is ``proven``, or the need matches no ``working``
+      registry capability (``proof_status is None``): satisfied, no gate, nothing
+      to surface.
+
+    Pure and IO-free: the single source of truth for the spawn seam's three-way
+    branch, so the classification and the enforce decision live in one place.
+    """
+    if capability_need_blocked_by_proof_gate(need, proof_status_by_name, mode=mode):
+        return "block", capability_need_proof_status(need, proof_status_by_name)
+    proof_status = capability_need_proof_status(need, proof_status_by_name)
+    if proof_status is not None and proof_status != "proven":
+        return "surface", proof_status
+    return "ok", proof_status
 
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
@@ -5674,8 +5721,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the structural source rather than deferred to the dispatch-time cycle breaker.
     from app.blocked_need_resolution import _would_create_cycle
     from app.capability_registry import (
-        capability_need_blocked_by_proof_gate,
-        capability_need_proof_status,
         consumer_gate_proof_status,
         registry_satisfies_capability_need,
         working_capability_names,
@@ -6000,14 +6045,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if prereq_need and registry_satisfies_capability_need(
                     prereq_need, _working_registry_caps
                 ):
-                    _proof_status = capability_need_proof_status(
-                        prereq_need, _working_registry_proof
-                    )
-                    if capability_need_blocked_by_proof_gate(
+                    _disposition, _proof_status = spawn_capability_gate_disposition(
                         prereq_need,
                         _working_registry_proof,
                         mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
-                    ):
+                    )
+                    if _disposition == "block":
                         # ENFORCE mode: an unproven/partial 'working' capability
                         # does NOT satisfy the prerequisite. Gate the dependent —
                         # wire the need as blocking exactly as an unresolved
@@ -6024,11 +6067,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         needs.append(prereq_need)
                         unresolved_entries.append(prereq)
-                    elif _proof_status is not None and _proof_status != "proven":
-                        # OBSERVE mode: surface (never gate) a resolution backed by
-                        # a capability declared 'working' with no proven evidence.
+                    elif _disposition == "surface":
+                        # OBSERVE/OFF mode: surface (never gate) a resolution backed
+                        # by a capability declared 'working' with no proven evidence.
                         # The need still resolves as satisfied-by-the-codebase; this
-                        # only makes the unproven claim visible while enforce is off.
+                        # makes the unproven claim visible while enforce is off —
+                        # both as a WARNING log AND, so an operator sees it without
+                        # re-deriving it from logs, as a durable marker on the
+                        # spawned dependent's context (mirroring the
+                        # ``_spawn_prereq_dropped_duplicate`` surfacing above).
                         logger.warning(
                             "[RESEARCH][capability-proof-observe] Finding '%s' "
                             "prerequisite capability:%s resolved as "
@@ -6039,6 +6086,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             prereq.get("ref"),
                             _proof_status,
                         )
+                        _uv_ctx = dict(ct.context or {})
+                        _uv_ctx[SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY] = [
+                            *(_uv_ctx.get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []),
+                            {
+                                "kind": prereq_need.get("kind"),
+                                "ref": prereq_need.get("ref"),
+                                "proof_status": _proof_status,
+                            },
+                        ]
+                        ct.context = _uv_ctx
+                        flag_modified(ct, "context")
+                        session.add(ct)
                     else:
                         logger.info(
                             "[RESEARCH] Finding '%s' prerequisite capability:%s is "
