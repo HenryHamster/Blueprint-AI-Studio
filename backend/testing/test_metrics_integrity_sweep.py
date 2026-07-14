@@ -5264,23 +5264,27 @@ async def test_auto_graduation_stale_proof_is_not_counted_by_working_status(db):
         "A fresh proof must still count as 'proven'."
     )
 
-    # Legacy path: without now=, stale proofs are never expired (backward compat).
+    # Default path: without an explicit now=, working_capability_proof_status
+    # defaults now to _utcnow() (capability_registry.py:585-588), so PROOF_FRESHNESS_TTL
+    # is STILL applied and a proof older than the TTL is demoted. There is no "legacy
+    # gap" that preserves stale proofs as 'proven' when now= is omitted.
     status_no_now = working_capability_proof_status(stale_model)
-    assert status_no_now.get("repo-map") == "proven", (
-        "Without now=, the legacy path preserves stale proofs as 'proven'."
+    assert status_no_now.get("repo-map") != "proven", (
+        "Without an explicit now=, working_capability_proof_status still defaults "
+        "now to _utcnow() and applies PROOF_FRESHNESS_TTL, so a proof older than the "
+        "TTL must not count as 'proven'."
     )
 
 
 @pytest.mark.asyncio
 async def test_auto_graduation_fleet_coverage_stale_proof_counts_without_now(db):
-    """Document the TTL gap in compute_fleet_proof_coverage.
+    """A proof older than PROOF_FRESHNESS_TTL is NOT counted by compute_fleet_proof_coverage.
 
-    When a proof is older than PROOF_FRESHNESS_TTL, compute_fleet_proof_coverage
-    currently COUNTS it as 'proven' because working_capability_proof_status is called
-    without now=. This test pins the current (buggy) behaviour as a regression
-    marker: if this test FAILS, it means compute_fleet_proof_coverage was fixed to
-    pass now= and stale proofs are no longer inflating graduation coverage — which
-    is the DESIRED outcome.
+    compute_fleet_proof_coverage snapshots ``now`` once and threads it explicitly into
+    working_capability_proof_status, which applies PROOF_FRESHNESS_TTL. A stale proof is
+    therefore demoted and excluded from ``total_proven`` (the graduation numerator) while
+    still counting toward ``total_non_exempt_working`` (the denominator). This pins that
+    stale proofs cannot silently inflate graduation coverage.
     """
     from datetime import timedelta
 
@@ -5307,20 +5311,28 @@ async def test_auto_graduation_fleet_coverage_stale_proof_counts_without_now(db)
     db.add(project)
     await db.commit()
 
-    # compute_fleet_proof_coverage has no `now` parameter and calls
-    # working_capability_proof_status without now=, so the TTL is not applied.
-    # Stale proofs are counted as 'proven', inflating graduation coverage.
+    # compute_fleet_proof_coverage snapshots now (defaulting to _utcnow()) and threads
+    # it into working_capability_proof_status, so PROOF_FRESHNESS_TTL IS applied.
+    # The stale proof is demoted and excluded from the numerator.
     coverage = await compute_fleet_proof_coverage(db, max_projects=25)
+    # The stale working capability still counts toward the denominator.
     assert coverage["total_non_exempt_working"] == 1
-    # Without the fix: stale proof is counted as proven → total_proven = 1.
-    # With the fix (now= threaded through): total_proven = 0 (stale demoted).
-    # This assertion documents the current behavior — update when the fix lands.
-    assert coverage["total_proven"] == 1, (
-        "compute_fleet_proof_coverage currently counts stale proofs as proven "
-        "because it does not pass now= to working_capability_proof_status. "
-        "If this assertion fails, the fix has been applied — update this test to "
-        "assert total_proven == 0 and verify graduation no longer fires on stale proofs."
+    # But the stale proof is demoted by the TTL, so it does NOT count as proven.
+    assert coverage["total_proven"] == 0, (
+        "compute_fleet_proof_coverage must exclude proofs older than "
+        "PROOF_FRESHNESS_TTL from total_proven — a stale proof cannot inflate "
+        "graduation coverage."
     )
+    # Coverage ratio reflects the demotion: 0 proven / 1 working.
+    assert coverage["coverage_ratio"] == 0.0
+
+    # Passing an explicit now= before the proof went stale counts it as proven,
+    # proving the demotion is driven by the freshness cutoff and not something else.
+    fresh_cutoff = now - PROOF_FRESHNESS_TTL + timedelta(days=1)
+    coverage_fresh = await compute_fleet_proof_coverage(
+        db, max_projects=25, now=fresh_cutoff
+    )
+    assert coverage_fresh["total_proven"] == 1
 
 
 @pytest.mark.asyncio

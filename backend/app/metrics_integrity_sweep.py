@@ -99,7 +99,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Awaitable, Callable, Deque, Dict, List, cast
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, cast
 
 from sqlalchemy import func
 from sqlmodel import or_, select
@@ -4159,7 +4159,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
 
 async def compute_fleet_proof_coverage(
-    session: Any, max_projects: int
+    session: Any, max_projects: int, now: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """Compute the fleet-wide capability-proof coverage ratio.
 
@@ -4192,6 +4192,16 @@ async def compute_fleet_proof_coverage(
     )
     from app.models import Project
 
+    # Snapshot ``now`` ONCE for the whole fleet scan and thread it explicitly into
+    # every ``working_capability_proof_status`` call below. PROOF_FRESHNESS_TTL
+    # demotion is applied against this single instant, so a proof older than the TTL
+    # is NOT counted toward ``total_proven`` — stale proofs cannot silently inflate
+    # graduation coverage. Passing an explicit ``now`` (rather than relying on the
+    # per-call ``_utcnow()`` default) also keeps the freshness cutoff deterministic
+    # across all projects in one scan instead of drifting mid-loop.
+    if now is None:
+        now = _utcnow()
+
     # ``capability_proof_records`` (the platform-only ledger) is loaded alongside
     # the problem_model so an operator-recorded exemption is honored here: without
     # it, ``exempt_capability_names`` defaults ``proof_records`` to None (an EMPTY
@@ -4219,7 +4229,9 @@ async def compute_fleet_proof_coverage(
     for project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
         proof_records = raw_records if isinstance(raw_records, dict) else {}
-        proof_by_name = working_capability_proof_status(pm, proof_records=proof_records)
+        proof_by_name = working_capability_proof_status(
+            pm, now=now, proof_records=proof_records
+        )
         if not proof_by_name:
             continue
         exempt_set = exempt_capability_names(pm, proof_records)
