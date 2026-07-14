@@ -1897,10 +1897,13 @@ export interface FleetRunner {
     // field(s) — the backend only surfaces it as LIVE when the rejected
     // generation matches the currently-desired generation (a stale reason tied to
     // a superseded generation is suppressed to null). rejected_config_generation
-    // is the generation the daemon could not apply. All absent on a legacy daemon.
+    // is the generation the daemon could not apply. config_rejected_fields is the
+    // offending field name(s) as a structured list, surfaced under the same
+    // live/stale suppression as apply_reason. All absent on a legacy daemon.
     apply_status?: string | null;
     apply_reason?: string | null;
     rejected_config_generation?: string | null;
+    config_rejected_fields?: string[] | null;
     gpu_indices_allowed?: 'all' | number[];
     // Number of GPUs the runner reserves per compute job (server-authoritative,
     // mirrored top-level for the fleet editor). Absent on runners enrolled before

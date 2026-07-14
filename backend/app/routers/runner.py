@@ -520,11 +520,13 @@ class HeartbeatRequest(BaseModel):
     # When a pushed config block cannot be fully applied (unrecognized non-null
     # field), the daemon reports a structured outcome: config_apply_status
     # ("applied"/"rejected"), config_apply_reason (naming the offending
-    # field(s)), and config_rejected_generation (the generation it could not
-    # apply, so the server can distinguish a current failure from a stale one
+    # field(s)), config_rejected_fields (the offending field name(s) as a
+    # structured list), and config_rejected_generation (the generation it could
+    # not apply, so the server can distinguish a current failure from a stale one
     # tied to a superseded generation). All None on an older daemon.
     config_apply_status: str | None = None
     config_apply_reason: str | None = None
+    config_rejected_fields: List[StrictStr] | None = None
     config_rejected_generation: str | None = None
 
 
@@ -1446,17 +1448,31 @@ async def heartbeat(
     if applied_report:
         caps["applied_config"] = applied_report
     # Structured config-apply outcome. Same merge discipline: dedicated caps keys,
-    # only written when the daemon reports them, never clobbering the desired
-    # subset. config_apply_status is only meaningful alongside a reason/rejected
-    # generation, so persist each field independently when present.
+    # never clobbering the desired subset or the applied_config echo. Only acted on
+    # when the daemon reports a status; an older daemon that omits it leaves any
+    # prior keys untouched. On a 'rejected' status we persist the reason, the
+    # offending field list (sanitized: list-of-strings, bounded count and length so
+    # a malformed report cannot inject unbounded/garbage data), and the rejected
+    # generation. On a clean 'applied' status we CLEAR any prior rejection keys so a
+    # resolved reason never lingers in the stored row (the view also suppresses a
+    # stale reason at read time, so the two mechanisms are complementary).
     if payload.config_apply_status is not None:
         caps["config_apply_status"] = str(payload.config_apply_status)[:32]
-    if payload.config_apply_reason is not None:
-        caps["config_apply_reason"] = str(payload.config_apply_reason)[:500]
-    if payload.config_rejected_generation is not None:
-        caps["config_rejected_generation"] = str(payload.config_rejected_generation)[
-            :128
-        ]
+        if payload.config_apply_status == "rejected":
+            if payload.config_apply_reason is not None:
+                caps["config_apply_reason"] = str(payload.config_apply_reason)[:500]
+            if payload.config_rejected_fields is not None:
+                caps["config_rejected_fields"] = [
+                    str(f)[:200] for f in payload.config_rejected_fields[:32]
+                ]
+            if payload.config_rejected_generation is not None:
+                caps["config_rejected_generation"] = str(
+                    payload.config_rejected_generation
+                )[:128]
+        else:
+            caps.pop("config_apply_reason", None)
+            caps.pop("config_rejected_fields", None)
+            caps.pop("config_rejected_generation", None)
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:

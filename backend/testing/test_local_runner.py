@@ -1892,6 +1892,80 @@ class TestRunnerConfigChannel:
         assert runner.capabilities["task_types"] == "all"
 
     @pytest.mark.asyncio
+    async def test_config_apply_rejection_reason_persists_and_surfaces(
+        self, client: AsyncClient, db_session
+    ):
+        """A heartbeat reporting a config-apply REJECTION (unrecognized field)
+        persists the reason + offending field(s) under dedicated caps keys and
+        the fleet view surfaces them — but ONLY while the refused generation
+        matches the current desired one; a stale reason is suppressed."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 5},
+        )
+
+        desired_gen = (
+            await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()["config"]["config_generation"]
+
+        # Daemon refuses the CURRENT desired generation for an unrecognized field.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "config_apply_status": "rejected",
+                "config_apply_reason": "unrecognized config field(s): retries",
+                "config_rejected_fields": ["retries"],
+                "config_rejected_generation": desired_gen,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert (
+            view["config"]["apply_reason"]
+            == "unrecognized config field(s): retries"
+        )
+        assert view["config"]["config_rejected_fields"] == ["retries"]
+        # Stored under dedicated caps keys, never clobbering the desired subset.
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 5
+        assert runner.capabilities["config_rejected_generation"] == desired_gen
+
+        # Operator changes the desired config: the stored rejection is now stale
+        # (its generation no longer matches desired) → suppressed by the view.
+        await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 3},
+        )
+        view_stale = (
+            await client.get(f"/api/admin/projects/{project.id}/runners")
+        ).json()[0]
+        assert view_stale["config"]["apply_reason"] is None
+        assert view_stale["config"]["config_rejected_fields"] is None
+
+        # A subsequent clean 'applied' heartbeat CLEARS the stored rejection keys.
+        new_gen = view_stale["config"]["config_generation"]
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "config_apply_status": "applied",
+                "applied_config_generation": new_gen,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        await db_session.refresh(runner)
+        assert "config_apply_reason" not in runner.capabilities
+        assert "config_rejected_fields" not in runner.capabilities
+        assert "config_rejected_generation" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_gpu_indices_allowed_patch_validation(
         self, client: AsyncClient, db_session
     ):

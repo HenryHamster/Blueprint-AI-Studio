@@ -612,9 +612,10 @@ class TestRunnerConfigView:
 
     def test_runner_config_reports_rejected_reason(self):
         """``_runner_config_view`` surfaces the daemon's structured apply-rejection
-        reason ONLY when the rejected generation matches the currently-desired
-        generation; a reason tied to a superseded generation is stale and
-        suppressed to None (the operator has since changed the desired config)."""
+        reason (and the offending field list) ONLY when the rejected generation
+        matches the currently-desired generation; a reason tied to a superseded
+        generation is stale and suppressed to None (the operator has since changed
+        the desired config)."""
         from app.routers.admin_runners import _runner_config_view
         from app.runner_config import live_safe_config_generation
 
@@ -625,12 +626,14 @@ class TestRunnerConfigView:
             {
                 "config_apply_status": "rejected",
                 "config_apply_reason": "unrecognized config field(s): foo",
+                "config_rejected_fields": ["foo"],
                 "config_rejected_generation": desired_gen,
             }
         )
         view_live = _runner_config_view(caps_live)
         assert view_live["apply_status"] == "rejected"
         assert view_live["apply_reason"] == "unrecognized config field(s): foo"
+        assert view_live["config_rejected_fields"] == ["foo"]
         assert view_live["rejected_config_generation"] == desired_gen
 
         # Case B — rejection tied to a SUPERSEDED generation → reason suppressed.
@@ -640,19 +643,22 @@ class TestRunnerConfigView:
             "max_concurrent": 8,  # different desired subset → different generation
             "config_apply_status": "rejected",
             "config_apply_reason": "unrecognized config field(s): foo",
+            "config_rejected_fields": ["foo"],
             "config_rejected_generation": "some-old-generation",
         }
         view_stale = _runner_config_view(caps_stale)
         # The raw daemon-reported status/generation still pass through additively…
         assert view_stale["apply_status"] == "rejected"
         assert view_stale["rejected_config_generation"] == "some-old-generation"
-        # …but the REASON is suppressed because it is tied to a superseded generation.
+        # …but the REASON and field list are suppressed (tied to a stale generation).
         assert view_stale["apply_reason"] is None
+        assert view_stale["config_rejected_fields"] is None
 
         # Case C — legacy daemon reports none of the structured fields → all None.
         view_legacy = _runner_config_view({"max_concurrent": 2})
         assert view_legacy["apply_status"] is None
         assert view_legacy["apply_reason"] is None
+        assert view_legacy["config_rejected_fields"] is None
         assert view_legacy["rejected_config_generation"] is None
 
 

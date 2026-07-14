@@ -565,9 +565,16 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(raw_reason, str):
         raw_reason = None
     # Suppress a stale reason whose rejected generation no longer matches desired.
-    apply_reason = (
-        raw_reason if rejected_generation == desired_generation else None
-    )
+    is_live_reason = bool(raw_reason) and rejected_generation == desired_generation
+    apply_reason = raw_reason if is_live_reason else None
+    # The offending field name(s) as a structured list, surfaced under the SAME
+    # live/stale discipline as the reason — a field list tied to a superseded
+    # generation is suppressed alongside its reason.
+    config_rejected_fields = None
+    if is_live_reason:
+        stored_fields = caps.get("config_rejected_fields")
+        if isinstance(stored_fields, list):
+            config_rejected_fields = [str(f) for f in stored_fields]
     return {
         "desired": desired,
         "config_generation": desired_generation,
@@ -579,6 +586,7 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
         "apply_status": apply_status,
         "apply_reason": apply_reason,
         "rejected_config_generation": rejected_generation,
+        "config_rejected_fields": config_rejected_fields,
         "gpu_indices_allowed": desired["gpu_indices_allowed"],
         "gpus_per_job": desired["gpus_per_job"],
     }

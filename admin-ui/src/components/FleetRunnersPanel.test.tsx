@@ -1596,6 +1596,7 @@ describe('FleetRunnersPanel — behavioral', () => {
           apply_status: 'rejected',
           apply_reason: 'unrecognized config field(s): foo',
           rejected_config_generation: 'gen-new',
+          config_rejected_fields: ['foo'],
         },
       },
     ]);
@@ -1606,6 +1607,30 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(badge?.className).toContain('text-red-300');
     // The honest reason REPLACES the ambiguous fallback.
     expect(badge?.textContent).not.toContain('rejected it or is stuck');
+  });
+
+  test('stuck config with NO reason keeps the generic ambiguous fallback', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        last_seen_at: new Date(Date.now() - 30_000).toISOString(), // live
+        config: {
+          config_generation: 'gen-new',
+          applied_config_generation: 'gen-old',
+          config_pending: true,
+          desired_changed_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+          daemon_reports_applied: true,
+          // No apply_reason → genuinely stuck-but-silent runner.
+          apply_reason: null,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const badge = el.querySelector('[data-testid="fleet-runner-config-status"]');
+    expect(badge?.textContent).toContain('rejected it or is stuck');
+    expect(badge?.textContent).not.toContain('config rejected —');
+    expect(badge?.className).toContain('text-red-300');
   });
 
   test('pending config on an OFFLINE runner reads neutral "queued", never red', async () => {

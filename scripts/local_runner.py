@@ -2212,10 +2212,12 @@ class _LiveRunnerConfig:
         self._applied_generation: str | None = None
         # Structured rejection state: when a config block cannot be fully applied
         # (an unrecognized non-null field), record WHY (naming the offending
-        # field(s)) and WHICH generation was rejected so the server/UI can render
-        # an honest "config rejected — <reason>" badge instead of the ambiguous
-        # "rejected it or is stuck". Cleared once a generation applies fully.
+        # field(s)), the offending field name(s) themselves, and WHICH generation
+        # was rejected so the server/UI can render an honest "config rejected —
+        # <reason>" badge instead of the ambiguous "rejected it or is stuck".
+        # Cleared once a generation applies fully.
         self._rejection_reason: str | None = None
+        self._rejected_fields: list[str] | None = None
         self._rejected_generation: str | None = None
 
     @classmethod
@@ -2255,13 +2257,20 @@ class _LiveRunnerConfig:
                 # Structured apply outcome (additive): "applied" when the last
                 # delivered generation was fully applied, "rejected" when a field
                 # could not be applied. config_apply_reason names the offending
-                # field(s); config_rejected_generation is the generation that was
-                # rejected so the server can tell a current failure from a stale
-                # one tied to a superseded generation. All None on a clean apply.
+                # field(s); config_rejected_fields is the offending field name(s)
+                # as a structured list; config_rejected_generation is the
+                # generation that was rejected so the server can tell a current
+                # failure from a stale one tied to a superseded generation. All
+                # None on a clean apply.
                 "config_apply_status": (
                     "rejected" if self._rejection_reason is not None else "applied"
                 ),
                 "config_apply_reason": self._rejection_reason,
+                "config_rejected_fields": (
+                    list(self._rejected_fields)
+                    if self._rejected_fields is not None
+                    else None
+                ),
                 "config_rejected_generation": self._rejected_generation,
             }
 
@@ -2308,13 +2317,20 @@ class _LiveRunnerConfig:
             if fully_applicable and isinstance(generation, str) and generation:
                 self._applied_generation = generation
             if fully_applicable:
-                # A clean apply clears any prior rejection state.
+                # A clean apply clears any prior rejection state (never let a
+                # resolved reason linger after convergence).
                 self._rejection_reason = None
+                self._rejected_fields = None
                 self._rejected_generation = None
             else:
+                # Refused this generation for an unrecognized field. Record the
+                # offending field name(s) + a stable human reason + the refused
+                # generation so the operator sees WHICH field broke, not 'stuck'.
+                sorted_fields = sorted(unrecognized)
                 self._rejection_reason = "unrecognized config field(s): " + ", ".join(
-                    sorted(unrecognized)
+                    sorted_fields
                 )
+                self._rejected_fields = sorted_fields
                 self._rejected_generation = (
                     generation if isinstance(generation, str) and generation else None
                 )

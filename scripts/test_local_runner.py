@@ -741,6 +741,68 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertFalse(holder.apply("not-a-dict"))
         self.assertEqual(holder.max_concurrent(), 2)
 
+    def test_clean_apply_reports_status_applied_with_null_reason(self):
+        # A config that applies cleanly reports status 'applied' with no reason
+        # or rejected fields — additive keys read as no-rejection for the UI.
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 4, "config_generation": "gen-A"})
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertIsNone(report["config_apply_reason"])
+        self.assertIsNone(report["config_rejected_fields"])
+        self.assertIsNone(report["config_rejected_generation"])
+
+    def test_unrecognized_field_records_reason_and_fields(self):
+        # An unrecognized non-null field forces non-application: the holder
+        # records the refused generation, the offending field name(s), and a
+        # stable human reason so the operator sees WHICH field broke.
+        holder, _ = self._holder()
+        applied = holder.apply({
+            "max_concurrent": 7,
+            "retries": 3,
+            "config_generation": "gen-B",
+        })
+        self.assertFalse(applied)
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertEqual(report["config_rejected_fields"], ["retries"])
+        self.assertEqual(report["config_rejected_generation"], "gen-B")
+        self.assertIn("retries", report["config_apply_reason"])
+        self.assertEqual(
+            report["config_apply_reason"], "unrecognized config field(s): retries"
+        )
+
+    def test_multiple_unrecognized_fields_sorted_in_reason(self):
+        holder, _ = self._holder()
+        holder.apply({
+            "zeta": 1,
+            "alpha": 2,
+            "config_generation": "gen-multi",
+        })
+        report = holder.report()
+        # Field names are de-duplicated and sorted for a stable reason string.
+        self.assertEqual(report["config_rejected_fields"], ["alpha", "zeta"])
+        self.assertEqual(
+            report["config_apply_reason"], "unrecognized config field(s): alpha, zeta"
+        )
+
+    def test_rejection_cleared_once_clean_later_generation_applies(self):
+        # A rejection reason must NOT linger after the operator fixes the config
+        # and a later clean generation converges — else the UI shows a resolved
+        # error forever.
+        holder, _ = self._holder()
+        holder.apply({"retries": 3, "config_generation": "gen-bad"})
+        self.assertEqual(holder.report()["config_apply_status"], "rejected")
+        # The operator removes the bad field; a clean later generation applies.
+        self.assertTrue(
+            holder.apply({"max_concurrent": 5, "config_generation": "gen-good"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertIsNone(report["config_apply_reason"])
+        self.assertIsNone(report["config_rejected_fields"])
+        self.assertIsNone(report["config_rejected_generation"])
+
     def test_reports_structured_rejected_reason_and_clears_on_apply(self):
         """A not-fully-applicable block reports a structured rejection naming the
         offending field(s) and the rejected generation; a fully-applied block
