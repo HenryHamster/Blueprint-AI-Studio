@@ -20577,6 +20577,197 @@ class TestTriggerForcePromote:
         assert "4242" in exc_info.value.detail
 
 
+class TestHotfixScopePreview:
+    """Router-level coverage for the read-only hotfix-scope preview
+    (``GET /projects/{id}/promote/hotfix/preview``).
+
+    The endpoint must report eligibility without triggering any promotion,
+    thread through the optional ``candidate_sha`` query parameter, enforce
+    owner-only access, and map internal statuses to the right HTTP codes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_reports_eligibility_without_promoting(
+        self, db_session, mocker
+    ):
+        """Happy path: machinery-only diff → eligible=True, no promotion occurs.
+
+        This is the named acceptance-evidence test for the task.  The endpoint
+        delegates to ``check_hotfix_scope_preview`` (mocked) and returns its
+        result verbatim.  A real ``promote`` call would also need
+        ``release_qualifier.hotfix_promote_current_version`` — we verify that
+        function is NEVER called, proving the preview is side-effect-free.
+        """
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "changed_files": ["backend/app/release_qualifier.py"],
+                    "offending_files": [],
+                    "reason": "all changed files are allowlisted release machinery",
+                    "candidate_sha": "deadbeef" * 5,
+                    "prior_deployed_sha": "cafecafe" * 5,
+                }
+            ),
+        )
+        promote_mock = mocker.patch(
+            "app.release_qualifier.hotfix_promote_current_version",
+            new=AsyncMock(),
+        )
+
+        result = await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["eligible"] is True
+        assert result["status"] == "eligible"
+        assert result["offending_files"] == []
+        assert "backend/app/release_qualifier.py" in result["changed_files"]
+        # The preview must NOT trigger an actual promotion.
+        promote_mock.assert_not_called()
+        preview_mock.assert_awaited_once_with(
+            db_session,
+            project.id,
+            candidate_sha=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_reports_ineligible_with_offending_files(
+        self, db_session, mocker
+    ):
+        """A diff touching a non-allowlisted file → eligible=False with offending_files."""
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "ineligible",
+                    "eligible": False,
+                    "changed_files": [
+                        "backend/app/release_qualifier.py",
+                        "backend/app/compute_jobs.py",
+                    ],
+                    "offending_files": ["backend/app/compute_jobs.py"],
+                    "reason": "backend/app/compute_jobs.py is outside the release-machinery allowlist",
+                    "candidate_sha": "deadbeef" * 5,
+                    "prior_deployed_sha": "cafecafe" * 5,
+                }
+            ),
+        )
+
+        result = await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["eligible"] is False
+        assert result["status"] == "ineligible"
+        assert "backend/app/compute_jobs.py" in result["offending_files"]
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_respects_candidate_sha_param(
+        self, db_session, mocker
+    ):
+        """An explicit ``candidate_sha`` is threaded through to
+        ``check_hotfix_scope_preview``."""
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "changed_files": [],
+                    "offending_files": [],
+                    "reason": "all changed files are allowlisted release machinery",
+                    "candidate_sha": "abc1234" * 5 + "abc1234",
+                    "prior_deployed_sha": "main000" * 5 + "main000",
+                }
+            ),
+        )
+
+        explicit_sha = "abc1234" * 5 + "abc1234"
+        await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=explicit_sha,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        preview_mock.assert_awaited_once_with(
+            db_session,
+            project.id,
+            candidate_sha=explicit_sha,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_returns_404_when_no_open_version(
+        self, db_session, mocker
+    ):
+        """``no_open_version`` from the preview helper maps to HTTP 404."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(return_value={"status": "no_open_version"}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_hotfix_scope_preview(
+                project.id,
+                candidate_sha=None,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_requires_owner_role(self, db_session, mocker):
+        """A member (non-owner) cannot call the preview endpoint — 404 from role check."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+        import uuid as _uuid
+
+        # Create a member user with a fresh user ID (not the owner).
+        project = await _make_project(db_session)
+        member_id = str(_uuid.uuid4())
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(return_value={"status": "eligible", "eligible": True}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_hotfix_scope_preview(
+                project.id,
+                candidate_sha=None,
+                session=db_session,
+                current_user={"user_id": member_id},
+            )
+        # _get_user_project_with_role raises 404 for users without the required role.
+        assert exc_info.value.status_code == 404
+
+
 class TestTriggerRollup:
     @pytest.mark.asyncio
     async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
