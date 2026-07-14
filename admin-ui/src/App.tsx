@@ -25,7 +25,6 @@ import {
 import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
-import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
 const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
@@ -346,39 +345,6 @@ export default function App() {
       .catch(() => {});
     return () => { cancelled = true; };
   }, [s.showResearchBrowser, selectedProjectId]);
-  // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
-  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
-  useEffect(() => {
-    if (!selectedProjectId) setSrInvestigationTaskIds({});
-  }, [selectedProjectId]);
-  usePoller(async (signal) => {
-    if (!selectedProjectId) return;
-    const pid = selectedProjectId;
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
-      if (!res.ok || signal.aborted) return;
-      const data = (await res.json()) as { task_ids?: Record<string, string> };
-      if (!signal.aborted) setSrInvestigationTaskIds(data.task_ids ?? {});
-    } catch { /* ignore */ }
-  }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId, deps: [selectedProjectId] });
-
-  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
-    if (!selectedProjectId) return null;
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(signal),
-      });
-      if (!res.ok) return null;
-      const data = (await res.json()) as { task_id: string; created: boolean };
-      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
-      return data.task_id;
-    } catch {
-      return null;
-    }
-  }, [selectedProjectId]);
-
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
     const zones = Object.entries(s.zoneHealth);
@@ -1812,8 +1778,6 @@ export default function App() {
           }}
           onViewTask={handleViewTask}
           projectId={s.selectedProjectId ?? undefined}
-          onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
-          activeInvestigationTaskIds={srInvestigationTaskIds}
           onClose={() => s.setShowAlertsPopover(false)}
         />
         </Suspense>

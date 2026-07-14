@@ -1,7 +1,6 @@
 import { X } from 'lucide-react';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
-import type { SrInvestigationSignal } from './SrTrendBreakdown';
 
 interface AlertsPopoverProps {
   alerts: Alert[];
@@ -9,8 +8,6 @@ interface AlertsPopoverProps {
   onDismissAll?: () => void;
   onViewTask?: (taskId: string) => void;
   projectId?: string;
-  onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
-  activeInvestigationTaskIds?: Record<string, string> | null;
   onClose: () => void;
 }
 
@@ -20,8 +17,6 @@ export function AlertsPopover({
   onDismissAll,
   onViewTask,
   projectId,
-  onSpawnSrInvestigation,
-  activeInvestigationTaskIds,
   onClose,
 }: AlertsPopoverProps) {
   return (
@@ -57,8 +52,6 @@ export function AlertsPopover({
               onClose();
             }}
             projectId={projectId}
-            onSpawnSrInvestigation={onSpawnSrInvestigation}
-            activeInvestigationTaskIds={activeInvestigationTaskIds}
           />
         </div>
       </div>
