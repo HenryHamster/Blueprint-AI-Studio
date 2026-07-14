@@ -15,7 +15,7 @@ referenced through the ``services`` module object so test patches against
 
 import hashlib as _hashlib
 import logging
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlmodel import select
 
 from app import services
@@ -158,13 +158,28 @@ async def _sweep_bootstrap_recovery() -> None:
                         Project.build_config["repo_is_empty"].as_string(), "false"
                     )
                     != "true",
-                    func.coalesce(
-                        Project.build_config["bootstrap_recovery_state"].as_string(), ""
-                    )
-                    != "exhausted",
-                    Project.build_config["bootstrap_recovery_exhausted_at"]
-                    .as_string()
-                    .is_(None),
+                    # A legacy project with an UNDETERMINED repo_is_empty (JSON
+                    # key absent → as_string() IS NULL) may already be stranded
+                    # at recovery-exhausted because it was retried blindly before
+                    # the self-heal existed. Let it back through the exhaustion
+                    # guards so spawn_bootstrap_task can run its emptiness
+                    # self-heal (seed + stamp) on it; a determined signal still
+                    # obeys the exhaustion guards unchanged.
+                    or_(
+                        Project.build_config["repo_is_empty"].as_string().is_(None),
+                        and_(
+                            func.coalesce(
+                                Project.build_config[
+                                    "bootstrap_recovery_state"
+                                ].as_string(),
+                                "",
+                            )
+                            != "exhausted",
+                            Project.build_config["bootstrap_recovery_exhausted_at"]
+                            .as_string()
+                            .is_(None),
+                        ),
+                    ),
                     or_(
                         Project.build_config["bootstrap_recovery_next_at"]
                         .as_string()

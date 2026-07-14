@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -76,6 +76,99 @@ def next_recovery_backoff(attempts: int) -> timedelta:
 REFRESH_SPAWN_REASON = "operator_refresh"
 
 
+def _empty_repo_build_config_fields() -> dict:
+    """Durable fields stamped when the live repo is confirmed commitless.
+
+    Mirrors ``admin_onboard._empty_repo_build_config`` field-for-field (kept in
+    sync deliberately, not imported, to avoid a router→helper import cycle) so a
+    self-healed legacy repo carries the same shape a fresh empty-repo onboarding
+    would: ``detection_completed`` is implied, the ``repo_is_empty`` guard is
+    reachable, and ``maybe_refresh_empty_build_config`` can later re-detect once
+    real source lands.
+    """
+    return {
+        "language": None,
+        "directories": [],
+        "env_vars": {},
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "repo_is_empty": True,
+        "source_file_count": 0,
+        "has_ci": False,
+    }
+
+
+async def _self_heal_undetermined_emptiness(
+    project: Project,
+    build_cfg: dict,
+    session: AsyncSession,
+) -> Literal["empty", "non_empty", "undetermined"]:
+    """Resolve an undetermined durable ``repo_is_empty`` against the live repo.
+
+    Legacy projects predating empty-repo detection carry no ``repo_is_empty`` at
+    all. Both the spawn gate and the recovery sweep coalesce that absent signal
+    to "not empty", so a genuinely commitless legacy repo gets bootstrap clones
+    that die exit-128 (``Remote branch not found``) and retry blindly to
+    exhaustion — never seeded, never re-detected, permanently stranded.
+
+    Resolve the signal authoritatively while we still hold a write-capable
+    installation token: seed a truly commitless repo (giving the trunk a real
+    commit) and stamp ``repo_is_empty=True`` with the full empty-repo config
+    shape; stamp ``False`` when the repo demonstrably has commits. Both cases
+    persist to ``project.build_config`` (caller commits) so the durable signal
+    stops being undetermined and future sweeps classify it correctly.
+
+    Best-effort: no installation token or ANY GitHub error leaves the signal
+    undetermined and the caller falls through to its prior behavior — a transient
+    failure must never block a spawn or mis-stamp a healthy repo.
+    """
+    owner = project.github_owner or ""
+    repo = project.github_repo or ""
+    if not owner or not repo:
+        return "undetermined"
+
+    from app.github import (
+        ensure_repo_initialized,
+        get_repo_default_branch,
+        get_repo_installation_token,
+        repo_has_commits,
+    )
+
+    try:
+        token = await get_repo_installation_token(owner, repo)
+        if not token:
+            return "undetermined"
+
+        if await repo_has_commits(token, owner, repo):
+            build_cfg["repo_is_empty"] = False
+            project.build_config = build_cfg
+            flag_modified(project, "build_config")
+            session.add(project)
+            return "non_empty"
+
+        # Commitless: seed the trunk so `--branch <trunk>` clones stop dying,
+        # then stamp the durable empty-repo signal so the guard suppresses the
+        # doomed bootstrap here instead of retrying it to exhaustion.
+        default_branch = project.integration_branch or await get_repo_default_branch(
+            token, owner, repo
+        )
+        await ensure_repo_initialized(token, owner, repo, default_branch)
+        build_cfg.update(_empty_repo_build_config_fields())
+        project.build_config = build_cfg
+        flag_modified(project, "build_config")
+        session.add(project)
+        return "empty"
+    except Exception:  # noqa: BLE001 — best-effort: any failure leaves the signal undetermined
+        logger.warning(
+            "[BOOTSTRAP] Undetermined-emptiness self-heal failed for project %s "
+            "(%s/%s) — leaving signal undetermined, falling through",
+            project.id,
+            owner,
+            repo,
+            exc_info=True,
+        )
+        return "undetermined"
+
+
 @dataclass
 class BootstrapSpawnResult:
     """Result of a spawn_bootstrap_task call."""
@@ -128,6 +221,17 @@ async def spawn_bootstrap_task(
             outcome="not_eligible",
             reason="self_repo",
         )
+
+    # Legacy projects predating empty-repo detection carry an undetermined
+    # (absent/None) durable repo_is_empty. Both this gate and the recovery sweep
+    # otherwise coalesce that to "not empty", so a genuinely commitless legacy
+    # repo loops clone_failed forever. Resolve the signal against the live repo
+    # first: a real empty repo is seeded + stamped here (and suppressed by the
+    # guard below); a repo with commits is stamped non-empty and proceeds. A
+    # no-token / GitHub-error self-heal leaves the signal undetermined and falls
+    # through to the prior behavior, so nothing regresses.
+    if build_cfg.get("repo_is_empty") is None:
+        await _self_heal_undetermined_emptiness(project, build_cfg, session)
 
     if build_cfg.get("repo_is_empty"):
         return BootstrapSpawnResult(

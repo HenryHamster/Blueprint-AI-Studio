@@ -346,3 +346,205 @@ class TestBootstrapGuardIsReachable:
         # If this ever starts returning not_eligible/repo_is_empty, the guard has
         # grown a second, independent source of truth and this fix is redundant.
         assert not {}.get("repo_is_empty")
+
+
+def _legacy_undetermined_project(**overrides) -> Project:
+    """A legacy project whose durable repo_is_empty was never determined.
+
+    The absent key is the exact pre-fix state that the spawn gate and recovery
+    sweep both coalesce to "not empty".
+    """
+    cfg = {"language": None, "detected_at": "2025-01-01T00:00:00+00:00"}
+    assert "repo_is_empty" not in cfg
+    kwargs = {
+        "name": "legacy/undetermined",
+        "user_id": "test-user-empty-repo",
+        "github_owner": "legacy",
+        "github_repo": "undetermined",
+        "build_config": cfg,
+        "integration_branch": "main",
+    }
+    kwargs.update(overrides)
+    return Project(**kwargs)
+
+
+class TestLegacyUndeterminedEmptinessSelfHeal:
+    """A legacy project with an undetermined (absent) durable ``repo_is_empty``
+    is resolved against the live repo at spawn time instead of looping
+    clone_failed to exhaustion — the sys-onboarding risk #1 this task closes."""
+
+    @pytest.mark.asyncio
+    async def test_commitless_repo_is_seeded_and_stamped_empty(self, db_session):
+        # Undetermined signal + a repo GitHub reports as commitless: the trunk
+        # must be seeded (so `--branch main` clones stop dying), the durable
+        # signal stamped repo_is_empty=True, and the doomed bootstrap suppressed
+        # HERE rather than retried to exhaustion.
+        project = _legacy_undetermined_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        ensure_mock = AsyncMock(return_value=True)
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch("app.github.ensure_repo_initialized", ensure_mock),
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+                automatic_recovery=True,
+            )
+        await db_session.commit()
+
+        assert result.outcome == "not_eligible"
+        assert result.reason == "repo_is_empty"
+        # The trunk was seeded on the project's real integration branch.
+        ensure_mock.assert_awaited_once()
+        assert ensure_mock.await_args.args[3] == "main"
+        # The durable signal is no longer undetermined — it now reads True with
+        # the full empty-repo shape, so future sweeps classify it correctly.
+        assert project.build_config["repo_is_empty"] is True
+        assert project.build_config["source_file_count"] == 0
+        assert project.build_config["has_ci"] is False
+
+    @pytest.mark.asyncio
+    async def test_repo_with_commits_is_stamped_non_empty_and_spawns(self, db_session):
+        # Undetermined signal + a repo that actually has commits: no seeding, the
+        # signal is stamped repo_is_empty=False, and bootstrap proceeds normally.
+        project = _legacy_undetermined_project(
+            name="legacy/has-commits", github_repo="has-commits"
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        ensure_mock = AsyncMock(return_value=False)
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch("app.github.ensure_repo_initialized", ensure_mock),
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+        # A repo with commits must never be seeded.
+        ensure_mock.assert_not_awaited()
+        assert project.build_config["repo_is_empty"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_token_leaves_signal_undetermined_and_falls_through(
+        self, db_session
+    ):
+        # Best-effort: no installation token (the test/no-GitHub-App default)
+        # must NOT stamp the signal or seed anything — the pre-fix behavior is
+        # preserved and the bootstrap spawns exactly as before.
+        project = _legacy_undetermined_project(
+            name="legacy/no-token", github_repo="no-token"
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        seed_mock = AsyncMock()
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("app.github.ensure_repo_initialized", seed_mock),
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+        seed_mock.assert_not_awaited()
+        # Signal untouched — still undetermined, exactly as before the fix.
+        assert "repo_is_empty" not in project.build_config
+
+    @pytest.mark.asyncio
+    async def test_github_error_falls_through_without_blocking_spawn(
+        self, db_session
+    ):
+        # A transient GitHub failure mid-heal must never block the spawn or
+        # mis-stamp the signal: swallow, leave undetermined, fall through.
+        project = _legacy_undetermined_project(
+            name="legacy/transient", github_repo="transient"
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.repo_has_commits",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("GitHub 502"),
+            ),
+        ):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+        assert "repo_is_empty" not in project.build_config
+
+    @pytest.mark.asyncio
+    async def test_determined_signal_skips_self_heal_entirely(self, db_session):
+        # Guard the hot path: a DETERMINED repo_is_empty=False must not touch
+        # GitHub at all — the self-heal is dead code for every non-legacy caller.
+        project = _legacy_undetermined_project(
+            name="legacy/determined",
+            github_repo="determined",
+            build_config={"language": "python", "repo_is_empty": False},
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        token_mock = AsyncMock(return_value="tok")
+        with patch("app.github.get_repo_installation_token", token_mock):
+            result = await spawn_bootstrap_task(
+                project,
+                db_session,
+                is_first_bootstrap=False,
+                spawn_reason="recovery_sweep",
+            )
+        await db_session.commit()
+
+        assert result.outcome == "spawned"
+        token_mock.assert_not_awaited()

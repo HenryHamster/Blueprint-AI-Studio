@@ -3088,6 +3088,59 @@ class TestBootstrapSweepDirect:
         )
 
     @pytest.mark.asyncio
+    async def test_sweep_reselects_exhausted_project_with_undetermined_emptiness(
+        self, db_session
+    ):
+        """A stranded legacy project (undetermined repo_is_empty) that already
+        hit recovery-exhausted is re-selected by the sweep so the emptiness
+        self-heal can run — while an exhausted project with a DETERMINED
+        non-empty signal stays excluded (the exhaustion guards still bind it)."""
+        from app.recovery_sweeps import _sweep_bootstrap_recovery
+        from app.repo_bootstrap import BootstrapSpawnResult
+
+        undetermined = _make_external_project(
+            db_session,
+            name="acme/legacy-stranded",
+            build_config={
+                "language": None,
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        determined = _make_external_project(
+            db_session,
+            name="acme/determined-stranded",
+            build_config={
+                "language": "python",
+                "repo_is_empty": False,
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        seen_ids = []
+
+        async def _capture(project, session, **kwargs):
+            seen_ids.append(project.id)
+            return BootstrapSpawnResult(outcome="not_eligible", reason="captured")
+
+        with patch(
+            "app.repo_bootstrap.spawn_bootstrap_task", side_effect=_capture
+        ):
+            await _sweep_bootstrap_recovery()
+
+        assert undetermined.id in seen_ids, (
+            "an exhausted project with an undetermined repo_is_empty must be "
+            "re-selected so its emptiness self-heal can run"
+        )
+        assert determined.id not in seen_ids, (
+            "an exhausted project with a determined non-empty signal must stay "
+            "excluded by the exhaustion guards"
+        )
+
+    @pytest.mark.asyncio
     async def test_sweep_idempotent_already_active(self, db_session):
         """Sweep must not spawn a second task when a bootstrap is already active."""
         from app.recovery_sweeps import _sweep_bootstrap_recovery
