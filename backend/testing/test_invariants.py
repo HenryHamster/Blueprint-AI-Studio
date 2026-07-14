@@ -5658,6 +5658,10 @@ class TestFailureClassificationInvariants:
                 REPO_UNINITIALIZED,
                 SCOPE_EMPTY,
                 REASSIGNED,
+                # Repo was never seeded / clone yields nothing — a permanent,
+                # structural operator-fix condition, not a code defect or a
+                # retryable transient. See failure_classification REPO_UNINITIALIZED.
+                REPO_UNINITIALIZED,
                 NO_PROGRESS_TIMEOUT,
                 # Repo never initialized (empty/near-empty upstream) — the task
                 # could not clone through no code defect of its own.

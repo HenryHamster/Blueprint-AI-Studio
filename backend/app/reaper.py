@@ -300,6 +300,7 @@ from app.reaper_sweeps import (
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
     sweep_capability_backing_proofs,
+    sweep_auto_clear_moot_pending_confirmations,
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
@@ -3175,6 +3176,24 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Compute-image auto-refresh sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22e: Auto-clear moot pending_user_confirmation items —
+                # remove credentials_needed/access_needed asks the runtime can
+                # already prove are resolved (owner LLM-account credential ready,
+                # live cached project repo token) so they drop off the operator's
+                # needs-action surface. Strictly conservative/fail-closed; never
+                # touches intent_change/major_decision. Hourly cadence-gated on an
+                # independent timer. Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_auto_clear_moot_pending_confirmations(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Moot pending-confirmation sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

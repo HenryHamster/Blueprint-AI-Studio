@@ -1575,6 +1575,139 @@ def append_revision_log(
         del model.revision_log[0 : len(model.revision_log) - REVISION_LOG_MAX]
 
 
+# ---------------------------------------------------------------------------
+# Auto-clear moot pending confirmations
+# ---------------------------------------------------------------------------
+
+
+class ConfirmationResolutionSignals(BaseModel):
+    """Positively-detected runtime availability signals used to auto-clear moot
+    pending confirmations.
+
+    Every flag is fail-closed (defaults ``False``): an empty/unpopulated signal
+    clears nothing, so :func:`auto_clear_resolved_confirmations` only ever
+    removes an item when the moot condition is POSITIVELY proven by the runtime.
+    The reaper sweep populates these from the same credential/access resolution
+    the dispatcher already uses (owner LLM-account readiness, cached project
+    repo token); keeping this model pure makes the detection logic unit-testable
+    without a DB or the in-memory pool.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_credentials_ready: bool = False
+    """Owner has >=1 enabled, runtime-ready LLM account (OAuth token / Secret
+    Manager credential present) — the account-credential the runtime resolves at
+    dispatch. Mirrors ``max_plan_pool._db_account_runtime_ready``."""
+
+    repo_access_ready: bool = False
+    """Project has a currently-live cached GitHub installation token, proving
+    repo access is granted right now. Mirrors
+    ``github_token_resolver.get_cached_project_token``."""
+
+
+# Keyword gates: a pending item is only bound to a resolution signal when its
+# free text clearly references that resource class. PendingConfirmation carries
+# no structured credential id, so this textual gate is what keeps the clear
+# conservative — a ``credentials_needed`` item about some OTHER secret (a
+# dataset key, a third-party API token) is left in place even when LLM
+# credentials are ready.
+_LLM_CREDENTIAL_TERMS = (
+    "llm",
+    "anthropic",
+    "claude",
+    "oauth",
+    "api key",
+    "api-key",
+    "apikey",
+    "max plan",
+    "max-plan",
+    "model credential",
+    "model access",
+)
+_REPO_ACCESS_TERMS = (
+    "repo",
+    "repository",
+    "github",
+    "git access",
+    "clone",
+    "push access",
+)
+
+
+def _confirmation_is_moot(
+    item: PendingConfirmation, signals: ConfirmationResolutionSignals
+) -> bool:
+    """Whether a single pending confirmation is POSITIVELY resolved.
+
+    Strictly conservative and fail-closed:
+
+    - only ``credentials_needed`` / ``access_needed`` are ever eligible;
+      ``intent_change`` / ``major_decision`` require a human decision and are
+      NEVER auto-removed;
+    - the relevant runtime signal must be positively available AND the item's
+      free text must reference that resource class. Anything ambiguous returns
+      ``False`` (leave it for the operator to dismiss).
+    """
+    text = f"{item.proposal or ''}\n{item.rationale or ''}".lower()
+    if item.type == "credentials_needed":
+        return signals.llm_credentials_ready and any(
+            t in text for t in _LLM_CREDENTIAL_TERMS
+        )
+    if item.type == "access_needed":
+        return signals.repo_access_ready and any(
+            t in text for t in _REPO_ACCESS_TERMS
+        )
+    return False
+
+
+def auto_clear_resolved_confirmations(
+    model: ProblemModel,
+    signals: ConfirmationResolutionSignals,
+    now_iso: str,
+) -> list[str]:
+    """Remove pending confirmations whose moot condition is positively detected.
+
+    Pure, DB-free counterpart to the operator dismiss/accept endpoints
+    (``admin_projects.dismiss_pending_confirmation``): it round-trips the
+    ``ProblemModel`` identically — removes the item(s), bumps ``revision``,
+    stamps ``last_updated`` / ``last_updated_by='user'`` (operator-surface
+    consistency), and appends one ``revision_log`` entry. Mutates ``model`` in
+    place and returns the ids cleared (empty list => no change, so the caller
+    keeps the durable column byte-identical on the no-op path).
+
+    Only ``credentials_needed`` / ``access_needed`` items are eligible, and only
+    when :func:`_confirmation_is_moot` positively proves resolution — see that
+    helper for the fail-closed contract. Idempotent and safe to run every sweep:
+    a second call with the same signals is a no-op because the cleared items are
+    already gone.
+    """
+    if not model.pending_user_confirmation:
+        return []
+    cleared: list[str] = []
+    kept: list[PendingConfirmation] = []
+    for item in model.pending_user_confirmation:
+        if _confirmation_is_moot(item, signals):
+            cleared.append(item.id)
+        else:
+            kept.append(item)
+    if not cleared:
+        return []
+    model.pending_user_confirmation = kept
+    model.revision += 1
+    model.last_updated = now_iso
+    model.last_updated_by = "user"
+    append_revision_log(
+        model,
+        (
+            f"auto-cleared {len(cleared)} moot pending confirmation(s): "
+            "credential/access now available"
+        ),
+        {"auto_cleared_pending_confirmations": cleared},
+    )
+    return cleared
+
+
 def append_self_reflection(
     log_raw: list | None,
     entry: SelfReflectionEntry,

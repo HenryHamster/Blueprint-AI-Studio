@@ -298,13 +298,6 @@ async def _make_project(session) -> Project:
                 {"name": "pipeline monitoring", "status": "working"},
                 {"name": "local strategic runner", "status": "partial"},
             ],
-            "pending_user_confirmation": [
-                {
-                    "id": "p-1",
-                    "type": "major_decision",
-                    "proposal": "Keep chat as the main surface.",
-                }
-            ],
         },
         design_doc={"_meta": {"revision": 3}, "pages": []},
         running_update=(
@@ -321,10 +314,111 @@ async def _make_project(session) -> Project:
 
 
 @pytest.mark.asyncio
+async def test_pending_confirmations_surface_as_needs_operator_attention(db_session):
+    """A pending_user_confirmation yields a needs_operator attention item.
+
+    Exercises the operator_attention seam directly: each durable confirmation
+    becomes one needs_operator item (with per-type lifecycle + accept/dismiss
+    affordances) and feeds the pending_confirmations count.
+    """
+    from app.operator_attention import build_operator_attention
+
+    project = Project(
+        name="Pending confirmations",
+        user_id=TEST_USER_ID,
+        problem_model={
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Need an OpenAI API key to run the experiment.",
+                    "created_at": "2026-07-14T00:00:00+00:00",
+                },
+                {
+                    "id": "p-decide",
+                    "type": "major_decision",
+                    "proposal": "Ship the migration this cycle?",
+                },
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["pending_confirmations"] == 2
+    assert attention["counts"]["needs_operator"] == 2
+
+    items = {item["id"]: item for item in attention["items"]}
+    cred = items["confirmation:p-cred"]
+    assert cred["kind"] == "confirmation"
+    assert cred["severity"] == "needs_operator"
+    assert cred["reason"] == "confirmation_credentials_needed"
+    assert cred["confirmation_type"] == "credentials_needed"
+    assert cred["unread"] is True
+    assert "OpenAI API key" in cred["detail"]
+    assert cred["ref"]["id"] == "p-cred"
+    # Lifecycle names the credential-available clear condition + inline affordances.
+    assert (
+        cred["lifecycle"]["clears_when"]
+        == "confirmation_accepted_dismissed_or_credential_provided"
+    )
+    accept_action = next(a for a in cred["actions"] if a["kind"] == "accept")
+    assert accept_action["path"].endswith(
+        f"/projects/{project.id}/pending-confirm/p-cred/accept"
+    )
+    assert any(a["kind"] == "dismiss" for a in cred["actions"])
+
+    decide = items["confirmation:p-decide"]
+    assert decide["reason"] == "confirmation_major_decision"
+    assert decide["lifecycle"]["clears_when"] == "confirmation_accepted_or_dismissed"
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmations_malformed_model_does_not_raise(db_session):
+    """A malformed pending_user_confirmation value must not raise or emit items."""
+    from app.operator_attention import build_operator_attention
+
+    project = Project(
+        name="Malformed pending confirmations",
+        user_id=TEST_USER_ID,
+        problem_model={"pending_user_confirmation": "garbage"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["pending_confirmations"] == 0
+    assert not any(item["kind"] == "confirmation" for item in attention["items"])
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_returns_persistent_workbench_projection(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    # One durable pending confirmation — asserted both as the scalar read-model
+    # summary count and as a needs_operator attention item below.
+    pm = dict(project.problem_model or {})
+    pm["pending_user_confirmation"] = [
+        {
+            "id": "p-1",
+            "type": "major_decision",
+            "proposal": "Keep chat as the main surface.",
+        }
+    ]
+    project.problem_model = pm
+    db_session.add(project)
+    await db_session.commit()
     phase2_task = Task(
         project_id=project.id,
         title="Strategic review",
@@ -472,8 +566,21 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert data["tasks"]["cumulative_estimated_cost_usd"] == 2.0
     assert data["messages"]["counts"] == {"open": 1, "linked": 1}
     assert {m["status"] for m in data["messages"]["items"]} == {"open", "linked"}
-    assert data["attention"]["level"] == "clear"
-    assert data["attention"]["counts"]["needs_operator"] == 0
+    # The fixture carries one pending_user_confirmation (p-1), which now surfaces
+    # as a needs_operator attention item alongside the scalar summary count.
+    assert data["attention"]["level"] == "needs_operator"
+    assert data["attention"]["counts"]["needs_operator"] == 1
+    assert data["attention"]["counts"]["pending_confirmations"] == 1
+    confirmation_item = next(
+        item for item in data["attention"]["items"] if item["id"] == "confirmation:p-1"
+    )
+    assert confirmation_item["severity"] == "needs_operator"
+    assert confirmation_item["kind"] == "confirmation"
+    assert confirmation_item["reason"] == "confirmation_major_decision"
+    assert confirmation_item["ref"]["id"] == "p-1"
+    assert "Keep chat as the main surface." in confirmation_item["detail"]
+    assert confirmation_item["lifecycle"]["operator_action"] == "answer_decision_or_dismiss"
+    assert {a["kind"] for a in confirmation_item["actions"]} == {"accept", "dismiss"}
     local_runner = data["runtime"]["local_runner"]
     assert local_runner["mode"] == "cloud"
     assert local_runner["status"] == "unavailable"
@@ -522,8 +629,11 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         "knowledge": 1,
         "artifacts": 1,
         "design": 1,
+        # The pending confirmation surfaces as a needs_operator attention item,
+        # which the context package now aggregates as an attention source.
+        "attention": 1,
     }
-    assert package["item_count"] == 14
+    assert package["item_count"] == 15
     assert package["canvas"]["node_count"] >= 8
     assert package["canvas"]["edge_count"] >= 7
     assert package["canvas"]["nodes"]

@@ -17520,6 +17520,130 @@ async def test_proof_earn_loop_runs_after_backing_proof_same_cycle(reaper_db, mo
         _rs._last_proof_earn_loop_sweep = _prev_earn
 
 
+# ── Step 22e: auto-clear moot pending confirmations ──────────────────────────
+
+
+async def _make_ready_llm_account(db, user_id: str):
+    """Create an enabled, runtime-ready Anthropic OAuth account for a user."""
+    from app.models import MaxPlanAccount
+
+    acct = MaxPlanAccount(
+        user_id=user_id,
+        name="acct-1",
+        enabled=True,
+        oauth_token="projects/x/secrets/tok",
+    )
+    db.add(acct)
+    await db.commit()
+    return acct
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_clears_credentials_when_owner_ready(reaper_db):
+    """A credentials_needed item auto-clears once the owner has a runtime-ready
+    LLM account, and the removal persists to the durable problem_model column."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        project = await _make_project(reaper_db)  # user_id == "user1"
+        await _make_ready_llm_account(reaper_db, "user1")
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add an Anthropic Claude OAuth token for the pool.",
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 1
+
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"] == []
+        # revision-log entry was appended by the pure helper
+        log = project.problem_model.get("revision_log") or []
+        assert any(
+            e.get("changes", {}).get("auto_cleared_pending_confirmations") == ["p-cred"]
+            for e in log
+        )
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_leaves_item_when_not_ready(reaper_db):
+    """No runtime-ready credential -> the credentials_needed item is left in place;
+    intent_change is never auto-removed regardless."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        project = await _make_project(reaper_db)  # no LLM account for user1
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add a Claude OAuth token.",
+                },
+                {
+                    "id": "p-intent",
+                    "type": "intent_change",
+                    "proposal": "Pivot the project.",
+                },
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 0
+
+        await reaper_db.refresh(project)
+        ids = {p["id"] for p in project.problem_model["pending_user_confirmation"]}
+        assert ids == {"p-cred", "p-intent"}
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_cadence_gated(reaper_db):
+    """A just-stamped cadence timer gates the sweep out (returns 0 without work)."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = _utcnow()  # just ran -> not due
+    try:
+        project = await _make_project(reaper_db)
+        await _make_ready_llm_account(reaper_db, "user1")
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add an Anthropic Claude OAuth token.",
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 0
+        await reaper_db.refresh(project)
+        # Untouched because the sweep was gated out.
+        assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-cred"
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
 @pytest.mark.asyncio
 async def test_proof_earn_loop_fires_without_demand_when_unproven_caps_exist(reaper_db, mocker):
     """Step 22b fires even with NO demand when unproven working capabilities exist.

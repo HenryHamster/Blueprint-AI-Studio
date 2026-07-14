@@ -468,7 +468,8 @@ export default function App() {
       (counts.stale_queued_tasks ?? 0) +
       (counts.failed_tasks ?? 0) +
       (counts.blocked_tasks ?? 0) +
-      (counts.parked_tasks ?? 0)
+      (counts.parked_tasks ?? 0) +
+      (counts.pending_confirmations ?? 0)
     );
   }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
   const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery } = useCommandPaletteState();
@@ -1357,6 +1358,8 @@ export default function App() {
                 accountSpend={strategicAccountSpend}
                 savingSessionRefs={savingStrategicWorkbench}
                 onUpdateSessionRefs={updateStrategicSessionRefs}
+                onConfirmationResolved={() => { void strategicReadModel.refresh(); }}
+                addToast={s.addToast}
               />
               </Suspense>
             )}

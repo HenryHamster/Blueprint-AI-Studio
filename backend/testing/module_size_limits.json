@@ -127,7 +127,7 @@
     "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
-    "operator_attention.py": 2650,
+    "operator_attention.py": 3150,
     "payload_schemas.py": 2050,
     "lifecycle.py": 2150,
     "research_direction_state.py": 1750,

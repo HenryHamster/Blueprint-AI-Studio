@@ -710,6 +710,167 @@ async def sweep_capability_backing_proofs(session, now=None) -> int:
     return total_recorded
 
 
+# Cadence gate for the moot-pending-confirmation auto-clear sweep (Step 22e).
+# Hourly, on an independent timer (see the Step 22/22b split note above for why
+# each cadence-gated sweep needs its own timestamp global).
+_MOOT_CONFIRM_INTERVAL_SECONDS = 3600
+_last_moot_confirm_sweep: datetime | None = None
+
+
+async def _owner_llm_credentials_ready(session, user_id: str | None) -> bool:
+    """Whether the project owner has >=1 enabled, runtime-ready LLM account.
+
+    Reuses the DB-side readiness check the pool uses
+    (``max_plan_pool._db_account_runtime_ready``) rather than inventing a new
+    probe — a positive result means the credential the runtime resolves at
+    dispatch is present. Fail-closed: no user / no accounts / any error -> False.
+    """
+    if not user_id:
+        return False
+    from app.max_plan_pool import _db_account_runtime_ready
+    from app.models import MaxPlanAccount
+
+    accounts = (
+        (
+            await session.execute(
+                select(MaxPlanAccount).where(
+                    MaxPlanAccount.user_id == user_id,
+                    MaxPlanAccount.enabled == True,  # noqa: E712
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return any(_db_account_runtime_ready(a) for a in accounts)
+
+
+async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
+    """Step 22e: Auto-clear moot ``pending_user_confirmation`` items.
+
+    Long-stale operator-action items pile up in ``ProblemModel.pending_user_confirmation``
+    because clearing is entirely manual and the strategy-internals surface where
+    they live is unvisited. This sweep removes the items whose ask the system can
+    already prove is resolved, so the operator's needs-action surface (which
+    re-derives from the durable list each poll) naturally drops them.
+
+    Strictly conservative and fail-closed:
+
+    - only ``credentials_needed`` / ``access_needed`` items are eligible;
+      ``intent_change`` / ``major_decision`` require a human decision and are
+      NEVER auto-removed;
+    - an item is removed ONLY when its moot condition is POSITIVELY detected via
+      the existing credential/access resolution paths — owner LLM-account
+      readiness (``_db_account_runtime_ready``) for credentials, a live cached
+      project repo token (``get_cached_project_token``) for access — AND the
+      item text references that resource class (see
+      :func:`app.problem_model._confirmation_is_moot`);
+    - when uncertain, the item is left in place.
+
+    Iterates a bounded set of projects (default 25) with a non-empty pending
+    list, mutates the durable model via the pure
+    :func:`app.problem_model.auto_clear_resolved_confirmations` helper (same
+    revision-log / ``last_updated_by`` contract as the operator dismiss
+    endpoint), and persists per project. Hourly cadence-gated, idempotent, and
+    wrapped so it can never crash the reaper cycle. Returns the total number of
+    items cleared.
+    """
+    global _last_moot_confirm_sweep
+    from app.github_token_resolver import get_cached_project_token
+    from app.models import Project
+    from app.problem_model import (
+        ConfirmationResolutionSignals,
+        auto_clear_resolved_confirmations,
+        parse_problem_model,
+    )
+    from sqlalchemy.orm import load_only
+    from sqlalchemy.orm.attributes import flag_modified
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_moot_confirm_sweep, _MOOT_CONFIRM_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_moot_confirm_sweep = _now
+
+    max_projects = 25
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.user_id,
+                        Project.problem_model,
+                        raiseload=True,
+                    )
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    total_cleared = 0
+    for project in rows:
+        try:
+            pm = getattr(project, "problem_model", None)
+            if not isinstance(pm, dict):
+                continue
+            pending = pm.get("pending_user_confirmation")
+            if not isinstance(pending, list) or not pending:
+                continue
+            # Skip early unless there is at least one auto-eligible item, so the
+            # common case does no credential/token I/O.
+            if not any(
+                isinstance(p, dict)
+                and p.get("type") in ("credentials_needed", "access_needed")
+                for p in pending
+            ):
+                continue
+
+            try:
+                model = parse_problem_model(pm)
+            except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
+                continue
+
+            signals = ConfirmationResolutionSignals(
+                llm_credentials_ready=await _owner_llm_credentials_ready(
+                    session, getattr(project, "user_id", None)
+                ),
+                repo_access_ready=bool(get_cached_project_token(str(project.id))),
+            )
+            cleared = auto_clear_resolved_confirmations(
+                model, signals, _now.isoformat()
+            )
+            if cleared:
+                project.problem_model = model.model_dump()
+                flag_modified(project, "problem_model")
+                session.add(project)
+                await session.commit()
+                total_cleared += len(cleared)
+
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] Moot pending-confirmation sweep failed for project %s:",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    if total_cleared:
+        logger.info(
+            "[REAPER] Step 22e: auto-cleared %d moot pending confirmation(s)",
+            total_cleared,
+        )
+    return total_cleared
+
+
 async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     """Step 22b: Earn proof for demanded unproven working capabilities.
 

@@ -57,6 +57,9 @@ from app.problem_model import (
     reconcile_gap_staffing_raw,
     reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
+    ConfirmationResolutionSignals,
+    PendingConfirmation,
+    auto_clear_resolved_confirmations,
 )
 
 
@@ -5799,3 +5802,155 @@ def test_evidence_primitive_phase1_gap_evidence_refs_downstream_consumer():
     ev_proven = gap_evidence_status(closed_gap_proven)
     assert ev_proven == "proven"
     assert claim_contradicts_evidence("closed", ev_proven) is False
+
+
+# ---------------------------------------------------------------------------
+# Auto-clear moot pending confirmations
+# ---------------------------------------------------------------------------
+
+
+def _pending(pid: str, ptype: str, proposal: str = "", rationale: str = ""):
+    return PendingConfirmation(
+        id=pid, type=ptype, proposal=proposal, rationale=rationale
+    )
+
+
+def test_auto_clear_credentials_needed_when_llm_ready():
+    """A credentials_needed item referencing LLM creds clears when the owner's
+    LLM account is runtime-ready — and revision/log are stamped like the
+    operator dismiss endpoint."""
+    model = ProblemModel(
+        revision=4,
+        pending_user_confirmation=[
+            _pending(
+                "p-cred",
+                "credentials_needed",
+                proposal="Add an Anthropic Claude OAuth token so the pool can run.",
+            )
+        ],
+    )
+    signals = ConfirmationResolutionSignals(llm_credentials_ready=True)
+    cleared = auto_clear_resolved_confirmations(model, signals, "2026-07-14T00:00:00")
+    assert cleared == ["p-cred"]
+    assert model.pending_user_confirmation == []
+    assert model.revision == 5
+    assert model.last_updated == "2026-07-14T00:00:00"
+    assert model.last_updated_by == "user"
+    assert len(model.revision_log) == 1
+    entry = model.revision_log[0]
+    assert entry.revision == 5
+    assert entry.changes["auto_cleared_pending_confirmations"] == ["p-cred"]
+
+
+def test_credentials_needed_left_when_llm_not_ready():
+    """Fail-closed: no positive credential signal -> item stays, byte-identical."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-cred", "credentials_needed", proposal="Need a Claude API key.")
+        ],
+    )
+    before = model.model_dump()
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(llm_credentials_ready=False), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert model.model_dump() == before  # no revision bump, no log entry
+
+
+def test_credentials_needed_left_when_text_unrelated():
+    """Positive LLM signal but the ask is about a DIFFERENT secret -> left in place."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending(
+                "p-hf",
+                "credentials_needed",
+                proposal="Need a HuggingFace dataset download token for the experiment.",
+            )
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(llm_credentials_ready=True), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert [p.id for p in model.pending_user_confirmation] == ["p-hf"]
+
+
+def test_auto_clear_access_needed_when_repo_ready():
+    """An access_needed item referencing repo/github access clears when a live
+    repo token proves access is granted."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending(
+                "p-access",
+                "access_needed",
+                proposal="Grant the GitHub app access to the repository.",
+            )
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(repo_access_ready=True), "2026-07-14T00:00:00"
+    )
+    assert cleared == ["p-access"]
+    assert model.pending_user_confirmation == []
+
+
+def test_access_needed_left_when_repo_not_ready():
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-access", "access_needed", proposal="Need github repo access.")
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(repo_access_ready=False), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert [p.id for p in model.pending_user_confirmation] == ["p-access"]
+
+
+def test_intent_change_and_major_decision_never_auto_cleared():
+    """Human-decision items are NEVER auto-removed, even with every signal set."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-intent", "intent_change", proposal="Pivot to a Claude API product."),
+            _pending("p-major", "major_decision", proposal="Migrate the github repo."),
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model,
+        ConfirmationResolutionSignals(
+            llm_credentials_ready=True, repo_access_ready=True
+        ),
+        "2026-07-14T00:00:00",
+    )
+    assert cleared == []
+    assert {p.id for p in model.pending_user_confirmation} == {"p-intent", "p-major"}
+
+
+def test_auto_clear_is_idempotent_and_mixed():
+    """Clears only the eligible/resolved item; second run is a no-op."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-cred", "credentials_needed", proposal="Anthropic OAuth token needed."),
+            _pending("p-intent", "intent_change", proposal="Change the focus."),
+        ],
+    )
+    signals = ConfirmationResolutionSignals(llm_credentials_ready=True)
+    first = auto_clear_resolved_confirmations(model, signals, "2026-07-14T00:00:00")
+    assert first == ["p-cred"]
+    rev_after_first = model.revision
+    second = auto_clear_resolved_confirmations(model, signals, "2026-07-14T01:00:00")
+    assert second == []
+    assert model.revision == rev_after_first  # no spurious bump on the no-op
+    assert [p.id for p in model.pending_user_confirmation] == ["p-intent"]
+
+
+def test_auto_clear_empty_model_is_noop():
+    model = ProblemModel()
+    before = model.model_dump()
+    cleared = auto_clear_resolved_confirmations(
+        model,
+        ConfirmationResolutionSignals(llm_credentials_ready=True, repo_access_ready=True),
+        "2026-07-14T00:00:00",
+    )
+    assert cleared == []
+    assert model.model_dump() == before

@@ -4,7 +4,6 @@ import { timeAgo, formatAbsolute } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
 import { PendingConfirmationList } from './ProblemModelAttention';
-import { dismissPendingConfirmation, acceptPendingConfirmation } from '../api';
 import type { CurrentVersion } from '../api';
 import type {
   ProblemModel,
@@ -481,48 +480,19 @@ export default function ProblemModelViewer({
           </div>
         )}
 
-        {/* Pending confirmations — calm rows, amber used once per row (left accent) */}
+        {/* Pending confirmations — read-only mirror. Acting on these lives in a
+            single place: the operator daily surface (chat rail "Needs your
+            action"), so the problem-model view lists them without action
+            buttons to avoid a second competing action surface. */}
         {pending.length > 0 && (
           <section>
             <SectionHeader icon={<AlertCircle size={14} />} amberCount={pending.length}>
               Needs your attention
             </SectionHeader>
-            <PendingConfirmationList
-              pending={pending}
-              onDismiss={async (id, note) => {
-                try {
-                  await dismissPendingConfirmation(projectId, id, note);
-                  onUpdated({
-                    ...problemModel,
-                    pending_user_confirmation: pending.filter((x) => x.id !== id),
-                    revision: (problemModel.revision ?? 0) + 1,
-                  });
-                } catch {
-                  addToast('Failed to dismiss — try again', 'error');
-                }
-              }}
-              onAccept={async (id, answer) => {
-                try {
-                  const result = await acceptPendingConfirmation(projectId, id, answer);
-                  const next: ProblemModel = {
-                    ...problemModel,
-                    pending_user_confirmation: pending.filter((x) => x.id !== id),
-                    revision: (problemModel.revision ?? 0) + 1,
-                  };
-                  // For intent_change, reflect the accepted proposal in local state.
-                  if (result.type === 'intent_change') {
-                    const accepted = pending.find((x) => x.id === id);
-                    if (accepted) {
-                      const cur = problemModel.intent ?? { purpose: '', current_focus: '' };
-                      next.intent = { ...cur, purpose: accepted.proposal };
-                    }
-                  }
-                  onUpdated(next);
-                } catch {
-                  addToast('Failed to accept — try again', 'error');
-                }
-              }}
-            />
+            <p className="pl-1 pb-1 text-ui-sm text-neutral-500">
+              Accept or resolve these from the chat view’s “Needs your action” list.
+            </p>
+            <PendingConfirmationList pending={pending} readOnly />
           </section>
         )}
 

@@ -38,9 +38,16 @@ export interface StrategicStateTask {
 export type StrategicStateMessagePreview = ProjectMessagePreview;
 export type StrategicStateMessage = StrategicStateMessagePreview;
 
+export interface StrategicStateAttentionItemAction {
+  kind: string;
+  label: string;
+  method?: string | null;
+  path?: string | null;
+}
+
 export interface StrategicStateAttentionItem {
   id: string;
-  kind: 'message' | 'task' | 'direction' | string;
+  kind: 'message' | 'task' | 'direction' | 'confirmation' | string;
   severity: 'needs_operator' | 'watch' | string;
   reason: string;
   label: string;
@@ -50,6 +57,10 @@ export interface StrategicStateAttentionItem {
   status?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  /** Present on ``kind: 'confirmation'`` items — the pending_user_confirmation type. */
+  confirmation_type?: string | null;
+  /** Inline affordances (accept/dismiss) the operator can act on from the daily surface. */
+  actions?: StrategicStateAttentionItemAction[] | null;
   ref: {
     kind: string;
     id: string;
@@ -997,6 +1008,7 @@ export interface StrategicStateResponse {
       stale_provisioning_tasks?: number;
       stale_queued_tasks?: number;
       manual_directions: number;
+      pending_confirmations?: number;
       alerts?: number;
       error_alerts?: number;
       warning_alerts?: number;

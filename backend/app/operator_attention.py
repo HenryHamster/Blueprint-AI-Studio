@@ -137,6 +137,10 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "corroboration_failed"): 68,
     ("needs_operator", "attestation_expiring_soon"): 69,
     ("needs_operator", "manual_intervention"): 70,
+    ("needs_operator", "confirmation_credentials_needed"): 71,
+    ("needs_operator", "confirmation_access_needed"): 72,
+    ("needs_operator", "confirmation_intent_change"): 73,
+    ("needs_operator", "confirmation_major_decision"): 74,
     ("needs_operator", "churn_retirement_recommended"): 72,
     ("needs_operator", "stale_completion_debt"): 75,
     ("needs_operator", "blocker"): 80,
@@ -242,6 +246,48 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "direction_lifecycle",
         "clears_when": "direction_flag_cleared_or_direction_inactive",
         "operator_action": "update_direction",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    # Pending operator confirmations (problem_model.pending_user_confirmation).
+    # These always need a human decision and never auto-acknowledge — they clear
+    # when the operator accepts/dismisses the item (endpoints below). For
+    # credentials/access requests they also clear once the requested
+    # credential/access becomes available, which pairs with the auto-clear reaper
+    # sweep that removes moot confirmations.
+    "confirmation_credentials_needed": {
+        "mode": "problem_model_lifecycle",
+        "clears_when": "confirmation_accepted_dismissed_or_credential_provided",
+        "operator_action": "provide_credentials_or_dismiss",
+        "accept_action": "pending_confirm_accept",
+        "dismiss_action": "pending_confirm_dismiss",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "confirmation_access_needed": {
+        "mode": "problem_model_lifecycle",
+        "clears_when": "confirmation_accepted_dismissed_or_access_granted",
+        "operator_action": "grant_access_or_dismiss",
+        "accept_action": "pending_confirm_accept",
+        "dismiss_action": "pending_confirm_dismiss",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "confirmation_intent_change": {
+        "mode": "problem_model_lifecycle",
+        "clears_when": "confirmation_accepted_or_dismissed",
+        "operator_action": "confirm_intent_change_or_dismiss",
+        "accept_action": "pending_confirm_accept",
+        "dismiss_action": "pending_confirm_dismiss",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "confirmation_major_decision": {
+        "mode": "problem_model_lifecycle",
+        "clears_when": "confirmation_accepted_or_dismissed",
+        "operator_action": "answer_decision_or_dismiss",
+        "accept_action": "pending_confirm_accept",
+        "dismiss_action": "pending_confirm_dismiss",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -707,6 +753,89 @@ def _churn_retirement_recommended_attention_item(
             "project_id": str(project_id),
             "section": "directions",
             "direction_id": direction_id,
+        }),
+    }
+
+
+# Per-type presentation for pending_user_confirmation attention items. The
+# `reason` is `confirmation_<type>` so each type carries its own lifecycle entry
+# (distinct clears_when) while all items share `kind='confirmation'`.
+_PENDING_CONFIRMATION_META: dict[str, dict[str, str]] = {
+    "credentials_needed": {
+        "label": "Credentials needed",
+        "accept_label": "Mark provided",
+    },
+    "access_needed": {
+        "label": "Access needed",
+        "accept_label": "Mark granted",
+    },
+    "intent_change": {
+        "label": "Intent change to confirm",
+        "accept_label": "Apply change",
+    },
+    "major_decision": {
+        "label": "Decision needed",
+        "accept_label": "Answer",
+    },
+}
+_DEFAULT_PENDING_CONFIRMATION_META = {
+    "label": "Confirmation needed",
+    "accept_label": "Accept",
+}
+
+
+def _pending_confirmation_attention_item(
+    project_id: uuid.UUID,
+    confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Attention item for one durable ``pending_user_confirmation`` entry.
+
+    These are external blockers the strategist cannot resolve on its own
+    (credentials/access/intent-change/major-decision). They always need a human,
+    so they surface as ``needs_operator`` and expose accept/dismiss affordances so
+    the operator can act inline from the daily surface instead of opening the
+    strategy-internals problem-model view.
+    """
+    pending_id = str(confirmation.get("id") or "unknown")
+    conf_type = str(confirmation.get("type") or "major_decision")
+    meta = _PENDING_CONFIRMATION_META.get(
+        conf_type, _DEFAULT_PENDING_CONFIRMATION_META
+    )
+    proposal = confirmation.get("proposal") or confirmation.get("rationale")
+    base_path = f"/api/admin/projects/{project_id}/pending-confirm/{pending_id}"
+    return {
+        "id": f"confirmation:{pending_id}",
+        "kind": "confirmation",
+        "severity": "needs_operator",
+        "reason": f"confirmation_{conf_type}",
+        "confirmation_type": conf_type,
+        "label": meta["label"],
+        "detail": _compact_text(proposal, max_chars=180),
+        "unread": True,
+        "created_at": confirmation.get("created_at") or None,
+        "actions": [
+            {
+                "kind": "accept",
+                "label": meta["accept_label"],
+                "method": "POST",
+                "path": f"{base_path}/accept",
+            },
+            {
+                "kind": "dismiss",
+                "label": "Dismiss",
+                "method": "POST",
+                "path": f"{base_path}/dismiss",
+            },
+        ],
+        "ref": {
+            "kind": "confirmation",
+            "id": pending_id,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "problem_model",
         }),
     }
 
@@ -2348,6 +2477,18 @@ async def build_operator_attention(
     ]
     churn_recommended_directions.sort(key=_direction_priority)
 
+    # Durable operator confirmations (problem_model.pending_user_confirmation).
+    # Read the raw dict defensively — never parse-and-raise here, so a malformed
+    # model can't 500 this poll-frequent endpoint.
+    problem_model = project.problem_model if isinstance(project.problem_model, dict) else {}
+    raw_pending = problem_model.get("pending_user_confirmation")
+    pending_confirmations = [
+        confirmation
+        for confirmation in (raw_pending if isinstance(raw_pending, list) else [])
+        if isinstance(confirmation, dict) and confirmation.get("id")
+    ]
+    pending_confirmation_count = len(pending_confirmations)
+
     candidate_items: list[dict[str, Any]] = []
 
     def add_candidate(item: dict[str, Any]) -> None:
@@ -2409,6 +2550,8 @@ async def build_operator_attention(
         add_candidate(
             _churn_retirement_recommended_attention_item(project.id, direction)
         )
+    for confirmation in pending_confirmations:
+        add_candidate(_pending_confirmation_attention_item(project.id, confirmation))
     for item in stuck_acceptance_criteria:
         add_candidate(item)
     for item in attestation_expired_items:
@@ -2463,6 +2606,7 @@ async def build_operator_attention(
         + stale_queued_count
         + len(manual_directions)
         + len(churn_recommended_directions)
+        + pending_confirmation_count
         + error_alert_count
         + stuck_criteria_count
         + coverage_blocked_count
@@ -2534,6 +2678,7 @@ async def build_operator_attention(
             "stuck_acceptance_criteria": stuck_acceptance_criteria_count,
             "manual_directions": len(manual_directions),
             "churn_retirement_recommended": len(churn_recommended_directions),
+            "pending_confirmations": pending_confirmation_count,
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
             "phantom_criterion_bookkeeping": (
