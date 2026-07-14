@@ -83,14 +83,21 @@ _COMMAND_LOG_TAIL_MAX_CHARS = 2000
 def _command_log_tail(polling_metadata: Dict[str, Any] | None) -> str | None:
     """Extract a bounded, credential-redacted tail of a job's command log.
 
-    Reads ``polling_metadata["command_log"]["text"]`` (the runner-captured
-    stdout/stderr marker), applies the shared credential redactor, and returns
-    the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters. Returns ``None`` when
-    the log is absent, malformed, or empty so success/legacy rows stay lean.
+    Reads the terminal command-log text, applies the shared credential
+    redactor, and returns the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters.
+    Two backends stamp the terminal log under different keys: managed/cloud
+    jobs use ``polling_metadata["command_log"]`` while runner-subprocess jobs
+    use ``polling_metadata["runner_command_log"]`` (see
+    ``runner.report_compute_job``). Prefer the cloud key, then fall back to the
+    runner key so runner-subprocess failures surface a tail too. Returns
+    ``None`` when neither log is present, malformed, or empty so success/legacy
+    rows stay lean.
     """
     if not isinstance(polling_metadata, dict):
         return None
     command_log = polling_metadata.get("command_log")
+    if not isinstance(command_log, dict):
+        command_log = polling_metadata.get("runner_command_log")
     if not isinstance(command_log, dict):
         return None
     text = command_log.get("text")

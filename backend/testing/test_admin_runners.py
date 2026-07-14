@@ -356,6 +356,50 @@ class TestRunnerStatsCloudCostAvoided:
         # A SUCCEEDED row never carries a tail even with a captured log.
         assert outcomes[str(succeeded.id)]["command_log_tail"] is None
 
+    async def test_runner_stats_tail_reads_runner_command_log_key(
+        self, client: AsyncClient, db_session
+    ):
+        # Runner-subprocess jobs stamp their terminal log under
+        # polling_metadata["runner_command_log"] (see runner.report_compute_job),
+        # NOT the cloud "command_log" key. The tail must fall back to that key or
+        # the exact fleet diagnostic the operator triages with is always None.
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id, token_hash="f" * 64, hostname="host6", status="active"
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        raw_text = "setup log line\nAuthorization: Bearer sk-runner-secret-value\nboom"
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        failed = ComputeJob(
+            project_id=project.id,
+            backend="runner-subprocess",
+            status=ComputeJobStatus.FAILED,
+            started_at=start,
+            completed_at=start + timedelta(minutes=5),
+            terminal_reason="process exited non-zero",
+            polling_metadata={
+                **_pin(runner.id),
+                "runner_command_log": {"text": raw_text, "truncated": False},
+            },
+        )
+        db_session.add(failed)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/stats"
+        )
+        assert resp.status_code == 200, resp.text
+        outcomes = {o["job_id"]: o for o in resp.json()["last_n_outcomes"]}
+
+        tail = outcomes[str(failed.id)]["command_log_tail"]
+        assert tail is not None
+        assert tail.endswith("boom")
+        # Credentials are scrubbed before the tail reaches the operator surface.
+        assert "runner-secret" not in tail
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Live-safe runner config: operator PATCH normalization + desired-vs-applied view

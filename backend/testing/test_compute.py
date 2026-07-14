@@ -48,6 +48,7 @@ from app.compute_backends import (
     LocalSubprocessComputeBackend,
     ComputeStatusResult,
     RunnerSubprocessBackend,
+    TerminalArtifactReference,
     OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
 )
 from app.database import resolve_async_engine
@@ -3008,6 +3009,222 @@ async def test_process_compute_jobs_once_reclassifies_no_usable_gpu_as_failure(
     # Outcome is FAILURE, not SUCCESS, even though the container exited 0.
     assert job.outcome == ComputeJobOutcome.FAILURE
     assert "no usable GPU" in (job.terminal_reason or "")
+
+
+@pytest.mark.parametrize(
+    "metrics,expected",
+    [
+        (None, True),
+        ({}, True),
+        ("not-a-dict", True),
+        ({"accuracy": 0.9}, False),
+    ],
+)
+def test_status_has_no_reported_metrics(metrics, expected):
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics=metrics,
+    )
+    assert compute_jobs._status_has_no_reported_metrics(status) is expected
+
+
+def test_job_expects_data_variants():
+    # Declared metric stamped in polling_metadata (job-creation path) → expects data.
+    job = ComputeJob(polling_metadata={"declared_metric": "val/loss"})
+    assert compute_jobs._job_expects_data(job, None) is True
+
+    # Arms block on the task payload → expects data even with no declared metric.
+    empty_job = ComputeJob(polling_metadata={})
+    arms_task = Task(payloads=[{"arms": {"a": {"metric": 1.0}}}])
+    assert compute_jobs._job_expects_data(empty_job, arms_task) is True
+
+    # success_criterion.metric on the task payload → expects data.
+    crit_task = Task(payloads=[{"success_criterion": {"metric": "acc"}}])
+    assert compute_jobs._job_expects_data(empty_job, crit_task) is True
+
+    # Pure side-effect job: no declared metric, no arms, no criterion → no data.
+    side_effect_task = Task(payloads=[{"type": "research"}])
+    assert compute_jobs._job_expects_data(empty_job, side_effect_task) is False
+    assert compute_jobs._job_expects_data(empty_job, None) is False
+
+
+async def _run_no_data_guard_job(
+    db_session,
+    monkeypatch,
+    *,
+    task_payload,
+    status_metrics=None,
+    artifact_reference=None,
+):
+    """Drive a SUCCEEDED metric-less compute job through the monitor.
+
+    Shared harness for the no-data-guard tests: creates a job whose backend
+    reports SUCCEEDED/exit 0 with the given ``status_metrics``, stubs
+    durable-artifact detection to return ``artifact_reference``, runs two
+    monitor ticks, and returns the refreshed job so the caller can assert the
+    resulting outcome/terminal_reason.
+    """
+    project = Project(name="No Data Guard", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[task_payload],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python run.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-data-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="no-data-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=status_metrics,
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+
+    async def _fake_collect(_job):
+        return artifact_reference
+
+    monkeypatch.setattr(
+        compute_jobs, "collect_terminal_artifact_reference", _fake_collect
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reclassifies_no_data_success_as_failure(
+    db_session, monkeypatch
+):
+    """A metric-declaring job that exits 0 with no metrics AND no artifacts fails.
+
+    Regression guard for the documented silent metric-less SUCCESS incidents: the
+    command exited cleanly but produced neither a reported metric nor any durable
+    artifact, so it never generated a usable result — it must be reclassified as a
+    FAILURE, not recorded as a clean SUCCESS.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "val/loss"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reclassifies_arms_no_data_as_failure(
+    db_session, monkeypatch
+):
+    """The arms sweep path is especially vulnerable — its preflight metric check is
+    skipped — so a metric-less, artifact-less arms job must still fail here."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_respects_reported_metrics(db_session, monkeypatch):
+    """A metric-declaring job that DID report metrics stays SUCCESS."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "accuracy"},
+        status_metrics={"accuracy": 0.91},
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch):
+    """A metric-less job that left a durable artifact is NOT a no-data failure."""
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/artifacts",
+        backend="local",
+        file_count=3,
+        total_size_bytes=1024,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "val/loss"},
+        status_metrics=None,
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_skips_side_effect_job(db_session, monkeypatch):
+    """A pure side-effect job (no declared metric, no arms) that exits 0 with no
+    metrics and no artifacts stays SUCCESS — the guard must not false-reject it."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
 
 
 @pytest.mark.asyncio
