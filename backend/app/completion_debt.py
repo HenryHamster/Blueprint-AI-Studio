@@ -47,6 +47,11 @@ logger = logging.getLogger(__name__)
 KIND_DORMANT_KNOB = "dormant_knob"
 KIND_CAPABILITY_TRIAL = "capability_trial"
 KIND_NO_CI_GATE = "no_ci_gate"
+# A release-machinery fix that was fast-tracked through the operator hotfix-deploy
+# channel (skipping the scoring/audit gate). The bypass is owed follow-through:
+# it stays open until the NORMAL gate re-qualifies the same content, so the
+# hotfix contributes to debt-pressure rather than being silently blessed.
+KIND_HOTFIX_DEPLOY_PENDING_BACKFILL = "hotfix_deploy_pending_backfill"
 KIND_RETIREMENT_RESIDUAL = "retirement_residual"
 KIND_SEED_INVENTORY = "seed_inventory"
 
