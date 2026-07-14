@@ -7983,14 +7983,35 @@ async def test_backing_path_only_ledger_blocks_spawn_under_enforce(
     )
 
 
+def _platform_exemption_ledger() -> dict:
+    """The operator's PLATFORM-recorded exemption for the gating capability.
+
+    Written into ``project.capability_proof_records`` — the platform-only column no
+    agent-facing endpoint can write. It is NOT a machine proof: it is the operator's
+    standing authorization to clear the gate without one.
+    """
+    from app.capability_registry import build_operator_exemption_record
+
+    return {
+        "budgeted-compute-job-substrate": [
+            build_operator_exemption_record(
+                "budgeted-compute-job-substrate",
+                authorized_by="operator@example.com",
+                reason="external substrate, no test hook",
+            )
+        ]
+    }
+
+
 @_pytest.mark.asyncio
-async def test_authorized_proof_exempt_clears_spawn_without_ledger(
+async def test_platform_recorded_exemption_clears_spawn_without_proof_entry(
     db_session, mocker
 ):
-    """PRESERVED CARVE-OUT. A provenance-AUTHORIZED ``proof_exempt`` (operator- or
-    strategic-attributed ``source``) clears the spawn-time gate with NO ledger entry:
-    the earn loop deliberately never mints proof-records for an exempt capability, so
-    demanding corroboration would nullify the exemption the operator granted."""
+    """PRESERVED CARVE-OUT. An OPERATOR-recorded exemption (an ``operator_exemption``
+    entry in the platform-only ledger) clears the spawn-time gate with NO machine
+    proof: the earn loop deliberately never mints proof-records for an exempt
+    capability, so demanding corroboration would nullify the exemption the operator
+    granted."""
     from app.task_blocked import get_blocker_needs
 
     child = await _spawn_child_under_enforce(
@@ -8009,14 +8030,60 @@ async def test_authorized_proof_exempt_clears_spawn_without_ledger(
                 },
             }
         ],
-        proof_records={},  # exempt capabilities never get a ledger entry, by design
+        # The operator's exemption record — and NO machine proof, by design.
+        proof_records=_platform_exemption_ledger(),
     )
 
     assert child.status != TaskStatus.BLOCKED, (
-        "an operator-authorized proof_exempt must still clear the gate without a "
-        "ledger entry"
+        "an operator-recorded exemption must still clear the gate without a "
+        "machine-proof ledger entry"
     )
     assert not get_blocker_needs(child)
+
+
+@_pytest.mark.asyncio
+async def test_agent_fabricated_exemption_provenance_blocks_spawn_under_enforce(
+    db_session, mocker
+):
+    """SECURITY (finding #9), spawn-resolver seam. THE CORE PROPERTY OF THIS RELEASE.
+
+    ``proof_exempt: true`` + ``source: {"type": "self_reflection"}`` lives entirely in
+    the AGENT-WRITABLE ``problem_model`` JSONB — the same store the ledger-
+    corroboration pass exists to distrust. The previous fix authorized the exemption
+    off that ``source.type``, so an agent could forge one of the accepted types and
+    clear the prerequisite gate for its own dependents with nothing verified.
+
+    The exemption must now be recorded in the platform-only ledger; a fabricated
+    provenance is refused and the dependent stays BLOCKED.
+    """
+    from app.task_blocked import get_blocker_needs
+
+    for forged_type in ("self_reflection", "agent_observation", "user_message"):
+        child = await _spawn_child_under_enforce(
+            db_session,
+            mocker,
+            direction_key=f"d-prq23-forged-{forged_type}",
+            capabilities=[
+                {
+                    "name": "Budgeted compute job substrate",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": forged_type, "ref": "trust me"},
+                }
+            ],
+            # Empty platform ledger — the operator granted NO exemption.
+            proof_records={},
+        )
+
+        assert child.status == TaskStatus.BLOCKED, (
+            f"an agent-fabricated exemption provenance (source.type={forged_type!r}) "
+            "must never clear the spawn-time capability gate"
+        )
+        assert any(n.get("kind") == "capability" for n in get_blocker_needs(child)), (
+            "the capability need must stay recorded so the resume sweep can unblock "
+            "it once a real proof (or a real exemption) lands"
+        )
 
 
 @_pytest.mark.asyncio

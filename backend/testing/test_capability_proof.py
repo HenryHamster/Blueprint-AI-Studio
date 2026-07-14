@@ -1708,34 +1708,56 @@ def _proven_ref() -> dict:
 
 
 def _exemption_source() -> dict:
-    """Provenance that authorizes a ``proof_exempt`` exemption.
+    """The DECLARED provenance an agent writes alongside ``proof_exempt``.
 
-    An operator (``user_message``) source is one of the deliberate
-    operator/strategic authoring channels
-    (``capability_registry._EXEMPTION_PROVENANCE_TYPES``) that make an exemption
-    real, rather than a bare, unattributed ``proof_exempt=True`` flag.
+    ``user_message`` is one of the attributed authoring channels
+    (``capability_registry._EXEMPTION_DECLARATION_TYPES``). It lives in the
+    AGENT-WRITABLE ``problem_model`` JSONB, so it is a declaration, NOT an
+    authorization (audit finding #9) — it keeps the earn loop from chasing a
+    capability the strategist says cannot be machine-proven, and it clears NO gate.
+    The authorizing artifact is ``_platform_exemption_ledger`` below.
     """
     return {"type": "user_message", "excerpt": "operator declared this exempt"}
 
 
+def _platform_exemption_ledger(*cap_names: str) -> dict:
+    """The PLATFORM-ONLY ledger entry that AUTHORIZES a proof exemption.
+
+    ``project.capability_proof_records`` is written only by the platform recorders
+    and an operator/admin path — no agent-facing endpoint touches it. An
+    ``operator_exemption`` record here is the only thing that lets a capability clear
+    an enforce gate without machine-verified proof.
+    """
+    from app.capability_registry import build_operator_exemption_record
+
+    return {
+        name: [
+            build_operator_exemption_record(
+                name, authorized_by="operator@example.com", reason="human process"
+            )
+        ]
+        for name in cap_names
+    }
+
+
 def test_exempt_capability_not_blocked_by_gate():
-    """A provenance-backed exempt working capability is NOT blocked by the proof gate.
+    """A PLATFORM-RECORDED exempt working capability is NOT blocked by the proof gate.
 
-    This is the load-bearing acceptance test for the proof_exempt feature:
-    a capability marked ``proof_exempt=True`` AND carrying operator/strategic
-    provenance classifies as ``"proven"`` in ``working_capability_proof_status()``,
-    so the enforce-mode gate predicate sees it as proven and returns ``False``
-    (not blocked).
+    The load-bearing acceptance test for the exemption feature: a capability the
+    operator exempted in the platform ledger classifies as ``"proven"`` in
+    ``working_capability_proof_status()``, so the enforce-mode gate predicate sees it
+    as proven and returns ``False`` (not blocked) — with zero machine-verified
+    evidence, which is the entire point of an exemption.
 
-    Without proof_exempt=True, the same capability with no evidence_refs
-    classifies as ``"unproven"`` and the gate WOULD block it.
+    Without the exemption, the same capability with no evidence_refs classifies as
+    ``"unproven"`` and the gate WOULD block it.
     """
     from app.capability_registry import (
         capability_need_blocked_by_proof_gate,
         working_capability_proof_status,
     )
 
-    # Exempt working capability with zero evidence but explicit provenance.
+    # Exempt working capability with zero evidence, exempted in the platform ledger.
     model = {
         "capabilities": [
             {
@@ -1747,11 +1769,13 @@ def test_exempt_capability_not_blocked_by_gate():
             }
         ]
     }
-    proof = working_capability_proof_status(model)
+    proof = working_capability_proof_status(
+        model, proof_records=_platform_exemption_ledger("human-code-review")
+    )
 
     # Exempt cap classifies as proven — the core semantic.
     assert proof.get("human-code-review") == "proven", (
-        "exempt working capability must classify as 'proven'"
+        "platform-exempted working capability must classify as 'proven'"
     )
 
     # In enforce mode, the gate predicate returns False (not blocked).
@@ -1759,6 +1783,17 @@ def test_exempt_capability_not_blocked_by_gate():
     assert not capability_need_blocked_by_proof_gate(
         need, proof, mode="enforce"
     ), "exempt cap must not be blocked in enforce mode"
+
+    # The SAME declaration with NO platform record does not survive an enforce gate:
+    # the tier-1 map grades the declaration "proven", but every gate re-grades through
+    # the ledger and demotes it (finding #9).
+    from app.capability_registry import consumer_gate_proof_status
+
+    gated = consumer_gate_proof_status(model, {})
+    assert gated["human-code-review"] != "proven", (
+        "an agent-declared exemption with no platform record must never clear a gate"
+    )
+    assert capability_need_blocked_by_proof_gate(need, gated, mode="enforce")
 
     # Same capability without proof_exempt WOULD be blocked.
     model_no_exempt = {
@@ -1887,7 +1922,12 @@ def test_exempt_capability_not_in_unproven_count():
 
 
 def test_exempt_capability_names_returns_correct_set():
-    """exempt_capability_names returns working+exempt names, excluding non-working/unexempt."""
+    """exempt_capability_names returns working caps PLATFORM-exempted in the ledger.
+
+    Membership requires BOTH ``status: working`` in the registry AND an
+    ``operator_exemption`` record in the platform-only ledger. The agent-writable
+    ``proof_exempt`` / ``source`` fields are not consulted at all (finding #9).
+    """
     from app.capability_registry import exempt_capability_names
 
     model = {
@@ -1898,18 +1938,34 @@ def test_exempt_capability_names_returns_correct_set():
             {"name": "exempt-planned", "status": "planned", "proof_exempt": True,
              "source": _exemption_source()},
             {"name": "no-exempt-field", "status": "working"},
-            # Exempt but with NO provenance — not a real exemption, excluded.
+            # Declared exempt but with NO provenance — not a real exemption.
             {"name": "exempt-no-provenance", "status": "working", "proof_exempt": True},
+            # Declared exempt with a FABRICATED-but-recognized source type and no
+            # platform record — the finding-#9 forgery. Not an exemption.
+            {"name": "forged-provenance", "status": "working", "proof_exempt": True,
+             "source": {"type": "self_reflection", "excerpt": "I hereby exempt myself"}},
         ]
     }
-    exempt = exempt_capability_names(model)
+    # The operator recorded an exemption for exempt-working and (uselessly, since it
+    # is not ``working``) exempt-planned.
+    ledger = _platform_exemption_ledger("exempt-working", "exempt-planned")
+    exempt = exempt_capability_names(model, ledger)
     assert exempt == {"exempt-working"}, (
-        "only working+exempt+provenance caps should be returned; got: " + str(exempt)
+        "only working caps with a PLATFORM exemption record should be returned; "
+        "got: " + str(exempt)
     )
 
+    # Without the platform ledger, NOTHING is exempt — the agent-writable
+    # proof_exempt/source declaration authorizes nothing (finding #9).
+    assert exempt_capability_names(model) == set(), (
+        "an agent-declared proof_exempt must never authorize an exemption"
+    )
+    assert exempt_capability_names(model, {}) == set()
+    assert exempt_capability_names(model, None) == set()
+
     # Empty model returns empty set.
-    assert exempt_capability_names({}) == set()
-    assert exempt_capability_names(None) == set()
+    assert exempt_capability_names({}, ledger) == set()
+    assert exempt_capability_names(None, ledger) == set()
 
 
 def test_exempt_capability_skipped_in_earn_loop():
@@ -3425,9 +3481,18 @@ class TestReleaseGateLedgerCorroboration:
         assert blocked is True
         assert "structural-cap" in detail["uncorroborated"]
 
-    def test_legacy_no_ledger_preserves_problem_model_only_behaviour(self):
-        """When ``proof_records`` is omitted (None), the derivation is unchanged:
-        a ``proven`` evidence_ref clears and no corroboration keys are added."""
+    def test_no_ledger_supplied_fails_closed(self):
+        """``proof_records=None`` is an EMPTY ledger, not a licence to skip
+        corroboration (finding #9 follow-through).
+
+        This previously took a "legacy problem_model-only" path that cleared a
+        self-declared ``proven`` evidence_ref outright — a hole wide enough to
+        swallow the whole gate, because ``capability_proof_records`` is nullable with
+        no server default (migration 0208): a project that has never earned a proof
+        reads ``None``, which is exactly the project whose agent has the most to gain
+        from forging one. ``None`` now means "this project has no recorded proofs",
+        matching what both consumer seams already did.
+        """
         from app.capability_registry import capability_proof_gate_release_status
 
         model = {
@@ -3442,27 +3507,37 @@ class TestReleaseGateLedgerCorroboration:
             ]
         }
         blocked, detail = capability_proof_gate_release_status(model, "enforce")
-        assert blocked is False
-        assert detail["unproven"] == []
-        assert "corroborated" not in detail
-        assert "uncorroborated" not in detail
+        assert blocked is True, (
+            "a self-declared proof must not clear the release gate just because the "
+            "caller's ledger column is NULL"
+        )
+        assert detail["unproven"] == ["legacy-cap"]
+        assert detail["uncorroborated"] == ["legacy-cap"]
+        assert detail["corroborated"] == []
 
 
 class TestAuthorizedExemptionLedgerCarveOut:
-    """Finding #2: the enforce-mode ledger-corroboration pass must NOT nullify a
-    provenance-AUTHORIZED ``proof_exempt`` exemption.
+    """Findings #2 + #9: WHO may authorize the one bypass of the machine-proof
+    requirement, and where that authorization must live.
 
-    An authorized exemption grades ``proven`` in the base map, but the earn loop
-    deliberately never mints a ``capability_proof_records`` ledger entry for an
-    exempt capability — so demanding ledger corroboration from it demoted every
-    authorized exemption to unproven and blocked promotion, defeating the entire
-    point of the exemption.
+    Finding #2 established the carve-out: an exemption is cleared BY ITS
+    AUTHORIZATION, not by machine proof — the earn loop deliberately never mints a
+    ``capability_proof_records`` PROOF entry for an exempt capability, so demanding
+    corroboration from it nullified every exemption and blocked promotion.
+
+    Finding #9 established WHERE the authorization must live. The first fix read it
+    from ``problem_model.capabilities[].source.type`` — the same AGENT-WRITABLE JSONB
+    the corroboration pass exists to distrust — so an agent could write
+    ``proof_exempt: true`` + ``source: {"type": "self_reflection"}`` and clear the
+    gate. An agent-writable field cannot authorize a bypass of an agent-writable
+    field. The authorization is now an ``operator_exemption`` record in the
+    platform-only ledger.
 
     The carve-out is exactly one capability class wide. It must STILL block:
-      * a bare / unauthorized ``proof_exempt`` (no operator or strategic
-        provenance), and
-      * a capability reading ``proven`` from a self-reported ``evidence_ref``
-        with no corroborating platform ledger entry.
+      * a bare ``proof_exempt`` (no source),
+      * a ``proof_exempt`` dressed in a FABRICATED source of an accepted type, and
+      * a capability reading ``proven`` from a self-reported ``evidence_ref`` with no
+        corroborating platform ledger entry.
     """
 
     @staticmethod
@@ -3474,13 +3549,13 @@ class TestAuthorizedExemptionLedgerCarveOut:
         )
 
     @staticmethod
-    def _authorized_exempt_cap(name: str = "human-process-cap") -> dict:
-        """A ``working`` capability exempted by an OPERATOR-authored source.
+    def _exempt_cap(name: str = "human-process-cap") -> dict:
+        """A ``working`` capability the operator exempted.
 
-        ``user_message`` is in ``_EXEMPTION_PROVENANCE_TYPES``, so
-        ``_exemption_is_authorized`` honours it. It carries NO evidence_refs and
-        NO ledger entry — by design: an exemption exists precisely because the
-        capability cannot have machine-verifiable proof.
+        It carries NO evidence_refs and NO ledger PROOF entry — by design: an
+        exemption exists precisely because the capability cannot have
+        machine-verifiable proof. Its ``proof_exempt`` / ``source`` fields are the
+        agent's DECLARATION; the authorization is ``_platform_exemption_ledger``.
         """
         return {
             "name": name,
@@ -3490,35 +3565,72 @@ class TestAuthorizedExemptionLedgerCarveOut:
             "source": {"type": "user_message", "ref": "operator granted exemption"},
         }
 
-    def test_authorized_exempt_clears_enforce_without_ledger_entry(self):
-        """AUTHORIZED-EXEMPT CLEARS: an operator/strategic-attributed exemption is
-        cleared by its AUTHORIZATION, not by machine proof, so the empty platform
-        ledger must not demote it.
-
-        Fails before the fix (the corroboration pass demanded a ledger entry the
-        earn loop never mints for an exempt capability, so promotion blocked);
-        passes after.
+    def test_platform_recorded_exemption_clears_enforce_without_proof_entry(self):
+        """PLATFORM-EXEMPT CLEARS: an operator-recorded exemption is cleared by its
+        AUTHORIZATION, not by machine proof, so a ledger holding no PROOF entry for
+        it must not demote it (finding #2, preserved).
         """
-        model = {"capabilities": [self._authorized_exempt_cap()]}
-        # Empty platform ledger — the earn loop skips exempt capabilities BY DESIGN.
-        blocked, detail = self._status(model, {})
+        model = {"capabilities": [self._exempt_cap()]}
+        # Ledger holds the operator's exemption and NO machine proof — the earn loop
+        # skips exempt capabilities BY DESIGN.
+        blocked, detail = self._status(
+            model, _platform_exemption_ledger("human-process-cap")
+        )
         assert blocked is False, (
-            "an authorized exemption must not be nullified by the ledger-"
+            "an operator-recorded exemption must not be nullified by the ledger-"
             f"corroboration pass; detail={detail}"
         )
         assert detail["unproven"] == []
         assert detail["uncorroborated"] == []
-        # It is cleared by authorization, not by the ledger: reported under its own
-        # audit bucket, and named in the exemption audit set.
+        # Cleared by authorization, not by proof: reported under its own audit bucket
+        # so an auditor can see exactly what bypassed the machine-proof requirement.
         assert detail["exempt_cleared"] == ["human-process-cap"]
-        assert detail["corroborated"] == []
+        assert detail["corroborated"] == [], (
+            "an exemption record is not machine proof and must never be laundered "
+            "into the corroborated bucket"
+        )
         assert detail["exempt_names"] == ["human-process-cap"]
         assert detail["exempt_count"] == 1
 
+    def test_fabricated_source_type_exemption_blocks(self):
+        """FINDING #9, THE CORE PROPERTY: an agent that writes ``proof_exempt: true``
+        plus a source whose ``type`` is one of the ACCEPTED authoring channels — the
+        exact forgery the previous fix allowed — still BLOCKS.
+
+        ``self_reflection`` and ``agent_observation`` are in
+        ``_EXEMPTION_DECLARATION_TYPES``: under the old rule they *authorized* the
+        exemption. They live in agent-writable JSONB, so they authorize nothing now.
+        """
+        for forged_type in ("self_reflection", "agent_observation", "user_message"):
+            model = {
+                "capabilities": [
+                    {
+                        "name": "self-exempt-cap",
+                        "status": "working",
+                        "evidence_refs": [],
+                        "proof_exempt": True,
+                        "source": {"type": forged_type, "excerpt": "trust me"},
+                    }
+                ]
+            }
+            blocked, detail = self._status(model, {})
+            assert blocked is True, (
+                f"a fabricated source.type={forged_type!r} must not clear the "
+                f"enforce gate; detail={detail}"
+            )
+            assert "self-exempt-cap" in detail["unproven"]
+            assert "self-exempt-cap" in detail["uncorroborated"], (
+                "the agent-declared exemption grades proven on the agent-writable "
+                "tier-1 map, so the ledger must REFUSE it — that refusal is the fix"
+            )
+            assert detail["exempt_cleared"] == []
+            assert detail["exempt_names"] == []
+            assert detail["corroborated"] == []
+
     def test_unauthorized_exempt_still_blocks_with_ledger_supplied(self):
-        """BARE/UNAUTHORIZED EXEMPT BLOCKS: a ``proof_exempt=True`` with no cited
-        ``source`` is the silent self-report escape hatch — it is not an exemption
-        at all, so the carve-out must not reach it and promotion must still block.
+        """BARE EXEMPT BLOCKS: a ``proof_exempt=True`` with no cited ``source`` is the
+        silent self-report escape hatch — it is not an exemption at all, so the
+        carve-out must not reach it and promotion must still block.
         """
         model = {
             "capabilities": [
@@ -3527,7 +3639,7 @@ class TestAuthorizedExemptionLedgerCarveOut:
                     "status": "working",
                     "evidence_refs": [],
                     "proof_exempt": True,
-                    # No `source` → no operator/strategic provenance.
+                    # No `source` → not even a declaration.
                 }
             ]
         }
@@ -3542,8 +3654,8 @@ class TestAuthorizedExemptionLedgerCarveOut:
         )
 
     def test_unrecognized_source_type_exemption_still_blocks(self):
-        """An exemption whose ``source.type`` is NOT an operator/strategic channel
-        is equally unauthorized — provenance must be real, not merely present."""
+        """An exemption whose ``source.type`` is not even an accepted authoring
+        channel is likewise not an exemption."""
         model = {
             "capabilities": [
                 {
@@ -3584,16 +3696,13 @@ class TestAuthorizedExemptionLedgerCarveOut:
         assert "forged-cap" in detail["unproven"]
         assert detail["exempt_cleared"] == []
 
-    def test_authorized_exemption_does_not_launder_a_sibling_self_report(self):
-        """The carve-out is per-capability: an authorized exemption on ONE
-        capability must not clear an uncorroborated self-report on ANOTHER.
-
-        This is the security property the finding warns about — the exemption may
-        bypass the ledger only for the capability the operator actually exempted.
+    def test_exemption_does_not_launder_a_sibling_self_report(self):
+        """The carve-out is per-capability: an operator exemption on ONE capability
+        must not clear an uncorroborated self-report on ANOTHER.
         """
         model = {
             "capabilities": [
-                self._authorized_exempt_cap(),
+                self._exempt_cap(),
                 {
                     "name": "forged-cap",
                     "status": "working",
@@ -3603,18 +3712,41 @@ class TestAuthorizedExemptionLedgerCarveOut:
                 },
             ]
         }
-        blocked, detail = self._status(model, {})
+        blocked, detail = self._status(
+            model, _platform_exemption_ledger("human-process-cap")
+        )
         assert blocked is True, "the sibling self-report must still block promotion"
         assert detail["unproven"] == ["forged-cap"]
         assert detail["uncorroborated"] == ["forged-cap"]
         assert detail["exempt_cleared"] == ["human-process-cap"]
 
-    def test_authorized_exempt_clears_alongside_ledger_backed_capability(self):
-        """A real, ledger-corroborated capability and an authorized exemption clear
-        together — the whole-project promotion path the finding said was blocked."""
+    def test_exemption_holds_when_agent_drops_the_proof_exempt_flag(self):
+        """The operator's grant is not the agent's to revoke: a platform-recorded
+        exemption clears even when the problem_model never declares ``proof_exempt``.
+
+        The mirror of the finding-#9 hole — if authorization lived in the agent's
+        JSONB, an agent could also NULLIFY an operator's exemption by rewriting the
+        capability without the flag (the finding-#2 failure, re-entered by the back
+        door). It lives in the ledger, so it survives any problem_model rewrite.
+        """
         model = {
             "capabilities": [
-                self._authorized_exempt_cap(),
+                {"name": "human-process-cap", "status": "working", "evidence_refs": []}
+            ]
+        }
+        blocked, detail = self._status(
+            model, _platform_exemption_ledger("human-process-cap")
+        )
+        assert blocked is False
+        assert detail["exempt_cleared"] == ["human-process-cap"]
+        assert detail["unproven"] == []
+
+    def test_exemption_clears_alongside_ledger_backed_capability(self):
+        """A real, ledger-corroborated capability and an operator exemption clear
+        together — the whole-project promotion path finding #2 said was blocked."""
+        model = {
+            "capabilities": [
+                self._exempt_cap(),
                 {
                     "name": "real-cap",
                     "status": "working",
@@ -3627,7 +3759,8 @@ class TestAuthorizedExemptionLedgerCarveOut:
         ledger = {
             "real-cap": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
-            ]
+            ],
+            **_platform_exemption_ledger("human-process-cap"),
         }
         blocked, detail = self._status(model, ledger)
         assert blocked is False
@@ -3701,22 +3834,51 @@ class TestConsumerGateSharesTheReleaseRule:
         )
         assert gate["structural-cap"] != "proven"
 
-    def test_authorized_exemption_clears_without_ledger(self):
-        """PRESERVED: a provenance-authorized ``proof_exempt`` is cleared BY ITS
-        AUTHORIZATION. The earn loop never mints a ledger entry for an exempt
-        capability, so requiring corroboration would nullify the exemption."""
-        model = {
+    @staticmethod
+    def _declared_exempt(name: str = "human-process-cap", source_type: str = "user_message") -> dict:
+        return {
             "capabilities": [
                 {
-                    "name": "human-process-cap",
+                    "name": name,
                     "status": "working",
                     "evidence_refs": [],
                     "proof_exempt": True,
-                    "source": {"type": "user_message", "ref": "operator granted"},
+                    "source": {"type": source_type, "ref": "operator granted"},
                 }
             ]
         }
-        assert self._gate(model, {})["human-process-cap"] == "proven"
+
+    def test_platform_recorded_exemption_clears_without_proof_entry(self):
+        """PRESERVED: an operator-recorded exemption is cleared BY ITS AUTHORIZATION.
+        The earn loop never mints a ledger PROOF entry for an exempt capability, so
+        requiring corroboration would nullify the exemption."""
+        gate = self._gate(
+            self._declared_exempt(), _platform_exemption_ledger("human-process-cap")
+        )
+        assert gate["human-process-cap"] == "proven"
+
+    def test_agent_fabricated_source_type_does_not_clear(self):
+        """FINDING #9 AT THE CONSUMER SEAMS: ``proof_exempt: true`` +
+        ``source: {"type": "<an accepted type>"}`` is agent-writable JSONB and must
+        NOT clear the prerequisite gate. Both consumer seams grade through this map,
+        so this pins the fix for the spawn resolver AND the blocked-resume sweep."""
+        for forged_type in ("self_reflection", "agent_observation", "user_message"):
+            gate = self._gate(self._declared_exempt(source_type=forged_type), {})
+            assert gate["human-process-cap"] == "unverified", (
+                f"a self-declared exemption (source.type={forged_type!r}) with no "
+                "platform record must be refused by the ledger, not honoured"
+            )
+
+    def test_exemption_holds_without_the_agent_writable_flag(self):
+        """A platform-recorded exemption clears even when the problem_model never
+        declares ``proof_exempt`` — an operator's grant is not the agent's to revoke."""
+        model = {
+            "capabilities": [
+                {"name": "human-process-cap", "status": "working", "evidence_refs": []}
+            ]
+        }
+        gate = self._gate(model, _platform_exemption_ledger("human-process-cap"))
+        assert gate["human-process-cap"] == "proven"
 
     def test_bare_exemption_does_not_clear(self):
         """A bare, unattributed ``proof_exempt=True`` is not an exemption at all and
@@ -3773,7 +3935,7 @@ class TestConsumerGateSharesTheReleaseRule:
                         {"kind": "named_test", "ref": "t.py::x", "proven": True}
                     ],
                 },
-                # authorized exemption → cleared by BOTH, without a ledger entry
+                # platform-recorded exemption → cleared by BOTH, with no PROOF entry
                 {
                     "name": "human-process-cap",
                     "status": "working",
@@ -3781,9 +3943,20 @@ class TestConsumerGateSharesTheReleaseRule:
                     "proof_exempt": True,
                     "source": {"type": "user_message", "ref": "operator granted"},
                 },
+                # agent-fabricated exemption provenance → refused by BOTH (finding #9)
+                {
+                    "name": "self-exempt-cap",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": "self_reflection", "ref": "trust me"},
+                },
             ]
         }
-        ledger = self._ledger("real-cap")
+        ledger = {
+            **self._ledger("real-cap"),
+            **_platform_exemption_ledger("human-process-cap"),
+        }
 
         consumer = self._gate(model, ledger)
         consumer_refused = {n for n, s in consumer.items() if s != "proven"}
@@ -3791,6 +3964,10 @@ class TestConsumerGateSharesTheReleaseRule:
         _blocked, detail = capability_proof_gate_release_status(
             model, "enforce", ledger
         )
-        assert consumer_refused == set(detail["unproven"]) == {"forged-cap"}
+        assert (
+            consumer_refused
+            == set(detail["unproven"])
+            == {"forged-cap", "self-exempt-cap"}
+        )
         assert set(detail["corroborated"]) == {"real-cap"}
         assert set(detail["exempt_cleared"]) == {"human-process-cap"}

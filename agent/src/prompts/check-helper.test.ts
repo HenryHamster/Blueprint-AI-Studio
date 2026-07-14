@@ -78,6 +78,15 @@ describe('writeCheckHelper — direct invocation', () => {
     // happy-dom, no Chromium, no VITE_* env vars needed for the unit suite).
     expect(script).toContain(`run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'`);
     expect(script).toMatch(/if admin_ui_runtime_touched; then[\s\S]*run "admin-ui vitest"/);
+    // The standalone backend harness run uses a baseline-recheck pattern:
+    // on failure, it re-runs on the base branch to distinguish pre-existing
+    // failures (WARN, not blocking) from regressions (real failure, blocking).
+    expect(script).toContain('bash scripts/test-backend.sh --standalone --no-postgres');
+    expect(script).toContain('backend pytest FAILED on PR — checking baseline on origin/$BASE');
+    expect(script).toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
+    expect(script).toContain('backend pytest FAILED — passes on $BPYTEST_BASE_REF, fails on PR. Real regression.');
+    expect(script).toContain('FAILED+=("backend pytest")');
+    expect(script).toContain('PASS — all checks green');
     // Size guardrail is wired into the self-repo gate: invoked by reference as
     // the committed checker script, run UNCONDITIONALLY across all sections
     // (not diff-scoped) — a rebase/merge can grow a file in a stack the diff
@@ -1175,6 +1184,14 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
       testsOnMainBranch: true,
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // The block exists and derives the impacted set from $CHANGED via the
+    // committed resolver, invoked BY REFERENCE (no embedded Python heredoc).
+    expect(script).toContain('impacted-test merge-time gate');
+    expect(script).toContain('python3 backend/testing/impacted_tests.py');
+    // Capped run, overflow deferred to CI (never silently dropped).
+    expect(script).toContain('IMPACTED_TEST_CAP=8');
+    expect(script).toContain('deferred-to-CI:');
     // Runs the impacted files under the sanctioned Postgres harness, routed
     // through `run` so a failure lands in FAILED and ./pr open (gates on
     // ./check) cannot push.
@@ -1231,7 +1248,7 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     // Gate compiles to "1" — not a constant-false guard.
     expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "1" = "1" ]');
     expect(script).not.toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
-    // Standalone smoke run is present.
+    // Standalone smoke run is present (with baseline-recheck on failure).
     expect(script).toContain('bash scripts/test-backend.sh --standalone --no-postgres');
     // Impacted-test gate is present.
     expect(script).toContain('impacted-test merge-time gate');

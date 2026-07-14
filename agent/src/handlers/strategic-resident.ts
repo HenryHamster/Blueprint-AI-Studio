@@ -260,6 +260,59 @@ export async function refreshResidentGitReadToken(ws: WebSocket | null): Promise
   }
 }
 
+/**
+ * Re-clone the resident workspace after it vanished mid-session (OOM-kill, /tmp
+ * cleaner), restoring it to EXACTLY the state the initial setup leaves it in.
+ *
+ * SECURITY + CORRECTNESS (audit finding, this PR). The guard used to re-clone with
+ * the `cloneUrl` / `ghToken` captured at session START, which is wrong twice over:
+ *
+ *  * STALE. A GitHub App installation token lives 60 minutes; the resident is a
+ *    multi-hour "workday". Any re-clone after the first hour authenticated with an
+ *    EXPIRED token — the clone throws, the throw escapes the turn loop, and the
+ *    whole resident session dies. The guard was least likely to work exactly when
+ *    it was most needed (deep into a long session).
+ *  * WRONG-SCOPED. `ghToken` is the PUSH-capable per-task token. Re-cloning with it
+ *    re-embedded a push-capable credential in the workspace remote and re-wrote it
+ *    into the ambient credential file — silently undoing the read-scoping the
+ *    8-minute background refresh exists to maintain (the resident never pushes).
+ *    The re-clone also dropped the credential helper, so the remote reverted to the
+ *    token-embedded form and stopped consulting the refreshed token file at all —
+ *    re-breaking `git fetch` at the next TTL boundary.
+ *
+ * So: mint a FRESH READ-SCOPED token at the moment of use, clone with it, then
+ * re-establish the credential helper (plain HTTPS remote + refreshable token file)
+ * exactly as `handleStrategicResident` does at startup. Consistent with the refresh
+ * loop, and correct at any point in the session.
+ *
+ * Throws when no read token can be minted — a re-clone with no valid credential
+ * cannot succeed anyway, and failing loudly beats silently re-parking a
+ * push-capable token in the ambient file.
+ */
+export async function recloneResidentWorkspace(
+  ws: WebSocket | null, owner: string, repo: string, baseBranch: string,
+): Promise<void> {
+  const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
+  const token = result?.token;
+  if (!token) {
+    throw new Error(
+      'resident workspace re-clone failed: /api/agent/git-read-token returned no token',
+    );
+  }
+  sendLog(ws, '[resident] re-clone: minted a fresh read-scoped git token\n');
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE,
+    repoUrl: `https://x-access-token:${token}@github.com/${owner}/${repo}.git`,
+    githubToken: token,
+    branch: baseBranch, baseBranch, depth: 0,
+  });
+  // Restore the refreshable credential: plain HTTPS remote + helper reading the
+  // token file. Without this the re-cloned workspace keeps a token-embedded remote
+  // that the background refresh cannot update, so fetches break at the next TTL.
+  writeGitTokenFile(token);
+  setupGitCredentialHelper(owner, repo, WORKSPACE);
+}
+
 export async function handleStrategicResident(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -942,13 +995,16 @@ export async function handleStrategicResident(
     for (;;) {
       // Guard: verify the workspace is still present before each turn. An
       // external event (OOM-kill, /tmp cleaner) can delete it mid-session.
+      //
+      // The re-clone mints a FRESH READ-SCOPED token at the moment of use rather
+      // than reusing the session-start `cloneUrl`/`ghToken`: that token is push-
+      // capable (which the resident must not hold ambiently) and expires after 60
+      // minutes (so a re-clone deep into a multi-hour session would just throw).
+      // See recloneResidentWorkspace.
       if (!fs.existsSync(`${WORKSPACE}/.git`)) {
         sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
         streamer.status('workspace vanished — re-cloning');
-        await prepareWorkspaceForRole({
-          workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
-          branch: baseBranch, baseBranch, depth: 0,
-        });
+        await recloneResidentWorkspace(ws, owner, repo, baseBranch);
         sendLog(ws, '[resident] workspace restored\n');
       }
 

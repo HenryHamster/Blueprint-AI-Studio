@@ -74,9 +74,11 @@ vi.mock('./strategic-sections.js', () => ({
 // ── Import after mocks ────────────────────────────────────────────────────────
 import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
+  recloneResidentWorkspace,
 } from './strategic-resident.js';
 import { apiGet, apiPost } from '../index.js';
-import { writeGitTokenFile } from '../git-credential.js';
+import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
   ResidentSession, ResidentSessionEvent, ResidentTurnResult,
@@ -183,6 +185,8 @@ const mockApiGet = vi.mocked(apiGet);
 const mockApiPost = vi.mocked(apiPost);
 const mockStartSession = vi.mocked(startResidentClaudeSession);
 const mockWriteGitTokenFile = vi.mocked(writeGitTokenFile);
+const mockSetupGitCredentialHelper = vi.mocked(setupGitCredentialHelper);
+const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
 
 /** A ResidentTurnResult with sane defaults, overridable per test. */
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
@@ -257,6 +261,11 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     let capturedCheckpoint = '';
 
     mockApiGet.mockImplementation((url: string) => {
+      // WORKSPACE is stubbed to '' here, so the per-turn "workspace vanished"
+      // guard fires and re-clones — which mints a fresh READ-scoped token.
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
       if (url.includes('/messages?')) {
         // Deliver the operator message exactly once, then drain.
         if (messagePollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
@@ -345,6 +354,50 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // …and DROPS the just-answered message (it is no longer open).
     expect(capturedCheckpoint).not.toContain('SHOULD_BE_DROPPED_AFTER_HANDLED');
   });
+
+  it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
+    // WORKSPACE is stubbed to '' so `${WORKSPACE}/.git` never exists → the per-turn
+    // "workspace vanished" guard fires on the first iteration. This pins the CALL
+    // SITE (not just the helper): the guard must route through
+    // recloneResidentWorkspace, which mints a fresh read-scoped token — not re-use
+    // the push-capable `ghtok` captured at session start (expired by mid-session,
+    // and a standing ambient push credential).
+    mockPrepareWorkspaceForRole.mockReset();
+    mockWriteGitTokenFile.mockReset();
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // A single dead session so the loop primes nothing and exits after one guard pass.
+    mockStartSession.mockImplementation(() => makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'x', inputTokens: 0 })),
+      () => false,
+    ));
+
+    await handleStrategicResident(
+      'task-rc', { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'p' }, context: {} },
+      'PUSH-CAPABLE-GHTOK', 'HenryHamster', 'BlueprintAIStudio', null, { value: '' },
+    );
+
+    // The re-clone (the LAST prepareWorkspaceForRole call) used the fresh read
+    // token, NOT the push-capable session-start ghtok.
+    const calls = mockPrepareWorkspaceForRole.mock.calls;
+    const reclone = calls[calls.length - 1][0];
+    expect(reclone.githubToken).toBe('fresh-read-token');
+    expect(reclone.repoUrl).toContain('fresh-read-token');
+    expect(reclone.repoUrl).not.toContain('PUSH-CAPABLE-GHTOK');
+    // The read-token endpoint was consulted for the re-clone; the push endpoint never.
+    const urls = mockApiGet.mock.calls.map((c) => c[0]);
+    expect(urls).toContain('/api/agent/git-read-token');
+    expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
+  });
 });
 
 // ── Ambient git credential must stay READ-SCOPED (audit finding #10) ───────────
@@ -387,6 +440,65 @@ describe('refreshResidentGitReadToken — the resident holds no ambient push-cap
     mockApiGet.mockRejectedValue(new Error('502 bad gateway'));
 
     await expect(refreshResidentGitReadToken(null)).resolves.toBeUndefined();
+    expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
+  });
+});
+
+// ── Mid-session "workspace vanished" re-clone must be consistent with the above ─
+// The guard re-cloned with the cloneUrl/ghToken captured at session START: a
+// PUSH-capable token (which the resident must never hold ambiently) that has also
+// EXPIRED by then (installation tokens live 60 min; the resident runs for hours),
+// so the re-clone threw and killed the session precisely when it was needed most.
+
+describe('recloneResidentWorkspace — fresh READ-scoped credential at the moment of use', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockSendLog.mockReset();
+    mockWriteGitTokenFile.mockReset();
+    mockSetupGitCredentialHelper.mockReset();
+    mockPrepareWorkspaceForRole.mockReset();
+  });
+
+  it('mints a FRESH read-scoped token and clones with it — never the stale push token', async () => {
+    mockApiGet.mockResolvedValue({ token: 'fresh-read-token' });
+
+    await recloneResidentWorkspace(null, 'HenryHamster', 'BlueprintAIStudio', 'automain');
+
+    // The token comes from the READ-scoped endpoint, minted now — not the
+    // session-start push-capable one, and not the push endpoint.
+    const urls = mockApiGet.mock.calls.map((c) => c[0]);
+    expect(urls).toEqual(['/api/agent/git-read-token']);
+    expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
+
+    const opts = mockPrepareWorkspaceForRole.mock.calls[0][0];
+    expect(opts.repoUrl).toBe(
+      'https://x-access-token:fresh-read-token@github.com/HenryHamster/BlueprintAIStudio.git',
+    );
+    expect(opts.githubToken).toBe('fresh-read-token');
+    expect(opts.branch).toBe('automain');
+    expect(opts.depth).toBe(0);
+  });
+
+  it('restores the refreshable credential helper so fetch survives the next TTL', async () => {
+    mockApiGet.mockResolvedValue({ token: 'fresh-read-token' });
+
+    await recloneResidentWorkspace(null, 'o', 'r', 'main');
+
+    // Without these the re-cloned workspace keeps a token-embedded remote that the
+    // 8-minute background refresh cannot update — fetches break at the next TTL.
+    expect(mockWriteGitTokenFile).toHaveBeenCalledWith('fresh-read-token');
+    expect(mockSetupGitCredentialHelper).toHaveBeenCalledWith('o', 'r', expect.anything());
+  });
+
+  it('throws rather than re-cloning when no read token can be minted', async () => {
+    mockApiGet.mockResolvedValue(null);
+
+    await expect(
+      recloneResidentWorkspace(null, 'o', 'r', 'main'),
+    ).rejects.toThrow(/git-read-token/);
+    // It must NOT fall back to any other credential: no clone, and nothing new
+    // parked in the ambient credential file.
+    expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
     expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
   });
 });

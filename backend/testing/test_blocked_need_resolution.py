@@ -1001,11 +1001,24 @@ def test_backing_path_only_ledger_does_not_clear_blocked_resume():
     ]
 
 
-def test_authorized_proof_exempt_clears_blocked_resume_without_ledger():
-    """PRESERVED CARVE-OUT. A provenance-AUTHORIZED ``proof_exempt`` (operator- or
-    strategic-attributed ``source``) clears the gate with NO ledger entry — the earn
-    loop deliberately never mints proof-records for an exempt capability, so
-    demanding corroboration from it would nullify the exemption the operator granted.
+def _exemption_ledger(name: str = "human-process-cap") -> dict:
+    """The operator's PLATFORM-recorded exemption (an agent cannot write this)."""
+    from app.capability_registry import build_operator_exemption_record
+
+    return {
+        name: [
+            build_operator_exemption_record(
+                name, authorized_by="operator@example.com", reason="human process"
+            )
+        ]
+    }
+
+
+def test_platform_recorded_exemption_clears_blocked_resume_without_proof():
+    """PRESERVED CARVE-OUT. An OPERATOR-recorded exemption clears the gate with NO
+    machine-proof ledger entry — the earn loop deliberately never mints proof-records
+    for an exempt capability, so demanding corroboration from it would nullify the
+    exemption the operator granted.
     """
     model = {
         "capabilities": [
@@ -1019,12 +1032,66 @@ def test_authorized_proof_exempt_clears_blocked_resume_without_ledger():
         ]
     }
     disp = asyncio.run(
-        _blocked_resume_disposition(model, {}, "human-process-cap")
+        _blocked_resume_disposition(model, _exemption_ledger(), "human-process-cap")
     )
 
     assert disp["completed_needs"] == [
         {"kind": "capability", "ref": "human-process-cap"}
-    ], "an authorized exemption must still clear the gate without a ledger entry"
+    ], "an operator-recorded exemption must clear the gate without machine proof"
+    assert disp["residual"] == []
+
+
+def test_agent_fabricated_exemption_provenance_blocks_blocked_resume():
+    """SECURITY (finding #9), blocked-resume seam. THE CORE PROPERTY OF THIS RELEASE.
+
+    ``proof_exempt: true`` + ``source: {"type": "self_reflection"}`` is written to the
+    AGENT-WRITABLE ``problem_model`` JSONB. The previous fix authorized the exemption
+    off that ``source.type``, so an agent could forge one of the accepted types and
+    resume every dependent blocked on the capability with nothing verified behind it.
+    The authorization now lives in the platform-only ledger, so the forgery is refused
+    and the dependent stays held.
+    """
+    for forged_type in ("self_reflection", "agent_observation", "user_message"):
+        model = {
+            "capabilities": [
+                {
+                    "name": "self-exempt-cap",
+                    "status": "working",
+                    "evidence_refs": [],
+                    "proof_exempt": True,
+                    "source": {"type": forged_type, "ref": "trust me"},
+                }
+            ]
+        }
+        # Empty platform ledger — the operator granted NO exemption.
+        disp = asyncio.run(_blocked_resume_disposition(model, {}, "self-exempt-cap"))
+
+        assert disp["completed_needs"] == [], (
+            f"an agent-fabricated exemption provenance (source.type={forged_type!r}) "
+            "must never clear the blocked-resume capability gate"
+        )
+        assert disp["proof_gate_held"] == [
+            {"kind": "capability", "ref": "self-exempt-cap"}
+        ]
+
+
+def test_platform_exemption_holds_when_agent_drops_the_flag():
+    """An operator's grant is not the agent's to revoke: the platform-recorded
+    exemption clears the gate even when the problem_model no longer declares
+    ``proof_exempt`` — the mirror hazard of putting authorization in agent-writable
+    JSONB (an agent could nullify an exemption as easily as forge one)."""
+    model = {
+        "capabilities": [
+            {"name": "human-process-cap", "status": "working", "evidence_refs": []}
+        ]
+    }
+    disp = asyncio.run(
+        _blocked_resume_disposition(model, _exemption_ledger(), "human-process-cap")
+    )
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "human-process-cap"}
+    ]
     assert disp["residual"] == []
 
 
@@ -2032,7 +2099,7 @@ def test_capability_proof_gate_full_cycle():
 
     # Enforce + unproven working capability → promotion blocked, audited.
     q_blocked, q_detail = capability_proof_gate_release_status(
-        unproven_model, "enforce"
+        unproven_model, "enforce", named_test_records
     )
     assert q_blocked is True, (
         "the release qualifier must block promotion under enforce mode when a "
@@ -2043,15 +2110,31 @@ def test_capability_proof_gate_full_cycle():
     assert q_detail["unproven_count"] == 1
     assert q_detail["total_working"] == 1
 
-    # Enforce + proven working capability → promotion NOT blocked.
+    # Enforce + proven working capability, CORROBORATED by the platform ledger →
+    # promotion NOT blocked. The ledger is what clears it: the same problem_model
+    # with an empty ledger stays blocked (asserted next), because a ``proven``
+    # evidence_ref on the agent-writable problem_model is a self-report.
     q_blocked_proven, q_detail_proven = capability_proof_gate_release_status(
-        proven_model, "enforce"
+        proven_model, "enforce", named_test_records
     )
     assert q_blocked_proven is False, (
-        "a recorded proof must clear the release-qualification gate too"
+        "a PLATFORM-recorded proof must clear the release-qualification gate too"
     )
     assert q_detail_proven["unproven"] == []
     assert q_detail_proven["unproven_count"] == 0
+    assert q_detail_proven["corroborated"] == ["container-runtime"]
+
+    # SECURITY: the same self-declared proven ref with NO platform ledger entry does
+    # NOT clear the release gate — including when the caller's ledger column is NULL.
+    for _empty_ledger in ({}, None):
+        q_blocked_forged, q_detail_forged = capability_proof_gate_release_status(
+            proven_model, "enforce", _empty_ledger
+        )
+        assert q_blocked_forged is True, (
+            "an uncorroborated self-report must never clear the release gate "
+            f"(ledger={_empty_ledger!r})"
+        )
+        assert q_detail_forged["uncorroborated"] == ["container-runtime"]
 
     # Off/observe modes record the dimension but never block promotion.
     for _mode in ("off", "observe"):
@@ -2878,14 +2961,54 @@ async def test_auto_graduation_never_regresses(_grad_db):
     assert _rc["capability_proof_gate_mode"] == "enforce"
 
 
-# ── All-exempt project excluded from aggregate ─────────────────────────────
+# ── Project with no working capabilities is excluded from the aggregate ────
 
 
 @pytest.mark.asyncio
-async def test_auto_graduation_skips_when_all_exempt(_grad_db):
-    """Projects where all working capabilities are exempt are excluded from the
-    aggregate. If no projects contribute non-exempt working caps, the sweep
-    returns SKIPPED."""
+async def test_auto_graduation_skips_when_no_working_caps(_grad_db):
+    """A project contributing no ``working`` capabilities is excluded from the
+    aggregate; with nothing to grade, the sweep returns SKIPPED rather than
+    advancing the gate off a zero denominator."""
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Planned only", "status": "planned", "evidence_refs": []},
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "no non-exempt" in results[0].detail.lower()
+    assert _rc["capability_proof_gate_mode"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_db):
+    """A DECLARED ``proof_exempt`` no longer excludes a capability from the coverage
+    aggregate (finding #9).
+
+    The graduation sweep reads the problem_model tier-1 map, where an attributed
+    ``proof_exempt`` declaration still grades ``proven`` (that is what keeps the earn
+    loop from chasing a capability the strategist says cannot be machine-proven). It
+    is NOT, however, an exemption: ``exempt_capability_names`` now requires an
+    operator record in the platform-only ledger, so the capability is no longer
+    excluded from the denominator — it is simply counted, and the fleet advances
+    toward ENFORCE, which is the safe direction. At the gate itself the very same
+    capability is refused (see
+    ``test_agent_fabricated_exemption_provenance_blocks_blocked_resume``), so a
+    self-declared exemption buys an agent nothing anywhere.
+    """
     from app.metrics_integrity_sweep import (
         CheckStatus,
         check_capability_proof_gate_auto_graduation,
@@ -2905,14 +3028,15 @@ async def test_auto_graduation_skips_when_all_exempt(_grad_db):
     )
 
     _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
     _rc["capability_proof_gate_mode"] = "off"
 
     ctx = _make_sweep_ctx(_grad_db)
     results = await check_capability_proof_gate_auto_graduation(ctx)
     assert len(results) == 1
-    assert results[0].status == CheckStatus.SKIPPED
-    assert "no non-exempt" in results[0].detail.lower()
-    assert _rc["capability_proof_gate_mode"] == "off"
+    assert results[0].status == CheckStatus.FLAGGED
+    assert "off → observe" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "observe"
 
 
 # ---------------------------------------------------------------------------

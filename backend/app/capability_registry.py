@@ -271,14 +271,40 @@ def registry_satisfies_capability_need(
     return normalized is not None and normalized in set(working_names)
 
 
-#: Source ``type`` values that represent a deliberate operator or
-#: strategic-agent authoring decision — the provenance a ``proof_exempt``
-#: exemption requires to be honored. A bare ``proof_exempt=True`` with no cited
-#: ``source`` (or a source whose ``type`` is unrecognized) is NOT authorized:
-#: the exemption docstring assumes operator/strategic authorship and this is
-#: what enforces it, closing the "silent self-report escape hatch" where any
-#: writer could clear the enforce gate with an unattributed boolean flag.
-_EXEMPTION_PROVENANCE_TYPES: frozenset[str] = frozenset(
+#: The ``proof_kind`` that marks a PLATFORM-RECORDED capability exemption inside
+#: ``project.capability_proof_records``.
+#:
+#: THIS IS THE ONLY THING THAT AUTHORIZES AN EXEMPTION. ``capability_proof_records``
+#: is the durable, platform-only ledger: no agent-facing endpoint writes it (agents
+#: author ``problem_model``; the ledger is written only by the recorders in
+#: :mod:`app.capability_proof` and by an operator/admin path). An exemption record
+#: is NOT a machine proof — it is an operator's standing authorization to clear the
+#: proof gate WITHOUT one — so it is filtered out of every machine-proof grading
+#: pass (:func:`_ledger_machine_proof_entries`) and takes effect solely through the
+#: exemption set (:func:`platform_exempt_capability_names`).
+CAPABILITY_EXEMPTION_PROOF_KIND = "operator_exemption"
+
+
+#: Source ``type`` values that represent a deliberate operator or strategic-agent
+#: authoring decision.
+#:
+#: ⚠️ THIS IS NOT AN AUTHORIZATION AND MUST NEVER BE USED AS ONE (audit finding
+#: #9). ``source`` lives in ``problem_model.capabilities[].source`` — the same
+#: AGENT-WRITABLE JSONB the whole ledger-corroboration pass exists to distrust — so
+#: an agent can trivially write ``proof_exempt: true`` plus
+#: ``source: {"type": "self_reflection"}`` and forge any provenance in this set.
+#: Using an agent-writable field to authorize a bypass of an agent-writable field
+#: is not a trust boundary at all.
+#:
+#: It survives ONLY as a DECLARATION filter on the tier-1 (problem_model-derived)
+#: proof map, whose consumers are the earn loop and the metrics sweeps — surfaces
+#: that decide what to spend effort proving, never what clears a gate. A capability
+#: the strategist declared exempt with an attributed source is skipped by the earn
+#: loop (there is nothing to machine-prove) exactly as before. Every ENFORCE seam
+#: re-grades the tier-1 map through :func:`ledger_corroborated_proof_status`, which
+#: carves out ONLY :func:`platform_exempt_capability_names` — so a declared-but-not-
+#: platform-recorded exemption is demoted to ``unverified`` and BLOCKS.
+_EXEMPTION_DECLARATION_TYPES: frozenset[str] = frozenset(
     {
         "user_message",       # operator explicitly authored the exemption
         "self_reflection",    # strategic agent authored it during reflection
@@ -301,17 +327,124 @@ def _exemption_source_type(source: object) -> str | None:
     return raw if isinstance(raw, str) and raw.strip() else None
 
 
-def _exemption_is_authorized(source: object) -> bool:
-    """True iff ``source`` carries provenance that authorizes a ``proof_exempt``.
+def _exemption_is_declared(source: object) -> bool:
+    """True iff ``source`` names an attributed authoring channel for a ``proof_exempt``.
 
-    An exemption is honored ONLY when the capability cites a ``source`` whose
-    ``type`` names a deliberate operator or strategic-agent authoring channel
-    (:data:`_EXEMPTION_PROVENANCE_TYPES`). A bare ``proof_exempt=True`` with no
-    source — the silent self-report vector this gate exists to close — is NOT
-    authorized, so the capability falls back to evidence-based classification
-    and cannot clear the enforce gate without real machine-verified proof.
+    A DECLARATION check, NOT an authorization check — see the warning on
+    :data:`_EXEMPTION_DECLARATION_TYPES`. ``source`` is agent-writable, so this can
+    be forged; it is used only to keep an unattributed boolean flag from suppressing
+    the earn loop on the tier-1 map. No gate consults it: gates consult
+    :func:`platform_exempt_capability_names` (the platform-only ledger).
     """
-    return _exemption_source_type(source) in _EXEMPTION_PROVENANCE_TYPES
+    return _exemption_source_type(source) in _EXEMPTION_DECLARATION_TYPES
+
+
+def _ledger_entries(proof_records: object, cap_name: object) -> list[dict]:
+    """Return the ledger entry dicts recorded for ``cap_name``, or ``[]``.
+
+    Tolerates a missing / non-dict ledger, a missing key, a non-list value, and
+    junk entries (all filtered out), so every reader below can assume a clean list.
+    """
+    if not isinstance(proof_records, dict) or not isinstance(cap_name, str):
+        return []
+    entries = proof_records.get(cap_name)
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _entry_is_exemption(entry: Mapping) -> bool:
+    """True iff a ledger entry is a platform-recorded operator exemption."""
+    kind = entry.get("proof_kind")
+    return (
+        isinstance(kind, str)
+        and kind.strip().lower() == CAPABILITY_EXEMPTION_PROOF_KIND
+    )
+
+
+def _ledger_machine_proof_entries(proof_records: object, cap_name: object) -> list[dict]:
+    """Ledger entries for ``cap_name`` EXCLUDING operator-exemption records.
+
+    An exemption record authorizes clearing the gate *without* machine proof; it is
+    not itself evidence of anything being verified. Filtering it here keeps the two
+    routes strictly separate — a capability is cleared either because the platform
+    ledger holds a real machine proof (``corroborated``) or because the operator
+    recorded an exemption (``exempt_cleared``), never by laundering the latter into
+    the former on a badge, an earn-loop decision, or a corroboration pass.
+    """
+    return [
+        e for e in _ledger_entries(proof_records, cap_name) if not _entry_is_exemption(e)
+    ]
+
+
+def platform_exempt_capability_names(proof_records: object) -> set[str]:
+    """Canonical capability names carrying a PLATFORM-RECORDED operator exemption.
+
+    THE EXEMPTION TRUST BOUNDARY, in one place. Reads
+    ``project.capability_proof_records`` — the durable, platform-only ledger the
+    agent cannot write — and returns the canonical names holding at least one entry
+    whose ``proof_kind`` is :data:`CAPABILITY_EXEMPTION_PROOF_KIND`.
+
+    This REPLACES the previous authorization rule, which read the exemption's
+    ``source.type`` out of ``problem_model`` (audit finding #9): that field is
+    agent-writable, so ``proof_exempt: true`` + ``source: {"type": "self_reflection"}``
+    cleared the enforce gate with nothing behind it. An exemption is now authorized
+    only by something the agent cannot write.
+
+    A missing / ``None`` / malformed ledger yields the empty set — no ledger means
+    no authorized exemptions, which fails CLOSED (the capability must then earn a
+    real machine proof to clear any gate).
+
+    Grant an exemption by appending :func:`build_operator_exemption_record` to the
+    project's ``capability_proof_records[cap_name]`` list through an operator/admin
+    path; nothing an agent can reach writes that column.
+    """
+    if not isinstance(proof_records, dict):
+        return set()
+    exempt: set[str] = set()
+    for raw_name, entries in proof_records.items():
+        normalized = normalize_capability_name(raw_name)
+        if not normalized or not isinstance(entries, list):
+            continue
+        if any(isinstance(e, Mapping) and _entry_is_exemption(e) for e in entries):
+            exempt.add(normalized)
+    return exempt
+
+
+def build_operator_exemption_record(
+    cap_name: str,
+    authorized_by: str,
+    reason: str | None = None,
+    proved_at: str | None = None,
+) -> dict:
+    """Build the platform ledger entry that AUTHORIZES a capability's proof exemption.
+
+    The canonical shape an operator/admin path appends to
+    ``project.capability_proof_records[normalize_capability_name(cap_name)]`` to
+    grant an exemption. It mirrors the entry shape the machine-proof recorders in
+    :mod:`app.capability_proof` write (``task_id`` / ``proved_at`` / ``proof_kind`` /
+    ``proof_ref`` / ``commit_sha``) so every existing ledger reader tolerates it,
+    but carries the distinguishing :data:`CAPABILITY_EXEMPTION_PROOF_KIND` so the
+    machine-proof passes skip it (:func:`_ledger_machine_proof_entries`) and only
+    the exemption set honors it.
+
+    ``authorized_by`` records WHO granted it (an operator id / email) and ``reason``
+    WHY — the audit trail the agent-writable ``source`` field could only pretend to
+    be.
+    """
+    if proved_at is None:
+        from app.time_utils import _utcnow
+
+        proved_at = _utcnow().isoformat()
+    normalized = normalize_capability_name(cap_name) or str(cap_name)
+    return {
+        "task_id": f"exemption:{normalized}",
+        "proof_kind": CAPABILITY_EXEMPTION_PROOF_KIND,
+        "proof_ref": reason or "operator-authorized proof exemption",
+        "proved_at": proved_at,
+        "commit_sha": "",
+        "authorized_by": authorized_by,
+    }
 
 
 def _iter_capability_evidence_entries(problem_model: object):
@@ -328,8 +461,9 @@ def _iter_capability_evidence_entries(problem_model: object):
     junk) — callers coerce them before handing them to
     :func:`classify_evidence`. ``proof_exempt`` defaults to ``False`` and
     ``source`` to ``None`` for backward-compatibility with payloads that omit
-    those fields. ``source`` is the provenance :func:`_exemption_is_authorized`
-    checks before honoring an exemption.
+    those fields. ``source`` is the *declared* provenance :func:`_exemption_is_declared`
+    reads — an agent-writable field that NO gate trusts (finding #9); the authorizing
+    exemption lives in the platform ledger (:func:`platform_exempt_capability_names`).
     """
     if isinstance(problem_model, Mapping):
         raw_caps = problem_model.get("capabilities")
@@ -363,6 +497,7 @@ def _iter_capability_evidence_entries(problem_model: object):
 def working_capability_proof_status(
     problem_model: object,
     now: "datetime | None" = None,
+    proof_records: object = None,
 ) -> dict[str, EvidenceStatus]:
     """Map every ``working`` capability's canonical name to its evidence status.
 
@@ -398,21 +533,34 @@ def working_capability_proof_status(
     evidence-less claims from structurally-backed ones that simply haven't been
     through the earning loop.
 
-    **Exemption**: a ``working`` capability with ``proof_exempt=True`` is
-    classified as ``"proven"`` ONLY when its exemption carries operator or
-    strategic-agent provenance — a ``source`` whose ``type`` is in
-    :data:`_EXEMPTION_PROVENANCE_TYPES` (checked by
-    :func:`_exemption_is_authorized`). A provenance-backed exemption satisfies
-    the proof gate without machine-verified evidence, is excluded from the
-    unproven count in the release qualifier, and does not inflate the
-    metrics-sweep delta. A bare ``proof_exempt=True`` with NO cited ``source``
-    is NOT honored — it is the silent self-report escape hatch this gate exists
-    to close, so it falls through to evidence-based classification (and thus
-    reads ``unproven`` / ``partial`` when it has no real proof, blocking the
-    enforce gate exactly as an un-exempt claim would). Exemption is for
-    capabilities that genuinely cannot have machine-verifiable proof (e.g.
-    purely human processes, external integrations without test hooks) and must
-    be explicitly set — with provenance — by an operator or strategic agent.
+    **Exemption (audit finding #9 — read this before trusting the map).** THIS IS
+    THE TIER-1, AGENT-WRITABLE VIEW. Two different things can mark a capability
+    exempt here, and only one of them is an authorization:
+
+    * **PLATFORM-RECORDED (authorized).** ``proof_records`` — the platform-only
+      ``project.capability_proof_records`` ledger — holds an operator-exemption
+      entry for the capability (:func:`platform_exempt_capability_names`). This is
+      the ONLY exemption any enforce gate honors, because it is the only one an
+      agent cannot write. It grades ``"proven"`` here regardless of what the
+      problem_model says, so an operator's grant cannot be nullified by an agent
+      rewriting (or dropping) the ``proof_exempt`` flag.
+    * **DECLARED (agent-writable, NOT an authorization).** The capability carries
+      ``proof_exempt=True`` plus an attributed ``source`` (:func:`_exemption_is_declared`).
+      It also grades ``"proven"`` HERE — but only so the earn loop and the metrics
+      sweeps (the tier-1 consumers) do not burn cycles trying to machine-prove a
+      capability the strategist says cannot be machine-proven. It CLEARS NO GATE:
+      every enforce seam re-grades this map through
+      :func:`ledger_corroborated_proof_status`, which demotes any ``proven`` the
+      platform ledger neither corroborates nor exempts to ``"unverified"``. A
+      forged ``source: {"type": "self_reflection"}`` therefore BLOCKS — that forgery
+      is exactly what finding #9 reported.
+
+    A bare ``proof_exempt=True`` with NO cited ``source`` is not honored even at
+    tier-1: it falls through to evidence-based classification and blocks
+    everywhere. Exemption is for capabilities that genuinely cannot have
+    machine-verifiable proof (purely human processes, external integrations without
+    test hooks) and is granted by an operator recording
+    :func:`build_operator_exemption_record` into the platform ledger.
 
     **Freshness re-verification**: capability proofs are written once (each
     ``evidence_ref`` stamps a ``recorded_at``) but nothing re-runs them, so a
@@ -438,19 +586,36 @@ def working_capability_proof_status(
         from app.time_utils import _utcnow
 
         now = _utcnow()
+    ledger_exempt = platform_exempt_capability_names(proof_records)
     out: dict[str, EvidenceStatus] = {}
     for raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt, source in _iter_capability_evidence_entries(
         problem_model
     ):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        # An exempt working capability grades "proven" ONLY when its exemption
-        # carries operator/strategic provenance (:func:`_exemption_is_authorized`).
-        # A bare ``proof_exempt=True`` with no cited ``source`` is the silent
-        # self-report vector this gate exists to close, so it falls through to
-        # evidence-based classification and cannot clear the enforce gate.
-        if proof_exempt and _exemption_is_authorized(source):
+        names = [
+            n
+            for n in (
+                normalize_capability_name(raw_name),
+                *_normalized_absorbed_names(absorbs),
+            )
+            if n
+        ]
+        # AUTHORIZED exemption: the platform-only ledger records an operator
+        # exemption for this capability (or for a name it absorbed). Honored
+        # regardless of the agent-writable ``proof_exempt`` flag — the operator's
+        # grant is not the agent's to revoke — and it is the ONLY exemption that
+        # survives ledger_corroborated_proof_status into an enforce gate.
+        if any(n in ledger_exempt for n in names):
             proof_status: EvidenceStatus = "proven"
+        # DECLARED exemption (agent-writable, NOT an authorization — finding #9):
+        # graded ``proven`` on this tier-1 map ONLY so the earn loop and metrics
+        # sweeps skip a capability the strategist says cannot be machine-proven.
+        # Every enforce seam re-grades through ledger_corroborated_proof_status,
+        # which does NOT carve this out, so it is demoted to ``unverified`` and
+        # BLOCKS. A bare flag with no attributed source is not honored even here.
+        elif proof_exempt and _exemption_is_declared(source):
+            proof_status = "proven"
         else:
             # Coerce a missing/None evidence_refs to the empty list so a capability
             # that simply omits the field classifies as ``unproven`` (definite absence
@@ -471,32 +636,48 @@ def working_capability_proof_status(
             # (no refs AND no backing_paths) are truly unproven.
             if proof_status == "unproven" and isinstance(backing_paths, list) and backing_paths:
                 proof_status = "partial"
-        for name in (
-            normalize_capability_name(raw_name),
-            *_normalized_absorbed_names(absorbs),
-        ):
-            if name and name not in out:
+        for name in names:
+            if name not in out:
                 out[name] = proof_status
     return out
 
 
-def exempt_capability_names(problem_model: object) -> set[str]:
-    """Return the canonical names of ``working`` capabilities with a *provenance-backed* ``proof_exempt``.
+def exempt_capability_names(
+    problem_model: object, proof_records: object = None
+) -> set[str]:
+    """Canonical names of ``working`` capabilities with an AUTHORIZED proof exemption.
 
-    These are capabilities the operator or strategic agent has declared genuinely
-    cannot have machine-verifiable proof. They are excluded from the proof-gate
-    delta, the release-qualifier unproven count, and the earn-loop targets.
+    THE GATE CARVE-OUT SET — the one set of capabilities allowed to clear an
+    enforce gate with no machine-verified proof behind them. Membership therefore
+    requires an authorization the agent cannot forge:
 
-    Only exemptions carrying operator/strategic provenance (a ``source`` accepted
-    by :func:`_exemption_is_authorized`) are returned — a bare, unattributed
-    ``proof_exempt=True`` is not a real exemption and is omitted here, matching
-    its evidence-based (non-``proven``) classification in
-    :func:`working_capability_proof_status`.
+    1. the capability is declared ``working`` in the registry, AND
+    2. the PLATFORM-ONLY ledger (``proof_records`` =
+       ``project.capability_proof_records``) holds an operator-exemption record for
+       its canonical name — or for a name it absorbed
+       (:func:`platform_exempt_capability_names`).
 
-    Alias-aware: same as :func:`working_capability_names`, an exempt entry
-    contributes its own canonical name AND every name in its ``absorbs`` list so
-    an absorbed old name still resolves as exempt.
+    The agent-writable ``proof_exempt`` flag and its ``source`` are NOT consulted
+    (audit finding #9). They used to be: an exemption was honored whenever
+    ``source.type`` named an "operator or strategic" channel — a field living in the
+    same ``problem_model`` JSONB the ledger-corroboration pass exists to distrust,
+    so any agent could write ``proof_exempt: true`` +
+    ``source: {"type": "self_reflection"}`` and clear the gate. An agent-writable
+    field can never authorize a bypass of an agent-writable field.
+
+    Conversely, an operator's grant is not the agent's to revoke: a ledger-recorded
+    exemption holds even if the agent never sets (or later deletes) ``proof_exempt``
+    on the problem_model.
+
+    ``proof_records`` defaults to ``None`` = EMPTY ledger = NO exemptions, so a
+    caller that does not supply the ledger fails CLOSED. The two enforce seams
+    (:func:`consumer_gate_proof_status`) and the release seam
+    (:func:`capability_proof_gate_release_status`) always supply the project's
+    column.
     """
+    ledger_exempt = platform_exempt_capability_names(proof_records)
+    if not ledger_exempt:
+        return set()
     exempt: set[str] = set()
     for (
         raw_name,
@@ -504,23 +685,24 @@ def exempt_capability_names(problem_model: object) -> set[str]:
         absorbs,
         _evidence_refs,
         _backing_paths,
-        proof_exempt,
-        source,
+        _proof_exempt,
+        _source,
     ) in _iter_capability_evidence_entries(problem_model):
-        if not proof_exempt:
-            continue
-        # Only provenance-backed exemptions are honored — an unattributed
-        # ``proof_exempt=True`` is not a real exemption (see
-        # :func:`_exemption_is_authorized`), so it never enters the audit set
-        # and its capability classifies by evidence in the proof map.
-        if not _exemption_is_authorized(source):
-            continue
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        normalized = normalize_capability_name(raw_name)
-        if normalized:
-            exempt.add(normalized)
-        exempt.update(_normalized_absorbed_names(absorbs))
+        names = [
+            n
+            for n in (
+                normalize_capability_name(raw_name),
+                *_normalized_absorbed_names(absorbs),
+            )
+            if n
+        ]
+        # Alias-aware, exactly as working_capability_names: an exemption recorded
+        # against an absorbed old name still exempts the surviving capability, and
+        # the survivor's aliases all resolve as exempt.
+        if any(n in ledger_exempt for n in names):
+            exempt.update(names)
     return exempt
 
 
@@ -628,16 +810,17 @@ def _ledger_proof_status(
     This is the trust boundary the enforce gate uses to distinguish
     platform-verified proof from an agent's self-reported ``evidence_refs`` /
     ``proof_exempt`` claim on the problem_model.
+
+    Operator-exemption records are EXCLUDED (:func:`_ledger_machine_proof_entries`):
+    an exemption authorizes clearing the gate *without* machine proof and must never
+    be laundered into machine proof. A capability whose ledger holds only an
+    exemption grades ``unproven`` here and is cleared solely through the exemption
+    carve-out in :func:`ledger_corroborated_proof_status`, so the ``corroborated`` /
+    ``exempt_cleared`` audit buckets stay honest about WHY each capability cleared.
     """
-    if not isinstance(proof_records, dict):
-        return "unproven"
-    entries = proof_records.get(cap_name)
-    if not isinstance(entries, list) or not entries:
-        return "unproven"
     synthetic = [
         {"kind": e.get("proof_kind"), "proven": True}
-        for e in entries
-        if isinstance(e, dict)
+        for e in _ledger_machine_proof_entries(proof_records, cap_name)
     ]
     if not synthetic:
         return "unproven"
@@ -661,11 +844,15 @@ def ledger_corroborated_proof_status(
     self-declared proof cannot clear an enforce gate:
 
     * ``status != "proven"``  → passed through unchanged (already not clearing).
-    * name in ``exempt_names`` → passed through unchanged. A *provenance-authorized*
-      ``proof_exempt`` (:func:`exempt_capability_names`, which drops bare/unattributed
-      flags) is cleared BY ITS AUTHORIZATION, not by machine proof: the earn loop
-      deliberately never mints a ledger entry for an exempt capability, so demanding
-      corroboration from it would nullify the exemption the operator granted.
+    * name in ``exempt_names`` → passed through unchanged. An exemption is cleared BY
+      ITS AUTHORIZATION, not by machine proof: the earn loop deliberately never mints
+      a ledger *proof* entry for an exempt capability, so demanding corroboration from
+      it would nullify the exemption the operator granted. ``exempt_names`` MUST come
+      from :func:`exempt_capability_names` / :func:`platform_exempt_capability_names`,
+      i.e. from an operator-exemption record in this same platform-only ledger —
+      NEVER from ``problem_model.proof_exempt`` / ``source``, which are agent-writable
+      and were the finding-#9 bypass. Anything an agent can write must arrive here as
+      a plain ``proven`` claim and take the corroboration path below.
     * ledger grades ``proven`` (:func:`_ledger_proof_status`) → corroborated, kept.
     * otherwise → demoted to ``"unverified"``: the capability CLAIMS proof that no
       platform record backs. ``unverified`` (not ``unproven``) names the situation
@@ -747,17 +934,15 @@ def fold_ledger_proof_upgrades(
     for name, tier1 in list(out.items()):
         if evidence_status_rank(tier1) >= EVIDENCE_STATUS_RANK["proven"]:
             continue
-        entries = proof_records.get(name)
-        if not isinstance(entries, list):
-            continue
+        # Operator-exemption records are not machine proof and must not upgrade a
+        # capability here (an exemption clears only via the exemption carve-out).
         synthetic = [
             {
                 "kind": e.get("proof_kind"),
                 "proven": True,
                 "recorded_at": e.get("proved_at"),
             }
-            for e in entries
-            if isinstance(e, dict)
+            for e in _ledger_machine_proof_entries(proof_records, name)
         ]
         if not synthetic:
             continue
@@ -784,19 +969,23 @@ def consumer_gate_proof_status(
     Three composed steps:
 
     1. :func:`working_capability_proof_status` — the tier-1, problem_model-derived
-       (AGENT-WRITABLE) grade, with evidence-freshness already applied.
+       (AGENT-WRITABLE) grade, with evidence-freshness already applied. The platform
+       ledger is threaded in so an operator-recorded exemption grades ``proven`` here
+       even when the agent never wrote ``proof_exempt``.
     2. :func:`fold_ledger_proof_upgrades` — the platform ledger RAISES a capability
        whose tier-1 ``evidence_refs`` append was lost to the fail-open path.
     3. :func:`ledger_corroborated_proof_status` — the platform ledger REFUSES a
        ``proven`` claim it does not corroborate, demoting a self-declared proof to
-       ``unverified`` so it cannot clear the enforce gate. Provenance-authorized
-       exemptions are carved out (they are cleared by authorization, never by a
-       ledger entry, which the earn loop never mints for them).
+       ``unverified`` so it cannot clear the enforce gate. Only PLATFORM-RECORDED
+       exemptions are carved out (:func:`exempt_capability_names`) — they are cleared
+       by authorization, never by a ledger proof entry, which the earn loop never
+       mints for them.
 
     Net contract — a capability need clears the enforce gate at a consumer seam iff
-    the capability is ``working`` AND (it carries an operator/strategic-authorized
-    ``proof_exempt`` OR the platform ledger holds a machine-verified proof for it).
-    A self-declared ``proven=true`` ``evidence_ref`` alone NEVER clears it.
+    the capability is ``working`` AND (the platform ledger holds an operator-recorded
+    EXEMPTION for it OR the platform ledger holds a machine-verified PROOF for it).
+    Nothing the agent writes to ``problem_model`` — a ``proven=true`` ``evidence_ref``,
+    a ``proof_exempt`` flag, a fabricated ``source.type`` (finding #9) — clears it.
 
     ``proof_records`` is the project's ``capability_proof_records`` column; ``None``
     / a missing column is treated as an EMPTY ledger (nothing corroborates), which
@@ -806,10 +995,14 @@ def consumer_gate_proof_status(
     problem_model-only derivation; here the caller ALWAYS supplies the project's
     column, so ``None`` genuinely means "this project has no recorded proofs".
     """
-    proof_map = working_capability_proof_status(problem_model, now=now)
+    proof_map = working_capability_proof_status(
+        problem_model, now=now, proof_records=proof_records
+    )
     proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now)
     return ledger_corroborated_proof_status(
-        proof_map, proof_records, exempt_capability_names(problem_model)
+        proof_map,
+        proof_records,
+        exempt_capability_names(problem_model, proof_records),
     )
 
 
@@ -843,36 +1036,45 @@ def capability_proof_gate_release_status(
     entry) and its ``proof_exempt`` flag — are AGENT-WRITABLE: an agent editing
     the JSONB problem_model can self-declare a capability proven or exempt and
     clear the enforce gate without any platform verification. To close that hole,
-    when ``proof_records`` (the durable, platform-only
-    ``project.capability_proof_records`` ledger) is provided, the enforce gate
-    additionally requires that every capability the base map treats as cleared be
-    CORROBORATED by a machine-verified entry in that ledger
-    (:func:`_ledger_proof_status` grades ``"proven"``). A capability that reads
+    the enforce gate requires that every capability the base map treats as cleared
+    be CORROBORATED by a machine-verified entry in ``proof_records`` (the durable,
+    platform-only ``project.capability_proof_records`` ledger —
+    :func:`_ledger_proof_status` grades it ``"proven"``). A capability that reads
     ``proven`` from a self-reported ``evidence_ref`` but carries no corroborating
     platform proof is NOT cleared: it is added to ``unproven`` (and surfaced under
-    ``uncorroborated``) so promotion blocks. When ``proof_records`` is ``None``
-    (callers that do not supply the ledger), the legacy problem_model-only
-    derivation is used unchanged.
+    ``uncorroborated``) so promotion blocks.
 
-    **Authorized exemptions bypass the ledger (audit finding #2).** A
-    *provenance-authorized* ``proof_exempt`` capability (one whose ``source``
-    :func:`_exemption_is_authorized` accepts — operator or strategic-agent
-    attribution) is cleared BY THAT AUTHORIZATION, not by machine proof. The earn
-    loop never mints a ledger entry for an exempt capability BY DESIGN, so
-    demanding ledger corroboration from it demoted every authorized exemption to
-    unproven and blocked promotion — nullifying the exemption. Those capabilities
-    are therefore EXCLUDED from the corroboration requirement and reported under
-    ``exempt_cleared``. This does not widen the self-report hole: a bare,
-    unattributed ``proof_exempt=True`` is not an exemption at all
-    (:func:`exempt_capability_names` drops it and
-    :func:`working_capability_proof_status` never grades it ``proven``), so it
-    still lands in ``unproven`` and still blocks.
+    ``proof_records=None`` means an EMPTY ledger — nothing corroborates, so nothing
+    self-declared clears — matching :func:`consumer_gate_proof_status`. It does NOT
+    mean "skip corroboration". It used to (the "legacy problem_model-only
+    derivation"), and that was a hole big enough to swallow the whole gate: the
+    column is nullable with no server default (migration 0208), so a project that
+    has never earned a proof reads ``None`` — precisely the project whose agent has
+    the most to gain from self-declaring one. The two consumer seams already treated
+    ``None`` as an empty ledger; the release seam now agrees, and the drift IS the
+    vulnerability.
+
+    **Authorized exemptions bypass the machine-proof requirement (findings #2 + #9).**
+    A capability the OPERATOR exempted — an ``operator_exemption`` record in the
+    platform-only ledger (:func:`exempt_capability_names`) — is cleared BY THAT
+    AUTHORIZATION, not by machine proof. The earn loop never mints a *proof* entry
+    for an exempt capability BY DESIGN, so demanding one from it would nullify the
+    exemption the operator granted (finding #2). Those capabilities are EXCLUDED
+    from the corroboration requirement and reported under ``exempt_cleared``.
+
+    This does not reopen the self-report hole (finding #9): the exemption must live
+    in the platform ledger, which no agent-facing endpoint writes. A ``proof_exempt``
+    flag on the problem_model — bare, or dressed in a fabricated
+    ``source: {"type": "self_reflection"}`` — is NOT an exemption here. It may grade
+    ``proven`` on the agent-writable base map, but it is not in ``exempt_set``, so
+    the corroboration pass demands a ledger proof it does not have, demotes it, and
+    it lands in ``uncorroborated`` → ``unproven`` → promotion BLOCKS.
 
     ``detail`` always carries ``mode`` and, when the enforce branch runs against
     a problem model, the ``total_working`` / ``unproven_count`` / ``unproven`` /
-    ``exempt_count`` / ``exempt_names`` audit fields, plus (when the ledger is
-    supplied) ``corroborated`` / ``uncorroborated`` / ``exempt_cleared`` for audit
-    visibility.
+    ``exempt_count`` / ``exempt_names`` audit fields plus ``corroborated`` /
+    ``uncorroborated`` / ``exempt_cleared`` — the last three answering, for every
+    cleared capability, WHY it cleared and on whose authority.
     """
     mode_norm = str(mode or "off").strip().lower()
     detail: dict = {"mode": mode_norm}
@@ -881,66 +1083,63 @@ def capability_proof_gate_release_status(
     if not problem_model:
         detail["error"] = "no problem_model"
         return False, detail
-    proof_map = working_capability_proof_status(problem_model)
-    exempt_set = exempt_capability_names(problem_model)
-    # Base (problem_model-only) unproven set: a capability the agent-authored view
+    proof_map = working_capability_proof_status(
+        problem_model, proof_records=proof_records
+    )
+    # The carve-out set: PLATFORM-recorded operator exemptions only (finding #9).
+    # An agent-declared proof_exempt/source never lands here, so it cannot skip the
+    # corroboration pass below.
+    exempt_set = exempt_capability_names(problem_model, proof_records)
+    # Base (problem_model-derived) unproven set: a capability the agent-authored view
     # already reports as not-proven.
     unproven = [name for name, status in proof_map.items() if status != "proven"]
 
-    if proof_records is not None:
-        # Corroboration pass (finding #1): every capability the base map treats as
-        # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
-        # entry — not just a self-reported evidence_ref / proof_exempt flag on the
-        # problem_model. Uncorroborated "proven" caps are demoted to blocked.
-        #
-        # EXCEPT a provenance-authorized exemption (finding #2): an operator- or
-        # strategic-attributed ``proof_exempt`` capability is cleared BY ITS
-        # AUTHORIZATION, not by machine proof, and the earn loop deliberately never
-        # mints a ledger entry for it (exempt capabilities are excluded from the
-        # earn targets BY DESIGN). Requiring a ledger entry from it therefore
-        # demoted every authorized exemption to unproven and blocked promotion —
-        # nullifying the exemption the operator explicitly granted. Such a
-        # capability is skipped here (neither corroborated nor uncorroborated; it
-        # is already audited under ``exempt_names``).
-        #
-        # The security property is unchanged: ``exempt_set`` holds ONLY
-        # provenance-backed exemptions (:func:`exempt_capability_names` drops any
-        # bare ``proof_exempt=True``), and an unauthorized exemption never grades
-        # ``proven`` in the base map to begin with, so it stays in ``unproven``. A
-        # self-reported ``evidence_ref`` still requires ledger corroboration.
-        # The corroboration rule itself lives in ledger_corroborated_proof_status,
-        # which the two CONSUMER seams also call (via consumer_gate_proof_status) —
-        # one implementation, so this seam and they cannot drift apart. A "proven"
-        # capability the ledger refuses comes back demoted; that demotion IS the
-        # uncorroborated set.
-        corroborated_map = ledger_corroborated_proof_status(
-            proof_map, proof_records, exempt_set
-        )
-        uncorroborated: list[str] = [
-            name
-            for name, status in proof_map.items()
-            if status == "proven" and corroborated_map.get(name) != "proven"
-        ]
-        if uncorroborated:
-            unproven = sorted(set(unproven) | set(uncorroborated))
-        uncorroborated_set = set(uncorroborated)
-        corroborated = [
-            name
-            for name, status in proof_map.items()
-            if status == "proven"
-            and name not in uncorroborated_set
-            and name not in exempt_set
-        ]
-        detail["corroborated"] = sorted(corroborated)
-        detail["uncorroborated"] = sorted(uncorroborated)
-        # Cleared by authorization rather than by ledger proof — surfaced
-        # separately so an auditor can see exactly which capabilities bypassed the
-        # machine-proof requirement and on whose authority.
-        detail["exempt_cleared"] = sorted(
-            name
-            for name, status in proof_map.items()
-            if status == "proven" and name in exempt_set
-        )
+    # Corroboration pass (finding #1): every capability the base map treats as
+    # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
+    # entry — not just a self-reported evidence_ref / proof_exempt flag on the
+    # problem_model. Uncorroborated "proven" caps are demoted to blocked. Runs
+    # UNCONDITIONALLY: proof_records=None is an empty ledger (nothing corroborates),
+    # never a licence to trust the problem_model on its own.
+    #
+    # EXCEPT a platform-recorded exemption (finding #2): an operator-granted
+    # exemption clears BY ITS AUTHORIZATION, not by machine proof, and the earn loop
+    # deliberately never mints a ledger proof entry for an exempt capability.
+    # Requiring one would demote every exemption to unproven and block promotion —
+    # nullifying the grant. Such a capability is skipped here (neither corroborated
+    # nor uncorroborated; it is audited under ``exempt_cleared`` / ``exempt_names``).
+    #
+    # The corroboration rule itself lives in ledger_corroborated_proof_status, which
+    # the two CONSUMER seams also call (via consumer_gate_proof_status) — one
+    # implementation, so this seam and they cannot drift apart. A "proven" capability
+    # the ledger refuses comes back demoted; that demotion IS the uncorroborated set.
+    corroborated_map = ledger_corroborated_proof_status(
+        proof_map, proof_records, exempt_set
+    )
+    uncorroborated: list[str] = [
+        name
+        for name, status in proof_map.items()
+        if status == "proven" and corroborated_map.get(name) != "proven"
+    ]
+    if uncorroborated:
+        unproven = sorted(set(unproven) | set(uncorroborated))
+    uncorroborated_set = set(uncorroborated)
+    corroborated = [
+        name
+        for name, status in proof_map.items()
+        if status == "proven"
+        and name not in uncorroborated_set
+        and name not in exempt_set
+    ]
+    detail["corroborated"] = sorted(corroborated)
+    detail["uncorroborated"] = sorted(uncorroborated)
+    # Cleared by authorization rather than by ledger proof — surfaced separately so
+    # an auditor can see exactly which capabilities bypassed the machine-proof
+    # requirement and on whose authority.
+    detail["exempt_cleared"] = sorted(
+        name
+        for name, status in proof_map.items()
+        if status == "proven" and name in exempt_set
+    )
 
     detail["total_working"] = len(proof_map)
     detail["unproven_count"] = len(unproven)
