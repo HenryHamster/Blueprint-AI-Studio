@@ -5920,14 +5920,29 @@ async def agent_build_config_discovery(
         if project is None:
             return {"persisted": False}
 
-        from app.build_config_detection import persist_discovered_build_commands
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+            persist_discovered_build_commands,
+        )
 
         persisted = await persist_discovered_build_commands(
             project,
             session,
             [d.model_dump() for d in body.discovered_directories],
         )
-        return {"persisted": persisted}
+        # Bidirectional emptiness re-detect: when the agent's live full-clone
+        # verdict disagrees with the durable repo_is_empty signal, re-run
+        # authoritative detection instead of trusting the stale signal. Best-
+        # effort and a no-op when the agent did not report a verdict or the
+        # signals already agree.
+        redetected = False
+        if body.observed_repo_is_empty is not None:
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project,
+                session,
+                observed_empty=body.observed_repo_is_empty,
+            )
+        return {"persisted": persisted, "emptiness_redetected": redetected}
     except HTTPException:
         raise
     except Exception:

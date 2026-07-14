@@ -926,6 +926,13 @@ class BuildDiscoveryReport(BaseModel):
     discovered_directories: List[DiscoveredBuildCommandEntry] = Field(
         default_factory=list, max_length=50
     )
+    # The agent VM's live full-clone verdict on whether the repo is empty/
+    # near-empty (same "real source" exclusion rules as the backend classifier).
+    # When present and it disagrees with the durable ``build_config.repo_is_empty``
+    # in EITHER direction, the endpoint re-runs authoritative detection rather
+    # than trusting the stale durable signal. Optional/None for older agents that
+    # do not report it.
+    observed_repo_is_empty: bool | None = None
 
 
 class MigrationConfig(BaseModel):

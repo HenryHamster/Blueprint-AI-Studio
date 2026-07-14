@@ -3593,6 +3593,275 @@ class TestMaybeRefreshEmptyBuildConfig:
         bcd._redetect_empty_cooldown.clear()
 
 
+class TestMaybeRedetectOnEmptinessDisagreement:
+    """Bidirectional re-detect when agent-observed emptiness disagrees with the
+    durable ``build_config.repo_is_empty`` signal in EITHER direction."""
+
+    @staticmethod
+    def _project(repo, build_config):
+        return Project(
+            name=repo,
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="develop",
+            build_config=build_config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_durable_empty_agent_nonempty_redetects_and_flips(self, db_session):
+        """Direction A: durable repo_is_empty=True but agent sees real source =>
+        re-detect and persist the fresh (non-empty) verdict."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "greenfield-gained-code",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                    "source_file_count": 42,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is True
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") == "develop"
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+        assert bc.get("repo_is_empty") is False
+        assert bc.get("source_file_count") == 42
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_durable_nonempty_agent_empty_redetects_and_flips(self, db_session):
+        """Direction B: durable repo_is_empty=False but agent sees an empty tree =>
+        re-detect; the authoritative walk confirms empty and the signal flips."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "misclassified-nonempty",
+            {"language": "python", "directories": [], "repo_is_empty": False},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": None,
+                    "directories": [],
+                    "repo_is_empty": True,
+                    "source_file_count": 0,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=True
+            )
+
+        assert redetected is True
+        mock_detect.assert_awaited_once()
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("repo_is_empty") is True
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_signals_agree_is_noop(self, db_session):
+        """Durable and observed agree (both non-empty) => no GitHub call."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "agree-repo",
+            {"language": "python", "directories": [], "repo_is_empty": False},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_absent_durable_signal_is_noop(self, db_session):
+        """An indeterminate (absent/None) durable signal has nothing to disagree
+        with => no GitHub call (that case belongs to maybe_refresh)."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "indeterminate-repo",
+            {"language": "python", "directories": []},  # no repo_is_empty key
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=True
+            )
+
+        assert redetected is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_honors_cooldown(self, db_session):
+        """A second disagreement within the 6h window skips detection entirely."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "disagreement-cooldown",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            r1 = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+            assert r1 is True
+            assert mock_detect.call_count == 1
+
+            # Re-arm the disagreement so only the cooldown can skip it.
+            project.build_config = {
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            }
+            await db_session.commit()
+
+            r2 = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+            assert r2 is False
+            assert mock_detect.call_count == 1
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_swallows_detection_exception(self, db_session):
+        """A detection failure is logged and swallowed, never raised."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "disagreement-boom",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("github down"),
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is False
+        await db_session.refresh(project)
+        # Config untouched on failure.
+        assert (project.build_config or {}).get("repo_is_empty") is True
+        bcd._redetect_disagreement_cooldown.clear()
+
+
 class TestOnboardDetectionIncompleteMarker:
     """Onboarding sets detection_incomplete only when detection did not complete."""
 

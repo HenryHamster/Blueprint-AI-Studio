@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 # Resets on process restart (rare, acceptable: burn is measured in minutes).
 _redetect_no_test_cooldown: Dict[str, float] = {}
 _redetect_empty_cooldown: Dict[str, float] = {}
+# Cooldown for the bidirectional emptiness-disagreement re-detect path
+# (maybe_redetect_on_emptiness_disagreement).
+_redetect_disagreement_cooldown: Dict[str, float] = {}
 # 6-hour window: a no-test repo walks the tree at most once per window.
 _REDETECT_COOLDOWN_S: float = 6 * 3600.0
 
@@ -528,6 +531,136 @@ async def maybe_redetect_ci_presence(project, session, *, ref=None) -> bool:
         logger.warning(
             "[BUILD_CONFIG] CI-presence re-detection failed for project %s; "
             "leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def maybe_redetect_on_emptiness_disagreement(
+    project, session, *, observed_empty: bool, ref=None
+) -> bool:
+    """Re-run authoritative detection when the agent-observed repo emptiness
+    disagrees with the durable ``build_config.repo_is_empty`` signal in EITHER
+    direction.
+
+    The durable ``repo_is_empty`` is a shallow onboarding-time signal that can
+    drift from reality in two ways once the agent VM does a full clone:
+
+    - Durable says NOT empty (``repo_is_empty=False``) but the agent's full
+      clone sees an empty/near-empty tree (``observed_empty=True``) — the repo
+      may have been mis-classified at onboarding, or emptied since.
+    - Durable says empty (``repo_is_empty=True``) but the agent sees real source
+      (``observed_empty=False``) — the greenfield repo gained structure the
+      shallow onboarding walk never re-scanned, and the durable signal keeps
+      advertising a greenfield repo (short-circuiting bootstrap-from-goal
+      guidance and greenfield gates).
+
+    Rather than hard-failing (direction 1 currently throws ``clone_failed``) or
+    silently trusting the stale durable signal (direction 2), this helper
+    re-runs the SAME authoritative GitHub detector (``_detect_build_config``)
+    the onboarding path used and persists its fresh verdict — so the
+    disagreement is resolved by the authoritative source, never by blindly
+    trusting either the stale durable signal or the agent's live tree.
+
+    Guards, mirroring the sibling re-detect helpers:
+
+    - Fires ONLY on a genuine disagreement: the durable ``repo_is_empty`` must
+      be a DEFINITE bool that differs from ``observed_empty``. An absent/None
+      durable tri-state is indeterminate (there is nothing to disagree with) and
+      is left to :func:`maybe_refresh_empty_build_config`, so the two paths never
+      compete.
+    - A 6-hour in-memory per-project cooldown prevents the BFS tree walk from
+      re-running on every agent report within the window.
+    - Reuses the operator-override-preserving merge, so operator-owned fields
+      survive; the fresh ``repo_is_empty``/``source_file_count`` are NOT carried
+      forward from the stale config and therefore win.
+
+    Returns True iff a fresh detection was persisted. Best-effort: never raises
+    into the caller; logs, rolls back the session on failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        durable = existing.get("repo_is_empty")
+        # Only a DEFINITE durable bool can disagree; a None/absent tri-state is
+        # indeterminate and belongs to maybe_refresh_empty_build_config.
+        if not isinstance(durable, bool):
+            return False
+        if bool(durable) == bool(observed_empty):
+            # Signals agree — nothing to reconcile.
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        # Cooldown: avoid repeated BFS walks within the same window.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_disagreement_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (
+            _now_mono - _last_attempt
+        ) < _REDETECT_COOLDOWN_S:
+            return False
+        # Stamp before any API call so concurrent callers in the same window skip
+        # rather than duplicate the expensive walk.
+        if _proj_id_key:
+            _redetect_disagreement_cooldown[_proj_id_key] = _now_mono
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Re-detected repo emptiness for project %s after "
+            "agent/backend disagreement (durable repo_is_empty=%s, agent "
+            "observed_empty=%s) → fresh repo_is_empty=%s",
+            getattr(project, "id", None),
+            durable,
+            observed_empty,
+            detected.get("repo_is_empty"),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never break the agent run
+        logger.warning(
+            "[BUILD_CONFIG] Emptiness-disagreement re-detection failed for "
+            "project %s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,
         )

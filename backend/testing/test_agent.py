@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from datetime import datetime, timedelta
@@ -24958,6 +24958,140 @@ async def test_agent_reported_build_discovery_fills_build_config(
     verdict = compute_merge_verification_verdict(project)
     assert verdict["state"] == "tests_gated"
     assert any(tc["test_cmd"] == "pytest backend/" for tc in verdict["test_commands"])
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_redetects_on_emptiness_disagreement(
+    client: AsyncClient, db_session
+):
+    """Agent reports observed_repo_is_empty=False against a durable
+    repo_is_empty=True => endpoint re-runs authoritative detection and flips the
+    stale signal (bidirectional re-detect wiring)."""
+    import app.build_config_detection as bcd
+
+    bcd._redetect_disagreement_cooldown.clear()
+    project = Project(
+        name="Discovery Disagreement Project",
+        user_id="user-disc-dis",
+        github_owner="acme",
+        github_repo="disagreement-repo",
+        integration_branch="develop",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [],
+            "repo_is_empty": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc-dis"}],
+        vm_instance_id="vm-disc-dis",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-dis")
+    with (
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value={
+                "language": "python",
+                "directories": [{"path": "backend", "type": "python"}],
+                "repo_is_empty": False,
+                "source_file_count": 17,
+            },
+        ) as mock_detect,
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+    ):
+        resp = await client.post(
+            "/api/agent/build-config-discovery",
+            headers={"x-agent-token": token},
+            json={
+                "discovered_directories": [
+                    {
+                        "path": "backend",
+                        "type": "python",
+                        "test_cmd": "pytest backend/",
+                        "executed_successfully": True,
+                    }
+                ],
+                "observed_repo_is_empty": False,
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["emptiness_redetected"] is True
+    mock_detect.assert_awaited_once()
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("repo_is_empty") is False
+    assert (project.build_config or {}).get("source_file_count") == 17
+    bcd._redetect_disagreement_cooldown.clear()
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_no_redetect_without_observed_signal(
+    client: AsyncClient, db_session
+):
+    """Omitting observed_repo_is_empty leaves the durable signal untouched and
+    reports emptiness_redetected=False (backward compatible with older agents)."""
+    project = Project(
+        name="Discovery No Observed Project",
+        user_id="user-disc-noobs",
+        github_owner="acme",
+        github_repo="no-observed-repo",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [],
+            "repo_is_empty": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc-noobs"}],
+        vm_instance_id="vm-disc-noobs",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-noobs")
+    with patch(
+        "app.routers.admin_onboard._detect_build_config",
+        new_callable=AsyncMock,
+    ) as mock_detect:
+        resp = await client.post(
+            "/api/agent/build-config-discovery",
+            headers={"x-agent-token": token},
+            json={
+                "discovered_directories": [
+                    {
+                        "path": "backend",
+                        "type": "python",
+                        "test_cmd": "pytest backend/",
+                        "executed_successfully": True,
+                    }
+                ]
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["emptiness_redetected"] is False
+    mock_detect.assert_not_awaited()
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("repo_is_empty") is True
 
 
 @pytest.mark.asyncio

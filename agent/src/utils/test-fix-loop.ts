@@ -136,7 +136,14 @@ async function postBuildDiscoveryReport(
   if (discovered_directories.length === 0) return;
 
   try {
-    await apiPost('/api/agent/build-config-discovery', { discovered_directories });
+    // We only reach here after actually executing runnable test suites from a
+    // full clone, so the repo is authoritatively NOT empty. Report that live
+    // verdict so the backend can re-detect when the durable repo_is_empty signal
+    // disagrees (e.g. a greenfield repo that has since gained real source).
+    await apiPost('/api/agent/build-config-discovery', {
+      discovered_directories,
+      observed_repo_is_empty: false,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     sendLog(ws, `WARNING: build-config discovery report failed: ${msg.slice(0, 500)}\n`);

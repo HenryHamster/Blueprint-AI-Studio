@@ -389,6 +389,7 @@ describe('captureTestBaseline build-config discovery reporting', () => {
           executed_successfully: true,
         },
       ],
+      observed_repo_is_empty: false,
     });
   });
 
@@ -404,9 +405,9 @@ describe('captureTestBaseline build-config discovery reporting', () => {
     const workspace = process.env.AGENT_WORKSPACE ?? '/tmp/workspace';
     mockReaddirSync.mockImplementation((p: fs.PathLike) => {
       const s = String(p);
-      if (s === workspace) return ['packages'] as unknown as string[];
-      if (s === `${workspace}/packages`) return ['a', 'b'] as unknown as string[];
-      return [] as unknown as string[];
+      if (s === workspace) return ['packages'];
+      if (s === `${workspace}/packages`) return ['a', 'b'];
+      return [];
     });
     vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
       const s = String(p);
@@ -432,6 +433,7 @@ describe('captureTestBaseline build-config discovery reporting', () => {
           executed_successfully: true,
         },
       ],
+      observed_repo_is_empty: false,
     });
   });
 });
