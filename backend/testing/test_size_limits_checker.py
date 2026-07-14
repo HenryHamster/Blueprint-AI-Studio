@@ -444,3 +444,191 @@ def test_coverage_threshold_in_sync_with_test_invariants():
     from testing import test_invariants
 
     assert csl._COVERAGE_THRESHOLD == test_invariants._COVERAGE_THRESHOLD
+
+
+# ── --base-root baseline mode ─────────────────────────────────────────────────
+# A breach INHERITED from the base branch (same file already over-cap there at
+# the same-or-larger size, judged against the base's own limits JSON) must not
+# fail the check — it is upstream breakage the current change cannot remediate.
+# A breach INTRODUCED here, or one that GREW past its base size, still blocks.
+
+
+def _build_base_repo(tmp_path, *, backend=None, agent=None, frontend=None):
+    """Like _build_repo but under a sibling 'base' dir (a fake base checkout)."""
+    base_dir = tmp_path / "base"
+    base_dir.mkdir(exist_ok=True)
+    return _build_repo(base_dir, backend=backend, agent=agent, frontend=frontend)
+
+
+def test_base_root_preexisting_breach_warn_passes(tmp_path, capsys):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (900, 800)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[pre-existing] backend/big.py" in out
+    assert "[breach]" not in out
+    # The advisory names the upstream remediation path (surface the REASON).
+    assert "chore PR running check_size_limits.py --fix" in out
+    assert "--force-chronic" in out
+
+
+def test_base_root_new_breach_still_blocks(tmp_path, capsys):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (700, 800)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/big.py: 900 lines (cap: 800)" in out
+    assert "[pre-existing]" not in out
+
+
+def test_base_root_grown_breach_blocks_with_growth_reason(tmp_path, capsys):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (950, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (900, 800)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/big.py" in out
+    assert "grew from 900 lines on base" in out
+
+
+def test_base_root_mixed_preexisting_and_new_blocks_on_new_only(tmp_path, capsys):
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"inherited.py": (900, 800), "fresh.py": (850, 800)},
+    )
+    base_repo, _ = _build_base_repo(
+        tmp_path,
+        backend={"inherited.py": (900, 800), "fresh.py": (100, 800)},
+    )
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/fresh.py" in out
+    assert "[pre-existing] backend/inherited.py" in out
+
+
+def test_base_root_preexisting_uncapped_warn_passes(tmp_path, capsys):
+    over = csl._COVERAGE_THRESHOLD + 100
+    repo, jp = _build_repo(tmp_path, backend={"capped.py": (10, 100)})
+    _write_lines(os.path.join(repo, "backend", "app", "huge.py"), over)
+    base_repo, _ = _build_base_repo(tmp_path, backend={"capped.py": (10, 100)})
+    _write_lines(os.path.join(base_repo, "backend", "app", "huge.py"), over)
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[pre-existing] backend/huge.py" in out
+    assert "[uncapped]" not in out
+
+
+def test_base_root_new_uncapped_still_blocks(tmp_path, capsys):
+    over = csl._COVERAGE_THRESHOLD + 100
+    repo, jp = _build_repo(tmp_path, backend={"capped.py": (10, 100)})
+    _write_lines(os.path.join(repo, "backend", "app", "huge.py"), over)
+    base_repo, _ = _build_base_repo(tmp_path, backend={"capped.py": (10, 100)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[uncapped] backend/huge.py" in out
+
+
+def test_base_root_unreadable_baseline_fails_closed(tmp_path, capsys):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    missing_base = str(tmp_path / "nonexistent-base")
+
+    rc = _run(jp, repo, "--base-root", missing_base, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[baseline] unavailable" in out
+    assert "[breach] backend/big.py" in out
+
+
+def test_base_root_judges_base_against_its_own_caps(tmp_path, capsys):
+    # Base file is over the PR's cap but within the BASE's own (higher) cap:
+    # the breach is NOT pre-existing — this change tightened the cap, so it
+    # owns the result and must block.
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (900, 1000)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/big.py" in out
+
+
+def test_base_root_ignored_under_fix(tmp_path):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (900, 800)})
+
+    rc = _run(jp, repo, "--fix", "--base-root", base_repo, "--sections", "backend")
+
+    assert rc == 0
+    data = json.loads(_read(jp))
+    # --fix still bumps the (pre-existing) breach — the flag only affects check mode.
+    assert data["backend"]["big.py"] == bump_size_limit(900)
+
+
+def test_no_base_root_output_unchanged(tmp_path, capsys):
+    # Without --base-root the classic output shape is preserved bit-for-bit
+    # (no baseline lines, plain [breach] with no growth suffix).
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+
+    rc = _run(jp, repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/big.py: 900 lines (cap: 800)\n" in out
+    assert "grew from" not in out
+    assert "[baseline]" not in out
+    assert "[pre-existing]" not in out
+
+
+def test_base_root_breach_not_excused_by_base_uncapped_offender(tmp_path, capsys):
+    # Cross-class mixup guard: the file is a capped BREACH on the PR but was an
+    # UNCAPPED offender (no cap entry) on base at the identical size. The two
+    # baseline maps are class-keyed separately, so the base's uncapped record
+    # must NOT excuse the PR-side breach — a mutation merging the two maps
+    # would wrongly warn-pass here.
+    over = csl._COVERAGE_THRESHOLD + 100
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (over, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"other.py": (10, 100)})
+    _write_lines(os.path.join(base_repo, "backend", "app", "big.py"), over)
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[breach] backend/big.py" in out
+    assert "[pre-existing]" not in out
+
+
+def test_base_root_uncapped_not_excused_by_base_breach(tmp_path, capsys):
+    # Cross-class mixup guard, other direction: the file is an UNCAPPED
+    # offender on the PR (its cap entry was removed) but was a capped BREACH on
+    # base at the identical size. Must block, not warn.
+    over = csl._COVERAGE_THRESHOLD + 100
+    repo, jp = _build_repo(tmp_path, backend={"other.py": (10, 100)})
+    _write_lines(os.path.join(repo, "backend", "app", "big.py"), over)
+    base_repo, _ = _build_base_repo(tmp_path, backend={"big.py": (over, 800)})
+
+    rc = _run(jp, repo, "--base-root", base_repo, "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[uncapped] backend/big.py" in out
+    assert "[pre-existing]" not in out

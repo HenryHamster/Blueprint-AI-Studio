@@ -92,7 +92,21 @@ describe('writeCheckHelper — direct invocation', () => {
     // (not diff-scoped) — a rebase/merge can grow a file in a stack the diff
     // never touched, and the check is sub-second, so it's cheap always-on
     // insurance against burning a CI iteration on a common, trivial breach.
-    expect(script).toContain('run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"');
+    expect(script).toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
+    // Baseline-recheck: on failure, the checker re-runs with --base-root
+    // against a detached worktree of the base branch so a breach INHERITED
+    // from the base (e.g. an upstream merge pushed a chronic offender over
+    // its cap on automain) warn-passes instead of blocking every unrelated
+    // PR — mirroring the viewport/backend-pytest baseline pattern. A NEW or
+    // GROWN breach still fails closed.
+    expect(script).toContain('size guardrail FAILED — checking baseline on origin/$BASE');
+    expect(script).toContain('python3 backend/testing/check_size_limits.py --base-root "$SIZE_GR_WT"');
+    expect(script).toContain('size guardrail WARN — every offender pre-exists on $SIZE_GR_BASE_REF; not blocking this PR');
+    expect(script).toContain('FAILED+=("size guardrail")');
+    // --full skips the baseline recheck (the result IS the new baseline),
+    // matching the viewport gate, so an agent can force a blocking view of a
+    // baseline-warned WARN.
+    expect(script).toContain('size guardrail FAILED (--full, no baseline recheck)');
     // It must NOT be gated on the touched stacks anymore.
     expect(script).not.toContain('SIZE_SECTIONS');
     expect(script).not.toContain('--sections $SIZE_SECTIONS');

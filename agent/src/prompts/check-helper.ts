@@ -55,6 +55,16 @@ function loadVisualCaptureScript(): string {
   try { return fs.readFileSync(_VISUAL_CAPTURE_PATH, 'utf8'); } catch { return ''; }
 }
 
+const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.sh');
+// Unlike the sibling loaders above (which gate OPTIONAL blocks), the size
+// guardrail is an ALWAYS-ON gate: a missing/unreadable fragment must fail
+// ./check closed, not silently emit a script with no size gate at all.
+function loadSizeGuardrailScript(): string {
+  try { return fs.readFileSync(_SIZE_GUARDRAIL_PATH, 'utf8'); } catch {
+    return '\necho "[check] size guardrail fragment missing from agent build — failing closed"\nFAILED+=("size guardrail")\n';
+  }
+}
+
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
  *
  *  For a ci_failure fix task we know the EXACT pytest node-ids CI reported
@@ -660,22 +670,7 @@ ${buildImpactedTestBlock(cfg.taskId)}  fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
 ${cfg.mergeVerify ? buildMergeVerifyBlock(cfg.taskId) : ''}
-
-# Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
-# the line-count caps that backend/testing/test_invariants.py enforces, so a
-# size breach surfaces HERE (before ./pr open) instead of only after a PR is
-# open and a full CI/Docker round-trip is burned. Runs UNCONDITIONALLY (all
-# sections, not diff-scoped): a rebase/merge can grow a file in a stack the
-# diff never touched (e.g. landing a feature whose merge balloons models.py),
-# and a size breach is a common, trivial CI failure we never want to burn a
-# fix iteration on. The checker is sub-second and skips any section whose
-# source tree is absent here, so always-on costs nothing.
-# Invoked BY REFERENCE as a committed script (exactly like the migration-chain
-# guard above) — no embedded Python heredoc (see CLAUDE.md). A breach makes
-# the checker exit non-zero, which \`run\` records in FAILED so ./check fails.
-# Remediate with: python3 backend/testing/check_size_limits.py --fix
-run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"
-`;
+${loadSizeGuardrailScript()}`;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
   //  2. no build_config, Blueprint self-repo → the hardcoded admin-ui/agent/

@@ -24,6 +24,8 @@ Usage (from the repo root, no install step)::
     python3 backend/testing/check_size_limits.py                 # check all sections
     python3 backend/testing/check_size_limits.py --sections backend
     python3 backend/testing/check_size_limits.py --fix           # bump breached caps
+    python3 backend/testing/check_size_limits.py --base-root /tmp/base_wt
+                                  # baseline-aware: block only NEW/GROWN offenders
 
 Stdlib only. The three sections resolve their source roots exactly the way
 ``test_invariants.py`` does: backend -> ``backend/app``, agent -> ``agent/src``,
@@ -301,6 +303,73 @@ def evaluate(
     return checked, skipped
 
 
+def _collect_baseline_offenders(
+    base_root: str, sections: list[str]
+) -> "tuple[dict, dict, str | None]":
+    """Offender maps for a BASE-branch checkout, or why the baseline is unusable.
+
+    Returns ``(breached, uncapped, unavailable_reason)``. ``breached`` maps
+    ``(section, rel) -> line count`` for every file already over its cap on the
+    base checkout — judged against the BASE's own ``module_size_limits.json``
+    (the caps this change inherited), not the PR's. ``uncapped`` maps
+    ``(section, rel) -> line count`` for every base source file over the
+    coverage threshold with no cap entry there. When the base checkout has no
+    readable limits JSON the baseline cannot be computed: both maps come back
+    empty with a reason, so the caller fails CLOSED (every PR-side offender is
+    treated as newly introduced).
+
+    Resolution is hermetic (``use_env_overrides=False``): the ADMIN_UI_SRC /
+    ``/admin-ui/src`` escape hatches would leak the PR tree into the baseline.
+    """
+    base_json = os.path.join(base_root, "backend", "testing", "module_size_limits.json")
+    try:
+        base_data = load_limits(base_json)
+    except (OSError, ValueError) as exc:
+        return {}, {}, f"cannot read {base_json}: {exc}"
+    checked, _skipped = evaluate(base_data, sections, base_root, use_env_overrides=False)
+    breached = {
+        (section, rec["rel"]): rec["count"]
+        for section, recs in checked.items()
+        for rec in recs
+        if rec["breach"]
+    }
+    uncapped: dict = {}
+    for section in sections:
+        root = resolve_section_root(section, base_root, use_env_overrides=False)
+        if root is None:
+            continue
+        suffixes, is_excluded = _SECTION_SCAN[section]
+        caps = base_data.get(section) or {}
+        for rec in scan_uncapped_section(root, caps, suffixes, is_excluded):
+            uncapped[(section, rec["rel"])] = rec["count"]
+    return breached, uncapped, None
+
+
+def _split_preexisting(
+    offenders: "list[tuple[str, dict]]", base_counts: dict
+) -> "tuple[list, list]":
+    """Partition offenders into (blocking, preexisting) against baseline counts.
+
+    An offender is PRE-EXISTING — inherited from the base branch, not this
+    change's responsibility — only when the same file was already an offender of
+    the same class on base AND has not grown past its base line count here. A
+    file that is clean on base, or that GREW while over-cap, is BLOCKING.
+
+    Entries come back as ``(section, rec, base_count)`` — ``base_count`` is
+    ``None`` for an offender absent from the baseline (including the
+    no-baseline case, where ``base_counts`` is empty and everything blocks).
+    """
+    blocking: list = []
+    preexisting: list = []
+    for section, rec in offenders:
+        base_count = base_counts.get((section, rec["rel"]))
+        if base_count is not None and rec["count"] <= base_count:
+            preexisting.append((section, rec, base_count))
+        else:
+            blocking.append((section, rec, base_count))
+    return blocking, preexisting
+
+
 def _parse_sections(raw: str) -> list[str]:
     if raw.strip().lower() == "all":
         return list(SECTIONS)
@@ -350,6 +419,19 @@ def main(argv: list[str] | None = None) -> int:
         dest="repo_root",
         default=None,
         help="repo root used to resolve section source trees (default: inferred)",
+    )
+    parser.add_argument(
+        "--base-root",
+        dest="base_root",
+        default=None,
+        help=(
+            "path to a checkout of the BASE branch (e.g. a detached worktree of "
+            "origin/automain). Check mode then blocks only on offenders "
+            "introduced or grown by this change; an offender already present at "
+            "the same-or-larger size on base (judged against the base's own "
+            "module_size_limits.json) is reported as [pre-existing] and does "
+            "not affect the exit code. Ignored under --fix."
+        ),
     )
     args = parser.parse_args(argv)
     repo_root_explicit = args.repo_root is not None
@@ -458,33 +540,81 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    # Baseline comparison: with --base-root, only offenders INTRODUCED or GROWN
+    # by this change block; offenders inherited from the base branch at the same
+    # or larger size there are reported as [pre-existing] and never fail the
+    # check — an upstream breach (e.g. a merge that pushed a chronic offender
+    # over its cap on automain) must not block every unrelated PR. An unreadable
+    # baseline fails CLOSED: everything is treated as newly introduced.
+    base_breached: dict = {}
+    base_uncapped: dict = {}
+    if args.base_root:
+        base_breached, base_uncapped, baseline_reason = _collect_baseline_offenders(
+            args.base_root, args.sections
+        )
+        if baseline_reason:
+            print(
+                f"[baseline] unavailable ({baseline_reason}) — treating every "
+                "offender as introduced by this change"
+            )
+
     exit_code = 0
-    if breaches:
-        for section, rec in breaches:
+    blocking_breaches, preexisting_breaches = _split_preexisting(
+        breaches, base_breached
+    )
+    if blocking_breaches:
+        for section, rec, base_count in blocking_breaches:
+            grew = f"; grew from {base_count} lines on base" if base_count is not None else ""
             print(
                 f"[breach] {section}/{rec['rel']}: {rec['count']} lines "
-                f"(cap: {rec['cap']})"
+                f"(cap: {rec['cap']}){grew}"
             )
         print(
-            f"\n{len(breaches)} size breach(es). Run with --fix to bump the "
-            f"breached caps to the canonical policy value."
+            f"\n{len(blocking_breaches)} size breach(es). Run with --fix to bump "
+            f"the breached caps to the canonical policy value."
         )
         exit_code = 1
 
-    if uncapped:
-        for section, rec in uncapped:
+    blocking_uncapped, preexisting_uncapped = _split_preexisting(
+        uncapped, base_uncapped
+    )
+    if blocking_uncapped:
+        for section, rec, base_count in blocking_uncapped:
+            grew = f"; grew from {base_count} lines on base" if base_count is not None else ""
             print(
                 f"[uncapped] {section}/{rec['rel']}: {rec['count']} lines "
-                f"(threshold: {_COVERAGE_THRESHOLD}) — NO cap entry"
+                f"(threshold: {_COVERAGE_THRESHOLD}) — NO cap entry{grew}"
             )
         print(
-            f"\n{len(uncapped)} uncapped file(s) over {_COVERAGE_THRESHOLD} lines "
-            f"violate the size guardrail (no cap entry). Run with --fix to add a "
-            f"cap entry (current size + policy headroom)."
+            f"\n{len(blocking_uncapped)} uncapped file(s) over "
+            f"{_COVERAGE_THRESHOLD} lines violate the size guardrail (no cap "
+            f"entry). Run with --fix to add a cap entry (current size + policy "
+            f"headroom)."
         )
         exit_code = 1
 
-    if exit_code == 0:
+    preexisting = [
+        ("cap breach", section, rec, base_count)
+        for section, rec, base_count in preexisting_breaches
+    ] + [
+        ("uncapped", section, rec, base_count)
+        for section, rec, base_count in preexisting_uncapped
+    ]
+    if preexisting:
+        for kind, section, rec, base_count in preexisting:
+            print(
+                f"[pre-existing] {section}/{rec['rel']}: {rec['count']} lines "
+                f"({kind}; already {base_count} lines on base) — inherited from "
+                f"the base branch, not introduced by this change"
+            )
+        print(
+            f"\n{len(preexisting)} pre-existing offender(s) inherited from the "
+            f"base branch — NOT blocking this change. Upstream remediation "
+            f"needed: a dedicated chore PR running check_size_limits.py --fix "
+            f"(chronic offenders require operator approval via --force-chronic)."
+        )
+
+    if exit_code == 0 and not preexisting:
         print("All scoped files within their size caps.")
     return exit_code
 
