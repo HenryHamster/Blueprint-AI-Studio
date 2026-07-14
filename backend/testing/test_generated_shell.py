@@ -901,6 +901,20 @@ def _read_packer_hcl() -> str:
     return _PACKER_HCL.read_text(encoding="utf-8")
 
 
+def test_packer_requires_codex_cli_with_gpt_5_6_picker():
+    hcl = _read_packer_hcl()
+    gate = next(
+        line.strip()
+        for line in hcl.splitlines()
+        if "Codex CLI >= 0.144.1 required for GPT-5.6 models" in line
+    )
+    assert gate.startswith('"codex_version=$(codex --version | awk')
+    assert "awk '{print $NF}'" in gate
+    assert 'dpkg --compare-versions \\"$codex_version\\" ge 0.144.1' in gate
+    assert "|| { echo" in gate
+    assert "exit 1; }" in gate
+
+
 def _read_packer_memo_smoke() -> str:
     if not _PACKER_MEMO_SMOKE.exists():
         pytest.skip("agent/src/handlers/memo-bake-smoke.ts not present")
