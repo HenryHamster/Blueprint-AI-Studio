@@ -16218,6 +16218,60 @@ def test_append_progress_sample_does_not_mutate_input():
     assert original["other"] == "data"
 
 
+def test_merge_progress_report_bridges_new_records_to_progress_series():
+    """_merge_progress_report returns new_records so callers can bridge them into
+    progress_series — the key the no-progress watchdog reads.  Verify that the
+    returned new_records list is non-empty and maps to the correct shape expected
+    by append_progress_sample (metric/value fields present)."""
+    from app.routers.runner import _merge_progress_report
+    from app.compute_jobs import append_progress_sample, _no_progress_stalled
+    from app.models import ComputeJob, ComputeJobStatus, _utcnow
+    import uuid
+
+    now = _utcnow()
+    raw = {
+        "records": [
+            {"metric": "reward", "value": 1.0, "ts": "2026-01-01T00:00:00"},
+            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:00:01"},
+        ],
+        "count": 2,
+    }
+    merged, new_records = _merge_progress_report(None, raw, now)
+
+    assert merged is not None, "merged dict must be returned for valid payload"
+    assert len(new_records) == 2, "both records are new and must be returned"
+    assert new_records[0]["metric"] == "reward"
+    assert new_records[1]["value"] == 2.0
+
+    # Bridge new_records into progress_series the same way the route handler does.
+    meta: dict = {}
+    for rec in new_records:
+        meta = append_progress_sample(
+            meta,
+            metric=rec["metric"],
+            value=rec["value"],
+            t=rec.get("ts") or now.isoformat(),
+        )
+
+    series = meta.get("progress_series", [])
+    assert len(series) == 2
+    assert series[0]["name"] == "reward"
+    assert series[0]["value"] == 1.0
+    assert series[1]["value"] == 2.0
+
+    # Confirm the watchdog can now read progress for a runner job.
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata=meta,
+        declared_metric="reward",
+    )
+    # Two ascending samples — watchdog must NOT stall (metric is advancing).
+    assert _no_progress_stalled(job, now=now) is False
+
+
 @pytest.mark.asyncio
 async def test_compute_job_vm_heartbeat_stores_progress_sample(
     client, db_session, monkeypatch

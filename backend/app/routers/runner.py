@@ -42,6 +42,7 @@ from app.auth import create_agent_token, get_current_runner
 from app.broadcast import broadcast_to_project
 from app.runner_project_binding import allowed_project_ids
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_jobs import append_progress_sample
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
 from app.runner_pull_skip import (
@@ -185,7 +186,7 @@ def _filter_progress_record(raw: Any) -> dict | None:
     return record
 
 
-def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | None:
+def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> tuple[dict | None, list]:
     """Validate a runner progress payload and merge it into the stored state.
 
     The runner sends ``{"records": [last ≤20 records], "count": total}`` on each
@@ -197,14 +198,14 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | Non
     stored state untouched. Garbage of any shape degrades to None, never a 500.
     """
     if not isinstance(raw, dict):
-        return None
+        return None, []
     raw_records = raw.get("records")
     if not isinstance(raw_records, list) or not raw_records:
-        return None
+        return None, []
     if len(raw_records) > _MAX_PROGRESS_RECORDS_PER_REPORT * 5:
         # Wildly oversized payload: reject wholesale rather than paying to
         # validate an unbounded list (the runner never sends more than 20).
-        return None
+        return None, []
     records = [
         rec
         for rec in (
@@ -214,7 +215,7 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | Non
         if rec is not None
     ]
     if not records:
-        return None
+        return None, []
 
     prev_records: list = []
     prev_count = 0
@@ -245,7 +246,7 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | Non
     if delta <= 0:
         # Re-sent snapshot with nothing new — keep the stored state (its
         # updated_at keeps meaning "when the last NEW record arrived").
-        return None
+        return None, []
     new_records = records[-min(delta, len(records)):]
     # Suffix-dedup backstop: a retried report whose count DISAGREES with its
     # validated records (count bumped, tail re-sent verbatim) passes the delta
@@ -259,13 +260,13 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> dict | Non
                 break
     if not new_records:
         # Every incoming record was already stored — treat as a re-send.
-        return None
+        return None, []
     merged = (prev_records + new_records)[-_MAX_PROGRESS_RECORDS_STORED:]
     return {
         "records": merged,
         "count": max(count, len(merged)),
         "updated_at": now.isoformat(),
-    }
+    }, new_records
 
 
 def _runner_capability_list(capabilities: Dict[str, Any], key: str) -> List[Any]:
@@ -1857,11 +1858,18 @@ async def report_compute_job(
             elif isinstance(payload.command_log, str):
                 meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
         if payload.progress is not None:
-            merged_progress = _merge_progress_report(
+            merged_progress, new_progress_records = _merge_progress_report(
                 meta.get("progress"), payload.progress, now
             )
             if merged_progress is not None:
                 meta["progress"] = merged_progress
+                for rec in new_progress_records:
+                    meta = append_progress_sample(
+                        meta,
+                        metric=rec["metric"],
+                        value=rec["value"],
+                        t=rec.get("ts") or now.isoformat(),
+                    )
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
         if isinstance(payload.resume_hydration, dict):

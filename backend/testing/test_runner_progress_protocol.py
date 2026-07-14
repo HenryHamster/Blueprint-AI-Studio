@@ -349,7 +349,8 @@ class TestMergeProgressReport:
         from app.routers.runner import _merge_progress_report
         from app.models import _utcnow
 
-        return _merge_progress_report(existing, raw, _utcnow())
+        merged, _new_records = _merge_progress_report(existing, raw, _utcnow())
+        return merged
 
     def test_invalid_count_treats_validated_records_as_new(self):
         merged = self._merge(
