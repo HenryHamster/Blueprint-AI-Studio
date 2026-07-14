@@ -234,6 +234,38 @@ def test_author_contract_omits_absent_gpu_fields():
     assert "provisioning_model" not in contract
 
 
+def test_author_contract_forwards_min_compute_capability():
+    # min_compute_capability (the image's GPU-arch floor) is forwarded so the
+    # dispatch eligibility gate can hold a job that would fail on an older GPU.
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 900,
+        "container_image": "my-sm80-image:latest",
+        "min_compute_capability": 8.0,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["min_compute_capability"] == 8.0
+    # Nested form overrides flat, mirroring accelerator/vram_gb.
+    nested = _author_compute_launch_contract(
+        {
+            "min_compute_capability": 7.0,
+            "compute_experiment": {
+                "command": "c",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 60,
+                "min_compute_capability": 8.9,
+            },
+        }
+    )
+    assert nested["min_compute_capability"] == 8.9
+    # Absent ⇒ omitted from the contract entirely.
+    bare = _author_compute_launch_contract(
+        {"command": "c", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    )
+    assert "min_compute_capability" not in bare
+
+
 def test_author_contract_forwards_sweep_id():
     # sweep_id is forwarded when present so the completion handler can route the
     # result through the sweep aggregate path instead of the standalone verdict path.

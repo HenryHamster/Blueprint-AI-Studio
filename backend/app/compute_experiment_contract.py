@@ -174,6 +174,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "input_artifact_job_id",
         "runner_target",
         "vram_gb",
+        "min_compute_capability",
     ):
         val = _pick(opt_key)
         if val is not None:

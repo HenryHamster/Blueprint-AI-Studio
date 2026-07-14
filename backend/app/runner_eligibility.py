@@ -191,6 +191,45 @@ def _runner_has_free_vram(
     return any(mib >= required_mib for mib in free_mib_list)
 
 
+def _runner_meets_min_compute_capability(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    min_cc: float,
+) -> bool:
+    """Whether any GPU on this runner meets an image's CUDA compute-capability floor.
+
+    A container image is built for a specific set of GPU architectures (its bundled
+    CUDA/torch wheels carry compiled SASS/PTX only for those). Sent to a box whose
+    GPU is OLDER than the image's floor — an ``sm_80``-built image on a V100
+    (``sm_70``) — the job launches and then dies inside the sandbox ("no kernel
+    image is available for execution"). Today that is only caught REACTIVELY by the
+    runner's in-sandbox probe, which fails the job terminally, and nothing stops the
+    same doomed ``(runner, image)`` pairing from being re-selected and thrashing.
+
+    Reads the heartbeat-reported ``gpu_compute_capabilities`` list (one CUDA compute
+    capability float per GPU, index-aligned with ``gpu_names``: ``7.0`` for a V100,
+    ``8.9`` for an L40S) and returns True when at least one GPU meets ``min_cc``.
+
+    As with :func:`_runner_has_free_vram`, absence of telemetry is NOT a
+    disqualification: a runner that never reports ``gpu_compute_capabilities``
+    (older runner, or one that does not expose nvidia-smi) is treated as eligible —
+    we gate dispatch only on real contradicting data, never on missing data, so a
+    legitimately-configured runner is never demoted (backward compatible). The
+    reactive in-sandbox probe remains the safety net for those. A non-positive floor
+    is no floor at all.
+    """
+    if min_cc <= 0:
+        return True
+    caps = runner.capabilities or {}
+    cc_list = caps.get("gpu_compute_capabilities")
+    if not isinstance(cc_list, list) or not cc_list:
+        return True
+    try:
+        return any(float(cc) >= min_cc for cc in cc_list)
+    except (TypeError, ValueError):
+        # Malformed telemetry entry — do not gate on data we cannot trust.
+        return True
+
+
 def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
     """Whether a runner is trustworthy GPU-capable for accelerator dispatch.
 
@@ -227,6 +266,49 @@ def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
         return len(gpu_names) > 0
     # No GPU telemetry reported at all — trust the self-report (backward compatible).
     return True
+
+
+def _runner_gpu_in_container_capable(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> bool:
+    """Whether a runner's container backend can pass GPUs through to containers.
+
+    When a job declares BOTH ``container_image`` AND ``accelerator``/``vram_gb``,
+    the runner must be able to expose GPUs *inside* the container — not merely
+    have a container runtime and a GPU independently (today a runner with both
+    can receive such a job and fail at runtime with "no supported GPU detected").
+
+    * **Non-docker** containers (podman, apptainer, enroot) handle GPU passthrough
+      natively — they are capable whenever the backend is available.
+    * **Docker** requires either CDI GPU support (``docker_cdi_gpu``, heartbeated
+      via ``isolation_backends``) or an nvidia-runtime hook (implied by a docker
+      runner with verified GPU capability). Both paths can pass GPUs into the
+      container (CDI via ``--device nvidia.com/gpu=N``, hook via ``--gpus``).
+
+    Returns ``False`` when no container backend is available or when a docker-only
+    runner lacks both CDI and GPU capability.
+    """
+    caps = runner.capabilities or {}
+    backends = caps.get("isolation_backends")
+    if not isinstance(backends, dict):
+        return False
+
+    # Non-docker containers handle GPU passthrough natively.
+    non_docker_keys = _CONTAINER_BACKEND_KEYS - {"docker_usable"}
+    if any(backends.get(k) for k in non_docker_keys):
+        return True
+
+    # Docker needs explicit GPU passthrough: CDI or nvidia-hook.
+    if backends.get("docker_usable"):
+        # CDI → explicit GPU-in-container support via --device nvidia.com/gpu=N.
+        if backends.get("docker_cdi_gpu"):
+            return True
+        # No CDI but the runner has verified GPU capability → nvidia-hook
+        # (--gpus device=... flag works).  Hook daemons return docker_cdi_gpu=False
+        # but are equally capable of exposing GPUs inside containers.
+        return bool(_runner_gpu_capable(runner))
+
+    return False
 
 
 def _runner_max_concurrent_compute(

@@ -218,6 +218,60 @@ def _coerce_vram_gb(payload: dict) -> tuple[float | None, str | None]:
     return value, None
 
 
+def _coerce_min_compute_capability(payload: dict) -> tuple[float | None, str | None]:
+    """Resolve an image's ``min_compute_capability`` floor to a float, or an error.
+
+    ``min_compute_capability`` is the CUDA compute-capability an image's bundled
+    GPU wheels require (e.g. ``8.0`` for an ``sm_80``-built image). It is the same
+    class of AGENT/OPERATOR-AUTHORED free-form payload data as ``vram_gb`` and is
+    read in the dispatch hot path, so it gets the identical defensive contract: a
+    bare ``float(raw)`` would raise on the values authors actually write (``"8.0"``
+    with a stray unit, ``[8.0]``, ``{}``) and that exception would propagate out of
+    the dispatch cycle, taking down dispatch for EVERY task in the cycle while the
+    offending task dies later, reasonless, in poison quarantine.
+
+    Returns ``(value, None)`` on success or ``(None, error)`` on a value that
+    cannot be a compute-capability figure — the caller fails THAT task with a
+    message naming the bad field and the cycle survives. ``None`` (unset) and a
+    non-positive figure both mean "no floor" and are not errors. ``bool`` is
+    rejected explicitly (an ``int`` subclass, so ``float(True) == 1.0`` would
+    silently mean a 1.0 floor).
+    """
+    raw = payload.get("min_compute_capability") or (
+        payload.get("compute_experiment") or {}
+    ).get("min_compute_capability")
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return None, (
+            f"min_compute_capability must be a CUDA compute-capability number "
+            f"(e.g. 7.0 or 8.9); got boolean {raw!r}"
+        )
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except (ValueError, TypeError):
+            return None, (
+                f"min_compute_capability must be a CUDA compute-capability number "
+                f"(e.g. 7.0 or 8.9); got {raw!r} — drop the unit suffix and requeue"
+            )
+    else:
+        return None, (
+            f"min_compute_capability must be a CUDA compute-capability number "
+            f"(e.g. 7.0 or 8.9); got {type(raw).__name__} {raw!r}"
+        )
+    if not math.isfinite(value):
+        return None, (
+            f"min_compute_capability must be a finite CUDA compute-capability "
+            f"number (e.g. 7.0 or 8.9); got {raw!r}"
+        )
+    if value <= 0:
+        return None, None  # non-positive floor == no floor
+    return value, None
+
+
 # ── Runner eligibility predicates ────────────────────────────────────────────
 # Moved to app/runner_eligibility.py. This module is a chronic size-limit
 # offender (decomposition required; cap bumps are forbidden by
@@ -236,10 +290,12 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_at_capacity,
     _runner_at_compute_capacity,
     _runner_gpu_capable,
+    _runner_gpu_in_container_capable,
     _runner_handles_task_type,
     _runner_has_container_capability,
     _runner_has_free_vram,
     _runner_max_concurrent_compute,
+    _runner_meets_min_compute_capability,
 )
 
 
@@ -490,6 +546,18 @@ async def _try_runner_dispatch(
             vram_error,
         )
         return False
+    # A declared min_compute_capability (image GPU-arch floor) restricts eligibility
+    # to runners whose GPUs meet it. Coerced defensively like vram_gb — a bad value
+    # declines to pin (falls through to the compute path, which fails IT honestly).
+    min_compute_capability, min_cc_error = _coerce_min_compute_capability(payload)
+    if min_cc_error is not None:
+        logger.warning(
+            "[RUNNERS] Not pinning task %s to a runner: invalid "
+            "min_compute_capability — %s",
+            task.id,
+            min_cc_error,
+        )
+        return False
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -500,6 +568,7 @@ async def _try_runner_dispatch(
         dispatch_seed=task.id.int,
         container_image=container_image,
         vram_gb=vram_gb,
+        min_compute_capability=min_compute_capability,
         # Runners that recently declined THIS task are excluded — otherwise the
         # per-task-stable tiebreak re-pins it to the same runner that just said
         # no, and the pin→pull→decline loop never terminates.
@@ -763,6 +832,7 @@ async def _diagnose_strict_runner_pin_hold(
     accelerator: str | None,
     container_image: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
+    min_compute_capability: float | None = None,
     declined_record: dict | None = None,
 ) -> tuple[str, str]:
     """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
@@ -834,6 +904,24 @@ async def _diagnose_strict_runner_pin_hold(
                 f"job declares container_image {container_image!r} but the "
                 "runner advertises no container isolation backend",
             )
+        if min_compute_capability and not _runner_meets_min_compute_capability(
+            snapshot, min_compute_capability
+        ):
+            reported = (snapshot.capabilities or {}).get("gpu_compute_capabilities")
+            return (
+                "incompatible_gpu_arch",
+                f"job requires GPU compute capability >= {min_compute_capability} "
+                f"but the runner's GPUs report {reported} — the image cannot run on "
+                "this architecture",
+            )
+        if accelerator and container_image and not _runner_gpu_in_container_capable(snapshot):
+            return (
+                "missing_gpu_in_container_capability",
+                f"job declares both container_image {container_image!r} and "
+                f"accelerator {accelerator!r} but the runner's container backend "
+                "cannot expose GPUs inside the container (no CDI and no "
+                "nvidia-hook for docker; no native GPU-capable container runtime)",
+            )
         return ("not_eligible", "runner failed dispatch eligibility this cycle")
 
     # Not in the live cache — distinguish unknown / cross-project / offline via
@@ -901,6 +989,7 @@ def _select_eligible_runner(
     container_image: str | None = None,
     forced_runner_target_id: str | None = None,
     vram_gb: float | None = None,
+    min_compute_capability: float | None = None,
     declined_runner_ids: set[str] | None = None,
     declined_exclusion_advisory: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
@@ -915,6 +1004,11 @@ def _select_eligible_runner(
     ``container_image`` is declared the runner must advertise a container isolation
     backend (docker, podman, etc.) — the orchestrator will not route a
     container-image-dependent job to a runner whose isolation support is unknown.
+    When a ``min_compute_capability`` floor is declared (an image's GPU-arch
+    requirement) a runner must have at least one GPU whose reported
+    ``gpu_compute_capabilities`` meets it — an older-arch box (a V100 for an
+    ``sm_80`` image) is excluded so the job holds for compatible hardware instead
+    of dying in the runner's reactive in-sandbox probe.
     A preferred runner wins only after those eligibility checks pass; otherwise
     selection prefers the least EFFECTIVE load — heartbeat-reported active count
     plus pins already made to the runner this cycle — so a same-cycle burst spreads
@@ -985,9 +1079,32 @@ def _select_eligible_runner(
             out = [r for r in out if _runner_gpu_capable(r)]
         if container_image:
             out = [r for r in out if _runner_has_container_capability(r)]
+        if accelerator and container_image:
+            # Combined gate: when BOTH a container image AND an accelerator are
+            # required, the runner must be GPU-in-container capable — merely
+            # having a container runtime AND a GPU independently is not enough
+            # (the job would launch in the container and fail at runtime with
+            # "no supported GPU detected"). A CDI daemon
+            # (docker_cdi_gpu) or an nvidia-hook docker runner (has_gpu verified)
+            # both satisfy this gate; non-docker containers (podman, apptainer,
+            # enroot) handle GPU passthrough natively.
+            out = [r for r in out if _runner_gpu_in_container_capable(r)]
         if vram_gb is not None and vram_gb > 0:
             required_mib = int(vram_gb * 1024)
             out = [r for r in out if _runner_has_free_vram(r, required_mib)]
+        if min_compute_capability is not None and min_compute_capability > 0:
+            # GPU-arch gate: an image built for a newer architecture (its bundled
+            # CUDA/torch wheels carry SASS only for that floor) cannot run on an
+            # older GPU. Exclude runners whose reported gpu_compute_capabilities are
+            # all below the image's floor so the job holds for compatible hardware
+            # instead of being sent and dying in the reactive in-sandbox probe.
+            # Runners that do not report the telemetry are not gated (backward
+            # compatible; the in-sandbox probe stays their safety net).
+            out = [
+                r
+                for r in out
+                if _runner_meets_min_compute_capability(r, min_compute_capability)
+            ]
         return out
 
     if declined_runner_ids and not forced_runner_target_id:
@@ -1484,6 +1601,18 @@ async def _dispatch_compute_experiment_directly(
             "compute_launch_failed",
             "Compute experiment misconfigured: " + vram_error,
         )
+    # min_compute_capability (flat or nested) is the image's GPU-arch floor; it
+    # gates runner eligibility on gpu_compute_capabilities. AGENT/OPERATOR-AUTHORED,
+    # so a bad value fails THIS task with an honest message (never raises in the
+    # dispatch hot path). Same terminal-fail contract as the vram_gb check above.
+    min_compute_capability, min_cc_error = _coerce_min_compute_capability(payload)
+    if min_cc_error is not None:
+        return await _fail_compute_experiment_task(
+            session,
+            task,
+            "compute_launch_failed",
+            "Compute experiment misconfigured: " + min_cc_error,
+        )
 
     # Launch-contract runner pin (operator or agent authored). The pin id feeds
     # the existing preferred-runner seam; ``strict`` additionally forbids any
@@ -1510,6 +1639,7 @@ async def _dispatch_compute_experiment_directly(
         container_image=container_image,
         forced_runner_target_id=forced_runner_target_id,
         vram_gb=vram_gb,
+        min_compute_capability=min_compute_capability,
         declined_runner_ids=recently_declined_runner_ids(task),
         declined_exclusion_advisory=decline_exclusion_is_advisory(
             task, "compute_experiment"
@@ -1537,6 +1667,7 @@ async def _dispatch_compute_experiment_directly(
             accelerator,
             container_image,
             runner_pins_this_cycle,
+            min_compute_capability=min_compute_capability,
             # A strict `runner_target` pin is passed to _select_eligible_runner as
             # a SOFT preference, so the decline exclusion DOES drop the pinned
             # runner from the candidate pool (unlike an operator hard pin, which
@@ -1651,6 +1782,51 @@ async def _dispatch_compute_experiment_directly(
             task.id,
         )
         return "held"
+
+    # ── GPU-arch hold: a min_compute_capability floor is declared and at least one
+    # live runner has a GPU but its architecture is too OLD to run the image
+    # (gpu_compute_capabilities all below the floor) → keep QUEUED with an honest
+    # "awaiting GPU with compute capability >= X.Y" reason instead of dispatching
+    # to a box where the job would die in the reactive in-sandbox probe. Fires only
+    # when a GPU-capable-but-wrong-arch runner exists (`arch_blocked`), so the arch
+    # floor is a genuine blocker for this fleet and not a stand-in for a more
+    # fundamental gate (no GPU at all, no container runtime — those own their own
+    # holds/fallbacks). Placed BEFORE the container-image hold so an
+    # otherwise-container-capable runner that fails only on GPU arch reports the
+    # accurate reason. Reuses the container-runner hold stamp so the existing
+    # bounded-wait sweep (15-min early alert, 6h terminal fail) covers it unchanged.
+    if runner is None and min_compute_capability:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        arch_blocked = any(
+            _runner_gpu_capable(r)
+            and not _runner_meets_min_compute_capability(r, min_compute_capability)
+            for r in project_runners
+        )
+        if arch_blocked:
+            hold_msg = (
+                f"awaiting GPU with compute capability >= {min_compute_capability}: "
+                "no live runner has a GPU whose architecture can run this image "
+                "(its GPUs report a lower CUDA compute capability)."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: min_compute_capability "
+                "%.1f declared but no GPU-arch-compatible runner available",
+                task.id,
+                min_compute_capability,
+            )
+            return "held"
 
     # ── Container-image hold: image declared + registered runners but none
     # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.

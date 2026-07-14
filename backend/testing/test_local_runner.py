@@ -626,6 +626,137 @@ def test_select_eligible_runner_excludes_gpu_liar_prefers_honest_runner():
     )
 
 
+def test_runner_meets_min_compute_capability_gates_on_reported_arch():
+    """`_runner_meets_min_compute_capability` returns True only when a reported GPU
+    meets the floor; absent/malformed telemetry and a non-positive floor never gate."""
+    # A V100 box (sm_70) reports compute capability 7.0.
+    v100 = _snapshot({"gpu_compute_capabilities": [7.0]})
+    # An L40S box (sm_89) reports 8.9.
+    l40s = _snapshot({"gpu_compute_capabilities": [8.9]})
+
+    # Floor met by the newer arch, not by the older one.
+    assert orch._runner_meets_min_compute_capability(l40s, 8.0) is True
+    assert orch._runner_meets_min_compute_capability(v100, 8.0) is False
+    # Exactly-at-floor counts (>= semantics).
+    assert orch._runner_meets_min_compute_capability(v100, 7.0) is True
+    # Any ONE GPU meeting the floor is enough (mixed fleet on one box).
+    mixed = _snapshot({"gpu_compute_capabilities": [7.0, 8.9]})
+    assert orch._runner_meets_min_compute_capability(mixed, 8.0) is True
+
+    # A non-positive floor is no floor at all.
+    assert orch._runner_meets_min_compute_capability(v100, 0.0) is True
+    assert orch._runner_meets_min_compute_capability(v100, -1.0) is True
+
+    # Absence of telemetry is NOT a disqualification (backward compatible — the
+    # reactive in-sandbox probe remains the safety net for such runners).
+    assert orch._runner_meets_min_compute_capability(_snapshot({}), 8.0) is True
+    assert (
+        orch._runner_meets_min_compute_capability(
+            _snapshot({"gpu_compute_capabilities": []}), 8.0
+        )
+        is True
+    )
+    # Malformed telemetry is not trusted to gate.
+    assert (
+        orch._runner_meets_min_compute_capability(
+            _snapshot({"gpu_compute_capabilities": ["oops"]}), 8.0
+        )
+        is True
+    )
+
+
+def test_coerce_min_compute_capability_defensive():
+    """`_coerce_min_compute_capability` accepts numbers/numeric strings, rejects
+    junk with an honest error, and treats unset/non-positive as no floor."""
+    assert orch._coerce_min_compute_capability({}) == (None, None)
+    assert orch._coerce_min_compute_capability({"min_compute_capability": 8.0}) == (
+        8.0,
+        None,
+    )
+    assert orch._coerce_min_compute_capability({"min_compute_capability": "7.0"}) == (
+        7.0,
+        None,
+    )
+    # Nested compute_experiment form is read too.
+    assert orch._coerce_min_compute_capability(
+        {"compute_experiment": {"min_compute_capability": 8.9}}
+    ) == (8.9, None)
+    # Non-positive floor == no floor (not an error).
+    assert orch._coerce_min_compute_capability({"min_compute_capability": 0}) == (
+        None,
+        None,
+    )
+    # Junk fails THIS task with a naming error, never raises.
+    val, err = orch._coerce_min_compute_capability({"min_compute_capability": "8.0sm"})
+    assert val is None and err is not None and "8.0sm" in err
+    # bool is rejected explicitly (int subclass would otherwise mean a 1.0 floor).
+    val, err = orch._coerce_min_compute_capability({"min_compute_capability": True})
+    assert val is None and err is not None
+    # inf is rejected (finite guard).
+    val, err = orch._coerce_min_compute_capability(
+        {"min_compute_capability": float("inf")}
+    )
+    assert val is None and err is not None
+
+
+def test_select_eligible_runner_excludes_incompatible_gpu_arch():
+    """A runner whose GPU arch is below an image's compute-capability floor is
+    excluded from dispatch; a runner meeting the floor is selected instead."""
+    project_id = uuid.uuid4()
+    v100 = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["Tesla V100"],
+            "gpu_compute_capabilities": [7.0],
+        }
+    )
+    l40s = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["L40S"],
+            "gpu_compute_capabilities": [8.9],
+        }
+    )
+    cache = {project_id: [v100, l40s]}
+
+    # An sm_80-floor image routes to the L40S, never the V100.
+    chosen = orch._select_eligible_runner(
+        cache,
+        project_id,
+        "compute_experiment",
+        "gpu",
+        {},
+        min_compute_capability=8.0,
+    )
+    assert chosen is l40s
+
+    # With ONLY the V100 available, an sm_80 image finds no eligible runner (it
+    # holds for compatible hardware rather than dying in the in-sandbox probe).
+    v100_only = {project_id: [v100]}
+    assert (
+        orch._select_eligible_runner(
+            v100_only,
+            project_id,
+            "compute_experiment",
+            "gpu",
+            {},
+            min_compute_capability=8.0,
+        )
+        is None
+    )
+    # Without a floor, the V100 is a perfectly good runner (gate is a no-op).
+    assert (
+        orch._select_eligible_runner(
+            v100_only, project_id, "compute_experiment", "gpu", {}
+        )
+        is v100
+    )
+
+
 class TestRunnerHealthAgentUnavailableReason:
     """_runner_health() surfaces agent_unavailable_reason from capabilities JSONB."""
 
@@ -8396,6 +8527,186 @@ class TestDirectComputeExperimentDispatch:
         assert hold is not None
         assert hold["reason_code"] == "missing_gpu"
         assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_holds_when_gpu_in_container_unavailable(
+        self, db_session
+    ):
+        """A strict pin to a docker runner with GPU but no CDI/hook for a job
+        declaring BOTH container_image and accelerator holds with the combined
+        missing_gpu_in_container_capability reason, not the individual gates."""
+        project = await _make_project(db_session)
+        docker_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="T4",
+                    container_image="my-image:latest",
+                    runner_target={"runner_id": str(docker_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [docker_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_gpu_in_container_capability", (
+            f"expected 'missing_gpu_in_container_capability', got {hold['reason_code']}"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_launch_holds_when_no_gpu_arch_compatible_runner(self, db_session):
+        """ACCEPTANCE: an image declaring a min_compute_capability above a runner's
+        advertised gpu_compute_capabilities is NOT dispatched to that runner — the
+        job holds QUEUED with an honest 'awaiting GPU with compute capability >= X.Y'
+        reason instead of being sent and failing the in-sandbox probe."""
+        project = await _make_project(db_session)
+        # A V100 box (sm_70) that is otherwise perfectly eligible: GPU-capable,
+        # container-capable, right task types — only its GPU ARCH is too old.
+        v100_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["Tesla V100"],
+                "gpu_compute_capabilities": [7.0],
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="gpu",
+                    container_image="my-sm80-image:latest",
+                    min_compute_capability=8.0,
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [v100_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        # Honest, arch-specific reason surfaced to the operator.
+        assert "compute capability >= 8.0" in (task.latest_status_message or ""), (
+            f"expected an arch-specific hold reason, got "
+            f"{task.latest_status_message!r}"
+        )
+        # No job was dispatched to the incompatible box.
+        assert await _compute_job_for_task(db_session, task.id) is None
+        # Reuses the bounded-wait container-hold stamp so the existing sweep covers it.
+        assert (task.context or {}).get("awaiting_container_runner_since")
+
+    @pytest.mark.asyncio
+    async def test_strict_pin_holds_when_gpu_arch_incompatible(self, db_session):
+        """A strict pin to a runner whose GPU arch is below the image's floor holds
+        with the incompatible_gpu_arch reason, not a generic not_eligible."""
+        project = await _make_project(db_session)
+        v100_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["Tesla V100"],
+                "gpu_compute_capabilities": [7.0],
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="gpu",
+                    container_image="my-sm80-image:latest",
+                    min_compute_capability=8.0,
+                    runner_target={"runner_id": str(v100_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [v100_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "incompatible_gpu_arch", (
+            f"expected 'incompatible_gpu_arch', got {hold['reason_code']}"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_launch_pins_arch_compatible_runner(self, db_session):
+        """Sanity: an image floor MET by the runner's GPU arch dispatches normally —
+        the gate is a no-op when the hardware is compatible."""
+        project = await _make_project(db_session)
+        l40s_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["L40S"],
+                "gpu_compute_capabilities": [8.9],
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(accelerator="gpu", min_compute_capability=8.0)],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [l40s_runner]}, {}
+        )
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(
+            l40s_runner.id
+        )
 
     @pytest.mark.asyncio
     async def test_strict_pin_hold_stable_reason_not_rewritten_each_cycle(

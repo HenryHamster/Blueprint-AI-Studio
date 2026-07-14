@@ -892,6 +892,309 @@ def test_select_eligible_runner_no_container_image_ignores_container_cap():
     )
 
 
+# ── GPU-in-container-capability gating (image + accelerator) ──────────────────
+
+
+@pytest.mark.parametrize("docker_cdi_gpu,has_gpu,gpu_count,expected", [
+    (True,  True,  1, True),    # CDI docker → capable
+    (False, True,  1, True),    # Hook docker (has_gpu + corroborated) → capable
+    (False, True,  0, False),   # Docker + has_gpu but telemetry contradicts → not capable
+    (False, False, 0, False),   # Docker, no GPU → not capable
+])
+def test_runner_gpu_in_container_capable_docker(
+    docker_cdi_gpu, has_gpu, gpu_count, expected
+):
+    """Docker GPU-in-container capability: CDI and nvidia-hook are both capable."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    proj_id = uuid.uuid4()
+    base_caps = {
+        "task_types": "all",
+        "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": docker_cdi_gpu},
+    }
+    if has_gpu:
+        base_caps["has_gpu"] = has_gpu
+    if has_gpu and gpu_count >= 0:
+        base_caps["gpu_count"] = gpu_count
+
+    runner = RunnerDispatchSnapshot(id=uuid.uuid4(), project_id=proj_id, capabilities=base_caps)
+    result = _runner_gpu_in_container_capable(runner)
+    assert result is expected, (
+        f"docker_cdi_gpu={docker_cdi_gpu}, has_gpu={has_gpu}, "
+        f"gpu_count={gpu_count}: expected {expected}, got {result}"
+    )
+
+
+def test_runner_gpu_in_container_capable_podman():
+    """Podman is natively GPU-capable in containers."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"podman_usable": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is True
+
+
+def test_runner_gpu_in_container_capable_apptainer():
+    """Apptainer is natively GPU-capable in containers."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"apptainer_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is True
+
+
+def test_runner_gpu_in_container_capable_enroot():
+    """Enroot is natively GPU-capable in containers."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"enroot_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is True
+
+
+def test_runner_gpu_in_container_capable_false_no_container_backend():
+    """Returns False when no container backend is available."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_runner_gpu_in_container_capable_false_no_isolation_backends():
+    """Returns False when isolation_backends is absent (old runner)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"task_types": "all"},
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_select_eligible_runner_image_plus_gpu_excludes_no_gpu_docker():
+    """A docker runner with no GPU must not be selected for image+GPU job."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    no_gpu_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+        },
+    )
+    cache = {project_id: [no_gpu_docker, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == cdi_docker.id, (
+        "the CDI-capable runner must be selected; no-gpu docker runner "
+        "must be excluded by the combined image+GPU gate"
+    )
+
+
+def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
+    """Both CDI and hook docker runners are eligible for image+GPU jobs."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    hook_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+        },
+    )
+    cache = {project_id: [hook_docker, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id in {hook_docker.id, cdi_docker.id}, (
+        "both CDI and hook docker runners should be eligible for image+GPU job"
+    )
+
+
+def test_select_eligible_runner_image_plus_gpu_hook_docker_eligible():
+    """A hook-only docker runner (has_gpu, no CDI) passes the combined gate."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    hook_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cache = {project_id: [hook_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None, (
+        "hook docker runner (has_gpu, no CDI) must be eligible for "
+        "image+GPU dispatch"
+    )
+    assert selected.id == hook_docker.id
+
+
+def test_select_eligible_runner_image_plus_gpu_excludes_non_container_runner():
+    """A GPU runner without container backend fails image+GPU dispatch."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 2,
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "a bwrap-only runner must not be selected for an image+GPU job"
+    )
+
+
+def test_select_eligible_runner_image_no_gpu_unaffected():
+    """When container_image is set but accelerator is None, the combined
+    GPU-in-container gate is NOT engaged (only individual checks fire)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    docker_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cache = {project_id: [docker_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,  # no accelerator — combined gate not engaged
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None, (
+        "a non-GPU docker runner must still be selectable when only "
+        "container_image is declared (no accelerator)"
+    )
+
+
 # ── VRAM-fit dispatch eligibility ─────────────────────────────────────────────
 
 
