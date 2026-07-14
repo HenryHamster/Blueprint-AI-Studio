@@ -6,8 +6,9 @@ import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { formatVerdict, verdictToneBadgeClass } from '../utils/verdictFormatting';
 import { fetchComputeJobs, fetchKnowledgeDocument, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl, type ComputeJob, type LiveReleaseEvidence } from '../api';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
-import { isComputeJobActive, computeJobTerminalLabel, computeJobExecutionLocation } from './ComputeJobsPanel.utils';
+import { isComputeJobActive, computeJobTerminalLabel, computeJobExecutionLocation, computeJobEvidenceTier } from './ComputeJobsPanel.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
 import type { AdversarialGateDiagnostic, PanelReviewIssue, PanelReviewVerdict, Task, TaskEvaluationSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
@@ -166,6 +167,7 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
                 {isOperatorHardware && !runnerName && (
                   <span className="text-xs text-amber-400/80 font-mono">operator hw</span>
                 )}
+                {!active && <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />}
               </span>
             </DetailRow>
             {runnerName && (
@@ -232,7 +234,7 @@ export const TaskComputeJobsSection = memo(function TaskComputeJobsSection({ tas
         );
       })}
       {planDoc && planDoc.compute_acceptance_grade && (
-        <DetailRow label="Evidence tier">
+        <DetailRow label="Acceptance grade">
           <AcceptanceGradeBadge doc={{
             source_kind: planDoc.source_kind ?? 'compute_experiment',
             compute_acceptance_grade: planDoc.compute_acceptance_grade,
