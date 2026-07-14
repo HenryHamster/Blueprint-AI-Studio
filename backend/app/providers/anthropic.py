@@ -133,7 +133,7 @@ _OAUTH_DEAD_AUTH_PATTERNS: tuple[str, ...] = (
 
 _DEFAULT_TIER_MODELS = {
     "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
@@ -159,16 +159,17 @@ _OPUS_MODELS: frozenset[str] = frozenset(
 
 
 # Models that accept the `[1m]` suffix for 1M-token context. Per Anthropic
-# docs, 1M is model-gated to Fable 5, the current Opus 4.x, and Sonnet 4.6
-# variants; haiku and older models silently ignore the suffix or error. We
-# drop the suffix with an unsupported marker when the effective model can't
-# use it.
+# docs, 1M is model-gated to Fable 5, the current Opus 4.x, and Sonnet 5 /
+# Sonnet 4.6 variants; haiku and older models silently ignore the suffix or
+# error. We drop the suffix with an unsupported marker when the effective
+# model can't use it.
 _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
     {
         "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
     }
 )
@@ -310,6 +311,7 @@ class AnthropicProvider(LLMProvider):
                         "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
+                        "claude-sonnet-5",
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
                     ],
@@ -336,9 +338,9 @@ class AnthropicProvider(LLMProvider):
                     "description": (
                         "Opt into the 1M-token context window. Appends `[1m]` to "
                         "the model ID so Claude Code routes to the 1M variant. "
-                        "Requires fable-5, opus-4-8, opus-4-7, opus-4-6, or "
-                        "sonnet-4-6 — haiku ignores the suffix (we drop it with an "
-                        "unsupported marker). 1M costs more and is only worth it "
+                        "Requires fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, "
+                        "or sonnet-4-6 — haiku ignores the suffix (we drop it with "
+                        "an unsupported marker). 1M costs more and is only worth it "
                         "when the prompt or exploration genuinely needs the extra "
                         "window."
                     ),
@@ -359,6 +361,7 @@ class AnthropicProvider(LLMProvider):
                         "claude-fable-5",
                         "claude-opus-4-8",
                         "claude-opus-4-7",
+                        "claude-sonnet-5",
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
                     ],
@@ -422,7 +425,7 @@ class AnthropicProvider(LLMProvider):
             elif use_1m:
                 unsupported.append(
                     f"use_1m_context=true requires a 1M-capable model "
-                    f"(fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-4-6); "
+                    f"(fable-5, opus-4-8, opus-4-7, opus-4-6, sonnet-5, sonnet-4-6); "
                     f"effective model {model!r} — suffix dropped, plain --model sent"
                 )
                 args += ["--model", model]
