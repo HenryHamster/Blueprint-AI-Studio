@@ -44,6 +44,7 @@ function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
 const viewableArtifacts = [
   { storage_uri: 'gs://bucket/plot.png', filename: 'reward-plot.png', content_type: 'image/png', size_bytes: 2048, kind: 'image' as const },
   { storage_uri: 'gs://bucket/rollout.mp4', filename: 'rollout.mp4', content_type: 'video/mp4', size_bytes: 5_000_000, kind: 'video' as const },
+  { storage_uri: 'gs://bucket/report.pdf', filename: 'report.pdf', content_type: 'application/pdf', size_bytes: 100_000, kind: 'pdf' as const },
 ];
 
 describe('ComputeArtifactGallery — viewport regression', () => {
@@ -71,7 +72,7 @@ describe('ComputeArtifactGallery — viewport regression', () => {
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
         const toggle = host.querySelector('[data-testid="drawer-artifact-gallery-toggle"]');
         expect(toggle).not.toBeNull();
-        expect((host.textContent ?? '')).toContain('Show previews (2)');
+        expect((host.textContent ?? '')).toContain('Show previews (3)');
       },
       { waitMs: 40 },
     );
@@ -93,8 +94,10 @@ describe('ComputeArtifactGallery — viewport regression', () => {
         expect(toggle).not.toBeNull();
         await act(async () => { toggle!.click(); });
         await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
-        // Both viewable artifacts render (image thumbnail + video) once resolved.
-        expect(host.querySelectorAll('[data-testid="drawer-viewable-artifact"]').length).toBe(2);
+        // All viewable artifacts render (image thumbnail + video + pdf button) once resolved.
+        expect(host.querySelectorAll('[data-testid="drawer-viewable-artifact"]').length).toBe(3);
+        // The pdf renders as an Open-PDF button, never inside an <img>.
+        expect(host.querySelector('[data-testid="drawer-artifact-pdf"]')).not.toBeNull();
       },
       { waitMs: 40 },
     );

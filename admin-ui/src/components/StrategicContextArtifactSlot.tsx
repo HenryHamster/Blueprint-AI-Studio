@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Maximize2, Network, RefreshCw, Table2, X } from 'lucide-react';
 import type {
+  StrategicContextArtifactViewablePreview,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
   StrategicContextRenderableDescriptor,
@@ -355,6 +356,74 @@ function ResolvedPdf({
       <span className="min-w-0 break-words">{label}</span>
       <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-500" aria-hidden="true" />
     </button>
+  );
+}
+
+/**
+ * Inline thumbnail strip for an artifact-evidence item's signed
+ * `viewable_previews`. The strategic backend already mints per-file signed
+ * URLs (and stamps their stable `storage_uri`) onto every artifact-evidence
+ * item, but the rail's artifact list only rendered names/refs — this surfaces
+ * the image/video previews inline, reusing the same signed-URL re-resolution,
+ * skeleton, retry, and lightbox pipeline as the descriptor tiles.
+ *
+ * Additive and self-hiding: renders nothing when there are no previews with a
+ * usable URL or re-resolvable ref, so rows without media are unchanged.
+ */
+export function ArtifactViewablePreviews({
+  previews,
+  projectId,
+  label,
+}: {
+  previews?: StrategicContextArtifactViewablePreview[] | null;
+  projectId?: string | null;
+  label?: string | null;
+}) {
+  const [lightbox, setLightbox] = useState<{ url: string; alt: string } | null>(null);
+  const onExpand = useCallback((url: string, alt: string) => setLightbox({ url, alt }), []);
+  const closeLightbox = useCallback(() => setLightbox(null), []);
+
+  // A preview is renderable from EITHER a baked url or a re-resolvable
+  // storage_uri — never filter on url alone, or an expired baked url would drop
+  // a still-resolvable preview.
+  const items = (previews ?? []).filter(
+    preview => (preview.kind === 'image' || preview.kind === 'video') && (preview.url || preview.storage_uri),
+  );
+  if (items.length === 0) return null;
+
+  return (
+    <div
+      className="mt-1 flex gap-1 overflow-x-auto rounded border border-neutral-800 bg-neutral-950/45 p-1 custom-scrollbar"
+      data-testid="strategic-artifact-viewable-previews"
+    >
+      {items.map((preview, i) => {
+        const alt = preview.filename || (label ? `${label} ${i + 1}` : `Artifact preview ${i + 1}`);
+        if (preview.kind === 'video') {
+          return (
+            <ResolvedVideo
+              key={preview.storage_uri || preview.url || i}
+              projectId={projectId}
+              storageUri={preview.storage_uri}
+              bakedUrl={preview.url}
+              ariaLabel={alt}
+              className="h-20 w-auto flex-shrink-0"
+            />
+          );
+        }
+        return (
+          <ResolvedImage
+            key={preview.storage_uri || preview.url || i}
+            projectId={projectId}
+            storageUri={preview.storage_uri}
+            bakedUrl={preview.url}
+            alt={alt}
+            className="h-20 w-auto flex-shrink-0 object-contain"
+            onExpand={onExpand}
+          />
+        );
+      })}
+      {lightbox && <MediaLightbox url={lightbox.url} alt={lightbox.alt} onClose={closeLightbox} />}
+    </div>
   );
 }
 

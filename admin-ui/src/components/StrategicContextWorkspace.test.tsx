@@ -639,4 +639,49 @@ describe('StrategicContextWorkspace', () => {
     const { host } = mount();
     expect(host.querySelector('[data-testid="strategic-context-workspace-integrity"]')).toBeNull();
   });
+
+  test('renders inline viewable thumbnails on an artifact-evidence row when present', () => {
+    const contextPackage = STATE.context_package!;
+    const artifacts = contextPackage.evidence!.artifacts!;
+    const stateWithPreview = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          ...contextPackage.evidence,
+          artifacts: {
+            ...artifacts,
+            items: [
+              {
+                ...artifacts.items[0],
+                viewable_previews: [
+                  {
+                    url: 'https://storage.example.com/rollout.png?sig=baked',
+                    kind: 'image',
+                    filename: 'rollout.png',
+                    storage_uri: 'gs://bucket/proj/rollout.png',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    } as StrategicStateResponse;
+
+    // projectId omitted → uses the baked URL directly (no signed-URL fetch).
+    const { host } = mount({ state: stateWithPreview });
+    const strip = host.querySelector('[data-testid="strategic-artifact-viewable-previews"]');
+    expect(strip).not.toBeNull();
+    const img = strip?.querySelector('img');
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute('src')).toContain('sig=baked');
+  });
+
+  test('renders no viewable-preview strip on an artifact-evidence row without previews', () => {
+    const { host } = mount();
+    const artifactsSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(artifactsSection).not.toBeNull();
+    expect(artifactsSection?.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
 });

@@ -24,7 +24,7 @@ import {
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
-import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
+import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import {
   StrategicSessionControl,
@@ -1204,14 +1204,24 @@ export function StrategicContextWorkspace({
                     <div className={CONTEXT_LIST_CLASS}>
                       {artifactEvidence.map(item => {
                         const ref = selectedRefFromArtifactEvidence(item);
-                        return renderKeepableRow({
-                          key: `artifact:${item.id}`,
-                          label: ref.label ?? 'Artifact',
-                          kind: item.artifact_type ?? item.kind,
-                          detail: item.task_title ?? item.task_status ?? null,
-                          target: item.target,
-                          ref,
-                        });
+                        const label = ref.label ?? 'Artifact';
+                        return (
+                          <div key={`artifact:${item.id}`} className="min-w-0">
+                            {renderKeepableRow({
+                              key: `artifact-row:${item.id}`,
+                              label,
+                              kind: item.artifact_type ?? item.kind,
+                              detail: item.task_title ?? item.task_status ?? null,
+                              target: item.target,
+                              ref,
+                            })}
+                            <ArtifactViewablePreviews
+                              previews={item.viewable_previews}
+                              projectId={projectId}
+                              label={label}
+                            />
+                          </div>
+                        );
                       })}
                     </div>
                   )}

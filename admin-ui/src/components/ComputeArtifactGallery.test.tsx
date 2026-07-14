@@ -53,6 +53,13 @@ const videoArtifact = {
   size_bytes: 5_000_000,
   kind: 'video' as const,
 };
+const pdfArtifact = {
+  storage_uri: 'gs://bucket/report.pdf',
+  filename: 'report.pdf',
+  content_type: 'application/pdf',
+  size_bytes: 100_000,
+  kind: 'pdf' as const,
+};
 
 afterEach(() => {
   resolveArtifactDownloadUrl.mockReset();
@@ -65,6 +72,33 @@ describe('ComputeArtifactGallery', () => {
       <ComputeArtifactGallery projectId="proj-1" job={makeJob({ viewable_artifacts: [] })} />,
     );
     expect(container.querySelector('[data-testid="drawer-artifact-gallery"]')).toBeNull();
+  });
+
+  test('renders the omitted-file note (no toggle) when every viewable file was capped away', () => {
+    const { getByTestId, queryByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [], viewable_artifacts_dropped_count: 3 })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-gallery')).toBeTruthy();
+    expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
+      '3 files omitted (exceeds preview cap: 25 files / 8 MiB each)',
+    );
+    // No previews to toggle when everything was dropped.
+    expect(queryByTestId('drawer-artifact-gallery-toggle')).toBeNull();
+  });
+
+  test('uses singular copy in the omitted note for a single dropped file', () => {
+    const { getByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [], viewable_artifacts_dropped_count: 1 })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-omitted-note').textContent).toBe(
+      '1 file omitted (exceeds preview cap: 25 files / 8 MiB each)',
+    );
   });
 
   test('renders nothing when projectId is empty', () => {
@@ -117,6 +151,34 @@ describe('ComputeArtifactGallery', () => {
       fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
     });
     expect(queryAllByTestId('drawer-viewable-artifact')).toHaveLength(0);
+  });
+
+  test('a pdf artifact renders an Open-PDF button (never an <img>) and opens a new tab on click', async () => {
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed/report.pdf');
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const { getByTestId, queryByTestId } = render(
+      <ComputeArtifactGallery projectId="proj-1" job={makeJob({ viewable_artifacts: [pdfArtifact] })} />,
+    );
+
+    // Expanding must NOT eagerly sign the pdf's URL (click-to-open only).
+    await act(async () => {
+      fireEvent.click(getByTestId('drawer-artifact-gallery-toggle'));
+    });
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalled();
+
+    const pdfButton = getByTestId('drawer-artifact-pdf');
+    expect(pdfButton.textContent).toContain('Open PDF');
+    // A pdf must never fall through to the image branch.
+    expect(queryByTestId('drawer-artifact-thumbnail')).toBeNull();
+    expect(pdfButton.querySelector('img')).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(pdfButton);
+    });
+    await waitFor(() => {
+      expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', pdfArtifact.storage_uri);
+    });
+    expect(openSpy).toHaveBeenCalled();
   });
 
   test('a failed resolution shows a retry placeholder and a click re-resolves', async () => {

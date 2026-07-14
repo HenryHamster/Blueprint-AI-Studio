@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
-import type { StrategicContextPackageDescriptor, StrategicContextRenderableDescriptor } from '../strategicStateApi';
+import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
+import type {
+  StrategicContextArtifactViewablePreview,
+  StrategicContextPackageDescriptor,
+  StrategicContextRenderableDescriptor,
+} from '../strategicStateApi';
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
@@ -379,5 +383,120 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
 
     expect(host!.textContent).not.toContain('Machine verified');
     expect(host!.textContent).not.toContain('Self-reported');
+  });
+});
+
+describe('ArtifactViewablePreviews — inline artifact-evidence thumbnails', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => r.unmount()); root = null; }
+    if (host) { host.remove(); host = null; }
+  });
+
+  async function render(
+    previews: StrategicContextArtifactViewablePreview[] | null | undefined,
+    projectId?: string | null,
+  ) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<ArtifactViewablePreviews previews={previews} projectId={projectId} label="Rollout" />);
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
+  }
+
+  test('renders an <img> for an image preview, re-resolved from storage_uri', async () => {
+    const { resolveArtifactDownloadUrl } = await import('../api');
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/plot.png?sig=stale',
+          kind: 'image',
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/proj/plot.png',
+        },
+      ],
+      'proj-1',
+    );
+
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledWith(
+      'proj-1',
+      'gs://bucket/proj/plot.png',
+      expect.anything(),
+    );
+    const img = host!.querySelector('img');
+    expect(img).not.toBeNull();
+    // Fresh signed URL, not the stale baked one.
+    expect(img!.getAttribute('src')).toContain('fresh.example.com');
+    expect(img!.getAttribute('src')).not.toContain('sig=stale');
+  });
+
+  test('renders a <video> for a video preview', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/rollout.mp4?sig=baked',
+          kind: 'video',
+          filename: 'rollout.mp4',
+          storage_uri: 'gs://bucket/proj/rollout.mp4',
+        },
+      ],
+      'proj-1',
+    );
+
+    const video = host!.querySelector('video');
+    expect(video).not.toBeNull();
+    expect(video!.getAttribute('src')).toContain('fresh.example.com');
+  });
+
+  test('renders nothing when there are no previews', async () => {
+    await render([], 'proj-1');
+    expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+    expect(host!.querySelector('img')).toBeNull();
+  });
+
+  test('renders nothing when previews is null', async () => {
+    await render(null, 'proj-1');
+    expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
+
+  test('ignores non-image/video kinds and previews with neither url nor storage_uri', async () => {
+    await render(
+      [
+        { url: '', kind: 'image', filename: 'empty.png', storage_uri: null },
+        { url: 'https://storage.example.com/doc.pdf?sig=baked', kind: 'pdf', filename: 'doc.pdf', storage_uri: null },
+      ],
+      'proj-1',
+    );
+    // Neither entry is renderable → the strip self-hides entirely.
+    expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
+
+  test('falls back to the baked URL when no projectId is available', async () => {
+    const { resolveArtifactDownloadUrl } = await import('../api');
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/plot.png?sig=baked',
+          kind: 'image',
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/proj/plot.png',
+        },
+      ],
+      null,
+    );
+    expect(vi.mocked(resolveArtifactDownloadUrl)).not.toHaveBeenCalled();
+    const img = host!.querySelector('img');
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute('src')).toContain('sig=baked');
   });
 });

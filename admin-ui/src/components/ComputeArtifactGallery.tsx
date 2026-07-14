@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { FileText } from 'lucide-react';
 import { resolveArtifactDownloadUrl, type ComputeJob } from '../api';
 import { computeJobViewableArtifacts, fmtBytes } from './ComputeJobsPanel.utils';
 
@@ -52,6 +53,10 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
         // Lazy resolution: sign URLs only on expand, skipping entries already
         // resolving or resolved.
         for (const art of artifacts) {
+          // PDFs are click-to-open (never rendered inline), so their signed URL
+          // is minted on click by openPreviewFullSize — don't waste a signing
+          // round-trip eagerly on expand.
+          if (art.kind === 'pdf') continue;
           const cached = previewUrls[art.storage_uri];
           if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
           void resolvePreviewUrl(art.storage_uri);
@@ -87,7 +92,29 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
   );
 
   if (!projectId) return null;
-  if (artifacts.length === 0) return null;
+
+  const droppedCount = job.viewable_artifacts_dropped_count ?? 0;
+  if (artifacts.length === 0 && droppedCount <= 0) return null;
+
+  const omittedNote =
+    droppedCount > 0 ? (
+      <div
+        className="text-ui-xs text-amber-400/90 font-mono"
+        data-testid="drawer-artifact-omitted-note"
+      >
+        {`${droppedCount} file${droppedCount === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+      </div>
+    ) : null;
+
+  // Every viewable file was dropped by the preview cap — surface the omitted
+  // note alone (no toggle, nothing to preview) rather than rendering nothing.
+  if (artifacts.length === 0) {
+    return (
+      <div className="mt-1.5" data-testid="drawer-artifact-gallery">
+        {omittedNote}
+      </div>
+    );
+  }
 
   return (
     <div className="mt-1.5" data-testid="drawer-artifact-gallery">
@@ -102,6 +129,7 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
           {expanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
         </button>
       </div>
+      {omittedNote}
       {expanded && (
         <div className="flex flex-wrap gap-2">
           {artifacts.map((art) => {
@@ -112,6 +140,34 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
                 {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
               </div>
             );
+            if (art.kind === 'pdf') {
+              // PDFs are never rendered inline on the app origin; they open in
+              // the browser's sandboxed viewer on the storage origin.
+              // openPreviewFullSize resolves a fresh signed URL and opens it in
+              // a new tab.
+              return (
+                <div key={art.storage_uri} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
+                  <button
+                    type="button"
+                    onClick={() => { void openPreviewFullSize(art.storage_uri); }}
+                    disabled={resolution?.state === 'resolving'}
+                    title={`Open ${art.name} in a new tab`}
+                    className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
+                    data-testid="drawer-artifact-pdf"
+                  >
+                    <FileText className="h-8 w-8 text-sky-400" />
+                    <span>
+                      {resolution?.state === 'resolving'
+                        ? 'opening…'
+                        : resolution?.state === 'error'
+                          ? 'open failed — retry'
+                          : 'Open PDF'}
+                    </span>
+                  </button>
+                  {caption}
+                </div>
+              );
+            }
             if (resolution?.state === 'resolved') {
               return (
                 <div key={art.storage_uri} className="flex flex-col gap-0.5" data-testid="drawer-viewable-artifact">
