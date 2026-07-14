@@ -2031,6 +2031,78 @@ describe('buildCompactionCheckpoint', () => {
     expect(result).not.toContain('## Self-model grounding');
     expect(result).not.toContain('### Problem model');
   });
+
+  it('test_compaction_checkpoint_carries_retired_staged_prior_and_field_level_grounding_fallback', () => {
+    // Acceptance test for the two compaction-checkpoint grounding-fidelity fixes.
+    //
+    // PROBLEM 1 — the checkpoint must carry the three STATIC session-start
+    // grounding sections the bootstrap renders (retired / staged / prior-cycle
+    // decisions) so a post-compaction session does not re-derive settled facts
+    // or re-propose already-retired/staged directions. They render when
+    // non-empty and are omitted when blank.
+    const retiredDirectionsText = 'These directions were recently retired.\n- [retired] old auth work (id: d-9)';
+    const stagedDirectionsText = 'These directions are already staged for a next version.\n- staged infra work (id: d-7)';
+    const previousDecisionOutcomesText = 'cycle=c-1\nCreated directions:\n- created d-3 | status=active';
+
+    const withStatic = buildCompactionCheckpoint({
+      roleIdentity: 'You are the resident strategist for Acme.',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      retiredDirectionsText,
+      stagedDirectionsText,
+      previousDecisionOutcomesText,
+    });
+    // Section headers mirror the bootstrap wording exactly.
+    expect(withStatic).toContain('## Already-staged (next-version) directions');
+    expect(withStatic).toContain('staged infra work (id: d-7)');
+    expect(withStatic).toContain('## Recently retired / completed directions');
+    expect(withStatic).toContain('old auth work (id: d-9)');
+    expect(withStatic).toContain('## Prior-cycle decision outcomes');
+    expect(withStatic).toContain('created d-3');
+
+    // Blank static texts → none of the three headers appear.
+    const withoutStatic = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      retiredDirectionsText: '',
+      stagedDirectionsText: '   ',
+      previousDecisionOutcomesText: undefined,
+    });
+    expect(withoutStatic).not.toContain('## Already-staged (next-version) directions');
+    expect(withoutStatic).not.toContain('## Recently retired / completed directions');
+    expect(withoutStatic).not.toContain('## Prior-cycle decision outcomes');
+
+    // PROBLEM 2 — field-level grounding fallback. A successful refetch that
+    // returns an empty STRUCTURAL field (problemModelJson / visionJson) is a
+    // transient degraded read: fall back to the snapshot rather than dropping
+    // the section. An empty refreshed openMessagesText still WINS (messages the
+    // operator's turn just handled must disappear).
+    const snapshot: CheckpointGrounding = {
+      problemModelJson: JSON.stringify({ goals: ['SNAPSHOT goal'] }, null, 2),
+      visionJson: JSON.stringify({ future: 'SNAPSHOT vision' }, null, 2),
+      strategicMemoryNotesText: '- SNAPSHOT lesson',
+      runningUpdate: 'SNAPSHOT running update',
+      openMessagesText: 'SNAPSHOT open message',
+    };
+    const refreshedDegraded: CheckpointGrounding = {
+      problemModelJson: '',
+      visionJson: '',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      openMessagesText: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshedDegraded);
+    // Structural fields fall back to the snapshot on an empty refetch.
+    expect(resolved.problemModelJson).toContain('SNAPSHOT goal');
+    expect(resolved.visionJson).toContain('SNAPSHOT vision');
+    expect(resolved.strategicMemoryNotesText).toBe('- SNAPSHOT lesson');
+    expect(resolved.runningUpdate).toBe('SNAPSHOT running update');
+    // openMessagesText is the deliberate exception — empty refreshed wins.
+    expect(resolved.openMessagesText).toBeUndefined();
+  });
 });
 
 describe('formatStrategicMemoryNotes', () => {
@@ -2150,9 +2222,13 @@ describe('resolveCheckpointGrounding', () => {
       .toContain('STALE goal');
   });
 
-  it('a refreshed field that was cleared mid-session collapses to undefined (not the stale value)', () => {
-    // Operator wiped the running update; the refreshed empty must win so the
-    // checkpoint drops the section rather than re-showing the stale text.
+  it('an empty refreshed STRUCTURAL field falls back to the snapshot (transient degraded read)', () => {
+    // A successful refetch that returns empty problem-model/vision/memory/running
+    // fields is treated as a transient degraded server read — NOT a mid-session
+    // clear — so the checkpoint must fall back to the session-start snapshot
+    // field-by-field rather than dropping structural grounding entirely. Only a
+    // non-empty refreshed value overrides. (openMessagesText is the exception,
+    // covered in the 'resolveCheckpointGrounding open_messages' suite.)
     const refreshed: CheckpointGrounding = {
       problemModelJson: JSON.stringify({ goals: ['FRESH goal'] }, null, 2),
       visionJson: '',
@@ -2160,10 +2236,14 @@ describe('resolveCheckpointGrounding', () => {
       runningUpdate: '',
     };
     const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    // Non-empty refreshed value still wins.
     expect(resolved.problemModelJson).toContain('FRESH goal');
-    expect(resolved.visionJson).toBeUndefined();
-    expect(resolved.strategicMemoryNotesText).toBeUndefined();
-    expect(resolved.runningUpdate).toBeUndefined();
+    expect(resolved.problemModelJson).not.toContain('STALE');
+    // Empty refreshed structural fields fall back to the snapshot, not undefined.
+    expect(resolved.visionJson).toBe(snapshot.visionJson);
+    expect(resolved.visionJson).toContain('STALE vision');
+    expect(resolved.strategicMemoryNotesText).toBe(snapshot.strategicMemoryNotesText);
+    expect(resolved.runningUpdate).toBe(snapshot.runningUpdate);
   });
 });
 

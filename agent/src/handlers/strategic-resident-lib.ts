@@ -447,13 +447,28 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
 }
 
 /**
- * Resolve the four grounding sub-fields for the compaction checkpoint,
- * preferring grounding refreshed at compaction time over the session-start
- * snapshot. When `refreshed` is present (the checkpoint-state fetch succeeded)
- * its values win entirely — even an empty field, so a mid-session clear (e.g.
- * the operator wipes the running update) is reflected rather than reverting to
- * the stale snapshot. When absent (fetch failed or never ran) the snapshot is
- * used. Empty strings collapse to `undefined` so the checkpoint omits that
+ * Resolve the grounding sub-fields for the compaction checkpoint, preferring
+ * grounding refreshed at compaction time over the session-start snapshot.
+ *
+ * When `refreshed` is absent (the checkpoint-state fetch failed or never ran)
+ * the snapshot is used wholesale. When present, the fields resolve with a
+ * DELIBERATE ASYMMETRY — do NOT "simplify" this back into a whole-object
+ * `refreshed ?? snapshot` switch:
+ *
+ *  - STRUCTURAL fields (problemModelJson, visionJson, strategicMemoryNotesText,
+ *    runningUpdate) fall back FIELD-BY-FIELD: a refreshed value that is
+ *    empty/blank is treated as a transient degraded server read (e.g.
+ *    _agent_view_problem_model / _agent_visible_vision formatting to empty) and
+ *    the session-start snapshot value is used instead. Losing the problem model
+ *    or vision to a momentary empty refetch is a coherence loss we refuse to
+ *    take; a genuine mid-session edit still refreshes because it returns a
+ *    non-empty value.
+ *  - openMessagesText is the EXCEPTION: a refreshed EMPTY open-messages list
+ *    must WIN over the stale bootstrap snapshot. Messages the operator's turn
+ *    just handled should DISAPPEAR from the checkpoint, so here empty-refreshed
+ *    beats snapshot rather than falling back to it.
+ *
+ * Empty strings collapse to `undefined` so the checkpoint omits that
  * sub-section, matching the existing `refreshedDirectionGrounding` fallback.
  */
 export function resolveCheckpointGrounding(
@@ -466,13 +481,27 @@ export function resolveCheckpointGrounding(
   runningUpdate?: string;
   openMessagesText?: string;
 } {
-  const src = refreshed ?? snapshot;
+  // No refetch → whole-snapshot fallback (unchanged behavior).
+  if (refreshed == null) {
+    return {
+      problemModelJson: snapshot.problemModelJson || undefined,
+      visionJson: snapshot.visionJson || undefined,
+      strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
+      runningUpdate: snapshot.runningUpdate || undefined,
+      openMessagesText: snapshot.openMessagesText || undefined,
+    };
+  }
+  // Refetch succeeded. Structural fields fall back to the snapshot when the
+  // refreshed value is blank (transient degraded read); openMessagesText lets a
+  // refreshed empty WIN (see the asymmetry note above).
+  const structural = (refreshedVal: string, snapshotVal: string): string | undefined =>
+    (refreshedVal && refreshedVal.trim() ? refreshedVal : snapshotVal) || undefined;
   return {
-    problemModelJson: src.problemModelJson || undefined,
-    visionJson: src.visionJson || undefined,
-    strategicMemoryNotesText: src.strategicMemoryNotesText || undefined,
-    runningUpdate: src.runningUpdate || undefined,
-    openMessagesText: src.openMessagesText || undefined,
+    problemModelJson: structural(refreshed.problemModelJson, snapshot.problemModelJson),
+    visionJson: structural(refreshed.visionJson, snapshot.visionJson),
+    strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
+    runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
+    openMessagesText: refreshed.openMessagesText || undefined,
   };
 }
 
@@ -505,6 +534,18 @@ export interface CompactionCheckpointContext {
   runningUpdate?: string;
   /** Formatted decisions register text (durable cross-tick decision memory). */
   decisionsRegisterText?: string;
+  // ── Static session-start grounding (same snapshot forward every checkpoint) ─
+  // These mirror three bootstrap sections that would otherwise vanish after a
+  // compaction restart, letting the resumed session re-derive settled facts or
+  // re-propose already-retired/staged directions. They are session-start values
+  // (not server-mutable grounding), so no refetch is needed — the same snapshot
+  // carries forward on every checkpoint.
+  /** Formatted recently retired / completed directions (buildRetiredContextText). */
+  retiredDirectionsText?: string;
+  /** Formatted already-staged (next-version) directions (buildStagedDirectionsText). */
+  stagedDirectionsText?: string;
+  /** Formatted prior-cycle decision outcomes (buildPriorDecisionsText). */
+  previousDecisionOutcomesText?: string;
   /**
    * True when the self-model grounding was re-fetched from the checkpoint-state
    * endpoint at compaction time (so it reflects current, not session-start,
@@ -600,6 +641,20 @@ ${ctx.autonomousState.trim()}`);
   // (vi) Durable decisions register — preserved across restarts.
   if (ctx.decisionsRegisterText?.trim()) {
     sections.push(ctx.decisionsRegisterText.trim());
+  }
+
+  // (vii) Static session-start grounding the bootstrap renders but the
+  // checkpoint previously dropped — so the resumed session does NOT re-derive
+  // settled facts or re-propose already-retired/staged directions. Wording
+  // mirrors buildBootstrapPrompt exactly.
+  if (ctx.stagedDirectionsText?.trim()) {
+    sections.push(`## Already-staged (next-version) directions\n${ctx.stagedDirectionsText.trim()}`);
+  }
+  if (ctx.retiredDirectionsText?.trim()) {
+    sections.push(`## Recently retired / completed directions\n${ctx.retiredDirectionsText.trim()}`);
+  }
+  if (ctx.previousDecisionOutcomesText?.trim()) {
+    sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a

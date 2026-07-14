@@ -460,15 +460,24 @@ export async function handleStrategicResident(
     typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
   ) ?? [];
 
+  // Static session-start grounding texts. Hoisted to consts so the SAME value
+  // feeds both the bootstrap prompt and the compaction checkpoint (see
+  // buildCheckpointContext) — the checkpoint would otherwise drop these three
+  // sections, letting a post-compaction session re-derive settled facts or
+  // re-propose already-retired/staged directions.
+  const stagedDirectionsText = buildStagedDirectionsText(stagedDirections);
+  const retiredDirectionsText = buildRetiredContextText(retiredDirections);
+  const previousDecisionOutcomesText = buildPriorDecisionsText(previousDecisionOutcomes);
+
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
     problemModelJson,
     runningUpdate: typeof payload.running_update === 'string' ? payload.running_update : '',
     directionsText: buildDirSummaryText(directionsSummary, authoritativeActive),
-    stagedDirectionsText: buildStagedDirectionsText(stagedDirections),
-    retiredDirectionsText: buildRetiredContextText(retiredDirections),
-    previousDecisionOutcomesText: buildPriorDecisionsText(previousDecisionOutcomes),
+    stagedDirectionsText,
+    retiredDirectionsText,
+    previousDecisionOutcomesText,
     strategicMemoryNotesText,
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
@@ -593,6 +602,11 @@ export async function handleStrategicResident(
         : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
       runningUpdate: grounding.runningUpdate,
       decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
+      // Static session-start grounding — same snapshot forward every checkpoint
+      // (no refetch): retired/staged/prior-decision context the bootstrap shows.
+      retiredDirectionsText: retiredDirectionsText || undefined,
+      stagedDirectionsText: stagedDirectionsText || undefined,
+      previousDecisionOutcomesText: previousDecisionOutcomesText || undefined,
       groundingRefreshed: refreshedGrounding !== null,
     };
   };
