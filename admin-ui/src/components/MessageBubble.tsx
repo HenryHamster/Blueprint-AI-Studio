@@ -310,6 +310,11 @@ export const MessageBubble = memo(function MessageBubble({
   const replyableChatAuthor = fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist';
   const canChatReply = chatMode && replyableChatAuthor && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
   const isResolving = resolvingId === msg.id;
+  // Only genuinely-actionable rows (the derived needs-action set: QUESTION / BLOCKER)
+  // keep a manual resolve affordance. Conversational NOTE/FEEDBACK/BUG_REPORT/reply
+  // rows are transcript and carry no open/resolved obligation, so the manual resolve
+  // control is noise there — the reaper sweeps auto-resolve linked/stale items server-side.
+  const isActionable = msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER';
   const taskId = msg.from_task_id;
   const strategicContextReceipt = chatMode && userMsg
     ? buildMessageStrategicContextDescriptor(msg.context)
@@ -537,7 +542,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </button>
               </div>
             )}
-            {actionMode === 'full' && (!isResolving ? (
+            {actionMode === 'full' && isActionable && (!isResolving ? (
               <button
                 onClick={() => onStartResolve(msg.id)}
                 title="Resolve"

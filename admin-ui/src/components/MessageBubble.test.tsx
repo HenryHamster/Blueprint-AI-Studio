@@ -68,7 +68,8 @@ describe('MessageBubble', () => {
 
   test('resolve action: clicking resolve calls onStartResolve', () => {
     const onStartResolve = vi.fn();
-    render(<MessageBubble {...makeProps({ onStartResolve })} />);
+    // Resolve is an actionable-row (QUESTION/BLOCKER) affordance only.
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), onStartResolve })} />);
     const resolveBtn = screen.getByTitle('Resolve');
     fireEvent.click(resolveBtn);
     expect(onStartResolve).toHaveBeenCalledWith('msg-1');
@@ -76,7 +77,7 @@ describe('MessageBubble', () => {
 
   test('resolve action: confirm calls onResolve with current resolveInput', () => {
     const onResolve = vi.fn();
-    render(<MessageBubble {...makeProps({ resolvingId: 'msg-1', resolveInput: 'fixed it', onResolve })} />);
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), resolvingId: 'msg-1', resolveInput: 'fixed it', onResolve })} />);
     const confirmBtn = screen.getByTitle('Confirm resolve');
     fireEvent.click(confirmBtn);
     expect(onResolve).toHaveBeenCalledWith('msg-1', 'fixed it');
@@ -84,11 +85,29 @@ describe('MessageBubble', () => {
 
   test('resolve action: cancel calls onCancelResolve', () => {
     const onCancelResolve = vi.fn();
-    render(<MessageBubble {...makeProps({ resolvingId: 'msg-1', resolveInput: '', onCancelResolve })} />);
+    render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type: 'BLOCKER' }), resolvingId: 'msg-1', resolveInput: '', onCancelResolve })} />);
     // The cancel button is the X next to the resolve confirm
     const cancelBtns = screen.getAllByTitle('Cancel');
     fireEvent.click(cancelBtns[0]);
     expect(onCancelResolve).toHaveBeenCalled();
+  });
+
+  test('conversational rows (NOTE/FEEDBACK/BUG_REPORT) have no manual resolve control', () => {
+    for (const message_type of ['NOTE', 'FEEDBACK', 'BUG_REPORT'] as const) {
+      const { unmount } = render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type }) })} />);
+      expect(screen.queryByTitle('Resolve')).toBeNull();
+      // Other transcript affordances remain available.
+      expect(screen.getByTitle('Reply')).toBeTruthy();
+      unmount();
+    }
+  });
+
+  test('actionable rows (QUESTION/BLOCKER) keep the manual resolve control', () => {
+    for (const message_type of ['QUESTION', 'BLOCKER'] as const) {
+      const { unmount } = render(<MessageBubble {...makeProps({ msg: makeMsg({ message_type }) })} />);
+      expect(screen.getByTitle('Resolve')).toBeTruthy();
+      unmount();
+    }
   });
 
   test('delete path: clicking delete calls onDelete', () => {
@@ -523,6 +542,7 @@ describe('MessageBubble', () => {
 
   test('non-QUESTION resolve: placeholder says "Note (optional)..."', () => {
     render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'BLOCKER' }),
       resolvingId: 'msg-1',
       resolveInput: '',
     })} />);
@@ -531,6 +551,7 @@ describe('MessageBubble', () => {
 
   test('non-QUESTION resolve: confirm button enabled with empty input', () => {
     render(<MessageBubble {...makeProps({
+      msg: makeMsg({ message_type: 'BLOCKER' }),
       resolvingId: 'msg-1',
       resolveInput: '',
     })} />);

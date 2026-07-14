@@ -1846,6 +1846,13 @@ async def get_operator_message_counts(
             ).scalar()
             or 0
         )
+    # needs_operator here is the message-based component: open questions + blockers.
+    # This matches the message-derived subset of build_operator_attention's
+    # total_needs_operator so the lightweight badge-poll endpoint and the full
+    # attention model agree on what counts as needing the operator from messages.
+    needs_operator = (
+        counts.get(MessageType.BLOCKER, 0) + counts.get(MessageType.QUESTION, 0)
+    )
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
         "question": counts.get(MessageType.QUESTION, 0),
@@ -1853,6 +1860,7 @@ async def get_operator_message_counts(
         "feedback": counts.get(MessageType.FEEDBACK, 0),
         "high_signal_note": note_count,
         "unread": unread,
+        "needs_operator": needs_operator,
     }
 
 

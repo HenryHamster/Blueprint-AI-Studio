@@ -279,9 +279,10 @@ export default function App() {
       if (!res.ok || signal.aborted) return;
       const data = await res.json();
       if (!signal.aborted) {
-        setOpenMessageCount(
-          (data.blocker ?? 0) + (data.question ?? 0) + (data.bug_report ?? 0) + (data.feedback ?? 0) + (data.high_signal_note ?? 0),
-        );
+        // Use the server-computed needs_operator count (blockers + questions)
+        // from the attention model so the badge agrees with StrategicContextRail
+        // and the in-panel needs-action set.
+        setOpenMessageCount(data.needs_operator ?? 0);
         setNewSinceLastVisit(data.unread ?? 0);
       }
     } catch { /* ignore */ }

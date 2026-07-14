@@ -4928,6 +4928,38 @@
       "source_path": "backend/app/workbench_events.py",
       "workbench_action": null,
       "workbench_resource": null
+    },
+    {
+      "callee": "_bcast",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "message_v1_payload",
+      "event": "message_updated",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1809,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "name:payload",
+      "scope": "sweep_resolve_linked_messages",
+      "source_path": "backend/app/reaper_sweeps.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
+      "callee": "_bcast",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "message_v1_payload",
+      "event": "message_updated",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1911,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "name:payload",
+      "scope": "sweep_decay_stale_open_messages",
+      "source_path": "backend/app/reaper_sweeps.py",
+      "workbench_action": null,
+      "workbench_resource": null
     }
   ],
   "schema_version": 1,

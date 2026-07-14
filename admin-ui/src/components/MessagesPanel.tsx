@@ -130,6 +130,48 @@ function attentionTextTone(level?: string | null): string {
   return 'text-emerald-300';
 }
 
+/** Human-readable label for an attention item's lifecycle.clears_when. */
+function lifecycleClearsLabel(clearsWhen?: string | null): string {
+  if (!clearsWhen) return '';
+  const labels: Record<string, string> = {
+    message_resolved_or_deleted: 'Clears when the message is resolved or deleted',
+    approval_resolved_or_task_terminal_or_archived: 'Clears when the approval is resolved or the task ends',
+    task_archived_or_pr_merged_or_closed: 'Clears when the task is archived or the PR merges',
+    eligible_runner_available_or_task_dispatches_expires_terminal_or_archived: 'Clears when an eligible runner is available or the task dispatches',
+    runner_recovers_task_unpins_dispatches_terminal_or_archived: 'Clears when the runner recovers or the task dispatches',
+    runner_heartbeats_back_to_live_or_is_deleted: 'Clears when the runner heartbeats or is removed',
+    task_claims_healthy_runtime_recovers_terminal_or_archived: 'Clears when the task claims a healthy runtime',
+    dependency_recovers_task_leaves_queue_terminal_or_archived: 'Clears when the dependency resolves or the task leaves queue',
+    criterion_mapped_to_active_direction_or_operator_attested: 'Clears when the criterion is mapped or attested',
+    confirmation_accepted_dismissed_or_credential_provided: 'Clears when accepted, dismissed, or credential provided',
+    confirmation_accepted_dismissed_or_access_granted: 'Clears when accepted, dismissed, or access granted',
+    confirmation_accepted_or_dismissed: 'Clears when accepted or dismissed',
+    alert_dismissed_or_resolved_at_source: 'Clears when the alert is dismissed or resolved',
+    task_unblocked_terminal_or_archived: 'Clears when the task is unblocked or ends',
+    task_unparked_terminal_or_archived: 'Clears when the task is unparked or ends',
+    task_requeued_archived_or_otherwise_resolved: 'Clears when the task is requeued or resolved',
+    task_archived_or_outside_6h_window: 'Clears when the task is archived or outside the 6h window',
+    criterion_covered_or_version_closed_or_attested: 'Clears when the criterion is covered, version closes, or attested',
+    criterion_covered_or_version_closed: 'Clears when the criterion is covered or version closes',
+    criteria_registered_or_prose_reconciled_or_version_closed: 'Clears when criteria are registered or version closes',
+    criterion_covered_or_version_closed_or_re_attested: 'Clears when the criterion is covered, version closes, or re-attested',
+    underlying_source_clears: 'Clears when the underlying source clears',
+    direction_flag_cleared_or_direction_inactive: 'Clears when the direction flag is cleared or the direction goes inactive',
+    debt_resolved_dismissed_or_linked_to_work: 'Clears when the debt is resolved, dismissed, or linked to work',
+  };
+  return labels[clearsWhen] ?? `Clears: ${clearsWhen.replace(/_/g, ' ')}`;
+}
+
+function attentionItemIcon(kind?: string): string {
+  if (kind === 'message') return '💬';
+  if (kind === 'confirmation') return '✋';
+  if (kind === 'task') return '📋';
+  if (kind === 'alert') return '🚨';
+  if (kind === 'direction') return '🧭';
+  if (kind === 'runner') return '🖥';
+  return '📌';
+}
+
 function messageReplyFromLabel(msg: ProjectMessage): string {
   const fromType = (msg.from_type || '').toLowerCase();
   if (fromType === 'strategic' || fromType === 'strategist') return 'Strategic';
@@ -422,6 +464,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // eslint-disable-next-line react-hooks/refs
   usesStrategicReadModelRef.current = usesStrategicReadModel;
   const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
+  // Needs-action items derived from the canonical attention model — these replace
+  // the client-side effectiveSignal re-derivation for the needs-action set.
+  const attentionNeedsActionItems = useMemo(
+    () => strategicAttention?.items.filter(item => item.severity === 'needs_operator') ?? [],
+    [strategicAttention?.items],
+  );
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -1251,13 +1299,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }, [conversationMode, streamingText]);
 
-  // Update parent with the high-signal count for the tab-title badge. highSignalCount is
-  // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
-  // App.tsx path, so the badge stays stable across open/closed transitions.
+  // Update parent with the high-signal count for the tab-title badge. When the
+  // strategic read model carries the canonical attention model, report its
+  // needs_operator count so the tab badge, StrategicContextRail, and in-panel
+  // needs-action set all agree on a single authority.
   useEffect(() => {
-    if (conversationMode && usesStrategicReadModel) return;
+    if (conversationMode && usesStrategicReadModel) {
+      onMessageCountChange?.(attentionNeeds);
+      return;
+    }
     onMessageCountChange?.(highSignalCount);
-  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel]);
+  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -2138,6 +2190,56 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               </span>
             )}
           </span>
+        </div>
+      )}
+
+      {/* Needs-action strip — derived from the canonical attention model when the
+          strategic read model is available. Shows needs_operator items at the top
+          with lifecycle.clears_when so the operator sees they will self-clear. */}
+      {usesStrategicReadModel && attentionNeedsActionItems.length > 0 && (
+        <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
+          <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-amber-200">Needs your action</span>
+              <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{attentionNeedsActionItems.length}</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {attentionNeedsActionItems.slice(0, 6).map(item => {
+                const isMessage = item.kind === 'message';
+                const isConfirmation = item.kind === 'confirmation';
+                const messageId = isMessage ? item.ref?.id : null;
+                const handleClick = () => {
+                  if (isMessage && messageId && conversationMode) {
+                    setHighlightedMessageId(messageId);
+                    const node = scrollRef.current?.querySelector(`[data-message-id="${messageId}"]`);
+                    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                  }
+                };
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={handleClick}
+                    disabled={!isMessage && !isConfirmation}
+                    title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
+                    className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
+                      isMessage
+                        ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                        : 'border-neutral-800 bg-neutral-950/50 cursor-default'
+                    }`}
+                  >
+                    <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
+                    <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
+                    {item.lifecycle?.clears_when && (
+                      <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
+                        auto-clears
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
 
