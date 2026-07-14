@@ -2568,6 +2568,111 @@ class TestProofEarnLoopDedup:
         )
 
 
+# ── Acceptance: full earn-loop with all-unproven capabilities ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_earn_loop_all_unproven_proves_caps_with_backing_paths():
+    """ACCEPTANCE EVIDENCE (salvage: capability-proof-earning-loop):
+    When ALL working capabilities are unproven, the earn loop correctly earns
+    proof for those with verifiable backing_paths and reports no_backing_paths
+    for those without.
+
+    This verifies the full earn-loop machinery against an all-unproven project,
+    mirroring the situation where the sweep fires without demand (the
+    "synthetic demand" path in sweep_proof_earn_loop / Step 22b).  Previously
+    the earn loop only fired on DEMANDED capabilities; an all-unproven project
+    with no blocked dependents was never processed, leaving the gate stuck.
+    """
+    project = MagicMock()
+    project.capability_proof_records = {}
+    problem_model = {
+        "capabilities": [
+            # Has backing_paths → will earn backing_path proof (path_proven)
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "backing_paths": ["backend/app/capability_proof.py"],
+            },
+            # No backing_paths → reported as gap
+            {
+                "name": "repo-map",
+                "status": "working",
+                "backing_paths": [],
+            },
+            # Already proven (evidence_refs with a proven ref) → excluded
+            {
+                "name": "already-proven",
+                "status": "working",
+                "evidence_refs": [{"kind": "named_test", "ref": "test_foo.py", "proven": True}],
+            },
+            # planned → not working, excluded
+            {
+                "name": "planned-cap",
+                "status": "planned",
+            },
+        ]
+    }
+    project.problem_model = problem_model
+
+    async def _all_present(p: str) -> bool:
+        return True
+
+    # Build a synthetic demand covering ALL unproven working capabilities
+    # (mirroring the synthetic demand built by sweep_proof_earn_loop).
+    from app.capability_registry import working_capability_proof_status
+
+    proof_by_name = working_capability_proof_status(problem_model)
+    unproven_names = [
+        name for name, status in proof_by_name.items() if status != "proven"
+    ]
+    synthetic_demand = {
+        "total": len(unproven_names),
+        "demands": [
+            {"kind": "capability", "ref": name, "dependent_count": 1}
+            for name in unproven_names
+        ],
+    }
+    assert "ci-pipeline" in unproven_names
+    assert "repo-map" in unproven_names
+    assert "already-proven" not in unproven_names  # already proven
+
+    with patch("app.capability_proof.flag_modified"):
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result=synthetic_demand,
+            problem_model=problem_model,
+            verify_path=_all_present,
+        )
+
+    # ci-pipeline should have earned backing_path proof.
+    assert result["earned"] >= 1, (
+        "ci-pipeline with backing_paths should earn proof"
+    )
+    assert result["total_demanded_unproven"] == 2, (
+        "two unproven working capabilities should be reported"
+    )
+    # ci-pipeline recorded in capability_proof_records.
+    assert "ci-pipeline" in (project.capability_proof_records or {}), (
+        "ci-pipeline must have a proof record"
+    )
+    # repo-map has no backing_paths → reported as no_backing_paths.
+    assert "repo-map" in result["no_backing_paths"], (
+        "repo-map without backing_paths must be in no_backing_paths"
+    )
+    # already-proven was excluded from the intersection.
+    assert "already-proven" not in result.get("still_unproven", []), (
+        "already-proven cap must be excluded from earn loop"
+    )
+    # still_unproven should be empty (ci-pipeline earned proof).
+    assert result["still_unproven"] == [], (
+        "no caps should remain unproven after earn loop"
+    )
+    assert result["path_proven_stuck"] == [], (
+        "first-earn path should not report stuck caps"
+    )
+
+
 # ── named_test_present-tier automated proof earning (c-e9ef1da6 / d-2b95bef1) ──
 #
 # The earn loop's discovery tier: when a capability's backing_paths are not

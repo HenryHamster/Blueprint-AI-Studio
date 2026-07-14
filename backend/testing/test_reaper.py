@@ -17521,6 +17521,95 @@ async def test_proof_earn_loop_runs_after_backing_proof_same_cycle(reaper_db, mo
 
 
 @pytest.mark.asyncio
+async def test_proof_earn_loop_fires_without_demand_when_unproven_caps_exist(reaper_db, mocker):
+    """Step 22b fires even with NO demand when unproven working capabilities exist.
+
+    The no-demand fallthrough breaks the circularity: demand requires blocked
+    dependents, blocked dependents require enforce mode, and enforce mode
+    requires proven capabilities.  Without this fallthrough the earn loop would
+    never fire on a project with all capabilities unproven and no blocked
+    dependents, leaving the gate permanently stuck in 'off'.
+
+    This test asserts that when collect_missing_capability_demand returns empty
+    demand, the sweep still calls commission_proof_earn_loop with a synthetic
+    demand covering all unproven working capabilities.
+    """
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    _rs._last_backing_proof_sweep = None
+    _rs._last_proof_earn_loop_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": "ci-pipeline",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                },
+                {
+                    "name": "repo-map",
+                    "status": "working",
+                    "backing_paths": [],
+                },
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        now = _utcnow()
+
+        # Return NO demand from the collector.
+        demand_spy = mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(return_value={"total": 0, "demands": []}),
+        )
+        # Spy on the earn loop to verify it receives a synthetic demand.
+        commission_spy = mocker.patch(
+            "app.capability_proof.commission_proof_earn_loop",
+            new=AsyncMock(
+                return_value={
+                    "total_demanded_unproven": 1,
+                    "earned": 0,
+                    "no_backing_paths": ["repo-map"],
+                    "still_unproven": [],
+                    "path_proven_stuck": [],
+                }
+            ),
+        )
+
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        # The demand collector was called.
+        demand_spy.assert_awaited()
+        # The earn loop was called (not skipped by the demand guard).
+        commission_spy.assert_awaited_once()
+        # Extract the synthetic demand passed to commission_proof_earn_loop.
+        _call_args = commission_spy.await_args
+        assert _call_args is not None
+        _synthetic_demand = _call_args[0][1] if _call_args.args else {}
+        assert _synthetic_demand.get("total", 0) >= 1, (
+            "synthetic demand must cover at least one unproven capability"
+        )
+        synthetic_refs = {
+            d["ref"] for d in _synthetic_demand.get("demands", [])
+            if d.get("kind") == "capability"
+        }
+        # Both capabilities should be in the synthetic demand.
+        assert "ci-pipeline" in synthetic_refs, (
+            "ci-pipeline must be in synthetic demand"
+        )
+        assert "repo-map" in synthetic_refs, (
+            "repo-map must be in synthetic demand"
+        )
+        # The sweep ran (result is not {} — it's the combined summary).
+        assert result != {}, "sweep must not return empty dict when it ran"
+        assert _rs._last_proof_earn_loop_sweep == now
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn
+
+@pytest.mark.asyncio
 async def test_proof_earn_loop_honors_its_own_cadence_gate(reaper_db, mocker):
     """Step 22b's cadence gate is independent of the backing-proof timer.
 

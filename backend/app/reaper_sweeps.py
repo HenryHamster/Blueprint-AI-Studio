@@ -719,6 +719,15 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     have no backing_paths, the gap is surfaced in the return summary so the
     strategist layer can act.
 
+    When there is NO demand (no blocked dependents — common when the proof gate
+    is in ``off`` mode), proactively builds a synthetic demand covering ALL
+    unproven working capabilities so the earn loop can still prove capabilities
+    independently of the demand signal.  This breaks the circularity: demand
+    requires blocked dependents, blocked dependents require enforce mode, and
+    enforce mode requires proven capabilities.  Without this fallthrough the
+    earn loop would never fire on a project with all capabilities unproven and
+    no blocked dependents, leaving the gate permanently stuck in ``off``.
+
     Cadence-gated to the same hourly interval as the backing-path sweep, but on
     an INDEPENDENT timer (``_last_proof_earn_loop_sweep``) so Step 22 stamping
     its own timer earlier in the same cycle cannot suppress this sweep.
@@ -728,6 +737,9 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     global _last_proof_earn_loop_sweep
     from app.capability_demand import collect_missing_capability_demand
     from app.capability_proof import commission_proof_earn_loop
+    from app.capability_registry import (
+        working_capability_proof_status,
+    )
     from app.models import Project
     from sqlalchemy.orm import load_only
 
@@ -782,8 +794,37 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             demand_result = await collect_missing_capability_demand(
                 session, project.id, now=_now
             )
+
+            # When there is NO demand (no blocked dependents), proactively attempt
+            # to prove ALL unproven working capabilities. This breaks the
+            # circularity where demand requires blocked dependents, blocked
+            # dependents require enforce mode, and enforce mode requires proven
+            # capabilities. Without this fallthrough, the earn loop would never
+            # fire on a project with all capabilities unproven and no blocked
+            # dependents, leaving the gate permanently stuck in 'off'.
             if not demand_result.get("demands"):
-                continue
+                proof_by_name = working_capability_proof_status(pm)
+                unproven_names = [
+                    name for name, status in proof_by_name.items()
+                    if status != "proven"
+                ]
+                if not unproven_names:
+                    continue
+                # Build a synthetic demand covering all unproven working
+                # capabilities so commission_proof_earn_loop can process them.
+                synthetic_demands = [
+                    {
+                        "kind": "capability",
+                        "ref": name,
+                        "label": name,
+                        "dependent_count": 1,
+                    }
+                    for name in unproven_names
+                ]
+                demand_result = {
+                    "total": len(synthetic_demands),
+                    "demands": synthetic_demands,
+                }
 
             result = await commission_proof_earn_loop(
                 project, demand_result, pm
