@@ -823,6 +823,60 @@ async def aresolve_deferred_retirement_debt(
     )
 
 
+async def aresolve_hotfix_deploy_backfill_debts(
+    session: Any,
+    project_id: Any,
+    *,
+    reason: str | None = None,
+) -> int:
+    """Best-effort discharge of a project's open hotfix-deploy backfill debts.
+
+    The operator hotfix-deploy channel opens a
+    :data:`KIND_HOTFIX_DEPLOY_PENDING_BACKFILL` row (keyed
+    ``hotfix_deploy:{project}:{candidate_sha}``) recording that a fast-tracked
+    release-machinery promotion bypassed the audit/scoring gate and is owed
+    re-qualification by the NORMAL gate.  Nothing else resolves it, so it stays
+    open forever and permanently depresses the debt-pressure sub-score.
+
+    Called when the normal qualification gate clears for the project — that IS
+    the owed re-qualification.  Resolves EVERY open hotfix-deploy backfill row
+    for ``project_id`` (a project may have accumulated several fast-tracks before
+    the next normal gate ran) and returns the number resolved.  Delegates each
+    flip to :func:`aresolve_completion_debt`, which is non-fatal, skips
+    already-resolved rows, and never reopens a dismissed row.  Never raises.
+    """
+    if session is None or project_id is None:
+        return 0
+    try:
+        from app.models import CompletionDebtEntry
+
+        open_rows = (
+            await session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project_id,
+                    CompletionDebtEntry.kind
+                    == KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+                    CompletionDebtEntry.status == STATUS_OPEN,
+                )
+            )
+        ).scalars().all()
+        resolved = 0
+        for entry in open_rows:
+            if await aresolve_completion_debt(
+                session, entry.dedupe_key, reason=reason
+            ):
+                resolved += 1
+        return resolved
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to resolve hotfix-deploy backfill debts "
+            "(project=%s)",
+            project_id,
+            exc_info=True,
+        )
+        return 0
+
+
 # ── Seed inventory ───────────────────────────────────────────────────────────
 
 
@@ -1012,6 +1066,7 @@ def _build_completion_debt_design_doc_section() -> dict:
             KIND_DORMANT_KNOB,
             KIND_CAPABILITY_TRIAL,
             KIND_NO_CI_GATE,
+            KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
             KIND_RETIREMENT_RESIDUAL,
             KIND_SEED_INVENTORY,
         ],
@@ -1019,12 +1074,14 @@ def _build_completion_debt_design_doc_section() -> dict:
             "dormant_knob": "backend/app/runtime_config_state.py",
             "capability_trial": "backend/app/capability_trial_verdict.py",
             "no_ci_gate": "backend/app/ci_resolution.py",
+            "hotfix_deploy_pending_backfill": "backend/app/release_qualifier.py",
             "retirement_residual": "backend/app/strategic_completion.py",
             "seed_inventory": "backend/app/completion_debt.py",
         },
         "reconciliation_surfaces": [
             "knob graduation via admin settings endpoint resolves dormant-knob debt",
             "decided capability verdicts resolve capability-trial debt",
+            "a passing normal qualification gate resolves hotfix-deploy backfill debt",
         ],
         "strategist_surface": "open_completion_debt payload section / ./fetch completion-debt verb",
         "admin_surface": "PATCH /api/admin/completion-debt endpoints (list, dismiss, resolve)",

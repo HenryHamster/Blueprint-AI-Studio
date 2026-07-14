@@ -4769,6 +4769,252 @@ async def test_ledger_stores_post_reconciliation_audit_score(db_session, mocker)
     assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
 
 
+async def _open_hotfix_backfill_debt(db_session, project, candidate_sha: str):
+    """Open a hotfix_deploy_pending_backfill debt row for ``project``, mirroring
+    what ``_record_hotfix_audit_trail`` writes after an operator hotfix-deploy."""
+    from app import completion_debt as cd
+
+    opened = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:{candidate_sha}",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title=f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes re-qual",
+        project_id=project.id,
+        source="hotfix_promote",
+        detail={"candidate_sha": candidate_sha},
+    )
+    assert opened is True
+    await db_session.commit()
+
+
+async def _hotfix_backfill_row(db_session, project, candidate_sha: str):
+    return (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == f"hotfix_deploy:{project.id}:{candidate_sha}"
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_finalize_discharges_hotfix_backfill_debt_on_passing_gate(
+    db_session, mocker
+):
+    """A passing normal qualification gate discharges the write-only
+    hotfix_deploy_pending_backfill debt the operator hotfix-deploy channel opened.
+
+    The hotfix-deploy channel mints a hotfix_deploy_pending_backfill completion-debt
+    row recording that a fast-tracked release-machinery promotion bypassed the
+    audit/scoring gate and is owed re-qualification by the NORMAL gate.  Nothing
+    used to resolve it, so it stayed open forever and permanently dragged the
+    debt-pressure sub-score down.  When the normal gate composite clears
+    (promote=True, here on the dry-run path so no real promote() is needed), the
+    owed re-qualification has demonstrably happened and the row must flip to
+    resolved with a reason.
+    """
+    from app import shared_state
+    from app.completion_debt import STATUS_OPEN, STATUS_RESOLVED
+
+    # Dry-run path: promote=True but promotion_enabled=False, so finalize returns
+    # 'dry_run' without entering promote() — exactly the composite["promote"] gate
+    # the discharge hooks onto.
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _open_hotfix_backfill_debt(db_session, project, "abc12345" + "0" * 32)
+
+    # Sanity: the debt is open before the gate runs.
+    row = await _hotfix_backfill_row(db_session, project, "abc12345" + "0" * 32)
+    assert row.status == STATUS_OPEN
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={"audit_score": 1.0, "findings": []},
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", result
+
+    row = await _hotfix_backfill_row(db_session, project, "abc12345" + "0" * 32)
+    assert row.status == STATUS_RESOLVED, (
+        f"expected hotfix-backfill debt resolved on passing gate, got {row.status!r}"
+    )
+    assert row.resolved_at is not None
+    assert "re-qualified by normal gate" in (row.resolution_reason or ""), (
+        f"resolution_reason must record the discharge, got {row.resolution_reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_leaves_hotfix_backfill_debt_open_when_not_promoted(
+    db_session, mocker
+):
+    """A not-promoted (blocked) normal gate must NOT discharge the hotfix-backfill
+    debt — the owed re-qualification has not succeeded, so the obligation stands."""
+    from app import shared_state
+    from app.completion_debt import STATUS_OPEN
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _open_hotfix_backfill_debt(db_session, project, "deadbeef" + "0" * 32)
+
+    # A deleted test file classified genuine_erosion drives compute_composite to
+    # the test_file_deleted hard blocker → not_promoted, so composite["promote"]
+    # is False and no discharge fires.
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": -5,
+            },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; test removed to stop a failing build.",
+                }
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted", result
+    assert result["blocker"] == "test_file_deleted", result
+
+    row = await _hotfix_backfill_row(db_session, project, "deadbeef" + "0" * 32)
+    assert row.status == STATUS_OPEN, (
+        f"a not-promoted gate must leave the hotfix-backfill debt OPEN, got {row.status!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aresolve_hotfix_backfill_scopes_to_project_and_kind(db_session):
+    """aresolve_hotfix_deploy_backfill_debts resolves ONLY open hotfix-deploy rows
+    for the target project — skipping dismissed rows, other kinds, other projects,
+    and returning the count resolved.  None inputs are a safe no-op (returns 0)."""
+    from app import completion_debt as cd
+
+    project, _ = await _make_project_and_version(db_session)
+    other, _ = await _make_project_and_version(db_session)
+
+    # Two open hotfix-backfill rows for the target project (a project can
+    # accumulate several fast-tracks before the next normal gate runs).
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_one",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix one",
+        project_id=project.id,
+    )
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_two",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix two",
+        project_id=project.id,
+    )
+    # A dismissed hotfix row for the same project — must NOT be reopened/resolved.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_dismissed",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix dismissed",
+        project_id=project.id,
+    )
+    # A different debt kind for the same project — out of scope.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"no_ci_gate:{project.id}:x",
+        kind=cd.KIND_NO_CI_GATE,
+        title="unrelated",
+        project_id=project.id,
+    )
+    # A hotfix row for a DIFFERENT project — out of scope.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{other.id}:sha_other",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="other project hotfix",
+        project_id=other.id,
+    )
+    await db_session.commit()
+
+    dismissed_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == f"hotfix_deploy:{project.id}:sha_dismissed"
+            )
+        )
+    ).scalar_one()
+    dismissed_row.status = cd.STATUS_DISMISSED
+    db_session.add(dismissed_row)
+    await db_session.commit()
+
+    resolved = await cd.aresolve_hotfix_deploy_backfill_debts(
+        db_session, project.id, reason="unit-test discharge"
+    )
+    await db_session.commit()
+    assert resolved == 2, f"expected exactly the 2 open target-project rows, got {resolved}"
+
+    def _status(key):
+        return (
+            db_session.execute(
+                select(CompletionDebtEntry.status).where(
+                    CompletionDebtEntry.dedupe_key == key
+                )
+            )
+        )
+
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_one")
+    ).scalar_one() == cd.STATUS_RESOLVED
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_two")
+    ).scalar_one() == cd.STATUS_RESOLVED
+    # Dismissed stays dismissed; other-kind and other-project stay open.
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_dismissed")
+    ).scalar_one() == cd.STATUS_DISMISSED
+    assert (
+        await _status(f"no_ci_gate:{project.id}:x")
+    ).scalar_one() == cd.STATUS_OPEN
+    assert (
+        await _status(f"hotfix_deploy:{other.id}:sha_other")
+    ).scalar_one() == cd.STATUS_OPEN
+
+    # None inputs are a safe no-op.
+    assert await cd.aresolve_hotfix_deploy_backfill_debts(None, project.id) == 0
+    assert await cd.aresolve_hotfix_deploy_backfill_debts(db_session, None) == 0
+
+
 class TestReconcileRefutedJustificationGate:
     """Backend reason-substantiveness gate for refuted_false_positive verdicts.
 

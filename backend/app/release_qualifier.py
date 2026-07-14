@@ -5901,6 +5901,46 @@ async def _finalize_qualification(
     # three terminal paths (not_promoted / dry_run / promote) are covered once.
     await _dual_write_dimension_results(session, version, base_record, composite)
 
+    # --- Discharge hotfix-deploy backfill debt on a passing normal gate ------
+    # The operator hotfix-deploy channel opens a hotfix_deploy_pending_backfill
+    # completion-debt row (see _record_hotfix_audit_trail) recording that a
+    # fast-tracked release-machinery promotion bypassed the audit/scoring gate
+    # and is owed re-qualification by the NORMAL gate.  This IS that gate: when
+    # the composite clears the audit/scoring bar (promote=True) the owed
+    # re-qualification has demonstrably happened, so resolve any open
+    # hotfix-deploy backfill debt for this project — otherwise the row is
+    # write-only and drags the debt-pressure sub-score down forever.  Fire on
+    # gate-pass (composite.promote), NOT on merge-land: a pass is robust to a
+    # descendant SHA and to a later dry-run/merge-conflict, and it mirrors the
+    # "gate cleared" semantics the debt records.  Best-effort — never raises,
+    # never alters the decision below.
+    if composite["promote"]:
+        try:
+            from app.completion_debt import aresolve_hotfix_deploy_backfill_debts
+
+            _discharged = await aresolve_hotfix_deploy_backfill_debts(
+                session,
+                version.project_id,
+                reason=(
+                    f"re-qualified by normal gate at "
+                    f"{(candidate_sha or '')[:8]} (v{version.version_number})"
+                ),
+            )
+            if _discharged:
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d discharged %d hotfix-deploy backfill "
+                    "debt row(s) on passing normal gate",
+                    version.version_number,
+                    _discharged,
+                )
+        except Exception:  # noqa: BLE001 — discharge must never break finalize
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d failed to discharge hotfix-deploy "
+                "backfill debt",
+                version.version_number,
+                exc_info=True,
+            )
+
     # --- Decide -------------------------------------------------------------
     if not composite["promote"]:
         # Monotonic ledger guard (incident 2026-06-09): a ci_unresolved blocker
