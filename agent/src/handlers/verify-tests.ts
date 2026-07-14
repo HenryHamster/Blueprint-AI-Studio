@@ -205,6 +205,22 @@ interface VerifyTestsResult {
     // status, yields false. Additive: a backend that does not read it is
     // unaffected; the sibling backend change consumes it to mint ``proven``.
     passed: boolean;
+    // Whether the declared test FILE is among the PR's own changed files — the
+    // SAME changed-files requirement the backend acceptance gate
+    // (acceptance_gate._evaluate_named_test) checks FIRST, before any green/
+    // verification logic. A declared test that runs green but is NOT in the PR's
+    // diff can never earn machine-proven coverage: the gate hard-fails
+    // ``proven=False`` for "declared named_test … is not among the PR's changed
+    // files". Surfacing it HERE makes that verdict visible PRE-merge (the agent
+    // already has the diff for the documented-command / disabled-tests probes)
+    // instead of only after the badge-only merge. true = the test file is in the
+    // diff; false = it is NOT (green run will not be credited proven); omitted
+    // when the diff could not be computed (base ref unavailable) so the check is
+    // indeterminate. ADDITIVE: an older backend that ignores it is unaffected;
+    // the sibling ci_resolution change withholds the targeted-green mint when it
+    // is explicitly false, so no spurious green is advertised for a test the gate
+    // will reject.
+    in_diff?: boolean;
   };
 }
 
@@ -713,6 +729,29 @@ function parseDeclaredAcceptanceTest(
   return { descriptor, selector };
 }
 
+// Whether a changed-file path refers to the declared test target. TS port of
+// the backend acceptance_gate._paths_match so the agent's pre-merge in_diff
+// signal matches the gate's authoritative changed-files check byte-for-byte:
+// tolerant of leading-directory differences — an exact match, a suffix match in
+// either direction, or a basename match all count.
+function acceptanceTestPathMatches(changed: string, declared: string): boolean {
+  const c = changed.trim().replace(/^[./]+/, '');
+  const d = declared.trim().replace(/^[./]+/, '');
+  if (!c || !d) return false;
+  if (c === d) return true;
+  if (c.endsWith('/' + d) || d.endsWith('/' + c)) return true;
+  return c.split('/').pop() === d.split('/').pop();
+}
+
+// The declared test's FILE path (the portion before any ``::`` node id),
+// mirroring the backend's ``(evidence.test_path).partition("::")[0]``. Prefers
+// the precise selector, falling back to the descriptor. Empty when neither
+// carries a path-shaped value.
+function declaredAcceptanceTestPath(declared: DeclaredAcceptanceTest): string {
+  const sel = (declared.selector || declared.descriptor || '').trim();
+  return sel.split('::')[0].trim();
+}
+
 // Run the declared acceptance test (if any) and fold the verdict into the
 // result via the additive ``acceptanceTest`` block. Self-contained: it detects
 // the runner, runs ONLY the declared test (targeted), and classifies whether it
@@ -721,11 +760,18 @@ function parseDeclaredAcceptanceTest(
 // degrades to ``could_not_run`` (fall-open). NEVER throws — any error degrades
 // to the unchanged result. Skipped entirely when no acceptance test was
 // declared, so a PR with no declaration is byte-for-byte unchanged.
+//
+// ``diff`` is the precomputed PR diff (shared with the documented-command /
+// disabled-tests probes). When available, the declared test file is cross-checked
+// against the PR's changed files to set ``in_diff`` — surfacing PRE-merge the
+// changed-files verdict the backend gate would otherwise only apply AFTER the
+// merge. Null diff leaves ``in_diff`` omitted (indeterminate).
 async function attachAcceptanceTestProbe(
   ws: WebSocket | null,
   buildConfig: BuildConfig | undefined,
   task: Record<string, unknown>,
   base: VerifyTestsResult,
+  diff: PrDiff | null,
 ): Promise<VerifyTestsResult> {
   let declared: DeclaredAcceptanceTest | null;
   try {
@@ -735,6 +781,27 @@ async function attachAcceptanceTestProbe(
   }
   if (!declared) return base;
   const label = declared.selector || declared.descriptor;
+
+  // Cross-check the declared test file against the PR's own changed files — the
+  // SAME check the backend gate runs FIRST. Omitted (undefined) when the diff
+  // is unavailable or the declaration carries no path-shaped value, so the
+  // result is indeterminate rather than a false "not in diff".
+  const declaredPath = declaredAcceptanceTestPath(declared);
+  // Indeterminate (omit) when the diff is unavailable, carries no changed files
+  // (base ref == HEAD / shallow clone — the same guard the other diff-aware
+  // probes use), or the declaration has no path-shaped value. Only a real,
+  // non-empty changed-file list can soundly say a test is NOT in the diff.
+  const inDiff: boolean | undefined =
+    diff && diff.changedFiles.length > 0 && declaredPath
+      ? diff.changedFiles.some(cf => acceptanceTestPathMatches(cf, declaredPath))
+      : undefined;
+  const inDiffField = inDiff !== undefined ? { in_diff: inDiff } : {};
+  // A green/present run that is NOT among the PR's changed files can never earn
+  // machine-proven coverage — the gate hard-fails proven=False. Warn PRE-merge.
+  const notInDiffNote =
+    inDiff === false
+      ? ` NOTE: the declared test \`${declaredPath}\` is NOT among this PR's changed files — a green run of an unmodified test cannot earn machine-proven coverage (the merge gate requires the declared test be added/modified by this PR); add or modify it here to earn proven credit.`
+      : '';
 
   let runner: TestRunner | null = null;
   try {
@@ -749,10 +816,10 @@ async function attachAcceptanceTestProbe(
   };
   if (!runner) {
     sendLog(ws, `Declared acceptance test [${label}]: no targetable suite — could not run the check (fall-open).\n`);
-    const note = `Declared acceptance test \`${label}\` could not be targeted (no runnable suite to execute it) — cannot confirm it ran; falling open as degraded.`;
+    const note = `Declared acceptance test \`${label}\` could not be targeted (no runnable suite to execute it) — cannot confirm it ran; falling open as degraded.${notInDiffNote}`;
     return {
       ...base,
-      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run', passed: false },
+      acceptanceTest: { ...blockBase, present: false, ran: false, status: 'could_not_run', passed: false, ...inDiffField },
       output: [base.output, note].filter(Boolean).join('\n'),
     };
   }
@@ -783,20 +850,23 @@ async function attachAcceptanceTestProbe(
   // non-``ran`` status yields false (see acceptanceTestRunPassed).
   const passed = acceptanceTestRunPassed(cleanExit, status);
   const present = status !== 'absent';
+  if (inDiff === false) {
+    sendLog(ws, `Declared acceptance test [${label}]: not among the PR's changed files — a green run cannot earn machine-proven coverage.\n`);
+  }
   sendLog(ws, `Declared acceptance test [${label}]: ${status}\n`);
   let note: string;
   if (status === 'ran') {
-    note = `Declared acceptance test \`${label}\` ran — confirmed present and executed.`;
+    note = `Declared acceptance test \`${label}\` ran — confirmed present and executed.${notInDiffNote}`;
   } else if (status === 'skipped') {
     note = `Declared acceptance test \`${label}\` was SKIPPED — the promised test did not actually execute; blocking the merge.`;
   } else if (status === 'absent') {
     note = `Declared acceptance test \`${label}\` is ABSENT — the promised test was not found in the PR's run; blocking the merge.`;
   } else {
-    note = `Declared acceptance test \`${label}\` could not be run — cannot confirm it ran; falling open as degraded.`;
+    note = `Declared acceptance test \`${label}\` could not be run — cannot confirm it ran; falling open as degraded.${notInDiffNote}`;
   }
   return {
     ...base,
-    acceptanceTest: { ...blockBase, present, ran, status, passed },
+    acceptanceTest: { ...blockBase, present, ran, status, passed, ...inDiffField },
     output: [base.output, note].filter(Boolean).join('\n'),
   };
 }
@@ -1163,7 +1233,7 @@ export async function handleVerifyTests(
   // completed path (the early setup-failure FAILED returns above skip it); a
   // no-op when no acceptance test was declared.
   statusRef.value = 'Confirming declared acceptance test ran...';
-  result = await attachAcceptanceTestProbe(ws, buildConfig, task, result);
+  result = await attachAcceptanceTestProbe(ws, buildConfig, task, result, prDiff);
 
   // Write the result file (parity with smoketest's /tmp result file — useful
   // for operator inspection); the authoritative copy is the artifact logs.

@@ -1089,6 +1089,17 @@ def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
     selector = raw.get("selector")
     if isinstance(selector, str) and selector.strip():
         block["selector"] = selector.strip()
+    # Optional pre-merge cross-check the agent computes against the PR's own
+    # changed files — the SAME changed-files requirement the acceptance gate
+    # (``acceptance_gate._evaluate_named_test``) checks FIRST. Carried through
+    # ONLY when the agent emitted a literal bool: ``True``/``False`` are surfaced,
+    # a missing / non-bool value (older agent) is left absent so the gate is
+    # unchanged. A green run reported with ``in_diff=False`` can never earn
+    # machine-proven coverage, so :func:`acceptance_test_is_green` withholds the
+    # targeted-green mint for it rather than advertising a green the gate rejects.
+    in_diff = raw.get("in_diff")
+    if isinstance(in_diff, bool):
+        block["in_diff"] = in_diff
     return block
 
 
@@ -1127,10 +1138,20 @@ def acceptance_test_is_green(block: Any) -> bool:
     agent that omits ``passed`` (:func:`acceptance_test_block` defaults it to
     False): all yield False, so today's behavior is preserved and no green signal
     is minted on absence.
+
+    A block that EXPLICITLY reports ``in_diff=False`` — the declared test is not
+    among the PR's own changed files — is NOT green here even if it ran and passed:
+    the acceptance gate checks the changed-files requirement FIRST and would
+    hard-fail ``proven=False`` regardless of a targeted-green run, so minting a
+    targeted-green signal for it would advertise a green the gate rejects and mask
+    the real (pre-merge) verdict. An older agent that omits ``in_diff`` is
+    unaffected (the key is absent, not ``False``), preserving today's behavior.
     """
     if not isinstance(block, dict):
         return False
     if block.get("declared") is not True:
+        return False
+    if block.get("in_diff") is False:
         return False
     if block.get("ran") is not True:
         return False

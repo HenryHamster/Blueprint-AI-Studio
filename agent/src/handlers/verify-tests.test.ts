@@ -995,9 +995,24 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     context: { acceptance_evidence: { kind, descriptor: 'the seam test', selector } },
   });
 
-  type Acc = { declared: boolean; descriptor: string; selector?: string; present: boolean; ran: boolean; status: string; passed?: boolean };
+  type Acc = { declared: boolean; descriptor: string; selector?: string; present: boolean; ran: boolean; status: string; passed?: boolean; in_diff?: boolean };
   function acceptanceBlock(): Acc | undefined {
     return (JSON.parse(lastPostedPayload().logs as string) as { acceptanceTest?: Acc }).acceptanceTest;
+  }
+
+  // Mock the shared PR-diff `git diff --name-only` pass to report `changedFiles`,
+  // while every other execFileAsync (git rev-parse, the targeted pytest run)
+  // returns `runOutput`. Lets a test control whether the declared test file is
+  // among the PR's changed files (the in_diff cross-check).
+  function mockDiffAndRun(changedFiles: string[], runOutput: string): void {
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git') {
+        const a = args as string[];
+        if (a.includes('--name-only')) return Promise.resolve(changedFiles.join('\n'));
+        return Promise.resolve('');
+      }
+      return Promise.resolve(runOutput);
+    });
   }
 
   beforeEach(() => {
@@ -1087,6 +1102,44 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     const block = acceptanceBlock();
     expect(block?.status).toBe('could_not_run');
     expect(block?.passed).toBe(false);
+  });
+
+  it('declared test RAN and IS among the PR changed files → in_diff=true', async () => {
+    mockDiffAndRun(['testing/test_seam.py', 'app/seam.py'], 'collected 1 item\n1 passed in 0.10s');
+    await handleVerifyTests('atd1', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('ran');
+    expect(block?.passed).toBe(true);
+    expect(block?.in_diff).toBe(true);
+  });
+
+  it('declared test RAN but NOT among the PR changed files → in_diff=false (visible pre-merge)', async () => {
+    // The declared test passes green, but the PR did not add/modify it — the
+    // backend gate will hard-fail proven=False. Surface it PRE-merge.
+    mockDiffAndRun(['app/seam.py', 'app/other.py'], 'collected 1 item\n1 passed in 0.10s');
+    await handleVerifyTests('atd2', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('ran');
+    expect(block?.passed).toBe(true);
+    expect(block?.in_diff).toBe(false);
+    // The operator-facing note carries the pre-merge warning.
+    const logs = lastPostedPayload().logs as string;
+    expect(logs).toContain('is NOT among');
+  });
+
+  it('basename-only changed path still matches the declared test (tolerant match)', async () => {
+    mockDiffAndRun(['backend/testing/test_seam.py'], 'collected 1 item\n1 passed in 0.10s');
+    await handleVerifyTests('atd3', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    expect(acceptanceBlock()?.in_diff).toBe(true);
+  });
+
+  it('empty changed-file list (diff unavailable) → in_diff omitted (indeterminate)', async () => {
+    // git returns '' for --name-only → changedFiles=[] → indeterminate, not false.
+    mockDiffAndRun([], 'collected 1 item\n1 passed in 0.10s');
+    await handleVerifyTests('atd4', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
+    const block = acceptanceBlock();
+    expect(block?.status).toBe('ran');
+    expect(block?.in_diff).toBeUndefined();
   });
 
   it('no acceptance evidence declared → acceptanceTest omitted entirely', async () => {

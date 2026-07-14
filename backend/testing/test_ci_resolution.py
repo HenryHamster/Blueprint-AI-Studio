@@ -2268,6 +2268,105 @@ def test_acceptance_test_is_green_predicate():
     assert not ci_resolution.acceptance_test_is_green("x")
 
 
+def test_acceptance_test_block_carries_in_diff():
+    # ``in_diff`` is surfaced ONLY when the agent emitted a literal bool.
+    in_diff_true = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+                "in_diff": True,
+            }
+        }
+    )
+    assert in_diff_true is not None and in_diff_true["in_diff"] is True
+    in_diff_false = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+                "in_diff": False,
+            }
+        }
+    )
+    assert in_diff_false is not None and in_diff_false["in_diff"] is False
+    # An older agent that omits ``in_diff`` leaves the key absent (not False),
+    # so today's behavior is preserved.
+    older = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+            }
+        }
+    )
+    assert older is not None and "in_diff" not in older
+    # A non-bool ``in_diff`` (malformed) is ignored — key absent.
+    malformed = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+                "in_diff": "true",
+            }
+        }
+    )
+    assert malformed is not None and "in_diff" not in malformed
+
+
+def test_acceptance_test_not_in_diff_is_not_green():
+    # A declared test that ran green but is NOT among the PR's changed files
+    # (in_diff=False) can never earn machine-proven coverage — the gate hard-fails
+    # proven=False on the changed-files check FIRST — so no targeted-green is minted.
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": True, "in_diff": False}
+    )
+    # in_diff=True keeps the green mint.
+    assert ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": True, "in_diff": True}
+    )
+    # Omitted in_diff (older agent) preserves today's green mint.
+    assert ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": True}
+    )
+
+
+def test_acceptance_test_not_in_diff_end_to_end_withholds_green():
+    # A full verdict whose acceptanceTest ran green but reports in_diff=False
+    # flows through acceptance_test_block → acceptance_test_is_green as NOT green.
+    verdict = {
+        "detected": False,
+        "acceptanceTest": {
+            "declared": True,
+            "descriptor": "the seam test",
+            "selector": "testing/test_seam.py::test_x",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "in_diff": False,
+        },
+    }
+    block = ci_resolution.acceptance_test_block(verdict)
+    assert block is not None and block["in_diff"] is False
+    assert ci_resolution.acceptance_test_is_green(block) is False
+    # It is also NOT a clear failure — the test DID run; the changed-files gap is a
+    # proven-credit issue, not an absent/skipped block.
+    assert ci_resolution.acceptance_test_is_clear_failure(block) is False
+
+
 def test_acceptance_test_is_green_end_to_end_from_verdict():
     # A full verify-tests verdict whose acceptanceTest block ran green flows
     # through acceptance_test_block → acceptance_test_is_green.
