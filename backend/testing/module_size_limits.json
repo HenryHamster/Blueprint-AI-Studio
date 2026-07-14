@@ -120,7 +120,7 @@
     "release_version.py": 2050,
     "ci_resolution.py": 2100,
     "routers/admin_project_config.py": 1800,
-    "compute_backends.py": 4450,
+    "compute_backends.py": 4850,
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 1850,
     "strategic_state_read_model.py": 1100,

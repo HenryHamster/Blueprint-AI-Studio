@@ -9,6 +9,7 @@ Covers:
 - Recent ProjectComputeImage rows are protected even before any job lands.
 """
 
+import asyncio
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -21,10 +22,15 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
+from sqlmodel import select
+
+from app import compute_backends as _cb
+from app.compute_image_build import BuildResult
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.reaper_sweeps import (
     _split_pinned_ref,
     sweep_protect_referenced_compute_image_digests,
+    sweep_refresh_project_compute_images,
 )
 
 
@@ -818,3 +824,565 @@ async def test_recent_digests_protected_when_image_rows_exceed_cap(db):
     # 5 recent digests are among the protected 500 (the specific GC trap this test
     # guards). Applied therefore equals the cap, not just the recent count.
     assert result["applied"] == 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Auto-rebuild project compute image on manifest change
+#
+# Driver: app.compute_backends.refresh_project_compute_image
+# Sweep:  app.reaper_sweeps.sweep_refresh_project_compute_images
+#
+# The driver recomputes a project's dependency hash CHEAPLY (GitHub file fetch,
+# NO clone) and rebuilds ONLY when the registry tag for that hash is absent (a
+# genuinely changed manifest). All external I/O is dependency-injected so nothing
+# hits real docker or GitHub.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_repo_project(db: AsyncSession, name: str = "img-proj") -> Project:
+    """A project with a connected GitHub repo (eligible for image refresh)."""
+    project = Project(
+        name=name,
+        user_id="user-1",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+# A manifest with a buildable compute.image.build section.
+_BUILD_MANIFEST = {
+    "compute": {
+        "image": {
+            "name": "widget-compute",
+            "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+        }
+    }
+}
+
+
+def _fetch_bytes_stub(files: dict[str, bytes]):
+    """Async get_file_bytes_at_ref stub returning bytes for *files*, else None."""
+
+    async def _fetch(path, *, token, owner, repo, ref, project_id=None):
+        return files.get(path)
+
+    return _fetch
+
+
+async def _record_row(session, project_id, registry_repo, image_name, result):
+    """Hermetic stand-in for record_project_compute_image_build.
+
+    The production upsert uses a PostgreSQL ``ON CONFLICT`` statement that SQLite
+    cannot execute, so tests inject this plain insert. It preserves the contract
+    the driver relies on: parse the digest out of the pinned ref and return the
+    persisted row.
+    """
+    row = ProjectComputeImage(
+        project_id=project_id,
+        image_name=image_name,
+        registry_repo=registry_repo,
+        dep_hash=getattr(result, "dep_hash", "") or "",
+        tag=getattr(result, "tag", "") or "",
+        pinned_ref=getattr(result, "pinned_ref", "") or "",
+        digest=_cb._parse_digest_from_pinned_ref(getattr(result, "pinned_ref", "") or ""),
+        built=bool(getattr(result, "built", False)),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+# ── Driver: no-config skips ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_repo_is_no_config(db):
+    """A project with no connected repo resolves to no_config with no I/O."""
+    project = Project(name="no-repo", user_id="user-1")
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+
+    called = {"manifest": False}
+
+    async def _manifest(_p):
+        called["manifest"] = True
+        return _BUILD_MANIFEST
+
+    result = await _cb.refresh_project_compute_image(
+        db, project, _manifest_fn=_manifest
+    )
+    assert result["status"] == "no_config"
+    assert called["manifest"] is False, "no-repo project must short-circuit before manifest fetch"
+
+
+@pytest.mark.asyncio
+async def test_refresh_no_build_section_is_no_config(db):
+    """A manifest that declares no compute.image.build section is no_config."""
+    project = await _make_repo_project(db)
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async({"compute": {"image": {"name": "x"}}}),
+        _token_fn=lambda o, r: _async("tok"),
+    )
+    assert result["status"] == "no_config"
+    assert "build section" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_dockerfile_is_no_config(db):
+    """No Dockerfile at the declared path => nothing buildable => no_config, no build."""
+    project = await _make_repo_project(db)
+    build_called = {"n": 0}
+
+    async def _build(*a, **k):
+        build_called["n"] += 1
+        raise AssertionError("build must not run when there is no Dockerfile")
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        # fetch returns None for everything (no Dockerfile, no dep files)
+        _fetch_bytes_fn=_fetch_bytes_stub({}),
+        _build_fn=_build,
+    )
+    assert result["status"] == "no_config"
+    assert build_called["n"] == 0
+
+
+# ── Driver: unchanged fast path ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_unchanged_manifest_no_build_no_clone(db):
+    """Registry tag already exists => fast-path no-op: no build fn call at all."""
+    project = await _make_repo_project(db)
+
+    build_called = {"n": 0}
+    tag_checked: list = []
+
+    async def _build(*a, **k):
+        build_called["n"] += 1
+        raise AssertionError("build/clone must not run for an unchanged manifest")
+
+    def _tag_exists(full_repo, dep_hash):
+        tag_checked.append((full_repo, dep_hash))
+        return True  # already present
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {
+                ".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n",
+                "requirements.txt": b"torch==2.3.0\n",
+            }
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,  # unknown digest
+        _build_fn=_build,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "unchanged"
+    assert build_called["n"] == 0, "no build/clone on the fast path"
+    assert tag_checked, "the registry-tag-exists fast path must be consulted"
+    # Digest unknown => refuse to write a NULL pin.
+    assert result["recorded"] is False
+    rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_unchanged_records_pin_when_digest_resolvable(db):
+    """Unchanged + a resolvable digest => the pin row is recorded (best-effort)."""
+    project = await _make_repo_project(db)
+    digest = "sha256:" + "c" * 64
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: True,
+        _resolve_digest_fn=lambda full_repo, dep_hash: digest,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "unchanged"
+    assert result["recorded"] is True
+    row = (await db.execute(select(ProjectComputeImage))).scalars().one()
+    assert row.digest == digest
+    assert row.dep_hash == result["dep_hash"]
+
+
+# ── Driver: changed manifest drives the build pipeline ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_changed_manifest_builds_and_records(db):
+    """Tag absent => the build pipeline runs and the result is recorded."""
+    project = await _make_repo_project(db)
+    digest = "sha256:" + "d" * 64
+    build_calls: list = []
+
+    async def _build(proj, *, registry_repo, build_config, ref=None):
+        build_calls.append({"ref": ref, "registry_repo": registry_repo, "name": build_config["name"]})
+        return BuildResult(
+            pinned_ref=f"{registry_repo}/widget-compute@{digest}",
+            tag="deadbeefdeadbeef",
+            dep_hash="deadbeefdeadbeef",
+            already_present=False,
+            built=True,
+            digest=digest,
+        )
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("release-main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: False,  # absent => rebuild
+        _build_fn=_build,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "rebuilt"
+    assert result["digest"] == digest
+    # Built at the branch we hashed, not a stale default.
+    assert build_calls and build_calls[0]["ref"] == "release-main"
+    row = (await db.execute(select(ProjectComputeImage))).scalars().one()
+    assert row.digest == digest
+    assert row.built is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_changed_build_digestless_preserves_stored_pin(db):
+    """A rebuild that resolves no digest must NOT NULL an already-stored digest."""
+    project = await _make_repo_project(db)
+    dep_hash = "abc123abc123abc1"
+    stored_digest = "sha256:" + "e" * 64
+    # A row already pins this dep_hash with a real digest.
+    db.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="widget-compute",
+            registry_repo="reg/compute",
+            dep_hash=dep_hash,
+            tag=dep_hash,
+            pinned_ref=f"reg/compute/widget-compute@{stored_digest}",
+            digest=stored_digest,
+            built=True,
+        )
+    )
+    await db.commit()
+
+    async def _build(proj, *, registry_repo, build_config, ref=None):
+        # A registry hiccup: digest could not be resolved (tag-only ref).
+        return BuildResult(
+            pinned_ref=f"{registry_repo}/widget-compute:{dep_hash}",
+            tag=dep_hash,
+            dep_hash=dep_hash,
+            already_present=True,
+            built=False,
+            digest=None,
+        )
+
+    async def _record_via_prod_shape(session, project_id, registry_repo, image_name, result):
+        # Assert the driver handed us the PRESERVED (digested) result, not the NULL one.
+        assert _cb._parse_digest_from_pinned_ref(result.pinned_ref) == stored_digest
+        # Emulate the production UPSERT on (project_id, dep_hash): update in place.
+        existing = (
+            await session.execute(
+                select(ProjectComputeImage).where(
+                    ProjectComputeImage.project_id == project_id,
+                    ProjectComputeImage.dep_hash == getattr(result, "dep_hash", ""),
+                )
+            )
+        ).scalars().one()
+        existing.pinned_ref = result.pinned_ref
+        existing.digest = _cb._parse_digest_from_pinned_ref(result.pinned_ref)
+        existing.built = bool(getattr(result, "built", False))
+        session.add(existing)
+        await session.commit()
+        await session.refresh(existing)
+        return existing
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash_: False,
+        _build_fn=_build,
+        _record_fn=_record_via_prod_shape,
+    )
+    assert result["status"] == "rebuilt"
+    assert result["digest"] == stored_digest
+
+
+# ── Driver: concurrency + budget deferral ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_defers_when_builder_busy(db):
+    """A build already in flight (semaphore locked) => deferred, no build."""
+    project = await _make_repo_project(db)
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()  # simulate an in-flight build
+    build_called = {"n": 0}
+
+    async def _build(*a, **k):
+        build_called["n"] += 1
+        raise AssertionError("must not build while the builder is busy")
+
+    try:
+        result = await _cb.refresh_project_compute_image(
+            db,
+            project,
+            build_semaphore=sem,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_build,
+            _record_fn=_record_row,
+        )
+    finally:
+        sem.release()
+    assert result["status"] == "deferred"
+    assert result["reason"] == "builder_busy"
+    assert build_called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_defers_when_build_budget_exhausted(db):
+    """allow_build=False on a changed manifest => deferred (budget), no build."""
+    project = await _make_repo_project(db)
+    build_called = {"n": 0}
+
+    async def _build(*a, **k):
+        build_called["n"] += 1
+        raise AssertionError("must not build when the per-cycle budget is exhausted")
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        allow_build=False,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: False,
+        _build_fn=_build,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "deferred"
+    assert result["reason"] == "build_budget_exhausted"
+    assert build_called["n"] == 0
+
+
+# ── Driver: never raises into caller ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_build_error_is_isolated(db):
+    """A build failure is captured as status=error, never raised."""
+    project = await _make_repo_project(db)
+
+    async def _build(*a, **k):
+        raise RuntimeError("docker build failed (exit 1)")
+
+    result = await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+        ),
+        _tag_exists_fn=lambda full_repo, dep_hash: False,
+        _build_fn=_build,
+        _record_fn=_record_row,
+    )
+    assert result["status"] == "error"
+    assert "docker build failed" in result["error"]
+
+
+# ── Driver: identical manifest bytes => identical hash => same fast path ───────
+
+
+@pytest.mark.asyncio
+async def test_refresh_hash_matches_build_and_push_input_keying(db):
+    """The dep_hash keys Dockerfile as 'Dockerfile' and dep files by relative path.
+
+    Same as compute_dependency_hash's contract in build_and_push — so an unchanged
+    manifest always resolves to the SAME tag the real build would produce.
+    """
+    from app.compute_image_build import compute_dependency_hash
+
+    project = await _make_repo_project(db)
+    dockerfile = b"FROM python:3.11-slim\nRUN pip install torch\n"
+    reqs = b"torch==2.3.0\nnumpy==1.26\n"
+    expected = compute_dependency_hash({"Dockerfile": dockerfile, "requirements.txt": reqs})
+
+    seen: list = []
+
+    def _tag_exists(full_repo, dep_hash):
+        seen.append(dep_hash)
+        return True
+
+    await _cb.refresh_project_compute_image(
+        db,
+        project,
+        _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+        _token_fn=lambda o, r: _async("tok"),
+        _default_branch_fn=lambda t, o, r: _async("main"),
+        _fetch_bytes_fn=_fetch_bytes_stub(
+            {".blueprint/Dockerfile.compute": dockerfile, "requirements.txt": reqs}
+        ),
+        _tag_exists_fn=_tag_exists,
+        _resolve_digest_fn=lambda full_repo, dep_hash: None,
+        _record_fn=_record_row,
+    )
+    assert seen == [expected], "driver dep_hash must match build_and_push keying"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sweep: sweep_refresh_project_compute_images
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _async(value):
+    async def _coro(*a, **k):
+        return value
+
+    return _coro()
+
+
+@pytest.mark.asyncio
+async def test_sweep_cadence_gate_skips_early_rerun(db):
+    """Called within the hourly window => skipped_cadence=1, driver not invoked."""
+    await _make_repo_project(db)
+    calls: list = []
+
+    async def _refresh(session, project, **kwargs):
+        calls.append(project.id)
+        return {"status": "unchanged"}
+
+    recent = datetime(2026, 6, 1, 12, 0, 0) - timedelta(minutes=10)
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", recent):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+    assert result["skipped_cadence"] == 1
+    assert calls == [], "cadence gate must prevent driver calls"
+
+
+@pytest.mark.asyncio
+async def test_sweep_only_visits_connected_repo_projects(db):
+    """Projects with no connected GitHub repo are excluded from the sweep query."""
+    await _make_repo_project(db, name="has-repo")
+    # A repo-less project must not be visited.
+    db.add(Project(name="no-repo", user_id="user-1"))
+    await db.commit()
+
+    visited: list = []
+
+    async def _refresh(session, project, **kwargs):
+        visited.append(project.name)
+        return {"status": "unchanged"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+    assert visited == ["has-repo"]
+    assert result["projects"] == 1
+    assert result["unchanged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_per_project_failure_is_isolated(db):
+    """One project's driver raising does not abort the sweep for the others."""
+    p1 = await _make_repo_project(db, name="p1")
+    await _make_repo_project(db, name="p2")
+
+    seen: list = []
+
+    async def _refresh(session, project, **kwargs):
+        seen.append(project.name)
+        if project.id == p1.id:
+            raise RuntimeError("boom")
+        return {"status": "unchanged"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+    assert set(seen) == {"p1", "p2"}, "both projects visited despite one erroring"
+    assert result["errors"] == 1
+    assert result["unchanged"] == 1
+    assert result["projects"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sweep_caps_builds_per_cycle(db):
+    """Only max_builds_per_cycle projects build; the rest are deferred."""
+    for i in range(4):
+        await _make_repo_project(db, name=f"p{i}")
+
+    async def _refresh(session, project, *, allow_build=True, **kwargs):
+        # Every project has a changed manifest; the driver would build if allowed.
+        if not allow_build:
+            return {"status": "deferred", "reason": "build_budget_exhausted"}
+        return {"status": "rebuilt", "dep_hash": "h"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+            max_builds_per_cycle=2,
+        )
+    assert result["rebuilt"] == 2
+    assert result["deferred"] == 2
+    assert result["projects"] == 4

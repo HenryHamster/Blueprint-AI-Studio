@@ -1986,6 +1986,169 @@ async def sweep_protect_referenced_compute_image_digests(
     return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
 
 
+# ── Auto-rebuild project compute images on manifest change ────────────────────
+#
+# A project-baked compute image (the images-first dependency substrate) only ever
+# rebuilds today via the manual OWNER-only admin endpoint. Nothing rebuilds it
+# when the project's declared dependency manifest changes, so the baked image
+# silently drifts from the code's real deps until an operator remembers to click
+# rebuild. This sweep closes that gap: hourly, it drives the reusable
+# ``compute_backends.refresh_project_compute_image`` driver per connected-repo
+# project, which CHEAPLY (no clone) recomputes the current dependency hash and
+# rebuilds ONLY when the registry tag is absent (a genuinely changed manifest).
+#
+# Independent hourly cadence timer so a shared global stamped earlier in the same
+# reaper cycle can never gate it out. Bounded work: honors the manifest cache,
+# skips repo-less projects, respects the process-wide build concurrency guard
+# (never stampedes the host with concurrent docker builds), and builds at most a
+# small number of projects per cycle so one pass cannot pin the host for an hour.
+_COMPUTE_IMAGE_REFRESH_INTERVAL_SECONDS = 3600
+_COMPUTE_IMAGE_REFRESH_MAX_PROJECTS = 25
+_COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE = 3
+_last_compute_image_refresh_sweep: datetime | None = None
+
+
+async def sweep_refresh_project_compute_images(
+    session,
+    now=None,
+    *,
+    _refresh_fn=None,
+    _build_semaphore=None,
+    max_projects: int = _COMPUTE_IMAGE_REFRESH_MAX_PROJECTS,
+    max_builds_per_cycle: int = _COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE,
+) -> dict[str, int]:
+    """Rebuild project baked compute images whose dependency manifest changed.
+
+    Iterates projects with a connected GitHub repo (bounded) and calls the
+    best-effort per-project driver
+    :func:`app.compute_backends.refresh_project_compute_image`. The driver
+    recomputes the current dependency hash without a clone and rebuilds ONLY when
+    the manifest genuinely changed (the registry tag for the new hash is absent);
+    an unchanged manifest is a cheap registry-lookup no-op.
+
+    Bounded so one cycle cannot pin the orchestrator host for an hour: at most
+    ``max_builds_per_cycle`` rebuilds are triggered (further changed projects are
+    ``deferred`` to the next hourly pass), and the driver is handed the same
+    process-wide build concurrency guard the admin endpoint uses so a build
+    already in flight defers rather than stampeding.
+
+    Cadence-gated to hourly on an independent timer. Returns a summary dict of
+    per-status counts (``rebuilt``/``unchanged``/``no_config``/``deferred``/
+    ``errors``/``projects``/``skipped_cadence``). A per-project failure is
+    isolated — it never aborts the sweep. The reaper wraps this so a raised error
+    can never crash the cycle.
+    """
+    global _last_compute_image_refresh_sweep
+    from app.models import Project
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_compute_image_refresh_sweep,
+        _COMPUTE_IMAGE_REFRESH_INTERVAL_SECONDS,
+        _now,
+    ):
+        return {
+            "projects": 0,
+            "rebuilt": 0,
+            "unchanged": 0,
+            "no_config": 0,
+            "deferred": 0,
+            "errors": 0,
+            "skipped_cadence": 1,
+        }
+    _last_compute_image_refresh_sweep = _now
+
+    if _refresh_fn is None:
+        from app.compute_backends import refresh_project_compute_image
+
+        refresh_fn = refresh_project_compute_image
+    else:
+        refresh_fn = _refresh_fn
+
+    if _build_semaphore is None:
+        try:
+            from app.routers.admin_project_tools import (
+                _compute_image_build_semaphore,
+            )
+
+            build_semaphore = _compute_image_build_semaphore
+        except Exception:  # noqa: BLE001 — guard defensively; run unbounded-by-sem
+            build_semaphore = None
+    else:
+        build_semaphore = _build_semaphore
+
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .where(
+                    Project.github_owner.is_not(None),
+                    Project.github_repo.is_not(None),
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    summary = {
+        "projects": 0,
+        "rebuilt": 0,
+        "unchanged": 0,
+        "no_config": 0,
+        "deferred": 0,
+        "errors": 0,
+        "skipped_cadence": 0,
+    }
+    builds_done = 0
+    for project in rows:
+        summary["projects"] += 1
+        try:
+            result = await refresh_fn(
+                session,
+                project,
+                allow_build=(builds_done < max_builds_per_cycle),
+                build_semaphore=build_semaphore,
+            )
+        except Exception:  # noqa: BLE001 — driver is best-effort; isolate anyway
+            logger.warning(
+                "[REAPER] compute-image auto-refresh raised for project %s",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            summary["errors"] += 1
+            continue
+
+        status = (result or {}).get("status")
+        if status == "rebuilt":
+            summary["rebuilt"] += 1
+            builds_done += 1
+        elif status == "unchanged":
+            summary["unchanged"] += 1
+        elif status == "no_config":
+            summary["no_config"] += 1
+        elif status == "deferred":
+            summary["deferred"] += 1
+        else:  # "error" or an unrecognized status
+            summary["errors"] += 1
+
+    if summary["rebuilt"] or summary["deferred"] or summary["errors"]:
+        logger.info(
+            "[REAPER] compute-image auto-refresh: rebuilt=%d unchanged=%d "
+            "deferred=%d no_config=%d errors=%d (of %d project(s))",
+            summary["rebuilt"],
+            summary["unchanged"],
+            summary["deferred"],
+            summary["no_config"],
+            summary["errors"],
+            summary["projects"],
+        )
+    return summary
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -2028,4 +2191,5 @@ __all__ = [
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
+    "sweep_refresh_project_compute_images",
 ]

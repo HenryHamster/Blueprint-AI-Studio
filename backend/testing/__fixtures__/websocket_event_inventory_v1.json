@@ -4660,22 +4660,6 @@
     {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
-      "classification": "legacy_review_required",
-      "event": "project_updated",
-      "event_expression": null,
-      "event_is_literal": true,
-      "lineno": 6317,
-      "notes": "",
-      "occurrence": 1,
-      "payload_arg_kind": "dict:status",
-      "scope": "_process_post_commit",
-      "source_path": "backend/app/task_lifecycle.py",
-      "workbench_action": null,
-      "workbench_resource": null
-    },
-    {
-      "callee": "broadcast_to_project",
-      "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
       "event": "task_updated",
       "event_expression": null,
@@ -4886,7 +4870,7 @@
   "summary": {
     "legacy_global_event": 14,
     "legacy_project_event": 209,
-    "legacy_review_required": 24,
+    "legacy_review_required": 23,
     "message_v1_payload": 12,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,

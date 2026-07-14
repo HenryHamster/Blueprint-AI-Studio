@@ -302,6 +302,7 @@ from app.reaper_sweeps import (
     sweep_capability_backing_proofs,
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
+    sweep_refresh_project_compute_images,
     sweep_proof_earn_loop,
     _sweep_strategic_cycle_starvation,
 )
@@ -3156,6 +3157,24 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Compute-image GC guard sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22d: Compute-image auto-refresh — rebuild a project's baked
+                # compute image when its declared dependency manifest changes, so
+                # the image can't silently drift from the code's real deps until an
+                # operator remembers to click the manual rebuild. Cheap no-op (no
+                # clone, no build) when the manifest is unchanged; hourly cadence-
+                # gated on an independent timer. Wrapped so it can never crash the
+                # cycle; the per-project driver is itself best-effort.
+                _mark_reaper_progress()
+                try:
+                    await sweep_refresh_project_compute_images(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Compute-image auto-refresh sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

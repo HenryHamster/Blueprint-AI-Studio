@@ -3694,6 +3694,337 @@ async def record_project_compute_image_build(
     return row
 
 
+async def _preserve_existing_digest_pin_cb(
+    session: Any, project_id: uuid.UUID, result: Any
+) -> Any:
+    """Never let a digest-less build result overwrite a stored digest.
+
+    The backend twin of ``admin_project_tools._preserve_existing_digest_pin``:
+    an unchanged-deps re-trigger takes ``build_and_push``'s already-present fast
+    path, which resolves the digest from the registry — but a briefly-unreachable
+    registry (or a tag-only push) still yields ``digest=None``. Recording that
+    would silently unpin the project's compute image. If a row for this
+    ``(project_id, dep_hash)`` already carries a digest, keep it.
+
+    Lives here (not imported from the router) so the reusable driver never has to
+    reach up into a FastAPI router module — that would be an import cycle
+    (``admin_project_tools`` imports ``compute_backends`` as ``_cb``).
+    """
+    from sqlalchemy import select
+
+    pinned_ref = getattr(result, "pinned_ref", None) or ""
+    if _parse_digest_from_pinned_ref(pinned_ref):
+        return result  # carries a digest — nothing to protect
+
+    dep_hash = getattr(result, "dep_hash", None) or ""
+    if not dep_hash:
+        return result
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.dep_hash == dep_hash,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is None or not existing.digest:
+        return result  # nothing stored to protect
+
+    logger.warning(
+        "[COMPUTE-IMAGE] auto-refresh for project=%s dep_hash=%s resolved no "
+        "digest; keeping the stored pin %s rather than overwriting it with NULL",
+        project_id,
+        dep_hash,
+        existing.pinned_ref,
+    )
+    return compute_image_build.BuildResult(
+        pinned_ref=existing.pinned_ref,
+        tag=existing.tag or getattr(result, "tag", "") or "",
+        dep_hash=dep_hash,
+        already_present=bool(getattr(result, "already_present", True)),
+        built=bool(existing.built or getattr(result, "built", False)),
+        digest=existing.digest,
+    )
+
+
+async def _record_unchanged_pin(
+    session: Any,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+    full_repo: str,
+    dep_hash: str,
+    resolve_digest_fn,
+    record_fn,
+) -> bool:
+    """Best-effort: record the pin for an image that is ALREADY present.
+
+    The fast-path no-op case: the registry already has this ``dep_hash`` tag, so
+    there is nothing to build. We still want the durable ``ProjectComputeImage``
+    pin to exist — but only when we can resolve a REAL ``sha256:`` digest.
+
+    A ``None`` digest means UNKNOWN (registry briefly unreachable), not "no
+    digest"; writing it would clobber a stored pin with NULL, so we refuse. This
+    is the ``_preserve_existing_digest_pin`` philosophy applied to the fast path:
+    only ever write a non-null digest. Returns whether a row was written.
+    """
+    try:
+        digest = await asyncio.to_thread(resolve_digest_fn, full_repo, dep_hash)
+    except Exception:  # noqa: BLE001 — registry helpers fail open
+        digest = None
+    if not digest:
+        return False
+    result = compute_image_build.BuildResult(
+        pinned_ref=f"{full_repo}@{digest}",
+        tag=dep_hash,
+        dep_hash=dep_hash,
+        already_present=True,
+        # The image is present in the registry; the pin describes a real image.
+        built=True,
+        digest=digest,
+    )
+    await record_fn(session, project_id, registry_repo, image_name, result)
+    await session.commit()
+    return True
+
+
+async def refresh_project_compute_image(
+    session: Any,
+    project: "Project",
+    *,
+    allow_build: bool = True,
+    build_semaphore: "asyncio.Semaphore | None" = None,
+    acquire_timeout: float = 1.0,
+    _manifest_fn=None,
+    _token_fn=None,
+    _default_branch_fn=None,
+    _fetch_bytes_fn=None,
+    _tag_exists_fn=None,
+    _resolve_digest_fn=None,
+    _build_fn=None,
+    _record_fn=None,
+) -> dict[str, Any]:
+    """Auto-rebuild ONE project's baked compute image when its manifest changed.
+
+    Closes the drift gap: today a project-baked compute image only ever rebuilds
+    via the manual OWNER-only ``POST /projects/{id}/compute-image/build``. This
+    driver lets a periodic sweep self-heal — a changed dependency manifest (any
+    hashed dep file, or the compute Dockerfile) triggers an automatic rebuild +
+    re-pin, while an unchanged manifest resolves to a cheap no-op with NO git
+    clone and NO docker build.
+
+    Steps, all best-effort — this function never raises into its caller:
+
+    * **resolve config** — discover ``.blueprint/tools.json`` (cached) and extract
+      ``compute.image.build`` via :func:`resolve_project_compute_image_build`;
+      skip cleanly (``no_config``) with no connected repo, no read token, no build
+      section, or no Dockerfile at the declared path.
+    * **cheap current hash** — fetch the Dockerfile and each present
+      :data:`_DEFAULT_DEP_FILES` from the repo's default branch via the GitHub
+      file-fetch helpers (NO clone), keyed exactly the way ``build_and_push``
+      assembles its inputs (Dockerfile as ``"Dockerfile"``, each dep file under
+      its relative path) so :func:`compute_image_build.compute_dependency_hash`
+      matches what a real build would produce.
+    * **fast-path no-op** — if ``registry_tag_exists(full_repo, dep_hash)`` the
+      image is current: do NOT build; best-effort record the pin (never overwrite
+      an existing digest with NULL).
+    * **rebuild** — only when the tag is ABSENT, drive the existing pipeline
+      (:func:`build_project_compute_image` -> :func:`record_project_compute_image_build`),
+      honoring the process-wide build concurrency guard (*build_semaphore*) and a
+      caller-supplied build budget (*allow_build*).
+
+    Returns a small structured result whose ``status`` is one of ``no_config`` /
+    ``unchanged`` / ``rebuilt`` / ``deferred`` / ``error``. All hooks default to
+    the real production functions; tests inject them so nothing hits docker or
+    GitHub.
+    """
+    manifest_fn = _manifest_fn
+    if manifest_fn is None:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        manifest_fn = _discover_manifest_tools
+    if _token_fn is None:
+        from app.github_auth import get_repo_installation_read_token
+
+        token_fn = get_repo_installation_read_token
+    else:
+        token_fn = _token_fn
+    if _default_branch_fn is None:
+        from app.github_refs import get_repo_default_branch
+
+        default_branch_fn = get_repo_default_branch
+    else:
+        default_branch_fn = _default_branch_fn
+    if _fetch_bytes_fn is None:
+        from app.github import get_file_bytes_at_ref
+
+        fetch_bytes_fn = get_file_bytes_at_ref
+    else:
+        fetch_bytes_fn = _fetch_bytes_fn
+    tag_exists_fn = _tag_exists_fn or compute_image_build.registry_tag_exists
+    resolve_digest_fn = _resolve_digest_fn or compute_image_build._resolve_digest
+    build_fn = _build_fn or build_project_compute_image
+    record_fn = _record_fn or record_project_compute_image_build
+
+    project_id = getattr(project, "id", None)
+    try:
+        owner = (getattr(project, "github_owner", None) or "").strip()
+        repo = (getattr(project, "github_repo", None) or "").strip()
+        if not owner or not repo:
+            return {"status": "no_config", "reason": "no connected repo"}
+
+        manifest = await manifest_fn(project)
+        build_config = resolve_project_compute_image_build(
+            (manifest or {}).get("compute")
+        )
+        if build_config is None:
+            return {"status": "no_config", "reason": "no compute.image.build section"}
+
+        token = await token_fn(owner, repo)
+        if not token:
+            return {"status": "no_config", "reason": "no installation read token"}
+
+        default_branch = await default_branch_fn(token, owner, repo)
+        project_id_str = str(project_id or "")
+        dockerfile_rel = (
+            build_config.get("dockerfile") or ".blueprint/Dockerfile.compute"
+        )
+
+        # Cheap current hash: fetch the Dockerfile + present dep files at the
+        # default branch, NO clone. Absent Dockerfile => nothing buildable (the
+        # real build would raise FileNotFoundError) => skip cleanly.
+        dockerfile_bytes = await fetch_bytes_fn(
+            dockerfile_rel,
+            token=token,
+            owner=owner,
+            repo=repo,
+            ref=default_branch,
+            project_id=project_id_str,
+        )
+        if dockerfile_bytes is None:
+            return {
+                "status": "no_config",
+                "reason": f"no Dockerfile at {dockerfile_rel}",
+            }
+
+        # Key inputs EXACTLY as build_and_push does: Dockerfile under
+        # "Dockerfile", each present dep file under its relative path — so the
+        # hash matches what a real build produces (an unchanged manifest =>
+        # identical dep_hash => registry-tag-exists fast path).
+        inputs: Dict[str, bytes] = {"Dockerfile": dockerfile_bytes}
+        for rel in _DEFAULT_DEP_FILES:
+            data = await fetch_bytes_fn(
+                rel,
+                token=token,
+                owner=owner,
+                repo=repo,
+                ref=default_branch,
+                project_id=project_id_str,
+            )
+            if data is not None:
+                inputs[rel] = data
+
+        dep_hash = compute_image_build.compute_dependency_hash(inputs)
+
+        registry_repo = resolve_compute_image_registry_repo()
+        image_name = (
+            str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+        )
+        full_repo = f"{registry_repo}/{image_name}"
+
+        # FAST-PATH NO-OP: the tag already exists => the image is current for this
+        # exact manifest. Do NOT build; just make sure the pin is recorded.
+        if await asyncio.to_thread(tag_exists_fn, full_repo, dep_hash):
+            recorded = await _record_unchanged_pin(
+                session,
+                project_id,
+                registry_repo,
+                image_name,
+                full_repo,
+                dep_hash,
+                resolve_digest_fn,
+                record_fn,
+            )
+            return {"status": "unchanged", "dep_hash": dep_hash, "recorded": recorded}
+
+        # A genuinely new/changed manifest: a real rebuild is needed.
+        if not allow_build:
+            # Per-cycle build budget exhausted — the next hourly pass retries.
+            return {
+                "status": "deferred",
+                "reason": "build_budget_exhausted",
+                "dep_hash": dep_hash,
+            }
+
+        # Respect the process-wide build concurrency guard the admin endpoint
+        # uses: never stampede the orchestrator host with concurrent builds. If a
+        # build is already in flight, skip building this cycle (retry next hour).
+        acquired = False
+        if build_semaphore is not None:
+            if build_semaphore.locked():
+                return {
+                    "status": "deferred",
+                    "reason": "builder_busy",
+                    "dep_hash": dep_hash,
+                }
+            try:
+                await asyncio.wait_for(
+                    build_semaphore.acquire(), timeout=acquire_timeout
+                )
+                acquired = True
+            except asyncio.TimeoutError:
+                return {
+                    "status": "deferred",
+                    "reason": "builder_busy",
+                    "dep_hash": dep_hash,
+                }
+
+        try:
+            result = await build_fn(
+                project,
+                registry_repo=registry_repo,
+                build_config=build_config,
+                ref=default_branch,
+            )
+        finally:
+            if acquired:
+                build_semaphore.release()
+
+        result = await _preserve_existing_digest_pin_cb(session, project_id, result)
+        row = await record_fn(
+            session, project_id, registry_repo, image_name, result
+        )
+        await session.commit()
+        logger.info(
+            "[COMPUTE-IMAGE] auto-rebuilt project=%s dep_hash=%s (built=%s)",
+            project_id,
+            dep_hash,
+            getattr(row, "built", None),
+        )
+        return {
+            "status": "rebuilt",
+            "dep_hash": dep_hash,
+            "pinned_ref": getattr(row, "pinned_ref", None),
+            "digest": getattr(row, "digest", None),
+            "built": bool(getattr(row, "built", False)),
+        }
+    except Exception as e:  # noqa: BLE001 — best-effort; never raise into the sweep
+        logger.warning(
+            "[COMPUTE-IMAGE] auto-refresh failed for project=%s: %s",
+            project_id,
+            e,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "error": str(e)}
+
+
 def is_digest_pinned(ref: str | None) -> bool:
     """True when an image reference is content-addressed (contains ``@sha256:``).
 

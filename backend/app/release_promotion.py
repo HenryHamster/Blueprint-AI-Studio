@@ -2123,6 +2123,57 @@ async def _record_promotion_success(
             exc,
         )
 
+    # Best-effort: refresh the project's baked compute image so a dependency
+    # manifest change that landed in the promoted commit re-pins the image right
+    # away instead of waiting up to an hour for the periodic sweep — the event-
+    # driven half of the "apply at the event AND self-heal via a periodic sweep"
+    # pattern. Runs in its OWN session (the driver commits its pin write and must
+    # not ride the caller's later transaction) and is STRICTLY fire-and-forget:
+    # any error (no build config, GitHub/registry/docker failure, timeout) is
+    # swallowed and logged only, so promotion can never be blocked, slowed, or
+    # failed by it. Reuses the SAME process-wide build concurrency guard the
+    # periodic sweep and admin endpoint use — a build already in flight defers
+    # (``deferred``/``builder_busy``) and the hourly sweep picks it up. An
+    # unchanged manifest costs only a cheap registry lookup via the driver's
+    # registry-tag-exists fast path. Mirrors the lane-baseline / staged-activation
+    # best-effort blocks above.
+    try:
+        from app.compute_backends import refresh_project_compute_image
+        from app.database import AsyncSessionLocal
+
+        try:
+            from app.routers.admin_project_tools import (
+                _compute_image_build_semaphore,
+            )
+
+            _build_semaphore = _compute_image_build_semaphore
+        except Exception:  # noqa: BLE001 — guard defensively; unbounded-by-sem
+            _build_semaphore = None
+
+        _refresh_pid = version.project_id
+        async with AsyncSessionLocal() as _img_session:
+            _refresh_project = await _img_session.get(Project, _refresh_pid)
+            if _refresh_project is not None:
+                _refresh_result = await refresh_project_compute_image(
+                    _img_session,
+                    _refresh_project,
+                    build_semaphore=_build_semaphore,
+                )
+                logger.info(
+                    "[RELEASE_QUALIFIER] compute-image refresh after v%d "
+                    "promotion for project %s: %s",
+                    version.version_number,
+                    _refresh_pid,
+                    (_refresh_result or {}).get("status"),
+                )
+    except Exception as exc:  # noqa: BLE001 — image refresh must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] compute-image refresh failed after v%d "
+            "promotion (non-fatal; periodic sweep will retry): %s",
+            version.version_number,
+            exc,
+        )
+
     return {
         "status": "promoted",
         "promoted_sha": effective_sha,
