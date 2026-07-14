@@ -147,7 +147,7 @@ export function ProjectWorkspace({
       {projectSection === 'tools' ? (
         selectedProjectId ? (
           <div className="min-h-0 overflow-auto p-4 custom-scrollbar">
-            <ProjectToolHost projectId={selectedProjectId} />
+            <ProjectToolHost projectId={selectedProjectId} myRole={selectedProject?.my_role} />
           </div>
         ) : (
           <ProjectNoSelectionState

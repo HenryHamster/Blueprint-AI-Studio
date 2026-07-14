@@ -631,6 +631,9 @@ def _tool_summary(tool: ProjectTool) -> Dict[str, Any]:
         "enabled": tool.enabled,
         "placement": tool.placement,
         "content_revision": tool.content_revision,
+        # config is small metadata (kind-specific settings), not the mutable
+        # content document — surfaced so the client Configure panel can prefill.
+        "config": tool.config or {},
     }
 
 
@@ -776,6 +779,7 @@ async def register_project_tool(
         )
     spec = TOOL_KINDS[kind]
 
+    explicit_slug = bool((payload.slug or "").strip())
     slug = (payload.slug or kind).strip()
     if not _SLUG_RE.match(slug):
         raise HTTPException(
@@ -797,21 +801,35 @@ async def register_project_tool(
     config = payload.config if isinstance(payload.config, dict) else {}
     _validate_config(kind, config, spec)
 
-    # Enforce unique (project_id, slug) with a friendly 409 before hitting the
-    # DB constraint, which would otherwise surface as a 500.
-    existing = (
-        await session.execute(
-            select(ProjectTool.id).where(
-                ProjectTool.project_id == project_id,
-                ProjectTool.slug == slug,
+    # Load slugs already taken in this project so we can either 409 (explicit
+    # slug) or auto-uniquify (omitted slug — lets an operator add a second tool
+    # of the same kind without hitting a dead-end).
+    taken = {
+        s
+        for (s,) in (
+            await session.execute(
+                select(ProjectTool.slug).where(
+                    ProjectTool.project_id == project_id
+                )
             )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A tool with slug '{slug}' already exists for this project",
-        )
+        ).all()
+    }
+
+    if slug in taken:
+        if explicit_slug:
+            # Caller pinned this slug — surface the collision as a friendly 409
+            # before the DB unique constraint turns it into a 500.
+            raise HTTPException(
+                status_code=409,
+                detail=f"A tool with slug '{slug}' already exists for this project",
+            )
+        # Slug was derived from the kind; append the smallest free numeric
+        # suffix so a second whiteboard/notes tool registers cleanly.
+        base = slug
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        slug = f"{base}-{n}"
 
     tool = ProjectTool(
         project_id=project_id,

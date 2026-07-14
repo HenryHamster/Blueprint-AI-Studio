@@ -7,6 +7,7 @@ import {
   fetchToolKinds,
   fetchProjectToolManifest,
   seedProjectTools as seedProjectToolsApi,
+  TOOL_PLACEMENTS,
   type ProjectTool,
   type ProjectToolManifestEntry,
   type ProjectSkillManifestEntry,
@@ -18,6 +19,20 @@ import { ProjectToolIframe } from './ProjectToolIframe';
 
 interface Props {
   projectId: string;
+  /**
+   * The caller's role on this project. Owner-only management controls
+   * (add / seed / configure / rename / enable-disable / remove) are hidden
+   * for non-owners so members never see buttons that only 403. When omitted
+   * (e.g. legacy call sites, tests) the caller is treated as an owner; the
+   * backend still enforces the owner requirement on every mutation.
+   */
+  myRole?: 'owner' | 'member' | 'viewer';
+}
+
+interface ConfigDraft {
+  title: string;
+  placement: string;
+  config: Record<string, string>;
 }
 
 type FetchState =
@@ -33,7 +48,27 @@ type ManifestState =
 const actionBtn =
   'inline-flex min-h-11 items-center gap-1.5 rounded-md border px-3 text-xs font-semibold transition-colors';
 
-export function ProjectToolHost({ projectId }: Props) {
+/**
+ * Coerce a raw text input into the type the config schema expects.
+ * Falls back to the raw string when coercion is ambiguous — the backend
+ * validates the final type and surfaces a 400 the caller renders.
+ */
+function coerceConfigValue(raw: string, type: string | undefined): unknown {
+  switch (type) {
+    case 'integer': {
+      const n = Number(raw);
+      return Number.isInteger(n) ? n : raw;
+    }
+    case 'boolean':
+      return raw === 'true' ? true : raw === 'false' ? false : raw;
+    default:
+      return raw;
+  }
+}
+
+export function ProjectToolHost({ projectId, myRole }: Props) {
+  // UI gating only — the backend independently enforces owner on every mutation.
+  const isOwner = myRole === undefined || myRole === 'owner';
   const [state, setState] = useState<FetchState>({ status: 'loading', projectId });
   const [manifestState, setManifestState] = useState<ManifestState>({ status: 'loading' });
   const abortRef = useRef<AbortController | null>(null);
@@ -49,6 +84,11 @@ export function ProjectToolHost({ projectId }: Props) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
   const [hiddenManifestSlugs, setHiddenManifestSlugs] = useState<Set<string>>(new Set());
+
+  // Per-tool configure/rename panel state
+  const [configuringId, setConfiguringId] = useState<string | null>(null);
+  const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
+  const [savingConfig, setSavingConfig] = useState(false);
 
   // Fetch registered tools on mount / projectId change
   useEffect(() => {
@@ -114,21 +154,87 @@ export function ProjectToolHost({ projectId }: Props) {
     }
   }
 
-  // Lazy-load tool kinds when "Add tool" is first clicked
-  async function handleOpenAddForm() {
-    setShowAddForm(true);
-    setActionError(null);
-    if (toolKinds !== null) return;
+  // Lazy-load tool kinds (shared by the Add form and per-tool Configure panel).
+  // Returns the loaded kinds, or [] on failure.
+  async function ensureToolKinds(): Promise<ToolKindConfig[]> {
+    if (toolKinds !== null) return toolKinds;
     setLoadingKinds(true);
     try {
       const kinds = await fetchToolKinds();
       setToolKinds(kinds);
-      if (kinds.length > 0) setSelectedKind(kinds[0].kind);
+      return kinds;
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to load tool kinds');
       setToolKinds([]);
+      return [];
     } finally {
       setLoadingKinds(false);
+    }
+  }
+
+  async function handleOpenAddForm() {
+    setShowAddForm(true);
+    setActionError(null);
+    const kinds = await ensureToolKinds();
+    if (!selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
+  }
+
+  // Look up the config schema (JSON-Schema `properties`) declared for a kind.
+  function schemaPropsForKind(kind: string): [string, Record<string, unknown>][] {
+    const spec = toolKinds?.find(k => k.kind === kind);
+    const props = (spec?.config_schema as { properties?: Record<string, Record<string, unknown>> } | undefined)
+      ?.properties;
+    return props ? Object.entries(props) : [];
+  }
+
+  async function handleOpenConfigure(tool: ProjectTool) {
+    setActionError(null);
+    if (configuringId === tool.id) {
+      // Toggle closed.
+      setConfiguringId(null);
+      setConfigDraft(null);
+      return;
+    }
+    await ensureToolKinds();
+    // Seed the draft config from the tool's existing config, stringifying
+    // values so every schema field is editable as text.
+    const existing = tool.config ?? {};
+    const config: Record<string, string> = {};
+    for (const [key, val] of Object.entries(existing)) {
+      config[key] = typeof val === 'string' ? val : JSON.stringify(val);
+    }
+    setConfigDraft({ title: tool.title, placement: tool.placement, config });
+    setConfiguringId(tool.id);
+  }
+
+  async function handleSaveConfig(tool: ProjectTool) {
+    if (!configDraft) return;
+    const title = configDraft.title.trim();
+    if (!title) {
+      setActionError('Title must not be empty');
+      return;
+    }
+    setSavingConfig(true);
+    setActionError(null);
+    try {
+      const config: Record<string, unknown> = {};
+      for (const [key, spec] of schemaPropsForKind(tool.kind)) {
+        const raw = configDraft.config[key];
+        if (raw === undefined || raw === '') continue;
+        config[key] = coerceConfigValue(raw, (spec as { type?: string }).type);
+      }
+      await updateProjectToolApi(projectId, tool.id, {
+        title,
+        placement: configDraft.placement,
+        ...(schemaPropsForKind(tool.kind).length > 0 ? { config } : {}),
+      });
+      setConfiguringId(null);
+      setConfigDraft(null);
+      void refresh();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update tool');
+    } finally {
+      setSavingConfig(false);
     }
   }
 
@@ -194,6 +300,7 @@ export function ProjectToolHost({ projectId }: Props) {
     return (
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-neutral-100">Tools</h2>
+        {isOwner && (
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -209,6 +316,70 @@ export function ProjectToolHost({ projectId }: Props) {
             className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200 disabled:opacity-50`}
           >
             {seeding ? 'Seeding…' : 'Seed defaults'}
+          </button>
+        </div>
+        )}
+      </div>
+    );
+  }
+
+  // Owner-only inline rename + placement + schema-driven config editor.
+  function renderConfigPanel(tool: ProjectTool): ReactNode {
+    if (configuringId !== tool.id || !configDraft) return null;
+    const schemaProps = schemaPropsForKind(tool.kind);
+    return (
+      <div className="workbench-card space-y-3 rounded-md border p-3">
+        <div>
+          <label className="block text-xs font-medium text-neutral-400">Title</label>
+          <input
+            type="text"
+            value={configDraft.title}
+            onChange={e => setConfigDraft(d => (d ? { ...d, title: e.target.value } : d))}
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-neutral-400">Placement</label>
+          <select
+            value={configDraft.placement}
+            onChange={e => setConfigDraft(d => (d ? { ...d, placement: e.target.value } : d))}
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+          >
+            {TOOL_PLACEMENTS.map(p => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+        </div>
+        {schemaProps.map(([key, spec]) => (
+          <div key={key}>
+            <label className="block text-xs font-medium text-neutral-400">
+              {key}
+              <span className="ml-1 text-neutral-600">({(spec as { type?: string }).type ?? 'string'})</span>
+            </label>
+            <input
+              type="text"
+              value={configDraft.config[key] ?? ''}
+              onChange={e => setConfigDraft(d =>
+                d ? { ...d, config: { ...d.config, [key]: e.target.value } } : d)}
+              className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+            />
+          </div>
+        ))}
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => { setConfiguringId(null); setConfigDraft(null); setActionError(null); }}
+            className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200`}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSaveConfig(tool)}
+            disabled={savingConfig || !configDraft.title.trim()}
+            className={`${actionBtn} border-indigo-600 bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50`}
+          >
+            {savingConfig ? 'Saving…' : 'Save'}
           </button>
         </div>
       </div>
@@ -292,11 +463,16 @@ export function ProjectToolHost({ projectId }: Props) {
   function renderToolContent(): ReactNode {
     if (effective.status !== 'ok') return null;
     const enabledTools = effective.tools.filter(t => t.enabled);
+    const disabledTools = effective.tools.filter(t => !t.enabled);
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
     const allManifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
     const manifestTools = allManifestTools.filter(t => !hiddenManifestSlugs.has(t.slug));
     const manifestSkills = manifestState.status === 'ok' ? manifestState.skills : [];
-    const hasAnyTool = registeredTools.length > 0 || manifestTools.length > 0 || manifestSkills.length > 0;
+    const hasAnyTool =
+      registeredTools.length > 0 ||
+      disabledTools.length > 0 ||
+      manifestTools.length > 0 ||
+      manifestSkills.length > 0;
 
     if (!hasAnyTool) {
       return (
@@ -318,26 +494,37 @@ export function ProjectToolHost({ projectId }: Props) {
                 <WorkbenchPanel title={tool.title}>
                   <ToolComponent projectId={projectId} tool={tool} />
                 </WorkbenchPanel>
-                {/* Per-tool management actions */}
-                <div className="flex items-center gap-2 px-1">
-                  <button
-                    type="button"
-                    data-viewport-allow-small-target
-                    onClick={() => handleToggleEnabled(tool)}
-                    className="text-xs text-neutral-500 hover:text-neutral-300"
-                  >
-                    {tool.enabled ? 'Disable' : 'Enable'}
-                  </button>
-                  <button
-                    type="button"
-                    data-viewport-allow-small-target
-                    onClick={() => handleDelete(tool.id)}
-                    disabled={deletingId === tool.id}
-                    className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
-                  >
-                    {deletingId === tool.id ? 'Removing…' : 'Remove'}
-                  </button>
-                </div>
+                {/* Per-tool management actions (owner only) */}
+                {isOwner && (
+                  <div className="flex items-center gap-2 px-1">
+                    <button
+                      type="button"
+                      data-viewport-allow-small-target
+                      onClick={() => handleOpenConfigure(tool)}
+                      className="text-xs text-neutral-500 hover:text-neutral-300"
+                    >
+                      Configure
+                    </button>
+                    <button
+                      type="button"
+                      data-viewport-allow-small-target
+                      onClick={() => handleToggleEnabled(tool)}
+                      className="text-xs text-neutral-500 hover:text-neutral-300"
+                    >
+                      {tool.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                    <button
+                      type="button"
+                      data-viewport-allow-small-target
+                      onClick={() => handleDelete(tool.id)}
+                      disabled={deletingId === tool.id}
+                      className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                    >
+                      {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                    </button>
+                  </div>
+                )}
+                {renderConfigPanel(tool)}
               </div>
             );
           })}
@@ -375,6 +562,44 @@ export function ProjectToolHost({ projectId }: Props) {
             </div>
           )}
         </div>
+
+        {/* Disabled tools — kept visible so they can be re-enabled or removed
+            (a disabled tool must never become a permanent dead-end). Owner-only:
+            members have no mutation controls here, so the section is hidden. */}
+        {isOwner && disabledTools.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold text-neutral-100">Disabled</h3>
+            <div className="space-y-1">
+              {disabledTools.map(tool => (
+                <div
+                  key={`disabled:${tool.id}`}
+                  className="flex items-center justify-between gap-2 rounded-md border border-workbench-border bg-workbench-layer px-3 py-2"
+                >
+                  <span className="min-w-0 truncate text-sm text-neutral-400">{tool.title}</span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      data-viewport-allow-small-target
+                      onClick={() => handleToggleEnabled(tool)}
+                      className="text-xs text-neutral-400 hover:text-neutral-200"
+                    >
+                      Enable
+                    </button>
+                    <button
+                      type="button"
+                      data-viewport-allow-small-target
+                      onClick={() => handleDelete(tool.id)}
+                      disabled={deletingId === tool.id}
+                      className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                    >
+                      {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Project-declared skills — read-only list from .blueprint/tools.json */}
         {manifestSkills.length > 0 && (

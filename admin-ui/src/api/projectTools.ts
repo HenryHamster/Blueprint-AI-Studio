@@ -8,6 +8,7 @@ export interface ProjectTool {
   enabled: boolean;
   placement: string;
   content_revision: number;
+  config?: Record<string, unknown>;
 }
 
 export interface ToolKindConfig {
@@ -28,7 +29,11 @@ export interface UpdateProjectToolPayload {
   title?: string;
   config?: Record<string, unknown>;
   enabled?: boolean;
+  placement?: string;
 }
+
+/** Placements the backend accepts (mirrors _VALID_PLACEMENTS server-side). */
+export const TOOL_PLACEMENTS = ['project_section', 'toolbar', 'sidebar'] as const;
 
 export interface FetchProjectToolsResult {
   tools: ProjectTool[];

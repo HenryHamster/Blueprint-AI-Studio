@@ -281,6 +281,49 @@ async def test_register_tool_duplicate_slug(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_register_second_tool_of_kind_auto_slugs(client: AsyncClient, db_session):
+    """Two registrations of the same kind with no explicit slug both succeed;
+    the second auto-uniquifies to '<kind>-2' instead of a 409 dead-end."""
+    project = await _make_project_member(db_session)
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "First notes"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["slug"] == "notes"
+
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Second notes"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["slug"] == "notes-2"
+
+    third = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Third notes"},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["slug"] == "notes-3"
+
+
+@pytest.mark.asyncio
+async def test_seed_then_register_same_kind_succeeds(client: AsyncClient, db_session):
+    """After Seed defaults installs one-of-each-kind, the Add form can still
+    register another tool of a seeded kind (no permanent 409 on the Add form)."""
+    project = await _make_project_member(db_session)
+    seed = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
+    assert seed.status_code == 200, seed.text
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Another board"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["slug"] == "whiteboard-2"
+
+
+@pytest.mark.asyncio
 async def test_create_tool_rejects_invalid_placement(client: AsyncClient, db_session):
     """POST /tools rejects a bogus placement string with 400."""
     project = await _make_project_member(db_session)
@@ -677,6 +720,31 @@ async def test_update_tool_config(client: AsyncClient, db_session):
         json={"config": {"theme": "dark"}},
     )
     assert resp.status_code == 200, resp.text
+    # The Configure UI prefills from the summary's `config`, so it must be
+    # surfaced (and reflect the just-saved value).
+    assert resp.json()["config"] == {"theme": "dark"}
+
+
+@pytest.mark.asyncio
+async def test_update_tool_placement_round_trips(client: AsyncClient, db_session):
+    """PATCH placement is accepted and echoed — the Configure UI relies on this."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "place-upd"},
+        )
+    ).json()
+    tool_id = created["id"]
+    # Fresh summaries expose `config` (empty by default) for prefill.
+    assert created["config"] == {}
+
+    resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "sidebar"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["placement"] == "sidebar"
 
 
 @pytest.mark.asyncio

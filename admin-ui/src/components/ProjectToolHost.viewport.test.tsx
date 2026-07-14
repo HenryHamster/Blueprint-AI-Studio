@@ -15,10 +15,11 @@ vi.mock('../api/projectTools', async () => {
     fetchAssetToken: vi.fn(),
     fetchToolContent: vi.fn(),
     saveToolContent: vi.fn(),
+    updateProjectTool: vi.fn(),
   };
 });
 
-import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent } from '../api/projectTools';
+import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent, updateProjectTool } from '../api/projectTools';
 import type { FetchProjectToolsResult } from '../api/projectTools';
 import NotesTool from './NotesTool';
 
@@ -186,6 +187,56 @@ describe('ProjectToolHost — viewport regression', () => {
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).not.toContain('Mock Widget content');
     expect(host.textContent).toContain('Mock Chart');
+  });
+
+  test('a disabled tool exposes an Enable control that re-enables it', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
+    vi.mocked(updateProjectTool).mockResolvedValue({
+      ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: true,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    // The disabled tool is not hidden — it shows under a "Disabled" section.
+    expect(host.textContent).toContain('Disabled');
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).not.toContain('Mock Widget content');
+    // Find the Enable button and click it.
+    const enableBtn = Array.from(host.querySelectorAll('button')).find(
+      b => b.textContent === 'Enable',
+    );
+    if (!enableBtn) throw new Error('Enable button not found');
+    await act(async () => { enableBtn.click(); });
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-1', { enabled: true });
+  });
+
+  test('a project with only disabled tools does not show the empty state', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).not.toContain('No tools registered');
+    expect(host.textContent).toContain('Disabled');
   });
 
   test('shows loading state before fetch resolves', async () => {
