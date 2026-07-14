@@ -332,6 +332,35 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     });
   });
 
+  test('compact jobs table renders evidence-tier badge and runner id for terminal jobs', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+      accrued_cost_usd: 0,
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+      runner: { id: 'dd59526e-0001-0002-0003-000000000004', hostname: 'iconlab-gpu-01', status: 'active' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId, findByText } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    // Wait for the job to render, then switch to compact table view
+    await findByText('Machine verified');
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // Table should show evidence badge and runner hostname
+    const table = await findByTestId('compact-jobs-table');
+    expect(table.textContent).toContain('Machine verified');
+    expect(table.textContent).toContain('iconlab-gpu-01');
+  });
+
   test('renders omitted-file note when viewable artifacts were dropped', async () => {
     const job = makeJob({
       backend: 'local-subprocess',

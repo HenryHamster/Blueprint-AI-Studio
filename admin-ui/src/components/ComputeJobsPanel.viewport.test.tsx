@@ -561,6 +561,8 @@ describe('ComputeJobsPanel — viewport regression', () => {
         if (!nameHeader) throw new Error('Name sort header not found');
         const costHeader = host.querySelector('[data-testid="jobs-table-sort-cost"]');
         if (!costHeader) throw new Error('Cost sort header not found');
+        const backendHeader = host.querySelector('[data-testid="jobs-table-sort-backend"]');
+        if (!backendHeader) throw new Error('Backend sort header not found');
         // Criterion chips should render for both jobs
         const chips = host.querySelectorAll('[data-testid="compact-table-criterion-chip"]');
         if (chips.length < 2) throw new Error(`Expected at least 2 criterion chips, got ${chips.length}`);
@@ -568,6 +570,8 @@ describe('ComputeJobsPanel — viewport regression', () => {
         const text = host.textContent ?? '';
         if (!text.includes('met')) throw new Error('met criterion chip not rendered');
         if (!text.includes('unmet')) throw new Error('unmet criterion chip not rendered');
+        // Evidence badge should render for terminal jobs (gcp_compute_engine → Attested)
+        if (!text.includes('Attested')) throw new Error('Evidence badge not rendered in compact table');
       },
       { waitMs: 60 },
     );

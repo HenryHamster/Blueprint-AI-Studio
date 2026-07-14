@@ -128,6 +128,10 @@ describe('TaskComputeJobsSection — viewport regression at 640px', () => {
       await act(async () => { r.render(<TaskComputeJobsSection task={computeTask} />); });
       // Wait for fetchComputeJobs effect to resolve
       await act(async () => { await Promise.resolve(); });
+      // Must render the evidence-tier badge (local-subprocess + no result → 'partial' → 'Partial')
+      if (!(host.textContent ?? '').includes('Partial')) {
+        throw new Error('Evidence-tier badge not rendered in TaskComputeJobsSection');
+      }
     });
   });
 });

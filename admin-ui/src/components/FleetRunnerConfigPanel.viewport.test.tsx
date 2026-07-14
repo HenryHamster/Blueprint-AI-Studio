@@ -1,87 +1,87 @@
-import { afterEach, beforeEach, describe, test } from 'vitest';
+import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { FleetRunnerConfigPanel } from './FleetRunnerConfigPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { FleetRunner } from '../api';
 
-// Minimal viewport coverage for the runner Configure panel. This component was
-// landed (Configure-panel rebuild) without a viewport test, tripping the
-// repo-wide viewport-coverage invariant. A GPU runner exercises the widest
-// form (max-concurrent, task-type allowlist, GPU allowlist, GPUs/job) so the
-// no-overflow check covers the busiest layout.
-function makeRunner(overrides: Partial<FleetRunner> = {}): FleetRunner {
-  return {
-    id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-    hostname: 'gpu-box',
-    version: '1.0',
-    status: 'active',
-    capabilities: {
-      task_types: 'all',
-      max_concurrent: 2,
-      has_gpu: true,
-      gpu_count: 2,
-    },
-    config: {
-      desired: {
-        max_concurrent: 2,
-        task_types: 'all',
-        gpu_indices_allowed: 'all',
-        gpus_per_job: 1,
-      },
-      config_generation: 'gen-1',
-    },
-    last_seen_at: '2026-07-08T10:00:00',
-    created_at: '2026-07-01T10:00:00',
-    ...overrides,
-  };
-}
+// A GPU-capable, non-strategic runner so every editable control renders (the
+// per-job GPU count + GPU-index allowlist appear only when has_gpu is true, and
+// concurrency/task-types are editable rather than read-only when the runner does
+// not pin the strategic config).
+const SAMPLE_RUNNER: FleetRunner = {
+  id: 'runner-cfg-abc123',
+  hostname: 'gpu-worker-config-01',
+  version: 'v22-3-gabcdef',
+  status: 'active',
+  capabilities: {
+    task_types: 'all',
+    has_gpu: true,
+    max_concurrent: 2,
+  },
+  config: {
+    config_generation: 'gen-abc',
+    applied_config_generation: 'gen-abc',
+    config_pending: false,
+    gpu_indices_allowed: 'all',
+    gpus_per_job: 2,
+    desired: { task_types: 'all' },
+  },
+  last_seen_at: new Date(Date.now() - 30_000).toISOString(),
+  created_at: '2026-06-01T00:00:00Z',
+};
 
-describe('FleetRunnerConfigPanel viewport', () => {
-  let root: Root;
-  let container: HTMLDivElement;
-
-  beforeEach(() => {
-    container = document.createElement('div');
-    container.style.padding = '12px';
-    document.body.appendChild(container);
-    root = createRoot(container);
+// FleetRunnerConfigPanel statically imports updateRunnerCapabilities from
+// '../api'; browser-mode ESM requires the mock factory to expose every export
+// the module graph imports, so use the complete typed api mock.
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    updateRunnerCapabilities: vi.fn(async () => {}),
   });
+});
+
+describe('FleetRunnerConfigPanel — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
 
   afterEach(() => {
-    act(() => {
-      root.unmount();
-    });
-    document.body.removeChild(container);
+    const r = root;
+    if (r) { act(() => { r.unmount(); }); root = null; }
+    if (host) { host.remove(); host = null; }
   });
 
-  test('renders without overflow at 375px (mobile)', async () => {
-    await expectNoOverflowAt(375, async () => {
-      act(() => {
-        root.render(
-          <FleetRunnerConfigPanel projectId="p-1" runner={makeRunner()} onSaved={() => {}} />,
-        );
-      });
+  async function mount(width: number) {
+    host = document.createElement('div');
+    host.style.width = `${width}px`;
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <FleetRunnerConfigPanel projectId="proj-canary" runner={SAMPLE_RUNNER} onSaved={() => {}} />,
+      );
     });
+    await act(async () => {});
+  }
+
+  test('renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => { await mount(375); });
   });
 
-  test('renders without overflow at 768px (tablet)', async () => {
-    await expectNoOverflowAt(768, async () => {
-      act(() => {
-        root.render(
-          <FleetRunnerConfigPanel projectId="p-1" runner={makeRunner()} onSaved={() => {}} />,
-        );
-      });
-    });
+  test('renders without horizontal overflow at 768px', async () => {
+    await expectNoOverflowAt(768, async () => { await mount(768); });
   });
 
-  test('renders without overflow at 1024px (desktop)', async () => {
-    await expectNoOverflowAt(1024, async () => {
-      act(() => {
-        root.render(
-          <FleetRunnerConfigPanel projectId="p-1" runner={makeRunner()} onSaved={() => {}} />,
-        );
-      });
-    });
+  test('renders without horizontal overflow at 1280px', async () => {
+    await expectNoOverflowAt(1280, async () => { await mount(1280); });
+  });
+
+  test('save control meets 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => { await mount(375); });
+  });
+
+  test('field labels are not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => { await mount(375); });
   });
 });
