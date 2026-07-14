@@ -24,11 +24,17 @@ from app.models import (
     ComputeJob,
     ComputeJobStatus,
     LocalRunner,
+    Project,
     RunnerHeartbeatSnapshot,
     Task,
     TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
     _utcnow,
+)
+from app.runner_project_binding import (
+    add_binding,
+    bound_project_ids,
+    remove_binding,
 )
 from app.runner_config import (
     GPU_INDICES_ALL,
@@ -1241,6 +1247,194 @@ async def delete_runner(
         "status": "deleted",
         "released_unpulled_pins": released_pins,
     }
+
+
+class RunnerProjectBindingAddRequest(BaseModel):
+    """Request body for POST /projects/../runners/../projects (add allow-list grant)."""
+    project_id: uuid.UUID
+
+
+async def _load_owned_runner(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    user_id: str,
+    *,
+    for_update: bool = False,
+) -> "tuple[Project, LocalRunner]":
+    """Load a runner scoped to its ENROLLMENT project, owner-gated.
+
+    ``project_id`` is the runner's enrollment project (``LocalRunner.project_id``),
+    matching every other runner endpoint in this module. Requires the caller to be
+    OWNER of that enrollment project — i.e. owner of the runner itself, the
+    authorization boundary the allow-list endpoints protect. Raises 404 for a
+    missing/deleted runner or a runner not enrolled in ``project_id``.
+    """
+    enrollment_project = await _get_user_project_with_role(
+        project_id, user_id, session, "owner"
+    )
+    query = select(LocalRunner).where(
+        LocalRunner.id == runner_id,
+        LocalRunner.project_id == project_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    runner = (await session.execute(query)).scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+    return enrollment_project, runner
+
+
+async def _runner_projects_view(
+    session: AsyncSession, runner: LocalRunner
+) -> Dict[str, Any]:
+    """Serialize a runner's project allow-list (enrollment anchor + bindings)."""
+    bound = await bound_project_ids(session, runner.id)
+    allowed = bound | {runner.project_id}
+    return {
+        "runner_id": str(runner.id),
+        "enrollment_project_id": str(runner.project_id),
+        "projects": [
+            {
+                "project_id": str(pid),
+                "is_enrollment": pid == runner.project_id,
+            }
+            # Enrollment anchor first, then the rest by stable id order.
+            for pid in sorted(
+                allowed, key=lambda p: (p != runner.project_id, str(p))
+            )
+        ],
+    }
+
+
+@router.get("/projects/{project_id}/runners/{runner_id}/projects")
+async def list_runner_projects(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """List the projects a runner is allowed to serve (owner-gated).
+
+    Returns the enrollment project (implicit anchor) UNIONed with every explicit
+    ``runner_project_binding`` grant. Requires owner on the enrollment project.
+    """
+    _enrollment, runner = await _load_owned_runner(
+        session, project_id, runner_id, current_user["user_id"]
+    )
+    return await _runner_projects_view(session, runner)
+
+
+@router.post("/projects/{project_id}/runners/{runner_id}/projects")
+async def add_runner_project(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    payload: RunnerProjectBindingAddRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Add a project to a runner's allow-list so the daemon also serves it.
+
+    Authorization (server-enforced security boundary):
+      * caller must be OWNER of the runner (owner of its enrollment project);
+      * caller must ALSO be OWNER of the project being added; and
+      * that project must be owned by the SAME account as the runner
+        (``Project.user_id`` must match) — the MVP consent model. Attaching a
+        project owned by a DIFFERENT account is rejected 403; a full cross-account
+        consent handshake is out of MVP scope.
+    """
+    user_id = current_user["user_id"]
+    enrollment_project, runner = await _load_owned_runner(
+        session, project_id, runner_id, user_id, for_update=True
+    )
+    # Caller must own the project being added (404 if not even a member).
+    target_project = await _get_user_project_with_role(
+        payload.project_id, user_id, session, "owner"
+    )
+    # No silent cross-account attach: the added project must belong to the same
+    # account that owns the runner (its enrollment project's account).
+    if target_project.user_id != enrollment_project.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "cannot attach a project owned by a different account to this "
+                "runner (same-owner is the MVP consent model)"
+            ),
+        )
+
+    await add_binding(session, runner.id, payload.project_id)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Added project %s to runner %s allow-list (enrollment project %s)",
+        payload.project_id,
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="allow_list_updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+            "added_project_id": str(payload.project_id),
+        },
+    )
+    return await _runner_projects_view(session, runner)
+
+
+@router.delete("/projects/{project_id}/runners/{runner_id}/projects/{added_project_id}")
+async def remove_runner_project(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    added_project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Remove a project from a runner's allow-list (owner-gated).
+
+    The enrollment project (``LocalRunner.project_id``) is the anchor member and
+    may NOT be removed — attempting to remove it is rejected 400. Removing a
+    project that is not currently bound is an idempotent no-op. Requires owner on
+    the enrollment project (owner of the runner).
+    """
+    _enrollment, runner = await _load_owned_runner(
+        session, project_id, runner_id, current_user["user_id"], for_update=True
+    )
+    if added_project_id == runner.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="the enrollment project cannot be removed from the allow-list",
+        )
+
+    removed = await remove_binding(session, runner.id, added_project_id)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Removed project %s from runner %s allow-list (removed=%s)",
+        added_project_id,
+        runner_id,
+        removed,
+    )
+    if removed:
+        await emit_workbench_refetch(
+            project_id,
+            resource="local_runner",
+            action="allow_list_updated",
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+            summary_key="runner",
+            summary={
+                "id": str(runner_id),
+                "status": runner.status,
+                "hostname": runner.hostname,
+                "removed_project_id": str(added_project_id),
+            },
+        )
+    return await _runner_projects_view(session, runner)
 
 
 @router.get("/fleet/runners/health-summary")

@@ -40,6 +40,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token, get_current_runner
 from app.broadcast import broadcast_to_project
+from app.runner_project_binding import allowed_project_ids
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.runner_config import config_generation, live_safe_config
@@ -807,9 +808,16 @@ async def next_task(
     # what THIS one can run (a task unpinned from A and re-pinned to B must not
     # inherit A's "unroutable" and be refused by B, which could run it fine).
     runner_id = str(runner.id)
+    # A runner claims work for ANY project on its allow-list (enrollment project
+    # UNIONed with its explicit bindings), not only its enrollment project — so one
+    # daemon serves N projects. Membership is the server-side authorization boundary:
+    # a task pinned to this runner but in a project NOT on the allow-list falls out
+    # of the guard and is never returned. The per-runner pin (vm_instance_id +
+    # runner_target_id) is unchanged.
+    allowed_projects = await allowed_project_ids(session, runner)
     claim_guard = (
         Task.status == TaskStatus.PROVISIONING,
-        Task.project_id == runner.project_id,
+        Task.project_id.in_(allowed_projects),
         Task.vm_instance_id == pinned_vm_id,
         Task.context["runner_target_id"].as_string() == str(runner.id),
         # Exclude tasks already dispatched: started_at is set on dispatch so
@@ -1589,10 +1597,14 @@ async def next_compute_job(
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
     now = _utcnow()
+    # Serve compute jobs for ANY project on this runner's allow-list, not only its
+    # enrollment project (multi-project runner). Membership is the authorization
+    # boundary: a job pinned to this runner in a non-allowed project falls out here.
+    allowed_projects = await allowed_project_ids(session, runner)
     result = await session.execute(
         select(ComputeJob)
         .where(
-            ComputeJob.project_id == runner.project_id,
+            ComputeJob.project_id.in_(allowed_projects),
             ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
             ComputeJob.status == ComputeJobStatus.STARTING,
             # Scope to jobs pinned to THIS runner. create_compute_job stamps the
@@ -1642,7 +1654,10 @@ async def next_compute_job(
         try:
             from app.branch_cleanup import _get_project_github_token
 
-            project = await session.get(Project, runner.project_id)
+            # Mint the token for the JOB's project, not the runner's enrollment
+            # project — a multi-project runner may be executing a job for any
+            # allowed project, and the repo checkout must match that project.
+            project = await session.get(Project, job.project_id)
             if project is not None:
                 repo_token = await _get_project_github_token(project, session)
         except Exception:
@@ -1710,11 +1725,15 @@ async def report_compute_job(
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
     now = _utcnow()
+    # Accept reports for any project on this runner's allow-list (multi-project
+    # runner). A job in a project NOT on the allow-list falls out of this filter and
+    # is treated as not-found (the cross-project mismatch branch below still fires).
+    allowed_projects = await allowed_project_ids(session, runner)
     result = await session.execute(
         select(ComputeJob)
         .where(
             ComputeJob.id == job_id,
-            ComputeJob.project_id == runner.project_id,
+            ComputeJob.project_id.in_(allowed_projects),
             ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
             # Scope to the pinned runner — mirrors the claim filter in
             # /next-compute-job so runner A cannot report on a job claimed by B.
@@ -1969,9 +1988,10 @@ async def upload_compute_job_artifact(
     # lock-held-across-slow-I/O pattern behind the task-row-contention
     # incidents. The row lock is taken only for the brief re-read + stamp
     # after the bytes are durably stored.
+    allowed_projects = await allowed_project_ids(session, runner)
     _job_scope = (
         ComputeJob.id == job_id,
-        ComputeJob.project_id == runner.project_id,
+        ComputeJob.project_id.in_(allowed_projects),
         ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
         ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
     )
@@ -2097,11 +2117,13 @@ async def download_compute_job_input_artifact(
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
-    # Same ownership scoping as the report/upload endpoints: pinned runner only.
+    # Same ownership scoping as the report/upload endpoints: pinned runner only,
+    # for any project on this runner's allow-list (multi-project runner).
+    allowed_projects = await allowed_project_ids(session, runner)
     result = await session.execute(
         select(ComputeJob).where(
             ComputeJob.id == job_id,
-            ComputeJob.project_id == runner.project_id,
+            ComputeJob.project_id.in_(allowed_projects),
             ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
             ComputeJob.polling_metadata["runner_target_id"].as_string()
             == str(runner.id),
@@ -2119,11 +2141,11 @@ async def download_compute_job_input_artifact(
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=404, detail="job has no resume source")
 
-    # Defense-in-depth: the predecessor must still exist and belong to this
-    # runner's project before we stream any bytes (launch-time validation already
-    # enforced same-project, but re-check in case the row changed).
+    # Defense-in-depth: the predecessor must still exist and belong to a project on
+    # this runner's allow-list before we stream any bytes (launch-time validation
+    # already enforced same-project, but re-check in case the row changed).
     source_job = await session.get(ComputeJob, source_id)
-    if source_job is None or source_job.project_id != runner.project_id:
+    if source_job is None or source_job.project_id not in allowed_projects:
         raise HTTPException(status_code=404, detail="resume source not found")
 
     from app import storage

@@ -1923,6 +1923,100 @@ export async function patchRunnerStatus(
   return res.json();
 }
 
+// --- Runner project allow-list (multi-project runner scoping) ------------------
+
+/** One project a runner is allowed to serve. `is_enrollment` marks the runner's
+ *  enrollment/default project — the implicit anchor member that cannot be removed
+ *  from the allow-list. Mirrors the backend `_runner_projects_view` entry shape. */
+export interface RunnerProjectEntry {
+  project_id: string;
+  is_enrollment: boolean;
+}
+
+/** A runner's project allow-list: the enrollment anchor UNIONed with every
+ *  explicit binding grant. Mirrors the backend `_runner_projects_view` payload. */
+export interface RunnerProjectAllowList {
+  runner_id: string;
+  enrollment_project_id: string;
+  projects: RunnerProjectEntry[];
+}
+
+/** List the projects a runner is allowed to serve (owner-gated). */
+export async function listRunnerProjects(
+  projectId: string,
+  runnerId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects`,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to list runner projects: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to list runner projects: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Add a project to a runner's allow-list so the daemon also serves it.
+ *  Throws with the backend detail (e.g. the 403 cross-account-attach rejection)
+ *  so callers can surface the precise reason inline. Returns the updated list. */
+export async function addRunnerProject(
+  projectId: string,
+  runnerId: string,
+  addProjectId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects`,
+    { method: 'POST', body: JSON.stringify({ project_id: addProjectId }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to add runner project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to add runner project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Remove a non-default project from a runner's allow-list. The enrollment
+ *  project cannot be removed (backend rejects it 400). Returns the updated list. */
+export async function removeRunnerProject(
+  projectId: string,
+  runnerId: string,
+  addedProjectId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects/${encodeURIComponent(addedProjectId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to remove runner project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to remove runner project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** A project the current user can attach to a runner (owner role). */
+export interface OwnedProjectSummary {
+  id: string;
+  name: string;
+}
+
+/** List projects the current user OWNS — the candidate set for the runner
+ *  allow-list add-picker. Filters the admin project list to `my_role === 'owner'`
+ *  (the role the add endpoint requires on the project being attached). */
+export async function listOwnedProjects(): Promise<OwnedProjectSummary[]> {
+  const res = await apiFetch('/api/admin/projects');
+  if (!res.ok) throw new Error(`Failed to list projects: ${res.status}`);
+  const data = await res.json();
+  const items: Array<{ id?: string; name?: string; my_role?: string }> = Array.isArray(data?.items)
+    ? data.items
+    : [];
+  return items
+    .filter(p => p.my_role === 'owner' && typeof p.id === 'string')
+    .map(p => ({ id: p.id as string, name: (p.name as string) || (p.id as string) }));
+}
+
 /** One heartbeat time-series snapshot for a runner (from RunnerHeartbeatSnapshot). */
 export interface RunnerTelemetrySnapshot {
   captured_at: string | null;

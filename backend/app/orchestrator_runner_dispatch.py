@@ -35,6 +35,7 @@ from app.models import (
     ComputeJobStatus,
     LocalRunner,
     Project,
+    RunnerProjectBinding,
     Task,
     TaskStatus,
 )
@@ -341,6 +342,13 @@ async def _load_active_runners_cache(
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
         session, runner_ids_for_load
     )
+    # Per-runner project allow-list bindings (many-to-many). A runner is a dispatch
+    # candidate under EVERY project on its allow-list, not only its enrollment
+    # project, so one daemon serves N projects. The enrollment project is the
+    # implicit anchor member and is folded in below regardless of binding rows.
+    bound_projects_by_runner = await _load_runner_project_bindings(
+        session, runner_ids_for_load
+    )
     # Authoritative per-runner agent-task load from Task rows (heartbeat-independent).
     active_task_count_by_runner = await _load_runner_active_task_counts(
         session, runner_ids_for_load
@@ -377,8 +385,52 @@ async def _load_active_runners_cache(
             consecutive_job_failures=consecutive_job_failures or 0,
             hostname=hostname,
         )
-        by_project.setdefault(project_id, []).append(snapshot)
+        # Register the SAME snapshot object under every project on the runner's
+        # allow-list (enrollment project UNIONed with its explicit bindings). Sharing
+        # one object per physical box is what keeps the GPU/concurrency ledger
+        # unified: per-cycle pins and heartbeat-reported active counts are read off
+        # this single snapshot, so a project-B pin still counts against the same
+        # box's capacity when a project-A task is next considered — one physical GPU
+        # can never be double-booked across two projects.
+        allowed_project_ids = {project_id} | bound_projects_by_runner.get(
+            runner_id, set()
+        )
+        for allowed_project_id in allowed_project_ids:
+            by_project.setdefault(allowed_project_id, []).append(snapshot)
     return by_project
+
+
+async def _load_runner_project_bindings(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Return the EXPLICIT project allow-list bindings keyed by runner id.
+
+    Reads ``runner_project_binding`` rows for the given runner ids so the dispatch
+    cache can register each runner as a candidate under every project on its
+    allow-list. The enrollment project (``LocalRunner.project_id``) is the implicit
+    anchor member and is folded in by the caller, so this returns only the EXPLICIT
+    bindings. Best-effort: on a query error returns an empty dict, degrading to
+    enrollment-project-only grouping rather than failing the whole dispatch cycle.
+    """
+    if not runner_ids:
+        return {}
+    try:
+        rows = (
+            await session.execute(
+                select(
+                    RunnerProjectBinding.runner_id,
+                    RunnerProjectBinding.project_id,
+                ).where(RunnerProjectBinding.runner_id.in_(runner_ids))
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner project bindings")
+        return {}
+    by_runner: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for runner_id, project_id in rows:
+        by_runner.setdefault(runner_id, set()).add(project_id)
+    return by_runner
 
 
 async def _load_runner_compute_job_assignments(

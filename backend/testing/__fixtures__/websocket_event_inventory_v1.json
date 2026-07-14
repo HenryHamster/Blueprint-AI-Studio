@@ -3042,6 +3042,38 @@
       "workbench_resource": "local_runner"
     },
     {
+      "callee": "emit_workbench_refetch",
+      "canonical_callee": "emit_workbench_refetch",
+      "classification": "workbench_v1_helper",
+      "event": "workbench_refetch",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1367,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "add_runner_project",
+      "source_path": "backend/app/routers/admin_runners.py",
+      "workbench_action": "allow_list_updated",
+      "workbench_resource": "local_runner"
+    },
+    {
+      "callee": "emit_workbench_refetch",
+      "canonical_callee": "emit_workbench_refetch",
+      "classification": "workbench_v1_helper",
+      "event": "workbench_refetch",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1417,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "remove_runner_project",
+      "source_path": "backend/app/routers/admin_runners.py",
+      "workbench_action": "allow_list_updated",
+      "workbench_resource": "local_runner"
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
@@ -4877,6 +4909,6 @@
     "strategic_v1_helper": 21,
     "transport": 5,
     "workbench_v1_emitter": 1,
-    "workbench_v1_helper": 12
+    "workbench_v1_helper": 14
   }
 }

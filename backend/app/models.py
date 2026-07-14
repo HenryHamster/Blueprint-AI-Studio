@@ -5110,6 +5110,59 @@ class LocalRunner(SQLModel, table=True):
     )
 
 
+class RunnerProjectBinding(SQLModel, table=True):
+    """Runner-level project allow-list — one row per (runner, project) grant.
+
+    A fleet ``LocalRunner`` historically pinned to exactly one project via its
+    ``project_id`` FK (the ENROLLMENT / default project). This join table adds a
+    many-to-many allow-list so ONE daemon per physical box can serve N projects
+    under a single unified GPU-index/concurrency ledger, without spinning up a
+    second per-project daemon that would double-book the same hardware.
+
+    This is the ADDITIVE, non-breaking schema foundation only: ``LocalRunner.
+    project_id`` is UNCHANGED and remains the anchor member of the runner's own
+    allow-list (a runner is always implicitly allowed on its enrollment project
+    even if no binding row exists — see ``app.runner_project_binding.
+    allowed_project_ids``). Dispatch/authz/claim rewiring lands in a follow-on
+    that depends on this table.
+    """
+
+    __tablename__ = "runner_project_binding"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the runner so bindings never outlive their runner row.
+    runner_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    # Deleted with the project so bindings never outlive their project row.
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # A runner cannot be double-bound to the same project.
+        UniqueConstraint(
+            "runner_id",
+            "project_id",
+            name="uq_runner_project_binding_runner_project",
+        ),
+    )
+
+
 class RunnerHeartbeatSnapshot(SQLModel, table=True):
     """Append-only time-series of runner heartbeat telemetry.
 

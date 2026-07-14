@@ -34,6 +34,7 @@ from app.models import (
     MessagesNoisePrefs,
     Project,
     ProjectMember,
+    RunnerProjectBinding,
     Task,
     TaskStatus,
     _utcnow,
@@ -284,6 +285,219 @@ async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session)
     assert refreshed is not None
     assert refreshed is first
     assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_runner_project_binding_backfill_and_resolver(db_session):
+    """The allow-list resolver folds in the enrollment project and unions
+    explicit bindings; the backfill produces exactly one row per runner."""
+    from app import runner_project_binding as rpb
+
+    proj_a = await _make_project(db_session, name="Alpha")
+    proj_b = await _make_project(db_session, name="Beta")
+    runner, _token = await _make_runner(db_session, proj_a.id)
+
+    # 1) Freshly enrolled runner with NO binding rows: the resolver still
+    #    reports its enrollment project (implicit anchor membership).
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert allowed == {proj_a.id}
+    assert await rpb.bound_project_ids(db_session, runner.id) == set()
+
+    # 2) Backfill creates exactly one binding row per runner (its enrollment
+    #    project) and is idempotent on a second run.
+    created = await rpb.backfill_enrollment_bindings(db_session)
+    await db_session.commit()
+    assert created == 1
+    rows = (
+        await db_session.execute(
+            select(RunnerProjectBinding).where(
+                RunnerProjectBinding.runner_id == runner.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].project_id == proj_a.id
+    # Idempotent: re-running adds nothing.
+    assert await rpb.backfill_enrollment_bindings(db_session) == 0
+
+    # 3) Adding a second project to the allow-list unions into the resolver.
+    await rpb.add_binding(db_session, runner.id, proj_b.id)
+    await db_session.commit()
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert allowed == {proj_a.id, proj_b.id}
+    assert await rpb.bound_project_ids(db_session, runner.id) == {
+        proj_a.id,
+        proj_b.id,
+    }
+
+    # add_binding is idempotent (unique constraint respected, no duplicate row).
+    await rpb.add_binding(db_session, runner.id, proj_b.id)
+    await db_session.commit()
+    assert await rpb.bound_project_ids(db_session, runner.id) == {
+        proj_a.id,
+        proj_b.id,
+    }
+
+    # 4) Removing the enrollment-project binding does NOT revoke access — the
+    #    resolver folds the enrollment anchor back in regardless.
+    assert await rpb.remove_binding(db_session, runner.id, proj_a.id) is True
+    await db_session.commit()
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert proj_a.id in allowed
+    assert allowed == {proj_a.id, proj_b.id}
+
+
+@pytest.mark.asyncio
+async def test_multi_project_runner_claim_and_authz(client: AsyncClient, db_session):
+    """Operator walkthrough: one runner enrolled under project A, granted project
+    B via the owner-gated endpoint, serves BOTH — while work in a non-allowed
+    project C is rejected server-side, and adding B does NOT create a second
+    per-project GPU/concurrency budget (the ledger stays unified).
+    """
+    proj_a = await _make_project(db_session, name="Alpha")
+    proj_b = await _make_project(db_session, name="Beta")
+    proj_c = await _make_project(db_session, name="Gamma")  # NOT on the allow-list
+    runner, token = await _make_runner(db_session, proj_a.id)
+    _seed_pool_account(TEST_USER_ID)
+    try:
+        # 1) Add project B to the runner's allow-list via the admin endpoint.
+        add_resp = await client.post(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects",
+            json={"project_id": str(proj_b.id)},
+        )
+        assert add_resp.status_code == 200, add_resp.text
+        listed = {p["project_id"] for p in add_resp.json()["projects"]}
+        assert listed == {str(proj_a.id), str(proj_b.id)}
+        # The enrollment project is flagged as the (non-removable) anchor member.
+        enrollment_entry = next(
+            p for p in add_resp.json()["projects"]
+            if p["project_id"] == str(proj_a.id)
+        )
+        assert enrollment_entry["is_enrollment"] is True
+
+        # 2) A project-B task pinned to this runner is returned by next-task, even
+        #    though the runner ENROLLED under project A.
+        task_b = Task(
+            project_id=proj_b.id,
+            payloads=[{"type": "create", "title": "cross-project claim"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_b)
+        await db_session.commit()
+
+        nt_resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert nt_resp.status_code == 200, nt_resp.text
+        assert nt_resp.json()["task_id"] == str(task_b.id)
+
+        # 3) A compute job in ALLOWED project B is claimable and reportable.
+        job_b = ComputeJob(
+            project_id=proj_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi",
+            },
+        )
+        # 4) A compute job in NON-allowed project C, pinned to the very same
+        #    runner, must NOT be claimable — the allow-list is the authz boundary.
+        job_c = ComputeJob(
+            project_id=proj_c.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo nope",
+            },
+        )
+        db_session.add(job_b)
+        db_session.add(job_c)
+        await db_session.commit()
+
+        ncj_resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ncj_resp.status_code == 200, ncj_resp.text
+        # Only the allowed-project job is handed out — the project-C job is never
+        # returned even though it is pinned to this runner and older/newer ordering
+        # cannot surface it.
+        assert ncj_resp.json()["job_id"] == str(job_b.id)
+
+        # A report against the non-allowed project-C job is rejected (404).
+        report_c = await client.post(
+            f"/api/runner/compute-job/{job_c.id}/report",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"exec_status": "succeeded", "exit_code": 0},
+        )
+        assert report_c.status_code == 404
+
+        # 5) UNIFIED LEDGER: the dispatch cache registers ONE shared snapshot per
+        #    physical box under each allowed project — the SAME object, so pins and
+        #    active counts accrue once and a single GPU cannot be double-booked
+        #    across projects. Adding project B created no second budget.
+        cache = await orch._load_active_runners_cache(db_session)
+        snap_a = next((s for s in cache.get(proj_a.id, []) if s.id == runner.id), None)
+        snap_b = next((s for s in cache.get(proj_b.id, []) if s.id == runner.id), None)
+        assert snap_a is not None and snap_b is not None
+        assert snap_a is snap_b  # one shared ledger, not a per-project copy
+        # The non-allowed project has no candidate for this runner.
+        assert all(s.id != runner.id for s in cache.get(proj_c.id, []))
+
+        # 6) AUTHZ: attaching a project owned by a DIFFERENT account is rejected
+        #    403 even when the caller holds an owner role on it (MVP consent model).
+        cross = Project(name="CrossAccount", user_id="other-account-999")
+        db_session.add(cross)
+        await db_session.commit()
+        await db_session.refresh(cross)
+        db_session.add(
+            ProjectMember(project_id=cross.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await db_session.commit()
+        cross_resp = await client.post(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects",
+            json={"project_id": str(cross.id)},
+        )
+        assert cross_resp.status_code == 403
+
+        # 7) The enrollment project cannot be removed from the allow-list.
+        rm_enroll = await client.delete(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects/{proj_a.id}"
+        )
+        assert rm_enroll.status_code == 400
+
+        # 8) Removing project B revokes cross-project service: after removal a
+        #    project-B job is no longer claimable.
+        rm_b = await client.delete(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects/{proj_b.id}"
+        )
+        assert rm_b.status_code == 200
+        remaining = {p["project_id"] for p in rm_b.json()["projects"]}
+        assert remaining == {str(proj_a.id)}
+
+        job_b2 = ComputeJob(
+            project_id=proj_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi again",
+            },
+        )
+        db_session.add(job_b2)
+        await db_session.commit()
+        ncj_after = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ncj_after.status_code == 204
+    finally:
+        _clear_pool()
 
 
 # ── Runner health / trust telemetry (pure, no DB) ────────────────────────────

@@ -67,10 +67,30 @@ vi.mock('../api', async () => {
     rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
     updateRunnerCapabilities: vi.fn(async () => SAMPLE_RUNNERS[0]),
+    // Default allow-list: enrollment project only. Individual tests override.
+    listRunnerProjects: vi.fn(async (_p: string, runnerId: string) => ({
+      runner_id: runnerId,
+      enrollment_project_id: 'proj-test',
+      projects: [{ project_id: 'proj-test', is_enrollment: true }],
+    })),
+    addRunnerProject: vi.fn(async (_p: string, runnerId: string) => ({
+      runner_id: runnerId,
+      enrollment_project_id: 'proj-test',
+      projects: [{ project_id: 'proj-test', is_enrollment: true }],
+    })),
+    removeRunnerProject: vi.fn(async (_p: string, runnerId: string) => ({
+      runner_id: runnerId,
+      enrollment_project_id: 'proj-test',
+      projects: [{ project_id: 'proj-test', is_enrollment: true }],
+    })),
+    listOwnedProjects: vi.fn(async () => [
+      { id: 'proj-test', name: 'test-project' },
+      { id: 'proj-extra', name: 'extra-project' },
+    ]),
   });
 });
 
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerStats, fetchRunnerTelemetry } from '../api';
+import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerStats, fetchRunnerTelemetry, listRunnerProjects, addRunnerProject, removeRunnerProject } from '../api';
 
 describe('FleetRunnersPanel — behavioral', () => {
   let root: Root | null = null;
@@ -2064,5 +2084,94 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.querySelector('[data-testid="fleet-outcome-task-link"]')).toBeNull();
     const detail = el.querySelector('[data-testid="fleet-runner-telemetry-detail"]');
     expect(detail?.textContent).toContain('task task-123');
+  });
+
+  // ── Projects allow-list section ──────────────────────────────────────────────
+
+  // React tracks controlled <select> values via a native setter, same as text
+  // inputs — assign through the prototype setter, then dispatch 'change'.
+  function selectOption(select: HTMLSelectElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    setter?.call(select, value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  test('renders the enrollment project marked default and non-removable', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    // Default listRunnerProjects mock returns the enrollment project only.
+    const el = await mount();
+
+    const section = el.querySelector('[data-testid="fleet-runner-projects"]');
+    expect(section).not.toBeNull();
+    // Enrollment project resolves to its owned-project name and is marked default.
+    expect(section?.textContent).toContain('test-project');
+    expect(section?.textContent).toContain('(default)');
+    // The enrollment anchor has no remove control.
+    expect(el.querySelector('button[aria-label^="Remove project"]')).toBeNull();
+  });
+
+  test('adding a project calls addRunnerProject then reloads the runner list', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    const el = await mount();
+
+    const callsBefore = vi.mocked(listFleetRunners).mock.calls.length;
+
+    const addBtn = el.querySelector('button[aria-label^="Add project to runner"]') as HTMLButtonElement;
+    expect(addBtn).not.toBeNull();
+    await act(async () => { addBtn.click(); });
+
+    const select = el.querySelector('select[aria-label="Project to add"]') as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    // proj-test is already on the allow-list, so only proj-extra is offered.
+    expect(select.textContent).toContain('extra-project');
+    expect(select.textContent).not.toContain('test-project');
+    await act(async () => { selectOption(select, 'proj-extra'); });
+
+    const saveBtn = el.querySelector('button[aria-label="Add selected project to runner"]') as HTMLButtonElement;
+    await act(async () => { saveBtn.click(); });
+    await act(async () => {});
+
+    expect(addRunnerProject).toHaveBeenCalledWith('proj-test', 'runner-abc123', 'proj-extra');
+    // load() re-fetches after a successful add.
+    expect(vi.mocked(listFleetRunners).mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+
+  test('removing a non-default project calls removeRunnerProject with its id', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    vi.mocked(listRunnerProjects).mockResolvedValueOnce({
+      runner_id: 'runner-abc123',
+      enrollment_project_id: 'proj-test',
+      projects: [
+        { project_id: 'proj-test', is_enrollment: true },
+        { project_id: 'proj-extra', is_enrollment: false },
+      ],
+    });
+    const el = await mount();
+
+    const removeBtn = el.querySelector('button[aria-label="Remove project extra-project from runner"]') as HTMLButtonElement;
+    expect(removeBtn).not.toBeNull();
+    await act(async () => { removeBtn.click(); });
+    await act(async () => {});
+
+    expect(removeRunnerProject).toHaveBeenCalledWith('proj-test', 'runner-abc123', 'proj-extra');
+  });
+
+  test('surfaces the backend 403 cross-account rejection inline when an add fails', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([SAMPLE_RUNNERS[0]]);
+    vi.mocked(addRunnerProject).mockRejectedValueOnce(
+      new Error('cannot attach a project owned by a different account to this runner'),
+    );
+    const el = await mount();
+
+    const addBtn = el.querySelector('button[aria-label^="Add project to runner"]') as HTMLButtonElement;
+    await act(async () => { addBtn.click(); });
+    const select = el.querySelector('select[aria-label="Project to add"]') as HTMLSelectElement;
+    await act(async () => { selectOption(select, 'proj-extra'); });
+    const saveBtn = el.querySelector('button[aria-label="Add selected project to runner"]') as HTMLButtonElement;
+    await act(async () => { saveBtn.click(); });
+    await act(async () => {});
+
+    expect(el.textContent).toContain('cannot attach a project owned by a different account');
+    vi.mocked(listFleetRunners).mockReset();
   });
 });

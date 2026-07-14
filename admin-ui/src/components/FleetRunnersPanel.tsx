@@ -1,8 +1,8 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats } from '../api';
-import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse } from '../api';
+import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats, listRunnerProjects, addRunnerProject, removeRunnerProject, listOwnedProjects } from '../api';
+import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse, RunnerProjectAllowList, OwnedProjectSummary } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FleetRunnerConfigPanel } from './FleetRunnerConfigPanel';
 import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
@@ -510,6 +510,18 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const [expandedTelemetry, setExpandedTelemetry] = useState<string | null>(null);
   // Which runner's configuration form is expanded.
   const [expandedConfig, setExpandedConfig] = useState<string | null>(null);
+  // Per-runner project allow-list (enrollment anchor + explicit bindings), keyed
+  // by runner id. Loaded alongside the runner list; a fetch failure just leaves a
+  // runner's entry absent so the Projects section degrades rather than erroring.
+  const [runnerProjects, setRunnerProjects] = useState<Record<string, RunnerProjectAllowList>>({});
+  // Projects the current user owns — the candidate set for the add-picker. Loaded
+  // once per projectId; best-effort (empty on failure disables adding, never errors).
+  const [ownedProjects, setOwnedProjects] = useState<OwnedProjectSummary[]>([]);
+  // Which runner is showing its add-project picker, and the selected project id.
+  const [addingProjectFor, setAddingProjectFor] = useState<string | null>(null);
+  const [addProjectSelection, setAddProjectSelection] = useState<string>('');
+  // Which runner's allow-list is mid-mutation (add/remove) — drives the spinner.
+  const [mutatingProjects, setMutatingProjects] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -526,11 +538,41 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     try {
       const data = await listFleetRunners(projectId);
       if (mountedRef.current) { setRunners(data); setError(null); }
+      // Fetch each runner's project allow-list concurrently. Best-effort: a
+      // per-runner failure resolves to null and simply omits that runner's
+      // Projects section rather than failing the whole panel load.
+      const lists = await Promise.all(
+        data.map(r => listRunnerProjects(projectId, r.id).catch(() => null)),
+      );
+      if (mountedRef.current) {
+        const map: Record<string, RunnerProjectAllowList> = {};
+        data.forEach((r, i) => {
+          const list = lists[i];
+          if (list && Array.isArray(list.projects)) map[r.id] = list;
+        });
+        setRunnerProjects(map);
+      }
     } catch (e) {
       if (mountedRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (mountedRef.current) setLoading(false);
     }
+  }, [projectId]);
+
+  // Load the owner's project set once per projectId — the candidate list for the
+  // add-picker. Best-effort: on failure the picker just has no options to add.
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      try {
+        const owned = await listOwnedProjects();
+        if (!cancelled && mountedRef.current) setOwnedProjects(owned);
+      } catch {
+        if (!cancelled && mountedRef.current) setOwnedProjects([]);
+      }
+    }
+    void run();
+    return () => { cancelled = true; };
   }, [projectId]);
 
   // load() is invoked through an effect-local async function so the setState
@@ -628,6 +670,32 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     }
   };
 
+  const handleAddRunnerProject = async (runner: FleetRunner, addProjectId: string) => {
+    setMutatingProjects(runner.id);
+    try {
+      await addRunnerProject(projectId, runner.id, addProjectId);
+      setAddingProjectFor(null);
+      setAddProjectSelection('');
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMutatingProjects(null);
+    }
+  };
+
+  const handleRemoveRunnerProject = async (runner: FleetRunner, addedProjectId: string) => {
+    setMutatingProjects(runner.id);
+    try {
+      await removeRunnerProject(projectId, runner.id, addedProjectId);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMutatingProjects(null);
+    }
+  };
+
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
     setUpdatingStatus(runner.id);
     try {
@@ -639,6 +707,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       setUpdatingStatus(null);
     }
   };
+
+  // Resolve project ids to human names for the Projects section. Only projects
+  // the user owns carry a name; ids outside that set fall back to a short prefix.
+  const ownedProjectNameById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const p of ownedProjects) map[p.id] = p.name;
+    return map;
+  }, [ownedProjects]);
 
   const { liveRunners, liveComputeRunners, liveGpuRunners, liveStrategicRunners } = useMemo(() => {
     const live = runners.filter(isRunnerLive);
@@ -824,6 +900,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
             const telemetryOpen = expandedTelemetry === runner.id;
             const configOpen = expandedConfig === runner.id;
+            // Project allow-list for this runner (enrollment anchor + bindings).
+            const allowList = runnerProjects[runner.id];
+            const allowedIds = new Set((allowList?.projects ?? []).map(p => p.project_id));
+            // Owned projects not already on the allow-list — the add-picker options.
+            const addableProjects = ownedProjects.filter(p => !allowedIds.has(p.id));
             return (
               <div
                 key={runner.id}
@@ -1092,6 +1173,97 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                   runner={runner}
                   onSaved={() => load()}
                 />
+              )}
+              {allowList && (
+                <div
+                  className="border-t border-neutral-800 px-2.5 py-2"
+                  data-testid="fleet-runner-projects"
+                >
+                  <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-neutral-400">
+                    <span>Projects</span>
+                    <span className="text-neutral-600">— projects this runner serves</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {allowList.projects.map(p => {
+                      const name = ownedProjectNameById[p.project_id] ?? p.project_id.slice(0, 8);
+                      return (
+                        <span
+                          key={p.project_id}
+                          className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                          data-testid="fleet-runner-project"
+                        >
+                          {name}
+                          {p.is_enrollment ? (
+                            <span className="text-neutral-500">(default)</span>
+                          ) : (
+                            <button
+                              onClick={() => void handleRemoveRunnerProject(runner, p.project_id)}
+                              disabled={mutatingProjects === runner.id}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-500 transition-colors hover:text-red-300 disabled:opacity-40 md:min-h-4 md:min-w-4"
+                              title={`Remove ${name}`}
+                              aria-label={`Remove project ${name} from runner`}
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          )}
+                        </span>
+                      );
+                    })}
+                    {addingProjectFor === runner.id ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                        data-testid="fleet-runner-add-project-editor"
+                      >
+                        <select
+                          value={addProjectSelection}
+                          onChange={e => setAddProjectSelection(e.target.value)}
+                          aria-label="Project to add"
+                          className="max-w-[10rem] bg-transparent text-xs text-neutral-200 outline-none"
+                          autoFocus
+                        >
+                          <option value="">
+                            {addableProjects.length > 0 ? 'Select project…' : 'No projects to add'}
+                          </option>
+                          {addableProjects.map(op => (
+                            <option key={op.id} value={op.id}>{op.name}</option>
+                          ))}
+                        </select>
+                        {mutatingProjects !== runner.id ? (
+                          <>
+                            <button
+                              onClick={() => addProjectSelection && void handleAddRunnerProject(runner, addProjectSelection)}
+                              disabled={!addProjectSelection}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-emerald-400 transition-colors hover:text-emerald-300 disabled:opacity-40 md:min-h-4 md:min-w-4"
+                              title="Add project"
+                              aria-label="Add selected project to runner"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => { setAddingProjectFor(null); setAddProjectSelection(''); }}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-400 transition-colors hover:text-neutral-200 md:min-h-4 md:min-w-4"
+                              title="Cancel"
+                              aria-label="Cancel adding project"
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-neutral-300 animate-pulse">saving…</span>
+                        )}
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => { setAddProjectSelection(''); setAddingProjectFor(runner.id); }}
+                        className="inline-flex min-h-[44px] items-center gap-1 rounded border border-dashed border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400 transition-colors hover:border-neutral-500 hover:text-neutral-200 md:min-h-0"
+                        title="Add a project this runner may serve"
+                        aria-label={`Add project to runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                      >
+                        + Add project
+                      </button>
+                    )}
+                  </div>
+                </div>
               )}
               {telemetryOpen && (
                 <RunnerTelemetryDetail

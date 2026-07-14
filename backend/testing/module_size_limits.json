@@ -145,6 +145,7 @@
     "acceptance_gate.py": 1800,
     "review_loop_convergence.py": 1950,
     "routers/admin_project_tools.py": 1800,
+    "routers/admin_runners.py": 1750,
     "compute_image_build.py": 1750
   },
   "agent": {

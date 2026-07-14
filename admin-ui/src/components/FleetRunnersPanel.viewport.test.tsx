@@ -70,6 +70,21 @@ vi.mock('../api', async () => {
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret' })),
     revokeFleetRunner: vi.fn(async () => {}),
     rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
+    // Project allow-list so the Projects section renders in the 1280px acceptance
+    // capture: the enrollment/default project plus one additional allowed project.
+    listRunnerProjects: vi.fn(async (_p: string, runnerId: string) => ({
+      runner_id: runnerId,
+      enrollment_project_id: 'proj-canary',
+      projects: [
+        { project_id: 'proj-canary', is_enrollment: true },
+        { project_id: 'proj-extra', is_enrollment: false },
+      ],
+    })),
+    listOwnedProjects: vi.fn(async () => [
+      { id: 'proj-canary', name: 'canary-project' },
+      { id: 'proj-extra', name: 'extra-project' },
+      { id: 'proj-third', name: 'third-project' },
+    ]),
   });
 });
 
