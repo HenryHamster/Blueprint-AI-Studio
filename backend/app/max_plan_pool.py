@@ -1585,7 +1585,10 @@ def summarize_pool_state(
 
 
 def get_all_account_health_summaries(
-    user_id: str | None = None, now: datetime | None = None, project_id: str | None = None
+    user_id: str | None = None,
+    now: datetime | None = None,
+    project_id: str | None = None,
+    persisted_usage_by_id: Mapping[str, Any] | None = None,
 ) -> list[dict]:
     """Return per-account health summaries for the admin dashboard.
 
@@ -1662,7 +1665,13 @@ def get_all_account_health_summaries(
             # Additive: latest cached proactive usage-headroom snapshot
             # (5h/7d utilization, reset times, probed_at, known/stale).
             # "known": False covers never-probed and probe-unknown states.
-            "usage_snapshot": _usage_snapshot_summary(acct, now),
+            # Falls back to the DB-persisted blob so the meter is populated on
+            # non-leader instances that never re-ran the (leader-only) probe.
+            "usage_snapshot": usage_snapshot_summary_with_fallback(
+                acct,
+                (persisted_usage_by_id or {}).get(str(acct["id"])),
+                now,
+            ),
         }
         # Per-project fields when scoped to a specific project.
         if project_id:
@@ -2862,6 +2871,71 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         "probed_at": snap.probed_at,
         "stale": stale,
     }
+
+
+def _usage_summary_from_snapshot(
+    snap: UsageSnapshot, at: datetime, now: datetime
+) -> Dict[str, Any]:
+    """JSON-safe summary for a KNOWN snapshot with wall-clock stamp ``at``."""
+    stale = (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+    return {
+        "known": True,
+        "five_hour_utilization": snap.window_utilizations.get("five_hour"),
+        "seven_day_utilization": snap.window_utilizations.get("seven_day"),
+        "resets_at": dict(snap.resets_at),
+        "probed_at": snap.probed_at,
+        "stale": stale,
+    }
+
+
+def usage_snapshot_summary_with_fallback(
+    acct: Dict[str, Any] | None,
+    persisted_raw: Any,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Usage-snapshot summary that falls back to the DB-persisted blob.
+
+    The in-memory probe result only exists on the instance whose orchestrator
+    leader actually ran the probe: probes are scheduled ONLY from the
+    leader-gated orchestrator cycle (``refresh_usage_meter_snapshots``), and
+    non-leader Cloud Run instances load the pool once at startup and never
+    refresh it (see ``lifecycle`` — the periodic ``load_max_plan_pool`` /
+    meter-refresh both live inside the leader-only loop). Because the admin API
+    is load-balanced across every instance, the in-memory snapshot is missing
+    (``known=False``) on each non-leader — so the meter renders blank for the
+    operator even though a fresh probe result is durably persisted in the shared
+    DB column ``MaxPlanAccount.rate_limit_usage``.
+
+    Fix: when the in-memory snapshot is missing/unknown — or when the persisted
+    blob is fresher than the frozen in-memory copy — reconstruct the summary
+    from the persisted blob so the meter is correct on every instance
+    regardless of which one is the leader. Picks the fresher of the two known
+    sources (mirrors ``_restore_usage_state``).
+    """
+    candidates: list[tuple[datetime, UsageSnapshot]] = []
+    if acct is not None:
+        snap = acct.get("usage_snapshot")
+        at = acct.get("usage_snapshot_at")
+        if isinstance(snap, UsageSnapshot) and snap.known and at is not None:
+            candidates.append((at, snap))
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        candidates.append((parsed[1], parsed[0]))
+    if not candidates:
+        # No known source anywhere — preserve the in-memory unknown summary
+        # (carries probed_at/stale from a probe-unknown result) when present.
+        if acct is not None:
+            return _usage_snapshot_summary(acct, now)
+        return {
+            "known": False,
+            "five_hour_utilization": None,
+            "seven_day_utilization": None,
+            "resets_at": {},
+            "probed_at": None,
+            "stale": True,
+        }
+    best_at, best_snap = max(candidates, key=lambda c: c[0])
+    return _usage_summary_from_snapshot(best_snap, best_at, now)
 
 
 async def select_max_plan_account_balanced(

@@ -670,6 +670,74 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
     assert a["usage_snapshot"]["stale"] is False
 
 
+async def test_usage_snapshot_falls_back_to_persisted_db_blob_on_non_leader(
+    client, db_session, inject_pool
+):
+    """Non-leader repro: the in-memory probe result is absent (probes run only
+    on the leader instance), but the shared DB has a persisted rate_limit_usage
+    blob. Both the roster and the health endpoint must surface it as known —
+    otherwise the operator's usage meter renders blank on every non-leader."""
+    now = _admin_pool_accounts._utcnow()
+    acct_id = uuid.uuid4()
+    persisted = {
+        "updated_at": now.isoformat(),
+        "source": "oauth_usage_probe",
+        "five_hour": {"utilization": 37.0, "resets_at": "2026-07-14T18:00:00Z"},
+        "seven_day": {"utilization": 58.0},
+    }
+    db_session.add(
+        MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="Non-Leader Account",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+            oauth_token="sk-ant-oat-token",
+            secret_blob_ref="sk-ant-oat-token",
+            provider_metadata={"available_models": ["claude-opus-4-8"]},
+            enabled=True,
+            rate_limit_usage=persisted,
+        )
+    )
+    await db_session.commit()
+
+    # In-memory pool entry WITHOUT any usage_snapshot — exactly what a
+    # non-leader instance holds after loading the pool with no probe of its own.
+    inject_pool(
+        "test-user-123",
+        [
+            {
+                "id": str(acct_id),
+                "user_id": "test-user-123",
+                "name": "Non-Leader Account",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "oauth_token": "sk-ant-oat-token",
+                "runtime_secret": "sk-ant-oat-token",
+                "enabled": True,
+                "active_tasks": 0,
+            }
+        ],
+    )
+
+    # Roster endpoint (SettingsAccountsSection data source).
+    roster = await client.get("/api/admin/max-plan-accounts")
+    assert roster.status_code == 200, roster.text
+    acct = {a["id"]: a for a in roster.json()["accounts"]}[str(acct_id)]
+    assert acct["usage_snapshot"]["known"] is True
+    assert acct["usage_snapshot"]["five_hour_utilization"] == 37.0
+    assert acct["usage_snapshot"]["seven_day_utilization"] == 58.0
+    assert acct["usage_snapshot"]["stale"] is False
+
+    # Health endpoint (RuntimeAccountsPanel + PoolAccountHealthPanel source).
+    health = await client.get("/api/admin/max-plan-accounts/health")
+    assert health.status_code == 200
+    h = {a["account_id"]: a for a in health.json()["accounts"]}[str(acct_id)]
+    assert h["usage_snapshot"]["known"] is True
+    assert h["usage_snapshot"]["five_hour_utilization"] == 37.0
+    assert h["usage_snapshot"]["seven_day_utilization"] == 58.0
+
+
 async def test_account_health_summary_failure_class_window_filter(
     client, db_session, inject_pool
 ):

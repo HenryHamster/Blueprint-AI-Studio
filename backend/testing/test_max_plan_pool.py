@@ -65,6 +65,7 @@ from app.max_plan_pool import (
     _usage_headroom_rank,
     _usage_headroom_settings,
     _usage_snapshot_summary,
+    usage_snapshot_summary_with_fallback,
     alternate_account_recovery_deadline,
     cascade_disabled_models,
     credential_sweep_service,
@@ -2726,6 +2727,98 @@ class TestUsageSnapshotSummary:
         assert out["stale"] is True
         # Stale-but-known still reports its last values for operator visibility.
         assert out["known"] is True
+
+
+def _persisted_usage_blob(five, seven, *, updated_at):
+    """Mirror the blob _persist_rate_limit_usage_to_db writes to the DB."""
+    return {
+        "updated_at": updated_at.isoformat(),
+        "source": "oauth_usage_probe",
+        "five_hour": {"utilization": float(five)},
+        "seven_day": {"utilization": float(seven)},
+    }
+
+
+class TestUsageSnapshotSummaryWithFallback:
+    """The admin meter must survive the leader-only probe: non-leader instances
+    never populate the in-memory snapshot, so the summary must fall back to the
+    DB-persisted rate_limit_usage blob (shared across instances)."""
+
+    def test_falls_back_to_persisted_when_memory_absent(self):
+        # Simulates a non-leader instance: no in-memory probe result, but the
+        # shared DB has a fresh persisted blob from the leader's probe.
+        now = _utcnow()
+        blob = _persisted_usage_blob(33.0, 71.0, updated_at=now)
+        out = usage_snapshot_summary_with_fallback(_acct(), blob, now)
+        assert out["known"] is True
+        assert out["five_hour_utilization"] == 33.0
+        assert out["seven_day_utilization"] == 71.0
+        assert out["stale"] is False
+
+    def test_falls_back_when_mem_account_is_none(self):
+        now = _utcnow()
+        blob = _persisted_usage_blob(5.0, 9.0, updated_at=now)
+        out = usage_snapshot_summary_with_fallback(None, blob, now)
+        assert out["known"] is True
+        assert out["five_hour_utilization"] == 5.0
+
+    def test_none_everywhere_is_unknown(self):
+        out = usage_snapshot_summary_with_fallback(None, None, _utcnow())
+        assert out["known"] is False
+        assert out["five_hour_utilization"] is None
+        assert out["stale"] is True
+
+    def test_memory_snapshot_preferred_when_present(self):
+        now = _utcnow()
+        acct = _acct_usage(_acct(), _known_snap(11.0, 22.0), at=now)
+        # Persisted blob is older — the fresher in-memory value must win.
+        blob = _persisted_usage_blob(
+            99.0, 99.0, updated_at=now - timedelta(hours=6)
+        )
+        out = usage_snapshot_summary_with_fallback(acct, blob, now)
+        assert out["five_hour_utilization"] == 11.0
+        assert out["seven_day_utilization"] == 22.0
+
+    def test_fresher_persisted_wins_over_stale_memory(self):
+        # Non-leader whose in-memory snapshot froze at startup: the DB blob the
+        # leader wrote afterwards is fresher and must override.
+        now = _utcnow()
+        acct = _acct_usage(
+            _acct(),
+            _known_snap(80.0, 80.0),
+            at=now - timedelta(hours=6),
+        )
+        blob = _persisted_usage_blob(12.0, 15.0, updated_at=now)
+        out = usage_snapshot_summary_with_fallback(acct, blob, now)
+        assert out["five_hour_utilization"] == 12.0
+        assert out["stale"] is False
+
+    def test_unknown_memory_falls_back_to_persisted(self):
+        # A probe-unknown in-memory snapshot (known=False) must not shadow a
+        # good persisted blob.
+        now = _utcnow()
+        acct = _acct_usage(_acct(), UsageSnapshot.unknown("t"), at=now)
+        blob = _persisted_usage_blob(40.0, 50.0, updated_at=now)
+        out = usage_snapshot_summary_with_fallback(acct, blob, now)
+        assert out["known"] is True
+        assert out["five_hour_utilization"] == 40.0
+
+    def test_persisted_staleness_flagged_past_display_window(self):
+        now = _utcnow()
+        blob = _persisted_usage_blob(
+            10.0,
+            10.0,
+            updated_at=now - timedelta(seconds=_USAGE_METER_DISPLAY_STALE_SECONDS + 1),
+        )
+        out = usage_snapshot_summary_with_fallback(_acct(), blob, now)
+        assert out["known"] is True
+        assert out["stale"] is True
+
+    def test_malformed_persisted_blob_ignored(self):
+        out = usage_snapshot_summary_with_fallback(
+            _acct(), {"source": "something_else"}, _utcnow()
+        )
+        assert out["known"] is False
 
 
 def _healthy_acct(acct_id, **kw):
