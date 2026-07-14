@@ -76,7 +76,7 @@ import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
   recloneResidentWorkspace,
 } from './strategic-resident.js';
-import { apiGet, apiPost } from '../index.js';
+import { apiGet, apiPost, recordResidentTurnLatency } from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
@@ -353,6 +353,105 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(capturedCheckpoint).toContain('[operator]');
     // …and DROPS the just-answered message (it is no longer open).
     expect(capturedCheckpoint).not.toContain('SHOULD_BE_DROPPED_AFTER_HANDLED');
+  });
+
+  it('answers an operator message that arrives after an autonomous turn BEFORE paying the compaction restart (operator-first)', async () => {
+    // Regression guard for the pickup-lag fix. An operator message that lands
+    // during an autonomous turn's tail (caught by the post-turn poll) must be
+    // answered ON THE EXISTING session FIRST; the compaction-restart cost is
+    // deferred until after the reply. Before the fix, the autonomous turn's
+    // maybeCompact ran immediately, so a high-token autonomous turn spawned the
+    // fresh subprocess BEFORE the operator's reply — the operator waited the whole
+    // restart. Here the autonomous turn's input tokens ALSO trip the compaction
+    // threshold, so the ONLY thing keeping compaction from front-running the reply
+    // is the operator-first ordering under test.
+    const OPERATOR_MSG = {
+      id: 'msg-op',
+      content: 'operator asks a question mid-autonomous-work',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const events: string[] = [];
+    let messagePollCount = 0;
+    vi.mocked(recordResidentTurnLatency).mockClear();
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        // Poll #0 = top-of-loop fast path (no message yet); poll #1 = the
+        // post-autonomous-turn poll, which delivers the operator message.
+        const n = messagePollCount++;
+        if (n === 1) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {}, vision: {}, strategic_memory_notes: [],
+          running_update: '', open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // session1 runs BOTH the autonomous turn (call #1) and the operator turn
+    // (call #2) — proving the operator was answered before compaction spawned a
+    // new subprocess. Both turns report high input tokens (trip the 100-token
+    // threshold). session2 is the post-compaction subprocess (dead ⇒ loop exits).
+    let s1Calls = 0;
+    const session1 = makeSession(
+      () => {
+        s1Calls += 1;
+        events.push(s1Calls === 1 ? 'auto' : 'op');
+        return Promise.resolve(turnResult({
+          resultText: s1Calls === 1 ? 'looked around' : 'answered the operator',
+          inputTokens: 5_000,
+        }));
+      },
+      () => true,
+    );
+    const session2 = makeSession(
+      () => { events.push('prime'); return Promise.resolve(turnResult({ inputTokens: 0 })); },
+      () => false,
+    );
+    let spawnCount = 0;
+    mockStartSession.mockImplementation(() => {
+      spawnCount += 1;
+      if (spawnCount === 1) return session1;
+      events.push('spawn2');
+      return session2;
+    });
+
+    await handleStrategicResident(
+      'task-of', {
+        project_name: 'Proj',
+        strategic_session_compaction_threshold_tokens: 100,
+        open_messages: [],
+      },
+      { project_metadata: { project_id: 'proj-1' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The operator turn ran on the ORIGINAL session (session1's 2nd sendTurn), and
+    // strictly BEFORE the compaction subprocess was spawned/primed.
+    expect(s1Calls).toBe(2);
+    const iOp = events.indexOf('op');
+    const iSpawn2 = events.indexOf('spawn2');
+    const iPrime = events.indexOf('prime');
+    expect(iOp).toBeGreaterThanOrEqual(0);
+    expect(iSpawn2).toBeGreaterThan(iOp);
+    expect(iPrime).toBeGreaterThan(iSpawn2);
+
+    // The interrupt/post-turn operator path now records pickup-lag telemetry (it
+    // previously passed no created_at → the lag was invisible in the summary).
+    const opLatency = vi.mocked(recordResidentTurnLatency).mock.calls
+      .map((c) => c[0])
+      .find((rec) => rec.kind === 'operator');
+    expect(opLatency).toBeDefined();
+    expect(typeof opLatency?.pickupLagMs).toBe('number');
+    expect(opLatency?.pickupLagMs as number).toBeGreaterThanOrEqual(0);
   });
 
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {

@@ -990,6 +990,63 @@ export async function handleStrategicResident(
   }
   gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
 
+  // Pickup lag for an operator turn: ms from the MOST RECENT operator message's
+  // server-side created_at to now. Server-absolute timestamps avoid agent-VM /
+  // backend clock drift inflating the value. Returns null when no usable
+  // created_at is present. Shared by every operator entry point so the metric is
+  // computed identically wherever a reply starts.
+  const computePickupLagMs = (msgs: ResidentInboundMessage[]): number | null => {
+    const now = Date.now();
+    let maxCreatedMs = 0;
+    for (const m of msgs) {
+      if (typeof m.created_at === 'string') {
+        const t = new Date(m.created_at).getTime();
+        if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
+      }
+    }
+    if (maxCreatedMs <= 0) return null;
+    const lag = now - maxCreatedMs;
+    return lag >= 0 ? lag : null;
+  };
+
+  // Run one operator turn end-to-end with OPERATOR-FIRST ordering: stream the
+  // reply, persist it, record any settled decision, heartbeat (marking the
+  // consumed messages handled), and only THEN pay any context-compaction cost.
+  // Shared by all THREE operator entry points — the top-of-loop fast path, an
+  // autonomous-turn interrupt, and a message that lands during a turn's tail — so
+  // none of them can regress into compacting ahead of the operator's reply. That
+  // ordering is what removes the measured compaction-restart pickup penalty: the
+  // operator no longer waits a full Claude-subprocess restart before their reply
+  // even starts. Returns 'stop' when the loop must break, 'continue' otherwise.
+  const handleOperatorTurn = async (
+    msgs: ResidentInboundMessage[],
+  ): Promise<'stop' | 'continue'> => {
+    const pickupLagMs = computePickupLagMs(msgs);
+    const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
+    if (turnWedgedSession(r)) return 'stop';
+    await persistReply(r);
+    // Collect the ids of the messages we just consumed so the backend can mark
+    // them handled — they stop counting as open backlog and won't be re-delivered
+    // to a restarted session.
+    const consumedIds = msgs
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    // Capture any operator-settled correction into the durable register BEFORE the
+    // heartbeat so it is serialized in this same round-trip.
+    recordOperatorDecision(r);
+    const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
+    if (hb?.stop_requested) return 'stop';
+    if (r.processGone) { stopReason = 'session_process_exited'; return 'stop'; }
+    // Compaction runs ONLY after the reply is streamed and the handled-marking
+    // heartbeat has landed — so a compaction on this turn primes the fresh session
+    // WITH the settled decision and WITHOUT the just-answered message, and the
+    // operator never waits a subprocess restart before their reply starts.
+    if (await maybeCompact(r)) return 'stop';
+    // A just-finished operator turn arms one autonomous follow-through tick.
+    operatorTurnJustCompleted = true;
+    return 'continue';
+  };
+
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   try {
     for (;;) {
@@ -1013,48 +1070,14 @@ export async function handleStrategicResident(
         break;
       }
 
-      // 1. Fast path: any pending operator message pre-empts everything.
+      // 1. Fast path: any pending operator message pre-empts everything. The
+      // operator reply is streamed and its lease-renewing heartbeat lands BEFORE
+      // any context compaction (handleOperatorTurn enforces that ordering), so a
+      // compaction never sits on the critical path ahead of the reply.
       const msgs = await pollMessages();
       if (msgs.length > 0) {
         streamer.status('operator message received — responding');
-        // Measure pickup lag: time from when the MOST RECENT operator message
-        // was created (server-side) to now. Uses server-absolute created_at
-        // timestamps so agent-VM / backend clock drift doesn't inflate the lag.
-        const pickupLagMs = (() => {
-          const now = Date.now();
-          let maxCreatedMs = 0;
-          for (const m of msgs) {
-            if (typeof m.created_at === 'string') {
-              const t = new Date(m.created_at).getTime();
-              if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
-            }
-          }
-          if (maxCreatedMs <= 0) return null;
-          const lag = now - maxCreatedMs;
-          return lag >= 0 ? lag : null;
-        })();
-        const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
-        if (turnWedgedSession(r)) break;
-        await persistReply(r);
-        // Collect the ids of the messages we just consumed so the backend can
-        // mark them handled — they stop counting as open backlog and won't be
-        // re-delivered to a restarted session.
-        const consumedIds = msgs.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-        // Capture any operator-settled correction into the durable register
-        // BEFORE the heartbeat so it is serialized in this same round-trip.
-        recordOperatorDecision(r);
-        const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
-        if (hb?.stop_requested) break;
-        if (r.processGone) { stopReason = 'session_process_exited'; break; }
-        // Check context-window pressure AFTER the decision is registered and the
-        // handled-marking heartbeat has landed. Compacting earlier would build the
-        // checkpoint from decisionsReg before this turn's OPERATOR-DECISION is
-        // pushed AND fetch checkpoint-state open_messages before the backend marks
-        // the just-answered message handled — priming the fresh session blind to
-        // the settled decision and re-surfacing the answered message as still-open.
-        if (await maybeCompact(r)) break;
-        // A just-finished operator turn arms one autonomous follow-through tick.
-        operatorTurnJustCompleted = true;
+        if (await handleOperatorTurn(msgs) === 'stop') break;
         continue;
       }
 
@@ -1139,8 +1162,11 @@ export async function handleStrategicResident(
       // dead-man's switch stays progress-gated).
       const r = await turnPromise;
       if (turnWedgedSession(r)) break;
-      // Check context-window pressure after the turn: compact if needed.
-      if (await maybeCompact(r)) break;
+      // Persist the autonomous turn's progress + cursor. Heartbeat runs BEFORE any
+      // compaction below so the ledger/cursor are durable regardless of what
+      // follows, and — crucially — compaction is deferred until AFTER the
+      // operator-message check further down, so an operator waiting on this turn is
+      // never made to sit through a Claude-subprocess restart first.
       const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.
@@ -1195,29 +1221,32 @@ export async function handleStrategicResident(
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;
 
-      // Handle any operator message that interrupted the autonomous turn.
-      if (watch.kind === 'message') {
-        streamer.status('operator message received (interrupted autonomous work)');
-        const or = await runTurn(combineOperatorMessages(watch.messages), true);
-        if (turnWedgedSession(or)) break;
-        await persistReply(or);
-        // Extract the ids of the messages we just consumed so the backend can mark
-        // them handled — same as the fast-path operator-message pre-emption above.
-        const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-        // Capture any operator-settled correction into the durable register
-        // BEFORE the heartbeat so it is serialized in this same round-trip.
-        recordOperatorDecision(or);
-        const hb2 = await heartbeat(true, consumedIds);
-        if (hb2?.stop_requested) break;
-        if (or.processGone) { stopReason = 'session_process_exited'; break; }
-        // Compact only AFTER the decision is registered and the handled-marking
-        // heartbeat has landed — identical ordering invariant as the fast path
-        // above, so a compaction on this interrupt turn primes the fresh session
-        // WITH the settled decision and WITHOUT the just-answered message.
-        if (await maybeCompact(or)) break;
-        operatorTurnJustCompleted = true;
+      // OPERATOR-FIRST: answer any operator message BEFORE paying the compaction
+      // restart. Two message sources are handled the same way:
+      //   - watch.kind === 'message': a message that pre-empted this autonomous
+      //     turn (caught by watchTurn's fast poll and already interrupted above);
+      //   - a message that landed during the turn's tail / the heartbeat above,
+      //     caught by this extra poll.
+      // handleOperatorTurn streams the reply and lands its lease-renewing
+      // heartbeat FIRST, then compacts — so the operator never waits a full Claude
+      // subprocess restart before their reply starts. Compacting here (as the loop
+      // used to, right after the autonomous turn) was the dominant contributor to
+      // the called-out operator pickup lag.
+      const pendingMsgs = watch.kind === 'message'
+        ? watch.messages
+        : await pollMessages();
+      if (pendingMsgs.length > 0) {
+        streamer.status(watch.kind === 'message'
+          ? 'operator message received (interrupted autonomous work)'
+          : 'operator message received — responding');
+        if (await handleOperatorTurn(pendingMsgs) === 'stop') break;
         continue;
       }
+
+      // No operator waiting → safe to pay the compaction cost now. Deferred to
+      // here (from immediately after the turn) so the operator-message check above
+      // always wins the race for the critical path.
+      if (await maybeCompact(r)) break;
 
       // Non-advancing turn (no strategic op applied) → pace so we don't hot-loop
       // the API, at the fast message-poll cadence so a just-arrived operator
