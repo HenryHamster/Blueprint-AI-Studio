@@ -546,7 +546,10 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('Runner token rotated');
     expect(el.textContent).toContain('tok-rotated-xyz');
     expect(el.textContent).toContain('Restart the existing runner process');
-    expect(el.textContent).toContain('Restart required');
+    // The rotate dialog now shows the honest "waiting" state instead of a static "Restart required" banner.
+    const status = el.querySelector('[data-testid="runner-connection-status"]');
+    expect(status?.textContent).toContain('Waiting for runner to reconnect with new token');
+    expect(el.textContent).not.toContain('Reconnected');
     expect(el.textContent).not.toContain('Connected on this project');
     expect(el.textContent).toContain('Windows PowerShell');
     expect(el.textContent).toContain('macOS/Linux');
@@ -597,6 +600,103 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(el.textContent).toContain('Rotate failed');
     expect(el.textContent).not.toContain('Runner token rotated');
+  });
+
+  test('rotate dialog transitions to reconnected once last_seen_at advances past rotation time', async () => {
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // Dialog shows the optimistic "Waiting" state initially.
+    const status = () => el.querySelector('[data-testid="runner-connection-status"]');
+    expect(status()?.textContent).toContain('Waiting for runner to reconnect');
+    expect(status()?.textContent).not.toContain('Reconnected');
+
+    // Simulate the runner restarting with the new token: last_seen_at is set to a
+    // time clearly after rotation (Date.now() + 10_000 is definitively post-rotation).
+    vi.mocked(listFleetRunners).mockResolvedValue([
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-abc123',
+        hostname: 'reconnected-host',
+        last_seen_at: new Date(Date.now() + 10_000).toISOString(),
+      },
+    ]);
+    const refreshBtn = el.querySelector('button[aria-label="Refresh runners"]');
+    await act(async () => { (refreshBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(status()?.textContent).toContain('Reconnected');
+    expect(status()?.textContent).toContain('reconnected-host');
+    expect(status()?.textContent).not.toContain('Waiting');
+    expect(status()?.textContent).not.toContain('Not reconnected yet');
+  });
+
+  test('rotate dialog falls back to honest not-reconnected state after connect timeout', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // The runner never reconnects: every poll returns the same runner with the old timestamp.
+      vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+      const el = await mount();
+
+      const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+      await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+      await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      const status = () => el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status()?.textContent).toContain('Waiting for runner to reconnect');
+
+      // Advance past the bounded reconnect wait with no new-token heartbeat.
+      await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+
+      expect(status()?.textContent).toContain('Not reconnected yet');
+      expect(status()?.textContent).toContain('bash blueprint-runner check');
+      expect(status()?.textContent).not.toContain('Waiting for runner to reconnect');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('"Keep waiting" in rotate dialog resets the timer and returns to waiting state', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+      const el = await mount();
+
+      const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+      await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+      await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      // Advance past the timeout to reach "Not reconnected yet".
+      await act(async () => { await vi.advanceTimersByTimeAsync(95_000); });
+
+      const status = () => el.querySelector('[data-testid="runner-connection-status"]');
+      expect(status()?.textContent).toContain('Not reconnected yet');
+
+      // "Keep waiting" re-arms the optimistic waiting state.
+      const keepBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Keep waiting');
+      expect(keepBtn).not.toBeNull();
+      await act(async () => { (keepBtn as HTMLButtonElement).click(); });
+
+      expect(status()?.textContent).toContain('Waiting for runner to reconnect');
+      expect(status()?.textContent).not.toContain('Not reconnected yet');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── Revoke runner ────────────────────────────────────────────────────────────

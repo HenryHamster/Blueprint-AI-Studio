@@ -26,6 +26,10 @@ const STALE_THRESHOLD_SEC = 600;
  *  (which never connects) can't spin forever. Generous enough to cover a normal
  *  first-time setup (repo clone + first heartbeat) landing within ~2 heartbeats. */
 const ENROLL_CONNECT_TIMEOUT_MS = 90_000;
+/** Same bounded-wait policy for the rotate dialog: after this elapses with no
+ *  new-token heartbeat, the dialog drops the optimistic spinner for an honest
+ *  "not reconnected yet" state. */
+const ROTATE_CONNECT_TIMEOUT_MS = 90_000;
 
 type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands | 'installUser' | 'installSystem';
 type TokenDialogMode = 'enroll' | 'rotate';
@@ -429,6 +433,14 @@ interface TokenDialogProps {
   waitTimedOut?: boolean;
   /** Reset the connect-wait timer and keep waiting (from the timed-out state). */
   onKeepWaiting?: () => void;
+  /** Rotate mode: true once the rotated runner has sent a new-token heartbeat. */
+  rotateConnected?: boolean;
+  /** Hostname reported by the re-connected runner after token rotation. */
+  rotateConnectedHostname?: string | null;
+  /** Rotate mode: true once the bounded reconnect wait elapsed with no heartbeat. */
+  rotateWaitTimedOut?: boolean;
+  /** Reset the rotate reconnect-wait timer and keep waiting. */
+  onRotateKeepWaiting?: () => void;
   onDismiss: () => void;
 }
 
@@ -441,6 +453,10 @@ function TokenDialog({
   connectedHostname,
   waitTimedOut = false,
   onKeepWaiting,
+  rotateConnected = false,
+  rotateConnectedHostname,
+  rotateWaitTimedOut = false,
+  onRotateKeepWaiting,
   onDismiss,
 }: TokenDialogProps) {
   const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
@@ -579,11 +595,53 @@ function TokenDialog({
 
         {mode === 'rotate' ? (
           <div
-            className="mb-4 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"
+            className={`mb-4 rounded-md border px-3 py-2 text-xs ${
+              rotateConnected
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                : rotateWaitTimedOut
+                  ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+            }`}
             data-testid="runner-connection-status"
           >
-            <KeyRound className="w-4 h-4 shrink-0 text-amber-300" />
-            <span>Restart required. Existing heartbeats may still reflect the old process until it is restarted.</span>
+            {rotateConnected ? (
+              <div className="flex items-center gap-2">
+                <Check className="w-4 h-4 shrink-0 text-emerald-400" />
+                <span className="font-medium">
+                  Reconnected{rotateConnectedHostname ? ` — ${rotateConnectedHostname}` : ''}
+                </span>
+              </div>
+            ) : rotateWaitTimedOut ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-300" />
+                  <span className="font-medium">Not reconnected yet</span>
+                </div>
+                <p className="text-red-200/90">
+                  No heartbeat arrived with the new token. Stop the existing runner process and restart it with the new
+                  token above. Run <code className="font-mono">bash blueprint-runner check</code> to verify
+                  prerequisites.
+                </p>
+                {onRotateKeepWaiting && (
+                  <button
+                    onClick={onRotateKeepWaiting}
+                    className="mt-1 rounded border border-red-400/40 px-3 py-2 text-red-200 transition-colors hover:bg-red-500/10 min-h-[44px]"
+                  >
+                    Keep waiting
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
+                  <span>Waiting for runner to reconnect with new token…</span>
+                </div>
+                <p className="text-amber-200/80">
+                  Stop the existing runner process and restart it with the new token above.
+                </p>
+              </div>
+            )}
           </div>
         ) : (
           <div
@@ -670,11 +728,16 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     token: string;
     mode: TokenDialogMode;
     preset: RunnerSetupPreset;
+    /** Rotate mode only: epoch ms when the rotation API call resolved (token invalidated). */
+    rotatedAt?: number;
   } | null>(null);
   // Bounded connect wait for the enroll dialog: after this elapses with no
   // heartbeat, the dialog drops the optimistic spinner for an honest
   // "not connected yet" state instead of implying success is imminent forever.
   const [enrollWaitTimedOut, setEnrollWaitTimedOut] = useState(false);
+  // Same bounded wait for the rotate dialog: after ROTATE_CONNECT_TIMEOUT_MS with
+  // no new-token heartbeat, the dialog shows an honest "not reconnected yet" state.
+  const [rotateWaitTimedOut, setRotateWaitTimedOut] = useState(false);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
@@ -777,7 +840,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const enrolledConnected = enrolledRunner ? isRunnerLive(enrolledRunner) : false;
 
   useEffect(() => {
-    if (!pendingToken || enrolledConnected) return;
+    if (!pendingToken || pendingToken.mode !== 'enroll' || enrolledConnected) return;
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
   }, [pendingToken, enrolledConnected, load]);
@@ -798,6 +861,41 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     const timer = setTimeout(() => setEnrollWaitTimedOut(true), ENROLL_CONNECT_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [pendingToken, enrolledConnected, enrollWaitTimedOut]);
+
+  // ── Rotate-mode reconnect tracking ──────────────────────────────────────────
+
+  // Resolve the rotated runner and determine if a new-token heartbeat has arrived.
+  // Detection: last_seen_at > rotatedAt means a heartbeat arrived AFTER the rotation
+  // API call resolved (i.e. from the restarted process with the new token).
+  const rotatedRunner = pendingToken?.mode === 'rotate'
+    ? runners.find(r => r.id === pendingToken.runnerId)
+    : undefined;
+  const rotateConnected = !!(
+    rotatedRunner?.last_seen_at &&
+    pendingToken?.rotatedAt != null &&
+    parseTimestamp(rotatedRunner.last_seen_at).getTime() > pendingToken.rotatedAt
+  );
+
+  // Fast-poll while waiting for the rotated runner to reconnect with its new token.
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'rotate' || rotateConnected) return;
+    const interval = setInterval(load, 3000);
+    return () => clearInterval(interval);
+  }, [pendingToken, rotateConnected, load]);
+
+  // Reset rotate timeout state on dialog open/close so every rotation starts optimistic.
+  useEffect(() => {
+    setRotateWaitTimedOut(false);
+  }, [pendingToken?.runnerId]);
+
+  // Bound the rotate reconnect wait: after ROTATE_CONNECT_TIMEOUT_MS with no
+  // new-token heartbeat, flip to honest "not reconnected yet".
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'rotate') return;
+    if (rotateConnected || rotateWaitTimedOut) return;
+    const timer = setTimeout(() => setRotateWaitTimedOut(true), ROTATE_CONNECT_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingToken, rotateConnected, rotateWaitTimedOut]);
 
   const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
     setEnrollingPreset(preset);
@@ -835,11 +933,15 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       setRotating(runner.id);
       try {
         const result = await rotateFleetRunnerToken(projectId, runner.id);
+        // Capture rotation time BEFORE load() so any heartbeat older than this
+        // correctly shows "Waiting" instead of prematurely claiming reconnection.
+        const rotatedAt = Date.now();
         setPendingToken({
           runnerId: result.runner_id,
           token: result.token,
           mode: 'rotate',
           preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
+          rotatedAt,
         });
         await load();
       } catch (e) {
@@ -1479,9 +1581,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           mode={pendingToken.mode}
           preset={pendingToken.preset}
           connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
-          connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
+          connectedHostname={pendingToken.mode === 'enroll' ? (enrolledRunner?.hostname ?? null) : null}
           waitTimedOut={pendingToken.mode === 'enroll' ? enrollWaitTimedOut : false}
           onKeepWaiting={() => setEnrollWaitTimedOut(false)}
+          rotateConnected={pendingToken.mode === 'rotate' ? rotateConnected : false}
+          rotateConnectedHostname={pendingToken.mode === 'rotate' ? (rotatedRunner?.hostname ?? null) : null}
+          rotateWaitTimedOut={pendingToken.mode === 'rotate' ? rotateWaitTimedOut : false}
+          onRotateKeepWaiting={() => setRotateWaitTimedOut(false)}
           onDismiss={() => setPendingToken(null)}
         />
       )}
