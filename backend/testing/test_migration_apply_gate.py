@@ -275,6 +275,8 @@ async def test_fetch_failure_defers(monkeypatch):
         return None
 
     monkeypatch.setattr(gate_mod, "_download_candidate_repo_archive", _no_archive)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
     async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
         await _seed_prod_sim(prod_engine, {"widget": True}, revision="a01")
         verdict, detail = await run_migration_apply_gate(
@@ -288,6 +290,132 @@ async def test_fetch_failure_defers(monkeypatch):
 
     assert verdict == "defer", detail
     assert "deadbeef" in detail
+
+
+@pytest.mark.asyncio
+async def test_transient_fetch_recovers_on_retry(monkeypatch):
+    """A transient GitHub fetch failure (None twice, then success) self-clears on
+    internal retry — the gate returns ``ok`` instead of deferring to a fresh
+    qualification cycle."""
+    import io
+    import tarfile
+
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    call_count = 0
+
+    async def _fails_then_succeeds(*_a, **_k):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return None
+        # Third call: return a valid minimal archive.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            data = b"revision = '0001'\ndown_revision = None\n"
+            info = tarfile.TarInfo("repo-abc/backend/alembic/versions/0001_init.py")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    monkeypatch.setattr(
+        gate_mod, "_download_candidate_repo_archive", _fails_then_succeeds
+    )
+
+    # Fast-path the DB operations with mocks.
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="0001", metadata=prod_meta)
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", AsyncMock(return_value=[]))
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="deadbeef",
+            required_metadata=sa.MetaData(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    # Verify the retry mechanism actually fired.
+    assert call_count == 3, (
+        f"_download_candidate_repo_archive called {call_count} times, expected 3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_seed_recovers_on_retry(monkeypatch):
+    """A transient seed failure (``_MigrationApplyError`` on first call,
+    success on second) self-clears on the internal backoff retry — the gate
+    returns ``ok`` without deferring."""
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    # Mock the prod state read so we skip to the provision/seed/apply/drift leg.
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)
+        ),
+    )
+
+    call_count = 0
+
+    async def _flaky_seed(scratch_engine, prod_state):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise gate_mod._MigrationApplyError("transient seed failure")
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", _flaky_seed)
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", AsyncMock(return_value=[]))
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=sa.MetaData(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    # Seed was called twice — once (failing) and once (succeeding).
+    assert call_count == 2
 
 
 @pytest.mark.asyncio
