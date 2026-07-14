@@ -3884,3 +3884,104 @@ class TestRunnerSubprocessPreflightSmokeSkip:
 
         # Smoke already stamped — idempotent guard means it must NOT be re-run.
         smoke_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_default_container_image — the single shared helper both the
+# completion authors and the dispatch path use to default a compute_experiment's
+# container_image to the project's digest-pinned baked image. Fail-OPEN.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_default_container_image_pins_manifest_tag(
+    db_session, mocker
+):
+    """A project whose manifest declares a compute image resolves to the durable
+    ProjectComputeImage digest-pinned ref (mutable tag -> content digest)."""
+    from app.compute_backends import resolve_project_default_container_image
+    from app.models import ProjectComputeImage
+
+    project = Project(name="DefaultImageHelper", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pinned_ref = "reg.example.com/org/repo/compute-proj@sha256:cafef00d"
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-h",
+            tag="latest",
+            pinned_ref=pinned_ref,
+            digest="sha256:cafef00d",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+            }
+        },
+    )
+
+    resolved = await resolve_project_default_container_image(db_session, project)
+    assert resolved == pinned_ref
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_default_container_image_none_when_no_manifest_image(
+    db_session, mocker
+):
+    """A manifest with no compute.image.name resolves to None (image-less)."""
+    from app.compute_backends import resolve_project_default_container_image
+
+    project = Project(name="NoImageManifest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {}},
+    )
+
+    assert await resolve_project_default_container_image(db_session, project) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_default_container_image_fails_open_on_error(
+    db_session, mocker
+):
+    """A manifest-fetch error must NOT raise — it resolves to None so the caller
+    keeps today's image-less behavior (fail-open, additive)."""
+    from app.compute_backends import resolve_project_default_container_image
+
+    project = Project(name="ManifestErrorProject", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("registry unreachable"),
+    )
+
+    assert await resolve_project_default_container_image(db_session, project) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_default_container_image_none_project():
+    """A None project resolves to None without touching the manifest."""
+    from app.compute_backends import resolve_project_default_container_image
+
+    assert await resolve_project_default_container_image(None, None) is None

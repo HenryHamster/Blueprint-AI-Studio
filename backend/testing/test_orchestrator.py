@@ -12547,6 +12547,255 @@ async def test_dispatch_holds_when_container_image_declared_but_no_capable_runne
 
 
 # ---------------------------------------------------------------------------
+# Images-first USE-default on the DISPATCH path: a compute_experiment dispatched
+# WITHOUT an explicit container_image defaults to the project's digest-pinned
+# baked image (ProjectComputeImage), exactly as the completion authoring path
+# does — so operator-created experiments, planned prerequisites, and retries run
+# reproducibly on the declared image instead of image-less on the host toolchain.
+# ---------------------------------------------------------------------------
+
+
+def _build_launch_kwargs(**overrides):
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    base = dict(command="python3 run.py", spend_cap_usd=5.0, deadline_seconds=1800)
+    base.update(overrides)
+    payload = base.pop("payload", {})
+    return _build_compute_launch_kwargs(payload, **base)
+
+
+def test_build_compute_launch_kwargs_applies_container_image_override():
+    """When the payload declares NO container_image, the resolved project-default
+    (``container_image_override``) is forwarded to create_compute_job."""
+    kwargs = _build_launch_kwargs(
+        payload={},
+        container_image_override="reg/repo/proj@sha256:abc123",
+    )
+    assert kwargs["container_image"] == "reg/repo/proj@sha256:abc123"
+
+
+def test_build_compute_launch_kwargs_explicit_payload_image_beats_override():
+    """An explicit payload container_image ALWAYS wins over the project default —
+    the override must never clobber an operator/agent-declared image."""
+    kwargs = _build_launch_kwargs(
+        payload={"container_image": "explicit/image:tag"},
+        container_image_override="reg/repo/proj@sha256:abc123",
+    )
+    assert kwargs["container_image"] == "explicit/image:tag"
+
+
+def test_build_compute_launch_kwargs_no_override_leaves_image_unset():
+    """No payload image and no override ⇒ image-less (unchanged host-toolchain
+    behavior); create_compute_job applies its own default."""
+    kwargs = _build_launch_kwargs(payload={}, container_image_override=None)
+    assert "container_image" not in kwargs
+    # An empty-string override is not a real image and must not be forwarded.
+    kwargs_blank = _build_launch_kwargs(payload={}, container_image_override="")
+    assert "container_image" not in kwargs_blank
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
+    db_session, mocker
+):
+    """A compute_experiment dispatched with NO container_image in its payload
+    defaults to the project's digest-pinned baked image (ProjectComputeImage),
+    and THAT resolved ref is what reaches create_compute_job.
+
+    Closes the images-first USE-default gap on the dispatch path: experiments
+    that never went through the plan/research completion authors (operator
+    experiments, planned prerequisites, retries) previously ran image-less on the
+    host toolchain, unreproducibly.
+    """
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="BakedImageDefaultProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Durable baked-image build record for this project (what the pipeline pushes).
+    pinned_ref = "reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe"
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-1",
+            tag="latest",
+            pinned_ref=pinned_ref,
+            digest="sha256:deadbeefcafe",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # The project manifest declares the MUTABLE tag for the baked image; dispatch
+    # must pin it down to the digest via resolve_digest_pinned_default_image.
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+            }
+        },
+    )
+
+    # Capture what dispatch forwards to create_compute_job; park is a no-op so the
+    # test stays a pure dispatch-path assertion.
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                # NO container_image — the case this feature closes.
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A container-capable runner so the (now image-declaring) job is dispatchable.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert captured.get("container_image") == pinned_ref, (
+        "dispatch must forward the project's digest-pinned baked image when the "
+        f"payload declares none; got {captured.get('container_image')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_leaves_explicit_container_image_untouched(db_session, mocker):
+    """An explicit payload container_image is used AS-IS — dispatch must NOT
+    consult the project manifest or override it with the baked default."""
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ExplicitImageProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A baked default EXISTS — but the explicit payload image must win over it.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-2",
+            tag="latest",
+            pinned_ref="reg.example.com/org/repo/compute-proj@sha256:defaultdigest",
+            digest="sha256:defaultdigest",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # The manifest fetch MUST NOT be consulted when the payload already declares an
+    # image — assert it is never called.
+    manifest_spy = mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+            }
+        },
+    )
+
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    explicit_image = "ghcr.io/vendor/custom:v3"
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": explicit_image,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert captured.get("container_image") == explicit_image, (
+        "an explicit payload container_image must be forwarded verbatim; got "
+        f"{captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Finding 12 — unvalidated float() coercion of the agent-authored `vram_gb`
 # payload field raised in the dispatch HOT PATH, taking down the whole dispatch
 # cycle (blast radius: every task in it) while the offending task itself only

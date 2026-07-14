@@ -1163,7 +1163,12 @@ def _select_eligible_runner(
 
 
 def _build_compute_launch_kwargs(
-    payload: dict, *, command: str, spend_cap_usd: float, deadline_seconds: int
+    payload: dict,
+    *,
+    command: str,
+    spend_cap_usd: float,
+    deadline_seconds: int,
+    container_image_override: str | None = None,
 ) -> dict:
     """Map a ``compute_experiment`` task payload to ``create_compute_job`` kwargs.
 
@@ -1176,6 +1181,10 @@ def _build_compute_launch_kwargs(
     as the agent saw it; ``declared_metric`` drives the platform pre-flight smoke, not
     ``create_compute_job``. The validated ``command``/``spend_cap_usd``/``deadline_seconds``
     are passed in by the caller (already range-checked).
+
+    ``container_image_override`` is the project's digest-pinned baked image the
+    caller resolved because the payload declared no ``container_image``; it is
+    forwarded ONLY when the payload has none (an explicit payload image wins).
     """
     def _present(value) -> bool:
         return isinstance(value, str) and value.strip() != ""
@@ -1222,6 +1231,11 @@ def _build_compute_launch_kwargs(
         kwargs["setup_step"] = payload["setup_step"]
     if _present(payload.get("container_image")):
         kwargs["container_image"] = payload["container_image"]
+    elif _present(container_image_override):
+        # USE-default: the payload declared no container_image, so dispatch
+        # resolved the project's digest-pinned baked image. An explicit payload
+        # image always wins over the default (checked first above).
+        kwargs["container_image"] = container_image_override
     if isinstance(payload.get("container_registry_auth"), dict):
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
     if payload.get("allow_host_fallback"):
@@ -1588,6 +1602,29 @@ async def _dispatch_compute_experiment_directly(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
+    # ── USE-default (images-first): default the project's baked image ──────────
+    # A compute_experiment dispatched WITHOUT an explicit container_image — an
+    # operator-created experiment, a planned compute_experiment prerequisite, or a
+    # retry that never went through the plan/research completion authors — reaches
+    # here image-less and would run unreproducibly on the host toolchain. Resolve
+    # the project's declared, digest-pinned baked image exactly as the completion
+    # path does (shared helper resolve_project_default_container_image). This runs
+    # BEFORE runner selection so the resolved digest flows through the
+    # container-runtime / GPU-in-container eligibility gate below. Fail-OPEN and
+    # additive: an explicit payload container_image is left untouched; a project
+    # with no manifest compute image / no build record / any error keeps today's
+    # image-less behavior (helper returns None).
+    resolved_default_container_image: str | None = None
+    if not container_image:
+        from app.compute_backends import resolve_project_default_container_image
+
+        resolved_default_container_image = (
+            await resolve_project_default_container_image(
+                session, await session.get(Project, task.project_id)
+            )
+        )
+        if resolved_default_container_image:
+            container_image = resolved_default_container_image
     # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
     # AGENT-AUTHORED, so a bad value ("24GB") must fail THIS task with an honest
     # validation message — never raise in the dispatch hot path, which would abort
@@ -1904,6 +1941,7 @@ async def _dispatch_compute_experiment_directly(
         command=command,
         spend_cap_usd=float(spend_cap),
         deadline_seconds=int(deadline_seconds),
+        container_image_override=resolved_default_container_image,
     )
     if runner is not None:
         # A runner was selected → the job runs on operator hardware. Pin the

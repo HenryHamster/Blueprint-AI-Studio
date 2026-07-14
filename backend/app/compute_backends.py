@@ -4394,6 +4394,52 @@ async def resolve_digest_pinned_default_image(
     return manifest_name
 
 
+async def resolve_project_default_container_image(
+    session: Any,
+    project: Any,
+) -> str | None:
+    """Resolve a project's default baked compute image to a digest-pinned ref.
+
+    The SINGLE shared implementation of the manifest-fetch + digest-pin idiom
+    used to default a ``compute_experiment``'s ``container_image`` to the
+    project's declared baked image. Both the completion authors
+    (``plan_completion`` / ``research_completion``) and the orchestrator dispatch
+    path (``_dispatch_compute_experiment_directly``) call this so the two cannot
+    drift — a compute_experiment gets the same digest-pinned default whether it
+    is authored through a completion handler or dispatched directly (operator
+    experiment, planned prerequisite, retry).
+
+    Reads the project's ``.blueprint/tools.json`` ``compute.image.name`` manifest
+    entry and, when present, pins the (typically mutable) tag to a
+    content-addressed ``registry/repo@sha256:...`` reference via
+    :func:`resolve_digest_pinned_default_image`.
+
+    Fail-OPEN and additive: returns ``None`` when the project is missing, its
+    manifest declares no compute image, or any manifest/registry error occurs —
+    the caller then preserves its current image-less behavior. Never raises.
+    """
+    if project is None:
+        return None
+    try:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+        manifest = await _discover_manifest_tools(project)
+        compute_image = (manifest.get("compute") or {}).get("image") or {}
+        name = compute_image.get("name") if isinstance(compute_image, dict) else None
+        if not name:
+            return None
+        # resolve_digest_pinned_default_image is idempotent (already-digest-pinned
+        # refs return unchanged), so double-resolution across authoring + dispatch
+        # is safe.
+        return await resolve_digest_pinned_default_image(session, project.id, name)
+    except Exception:  # noqa: BLE001 — fail-open to image-less behavior.
+        logger.debug(
+            "[COMPUTE] project default container-image resolution failed for "
+            "project=%s",
+            getattr(project, "id", None),
+        )
+        return None
+
+
 def resolve_compute_image_registry_repo() -> str:
     """Return the Artifact Registry repo base for compute images.
 

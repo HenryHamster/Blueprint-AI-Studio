@@ -2107,8 +2107,12 @@ class ProjectComputeImage(SQLModel, table=True):
     mapping so a later trigger can record and re-read what was built without
     re-running the pipeline.
 
-    Additive and purely a record: nothing in dispatch reads it yet. Rows UPSERT
-    on ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
+    Additive record of what was built. Dispatch now reads it: when a
+    compute_experiment is dispatched with no explicit ``container_image``,
+    ``_dispatch_compute_experiment_directly`` resolves the project's manifest
+    default against this table (via ``resolve_digest_pinned_default_image``) to a
+    digest-pinned ref, matching the completion authoring path. Rows UPSERT on
+    ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
     update the single row in place rather than accumulating duplicates.
     """
 

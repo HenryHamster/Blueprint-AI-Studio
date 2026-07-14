@@ -3718,23 +3718,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
 
-    _project_default_container_image: str | None = None
-    if _scope_cal_project:
-        try:
-            from app.routers.admin_project_tools import _discover_manifest_tools as _dmt
-            _manifest = await _dmt(_scope_cal_project)
-            _ci = ((_manifest.get("compute") or {}).get("image") or {})
-            if isinstance(_ci, dict):
-                _project_default_container_image = _ci.get("name") or None
-            if _project_default_container_image:
-                # Pin the mutable manifest tag to a content-addressed digest so
-                # repeated defaulting is bit-identical over time (design gap G3).
-                from app.compute_backends import resolve_digest_pinned_default_image
-                _project_default_container_image = await resolve_digest_pinned_default_image(
-                    session, _scope_cal_project.id, _project_default_container_image
-                )
-        except Exception:
-            logger.debug("[RESEARCH] manifest fetch for compute image default failed")
+    # Default a child compute_experiment's container_image to the project's
+    # declared, digest-pinned baked image. Shared with the dispatch path via
+    # resolve_project_default_container_image so the two cannot drift (fail-open).
+    from app.compute_backends import resolve_project_default_container_image
+    _project_default_container_image = await resolve_project_default_container_image(
+        session, _scope_cal_project
+    )
 
     _directions_by_id: dict = {}
     if _scope_cal_project:
