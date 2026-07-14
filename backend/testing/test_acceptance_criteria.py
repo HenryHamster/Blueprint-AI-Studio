@@ -9147,3 +9147,203 @@ async def test_reconcile_backfill_skips_child_without_github_verified_ancestor(
     child_ctx = child.context or {}
     assert "_pr_changed_files" not in child_ctx
     assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
+
+
+# ---------------------------------------------------------------------------
+# Evidence summary tier + provenance fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_summary_entries_tier_field(db_session):
+    """_criterion_evidence_summary_entries assigns the correct tier per evidence row."""
+    from app.acceptance_criteria import (
+        _criterion_evidence_summary_entries,
+        UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+    )
+
+    project = await _make_project(db_session, "EvidenceTierField")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Tier classification"
+    )
+
+    rows = [
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="t1",
+            detail={"proven": True},
+        ),
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="task_merge",
+            source_id="t1",
+            detail={"proven": True},
+        ),
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+            source_id="t2",
+            detail={"backfilled": True},
+        ),
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="operator",
+            source_id="op1",
+            detail={},
+        ),
+    ]
+
+    entries = _criterion_evidence_summary_entries(rows)
+
+    assert entries[0]["tier"] == "covered"   # reachability → covered
+    assert entries[1]["tier"] == "covered"   # task_merge proven=True → covered
+    assert entries[2]["tier"] == "backfilled"  # unverified_merge_backfill → backfilled
+    assert entries[3]["tier"] == "partial"    # unknown source_kind → partial
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_summary_entries_provenance_field(db_session):
+    """_criterion_evidence_summary_entries extracts runner provenance from detail."""
+    from app.acceptance_criteria import _criterion_evidence_summary_entries
+
+    project = await _make_project(db_session, "EvidenceProvenanceField")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Provenance extraction"
+    )
+
+    with_provenance = CriterionEvidence(
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="t1",
+        detail={
+            "proven": True,
+            "executing_backend": "self_hosted",
+            "runner_target_id": "runner-abc123",
+            "runner_hostname": "agent-host-1",
+        },
+    )
+    without_provenance = CriterionEvidence(
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="reachability",
+        source_id="t1",
+        detail={"proven": True},
+    )
+
+    entries = _criterion_evidence_summary_entries([with_provenance, without_provenance])
+
+    prov = entries[0]["provenance"]
+    assert prov is not None
+    assert prov["executing_backend"] == "self_hosted"
+    assert prov["runner_id"] == "runner-abc123"
+    assert prov["runner_hostname"] == "agent-host-1"
+
+    assert entries[1]["provenance"] is None
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_attaches_runner_provenance(db_session):
+    """record_task_merge_evidence writes executing_backend + runner id to task_merge detail."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import ComputeJob
+
+    project = await _make_project(db_session, "MergeEvidenceRunnerProv")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Runner provenance on task_merge"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="self_hosted",
+        polling_metadata={
+            "runner_target_id": "runner-xyz",
+            "runner_hostname": "worker-node-1",
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    count = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert count == 2  # task_merge + reachability
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    task_merge_ev = next(e for e in evidence if e.source_kind == "task_merge")
+    detail = task_merge_ev.detail or {}
+    assert detail.get("executing_backend") == "self_hosted"
+    assert detail.get("runner_target_id") == "runner-xyz"
+    assert detail.get("runner_hostname") == "worker-node-1"
+    assert detail.get("proven") is True
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_evidence_carries_tier_and_provenance(db_session):
+    """get_version_coverage_summary evidence entries include tier and provenance fields."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import ComputeJob
+
+    project = await _make_project(db_session, "SummaryTierProv")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Summary tier and provenance"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="gcp",
+        polling_metadata={"runner_target_id": "gcp-runner-1"},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    item = summary["criteria"][0]
+    assert item["coverage"] == "covered"
+
+    evidence_list = item["evidence"]
+    assert len(evidence_list) == 2
+
+    task_merge_entry = next(e for e in evidence_list if e["source_kind"] == "task_merge")
+    assert task_merge_entry["tier"] == "covered"
+    prov = task_merge_entry["provenance"]
+    assert prov is not None
+    assert prov["executing_backend"] == "gcp"
+    assert prov["runner_id"] == "gcp-runner-1"
+
+    reachability_entry = next(e for e in evidence_list if e["source_kind"] == "reachability")
+    assert reachability_entry["tier"] == "covered"
+    assert reachability_entry["provenance"] is None

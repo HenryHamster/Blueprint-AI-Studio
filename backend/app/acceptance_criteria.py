@@ -877,6 +877,34 @@ def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | 
     return None
 
 
+def _evidence_tier_for_entry(e: CriterionEvidence) -> str:
+    """Classify a single evidence row into its earned evidence tier."""
+    if _evidence_proves_covered(e):
+        return "covered"
+    if _evidence_is_attested(e):
+        return "attested"
+    if _evidence_is_backfilled(e):
+        return "backfilled"
+    if _evidence_is_probed(e):
+        return "probed"
+    return "partial"
+
+
+def _evidence_provenance_for_entry(e: CriterionEvidence) -> dict[str, Any] | None:
+    """Extract runner provenance from the evidence detail dict, if present."""
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    executing_backend = detail.get("executing_backend")
+    runner_id = detail.get("runner_target_id")
+    runner_hostname = detail.get("runner_hostname")
+    if not executing_backend and not runner_id and not runner_hostname:
+        return None
+    return {
+        "executing_backend": executing_backend or None,
+        "runner_id": runner_id or None,
+        "runner_hostname": runner_hostname or None,
+    }
+
+
 def _criterion_evidence_summary_entries(
     evidence: list[CriterionEvidence],
 ) -> list[dict[str, Any]]:
@@ -888,6 +916,8 @@ def _criterion_evidence_summary_entries(
             "source_id": e.source_id,
             "detail": e.detail,
             "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+            "tier": _evidence_tier_for_entry(e),
+            "provenance": _evidence_provenance_for_entry(e),
         }
         for e in preview
     ]
@@ -1220,6 +1250,37 @@ async def record_task_merge_evidence(
         task_merge_detail["direction_key"] = direction_id_key
     if proof_ref is not None:
         task_merge_detail["proof_ref"] = proof_ref
+    # Best-effort: attach runner provenance from the task's most recent compute job.
+    # Never block merge finalization on failure.
+    try:
+        task_id_val = getattr(task, "id", None)
+        if task_id_val is not None:
+            from app.models import ComputeJob
+
+            _job_result = await session.execute(
+                select(ComputeJob)
+                .where(ComputeJob.task_id == task_id_val)
+                .order_by(ComputeJob.created_at.desc())
+                .limit(1)
+            )
+            _job = _job_result.scalar_one_or_none()
+            if _job is not None:
+                _backend = getattr(_job, "backend", None)
+                if _backend:
+                    task_merge_detail["executing_backend"] = _backend
+                _meta = getattr(_job, "polling_metadata", None) or {}
+                _runner_id = _meta.get("runner_target_id")
+                _runner_hostname = _meta.get("runner_hostname")
+                if _runner_id:
+                    task_merge_detail["runner_target_id"] = str(_runner_id)
+                if _runner_hostname:
+                    task_merge_detail["runner_hostname"] = str(_runner_hostname)
+    except Exception:
+        logger.debug(
+            "record_task_merge_evidence: could not attach runner provenance for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
     try:
         _release_version_id: uuid.UUID | None = None
         try:

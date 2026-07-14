@@ -442,6 +442,18 @@ export interface ChangelogEntry {
   pr_url?: string | null;
 }
 
+export interface EvidencePreviewEntry {
+  source_kind: string;
+  source_id?: string | null;
+  recorded_at?: string | null;
+  tier?: string | null;
+  provenance?: {
+    executing_backend?: string | null;
+    runner_id?: string | null;
+    runner_hostname?: string | null;
+  } | null;
+}
+
 export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
@@ -454,6 +466,8 @@ export interface CriterionCoverageEntry {
    *  parseable attested_at timestamp. Null/absent for legacy (non-expiring)
    *  attestations and for all non-attested coverage tiers. */
   attestation_expires_at?: string | null;
+  /** Per-evidence preview rows. Optional — absent on older backends. */
+  evidence?: EvidencePreviewEntry[];
 }
 
 export interface VersionCriterionCoverage {

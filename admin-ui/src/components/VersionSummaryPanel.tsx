@@ -1,5 +1,5 @@
 import { useState, type JSX } from 'react';
-import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry } from '../api';
+import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry, EvidencePreviewEntry } from '../api';
 import { isSafeUrl } from './TaskCard';
 import { EvidenceTierBadge } from './EvidenceTierBadge';
 
@@ -173,6 +173,30 @@ const STATUS_BADGE: Record<NonNullable<CriterionCoverageEntry['status']>, { labe
   superseded: { label: 'superseded', className: 'bg-sky-500/15 text-sky-300 border border-sky-500/30' },
 };
 
+function EvidenceRow({ entry, idx, criterionKey }: { entry: EvidencePreviewEntry; idx: number; criterionKey: string }): JSX.Element {
+  const provenance = entry.provenance;
+  const provenanceLabel = provenance
+    ? [provenance.executing_backend, provenance.runner_hostname ?? provenance.runner_id]
+        .filter(Boolean)
+        .join(' / ')
+    : null;
+  return (
+    <li
+      className="flex items-center gap-1.5 text-ui-sm text-slate-400"
+      data-testid={`criterion-evidence-${criterionKey}-${idx}`}
+    >
+      <EvidenceTierBadge tier={entry.tier ?? null} />
+      <span className="text-slate-500">{entry.source_kind}</span>
+      {provenanceLabel && (
+        <span className="text-slate-600 truncate" title={provenanceLabel}>{provenanceLabel}</span>
+      )}
+      {entry.recorded_at && (
+        <span className="text-slate-600 ml-auto shrink-0">{new Date(entry.recorded_at).toLocaleDateString()}</span>
+      )}
+    </li>
+  );
+}
+
 function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void }): JSX.Element {
   if (coverage.criteria.length === 0) {
     return (
@@ -242,76 +266,85 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
           return (
             <li
               key={c.criterion_key}
-              className={`flex items-start gap-2 ${status !== 'active' ? 'opacity-80' : ''}`}
+              className={status !== 'active' ? 'opacity-80' : ''}
               data-testid={`criterion-row-${c.criterion_key}`}
             >
-              <EvidenceTierBadge tier={c.coverage} />
-              {status !== 'active' && (
-                <span
-                  className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${statusBadge.className}`}
-                  data-testid={`criterion-status-${c.criterion_key}`}
-                >
-                  {statusBadge.label}
-                </span>
-              )}
-              <span className="text-xs text-slate-300 break-words min-w-0">{c.text}</span>
-              {stuckLabel != null && (
-                <span className="shrink-0 text-ui-sm text-red-400 ml-1" data-testid={`stuck-reason-${c.criterion_key}`} title={`Stuck: ${c.stuck_reason}`}>
-                  {stuckLabel}
-                </span>
-              )}
-              {isInProgress && (
-                <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
-                  in progress
-                </span>
-              )}
-              {c.coverage === 'attested' && c.attestation_expires_at != null && (
-                <span
-                  className="shrink-0 text-ui-sm text-amber-500 ml-1"
-                  data-testid={`attestation-expiry-${c.criterion_key}`}
-                  title={`Attestation expires at ${c.attestation_expires_at}`}
-                >
-                  {formatExpiresIn(c.attestation_expires_at)}
-                </span>
-              )}
-              {c.evidence_count > 0 && (
-                <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
-              )}
-              {status === 'active' && stuckLabel != null && onAttest != null && (
-                <button
-                  className="shrink-0 text-ui-sm text-amber-400 hover:text-amber-200 ml-1 transition-colors"
-                  data-testid={`attest-btn-${c.criterion_key}`}
-                  onClick={() => onAttest(c.criterion_key)}
-                >
-                  Attest
-                </button>
-              )}
-              {status === 'active' && stuckLabel != null && onLinkDirection != null && (
-                <button
-                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
-                  data-testid={`link-direction-btn-${c.criterion_key}`}
-                  onClick={() => onLinkDirection(c.criterion_key)}
-                >
-                  Link direction
-                </button>
-              )}
-              {isInProgress && onLinkDirection != null && (
-                <button
-                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
-                  data-testid={`relink-direction-btn-${c.criterion_key}`}
-                  onClick={() => onLinkDirection(c.criterion_key)}
-                >
-                  Relink
-                </button>
-              )}
-              {status !== 'active' && onReinstate != null && (
-                <button
-                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
-                  data-testid={`reinstate-btn-${c.criterion_key}`}
-                  onClick={() => onReinstate(c.criterion_key)}
-                >
-                  Reinstate
-                </button>
+              <div className="flex items-start gap-2">
+                <EvidenceTierBadge tier={c.coverage} />
+                {status !== 'active' && (
+                  <span
+                    className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${statusBadge.className}`}
+                    data-testid={`criterion-status-${c.criterion_key}`}
+                  >
+                    {statusBadge.label}
+                  </span>
+                )}
+                <span className="text-xs text-slate-300 break-words min-w-0">{c.text}</span>
+                {stuckLabel != null && (
+                  <span className="shrink-0 text-ui-sm text-red-400 ml-1" data-testid={`stuck-reason-${c.criterion_key}`} title={`Stuck: ${c.stuck_reason}`}>
+                    {stuckLabel}
+                  </span>
+                )}
+                {isInProgress && (
+                  <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
+                    in progress
+                  </span>
+                )}
+                {c.coverage === 'attested' && c.attestation_expires_at != null && (
+                  <span
+                    className="shrink-0 text-ui-sm text-amber-500 ml-1"
+                    data-testid={`attestation-expiry-${c.criterion_key}`}
+                    title={`Attestation expires at ${c.attestation_expires_at}`}
+                  >
+                    {formatExpiresIn(c.attestation_expires_at)}
+                  </span>
+                )}
+                {c.evidence_count > 0 && (
+                  <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
+                )}
+                {status === 'active' && stuckLabel != null && onAttest != null && (
+                  <button
+                    className="shrink-0 text-ui-sm text-amber-400 hover:text-amber-200 ml-1 transition-colors"
+                    data-testid={`attest-btn-${c.criterion_key}`}
+                    onClick={() => onAttest(c.criterion_key)}
+                  >
+                    Attest
+                  </button>
+                )}
+                {status === 'active' && stuckLabel != null && onLinkDirection != null && (
+                  <button
+                    className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                    data-testid={`link-direction-btn-${c.criterion_key}`}
+                    onClick={() => onLinkDirection(c.criterion_key)}
+                  >
+                    Link direction
+                  </button>
+                )}
+                {isInProgress && onLinkDirection != null && (
+                  <button
+                    className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                    data-testid={`relink-direction-btn-${c.criterion_key}`}
+                    onClick={() => onLinkDirection(c.criterion_key)}
+                  >
+                    Relink
+                  </button>
+                )}
+                {status !== 'active' && onReinstate != null && (
+                  <button
+                    className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                    data-testid={`reinstate-btn-${c.criterion_key}`}
+                    onClick={() => onReinstate(c.criterion_key)}
+                  >
+                    Reinstate
+                  </button>
+                )}
+              </div>
+              {c.evidence != null && c.evidence.length > 0 && (
+                <ul className="ml-5 mt-0.5 space-y-0.5">
+                  {c.evidence.map((ev, idx) => (
+                    <EvidenceRow key={idx} entry={ev} idx={idx} criterionKey={c.criterion_key} />
+                  ))}
+                </ul>
               )}
             </li>
           );
