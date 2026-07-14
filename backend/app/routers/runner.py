@@ -103,6 +103,56 @@ _MAX_GPU_LIST_ENTRIES = 64
 _MAX_GPU_MEMORY_MIB = 4_194_304  # 4 TiB
 _MAX_CLI_INVENTORY_ENTRIES = 16
 _MAX_CLI_VERSION_CHARS = 128
+# Bound the runner-reported per-project image-cache map: a runner's allow-list is
+# small, so an unbounded project map would be a malformed/hostile report.
+_MAX_IMAGE_CACHE_PROJECTS = 64
+# 1 PiB per bucket — far beyond any real image cache, so an absurd runner-reported
+# integer can never poison the telemetry while every plausible value passes.
+_MAX_IMAGE_CACHE_BYTES = 1 << 50
+
+
+def _sanitize_image_cache_by_project(raw: Any) -> dict | None:
+    """Validate/bound a runner-reported image-cache accounting map, or None.
+
+    The runner's report is untrusted display telemetry: coerce every numeric
+    field, clamp to sane ceilings, and cap the number of project buckets so a
+    malformed or hostile heartbeat can neither store an absurd value nor grow
+    the map without bound. Returns None when the payload is absent or unusable.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _clamp_bytes(value: Any) -> int:
+        try:
+            return max(0, min(_MAX_IMAGE_CACHE_BYTES, int(value)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _clamp_count(value: Any) -> int:
+        try:
+            return max(0, min(_MAX_IMAGE_CACHE_BYTES, int(value)))
+        except (TypeError, ValueError):
+            return 0
+
+    by_project: dict[str, dict] = {}
+    raw_by_project = raw.get("by_project")
+    if isinstance(raw_by_project, dict):
+        for pid, bucket in raw_by_project.items():
+            if len(by_project) >= _MAX_IMAGE_CACHE_PROJECTS:
+                break
+            if not isinstance(pid, str) or not pid.strip() or not isinstance(bucket, dict):
+                continue
+            by_project[pid.strip()[:128]] = {
+                "bytes": _clamp_bytes(bucket.get("bytes")),
+                "image_count": _clamp_count(bucket.get("image_count")),
+            }
+    return {
+        "total_bytes": _clamp_bytes(raw.get("total_bytes")),
+        "image_count": _clamp_count(raw.get("image_count")),
+        "by_project": by_project,
+        "unattributed_bytes": _clamp_bytes(raw.get("unattributed_bytes")),
+        "unattributed_image_count": _clamp_count(raw.get("unattributed_image_count")),
+    }
 # _RUNNER_LIVENESS_SECONDS is imported from runner_health_monitors (SSOT) above.
 
 # ComputeJob statuses after which runner reports/uploads must no longer mutate
@@ -440,6 +490,14 @@ class HeartbeatRequest(BaseModel):
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
     gpu_free_vram_mib: List[int] | None = None
+    # Per-project docker image-cache accounting (optional; only docker-backed
+    # runners report it). Shape:
+    #   {"total_bytes": int, "image_count": int,
+    #    "by_project": {project_id: {"bytes": int, "image_count": int}},
+    #    "unattributed_bytes": int, "unattributed_image_count": int}
+    # Display-only trust telemetry: an operator can see which allowed project's
+    # images fill a multi-project runner's (small) image-layer disk.
+    image_cache_by_project: dict | None = None
     # ── Applied-config report (two-way heartbeat config channel) ──────────────
     # The daemon echoes back the LIVE-SAFE config generation it currently has in
     # effect plus the applied live values, so the orchestrator/UI can tell
@@ -1328,6 +1386,9 @@ async def heartbeat(
         runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
     if payload.disk_free_bytes is not None:
         caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    sanitized_image_cache = _sanitize_image_cache_by_project(payload.image_cache_by_project)
+    if sanitized_image_cache is not None:
+        caps["image_cache_by_project"] = sanitized_image_cache
     if payload.cpu_load_avg is not None:
         caps["cpu_load_avg"] = max(0.0, float(payload.cpu_load_avg))
     if payload.memory_free_bytes is not None:
@@ -1700,6 +1761,11 @@ async def next_compute_job(
 
     return {
         "job_id": str(job.id),
+        # The job's OWNING project (not the runner's enrollment project — a
+        # multi-project runner may run jobs for any allowed project). The runner
+        # stamps this into its image-use ledger so the heartbeat can attribute
+        # per-project docker image-cache storage back to the right project.
+        "project_id": str(job.project_id) if job.project_id else None,
         "command": refreshed_meta.get("command", ""),
         "env": refreshed_meta.get("env") or {},
         "cwd": refreshed_meta.get("cwd"),

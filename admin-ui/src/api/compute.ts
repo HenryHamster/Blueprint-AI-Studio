@@ -1736,6 +1736,17 @@ export interface FleetRunner {
     memory_free_bytes?: number;
     cpu_load_avg?: number;
     gpu_utilization_pct?: number;
+    // Per-project docker image-cache accounting (docker-backed runners only).
+    // A multi-project runner shares one image cache; this attributes its size
+    // back to the project that pulled each image, so the operator can see which
+    // allowed project fills a small image-layer disk.
+    image_cache_by_project?: {
+      total_bytes?: number;
+      image_count?: number;
+      by_project?: Record<string, { bytes?: number; image_count?: number }>;
+      unattributed_bytes?: number;
+      unattributed_image_count?: number;
+    };
     [key: string]: unknown;
   };
   health?: {

@@ -6787,6 +6787,54 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         )
         self.assertEqual(result["removed"], 0, result)
 
+    def test_record_image_use_stores_project_owner(self):
+        """A recorded use with a project_id is stored as a dict and round-trips."""
+        local_runner._record_image_use(
+            "registry.example.com/proj-a/train:v1",
+            project_id="proj-a",
+            _now=self.now,
+        )
+        ledger = local_runner._load_image_use_ledger()
+        value = ledger["registry.example.com/proj-a/train:v1"]
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value["project_id"], "proj-a")
+        self.assertEqual(
+            local_runner._parse_docker_time(local_runner._ledger_last_used(value)),
+            self.now,
+        )
+
+    def test_record_image_use_preserves_owner_when_reused_without_project(self):
+        """A later use with no project_id keeps a previously-recorded owner."""
+        local_runner._record_image_use("img:v1", project_id="proj-a", _now=self.now)
+        local_runner._record_image_use(
+            "img:v1", _now=self.now + timedelta(hours=1)
+        )
+        value = local_runner._load_image_use_ledger()["img:v1"]
+        self.assertEqual(local_runner._ledger_project_id(value), "proj-a")
+
+    def test_prune_tolerates_dict_ledger_values(self):
+        """The dict-shaped ledger value still protects an old pull from eviction."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:inuse",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=30)),
+                "tags": ["registry.example.com/proj/train:v3"],
+            }
+        ])
+        result = self._prune(
+            docker,
+            keep_days=7,
+            ledger={
+                "registry.example.com/proj/train:v3": {
+                    "last_used": (self.now - timedelta(hours=1)).isoformat(),
+                    "project_id": "proj",
+                }
+            },
+        )
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+
     def test_parse_docker_time_formats(self):
         """Docker emits RFC3339 (.Created), Go time.Time (.Metadata.LastTagTime),
         and a Go zero value for never-tagged images."""
@@ -6801,6 +6849,96 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         self.assertIsNone(local_runner._parse_docker_time("0001-01-01T00:00:00Z"))
         self.assertIsNone(local_runner._parse_docker_time(""))
         self.assertIsNone(local_runner._parse_docker_time("not-a-time"))
+
+
+class _FakeCacheDocker:
+    """Scriptable ``docker`` for _docker_image_cache_by_project.
+
+    *images* is a list of ``{"id", "size", "tags"}``. Answers ``image ls`` with
+    the ids and ``image inspect --format {{.Id}}\\t{{.Size}}\\t{{.RepoTags}}``
+    with size in BYTES (the shape `.Size` renders), so the accounting can be
+    tested without a real docker.
+    """
+
+    def __init__(self, images, list_rc=0, inspect_rc=0):
+        self.images = images
+        self.list_rc = list_rc
+        self.inspect_rc = inspect_rc
+        self.calls = []
+
+    def _result(self, rc, out="", err=""):
+        class P:
+            returncode = rc
+            stdout = out
+            stderr = err
+        return P()
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        if cmd[:4] == ["docker", "image", "ls", "-a"]:
+            if self.list_rc != 0:
+                return self._result(self.list_rc, err="permission denied")
+            return self._result(0, "".join(f"{i['id']}\n" for i in self.images))
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if self.inspect_rc != 0:
+                return self._result(self.inspect_rc, err="no such image")
+            rows = []
+            for img in self.images:
+                tags = "[" + " ".join(img.get("tags") or []) + "]"
+                rows.append(f"{img['id']}\t{img.get('size', 0)}\t{tags}")
+            return self._result(0, "\n".join(rows))
+        raise AssertionError(f"unexpected docker invocation: {cmd}")
+
+
+class TestDockerImageCacheAccounting(unittest.TestCase):
+    """Per-project docker image-cache accounting (_docker_image_cache_by_project)."""
+
+    def _cache(self, docker, ledger):
+        return local_runner._docker_image_cache_by_project(_run=docker, _ledger=ledger)
+
+    def test_attributes_size_to_owning_project(self):
+        docker = _FakeCacheDocker([
+            {"id": "sha256:a", "size": 3_000_000_000, "tags": ["reg/proj-a/train:v1"]},
+            {"id": "sha256:b", "size": 1_000_000_000, "tags": ["reg/proj-b/train:v1"]},
+        ])
+        ledger = {
+            "reg/proj-a/train:v1": {"last_used": "2026-07-12T00:00:00+00:00", "project_id": "proj-a"},
+            "reg/proj-b/train:v1": {"last_used": "2026-07-12T00:00:00+00:00", "project_id": "proj-b"},
+        }
+        result = self._cache(docker, ledger)
+        self.assertEqual(result["total_bytes"], 4_000_000_000)
+        self.assertEqual(result["image_count"], 2)
+        self.assertEqual(result["by_project"]["proj-a"], {"bytes": 3_000_000_000, "image_count": 1})
+        self.assertEqual(result["by_project"]["proj-b"], {"bytes": 1_000_000_000, "image_count": 1})
+        self.assertEqual(result["unattributed_bytes"], 0)
+
+    def test_legacy_string_ledger_entry_is_unattributed(self):
+        """An image whose ledger stamp predates project tracking is unattributed."""
+        docker = _FakeCacheDocker([
+            {"id": "sha256:a", "size": 2_000_000_000, "tags": ["reg/old/train:v1"]},
+        ])
+        ledger = {"reg/old/train:v1": "2026-07-12T00:00:00+00:00"}  # legacy shape
+        result = self._cache(docker, ledger)
+        self.assertEqual(result["by_project"], {})
+        self.assertEqual(result["unattributed_bytes"], 2_000_000_000)
+        self.assertEqual(result["unattributed_image_count"], 1)
+
+    def test_no_images_returns_zeroed_accounting(self):
+        result = self._cache(_FakeCacheDocker([]), {})
+        self.assertEqual(result["total_bytes"], 0)
+        self.assertEqual(result["image_count"], 0)
+        self.assertEqual(result["by_project"], {})
+
+    def test_docker_missing_returns_none(self):
+        def boom(cmd, **kw):
+            raise OSError("docker not found")
+        self.assertIsNone(
+            local_runner._docker_image_cache_by_project(_run=boom, _ledger={})
+        )
+
+    def test_list_nonzero_returns_none(self):
+        docker = _FakeCacheDocker([], list_rc=1)
+        self.assertIsNone(self._cache(docker, {}))
 
 
 class _FakeResp:

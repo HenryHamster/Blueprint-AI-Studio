@@ -3976,6 +3976,63 @@ class TestRunnerEndpoints:
         assert health2["degraded"] is False
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_and_bounds_image_cache_by_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-project image-cache accounting rides on caps, coerced and bounded."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Craft a report with an absurd byte value, a non-numeric count, and more
+        # project buckets than the cap allows — all must be sanitized.
+        absurd = 10 ** 60
+        by_project = {f"proj-{i}": {"bytes": 1000, "image_count": 1} for i in range(70)}
+        by_project["proj-bad"] = {"bytes": absurd, "image_count": "not-a-number"}
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "image_cache_by_project": {
+                    "total_bytes": absurd,
+                    "image_count": 71,
+                    "by_project": by_project,
+                    "unattributed_bytes": -5,
+                    "unattributed_image_count": 2,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        stored = runner.capabilities["image_cache_by_project"]
+        # Absurd byte value clamped to the ceiling, not stored raw.
+        assert stored["total_bytes"] == (1 << 50)
+        assert stored["total_bytes"] < absurd
+        # Negative coerced to 0; the project map is capped.
+        assert stored["unattributed_bytes"] == 0
+        assert len(stored["by_project"]) <= 64
+        # Non-numeric count in a bucket degrades to 0, never raises.
+        for bucket in stored["by_project"].values():
+            assert isinstance(bucket["bytes"], int)
+            assert isinstance(bucket["image_count"], int)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_image_cache_by_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner that reports no image cache leaves the field absent, no error."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"disk_free_bytes": 100},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "image_cache_by_project" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_heartbeat_persists_isolation_backends(
         self, client: AsyncClient, db_session
     ):
@@ -5079,6 +5136,9 @@ class TestNextComputeJobDiskFit:
 
         await db_session.refresh(job)
         assert job.status == ComputeJobStatus.RUNNING
+        # The claim body carries the job's owning project so a multi-project
+        # runner can attribute its image-cache storage back to the right project.
+        assert resp.json()["project_id"] == str(project.id)
 
     @pytest.mark.asyncio
     async def test_non_image_job_claimed_despite_low_disk(

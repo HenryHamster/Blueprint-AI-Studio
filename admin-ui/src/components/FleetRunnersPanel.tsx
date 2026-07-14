@@ -297,6 +297,14 @@ function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } 
   if (typeof diskFree === 'number') parts.push(`${formatBytes(diskFree)} disk`);
   const memFree = health?.memory_free_bytes ?? runner.capabilities.memory_free_bytes;
   if (typeof memFree === 'number') parts.push(`${formatBytes(memFree)} mem`);
+  const imageCache = runner.capabilities.image_cache_by_project;
+  if (imageCache && typeof imageCache.total_bytes === 'number') {
+    const projectCount = imageCache.by_project ? Object.keys(imageCache.by_project).length : 0;
+    // Only note the per-project split when the cache is genuinely shared; a
+    // single-project runner's image cache adds nothing over disk-free.
+    const suffix = projectCount > 1 ? ` (${projectCount} projects)` : '';
+    parts.push(`${formatBytes(imageCache.total_bytes)} images${suffix}`);
+  }
   if (parts.length === 0) return null;
   return {
     text: parts.join(' · '),

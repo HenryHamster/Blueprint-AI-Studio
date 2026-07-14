@@ -1083,7 +1083,14 @@ def _image_use_ledger_path() -> str:
 
 
 def _load_image_use_ledger() -> dict:
-    """``{image_ref: iso8601_last_used}``. Best-effort — {} on any read error."""
+    """The runner's image last-use ledger. Best-effort — {} on any read error.
+
+    Each value is EITHER a bare ISO-8601 last-use string (legacy shape) OR a
+    ``{"last_used": iso8601, "project_id": str}`` object once the runner learns
+    which project drove the pull. Both shapes coexist on disk across a rolling
+    upgrade, so every reader goes through :func:`_ledger_last_used` /
+    :func:`_ledger_project_id` rather than touching the raw value.
+    """
     try:
         with open(_image_use_ledger_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1092,19 +1099,48 @@ def _load_image_use_ledger() -> dict:
         return {}
 
 
-def _record_image_use(image_ref: str | None, *, _now=None) -> None:
+def _ledger_last_used(value) -> str | None:
+    """Extract the ISO-8601 last-use string from a ledger value (either shape)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        got = value.get("last_used")
+        return got if isinstance(got, str) else None
+    return None
+
+
+def _ledger_project_id(value) -> str | None:
+    """Extract the owning project id from a ledger value, or None (legacy shape)."""
+    if isinstance(value, dict):
+        pid = value.get("project_id")
+        return pid if isinstance(pid, str) and pid else None
+    return None
+
+
+def _record_image_use(image_ref: str | None, *, project_id: str | None = None, _now=None) -> None:
     """Stamp *image_ref* as used NOW in the last-use ledger (best-effort).
 
     Docker records no last-use time for an image, so the runner keeps its own.
     Without this, cache hygiene can only see image CREATION time — which says
     nothing about whether a job needs the image (see :func:`_prune_docker_images`).
+
+    When *project_id* is known (a multi-project runner serves several projects
+    from one image cache), it is stored alongside the timestamp so the heartbeat
+    can attribute per-image storage back to the project that pulled it
+    (see :func:`_docker_image_cache_by_project`). An owning project already on
+    record is preserved when a later use arrives without one, so a re-pull under
+    a stale runner never erases attribution.
     """
     if not image_ref:
         return
     now = _now or datetime.now(timezone.utc)
     try:
         ledger = _load_image_use_ledger()
-        ledger[image_ref] = now.isoformat()
+        owner = project_id or _ledger_project_id(ledger.get(image_ref))
+        stamp = now.isoformat()
+        ledger[image_ref] = (
+            {"last_used": stamp, "project_id": owner} if owner else stamp
+        )
         # Bound the ledger: drop stamps older than 90 days so it cannot grow
         # without limit on a long-lived runner.
         floor = now - timedelta(days=90)
@@ -1112,7 +1148,7 @@ def _record_image_use(image_ref: str | None, *, _now=None) -> None:
             ref: ts
             for ref, ts in ledger.items()
             if ref == image_ref
-            or ((_parse_docker_time(ts) or now) >= floor)
+            or ((_parse_docker_time(_ledger_last_used(ts)) or now) >= floor)
         }
         path = _image_use_ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1293,7 +1329,7 @@ def _prune_docker_images(
 
         candidates = [t for t in (tag_time, created) if t is not None]
         for ref in repo_tags:
-            used = _parse_docker_time(ledger.get(ref))
+            used = _parse_docker_time(_ledger_last_used(ledger.get(ref)))
             if used is not None:
                 candidates.append(used)
         last_used = max(candidates) if candidates else None
@@ -1331,6 +1367,113 @@ def _prune_docker_images(
         "kept": kept,
         "in_use_skipped": in_use_skipped,
         "output": f"removed={len(removed)} kept={kept} in_use_or_error={in_use_skipped}",
+    }
+
+
+# Cap on images accounted per heartbeat. A pathological cache can't turn the
+# telemetry pass into an unbounded inspect; excess images fall into the total
+# only (via the cheap `ls` size column), never the per-image inspect loop.
+_IMAGE_CACHE_MAX_IMAGES = 500
+
+
+def _docker_image_cache_by_project(*, _run=subprocess.run, _ledger=None) -> dict | None:
+    """Best-effort per-project Docker image-cache accounting for the heartbeat.
+
+    A local-runner daemon can serve several projects from ONE docker image
+    cache (the project allow-list), but nothing on the runner attributed image
+    storage to a project — the heartbeat reported only whole-filesystem
+    ``disk_free_bytes``. On a small data-root (dgx-1 is ~30 GB of image-layer
+    storage) an operator could not see WHICH project's images were filling the
+    disk. This walks ``docker image inspect`` once and attributes each image's
+    size to the project that last pulled/used it, per the last-use ledger
+    (:func:`_record_image_use`).
+
+    Returns None when docker is unavailable or errors (the field is then simply
+    omitted from the heartbeat — older/dockerless runners are unaffected).
+    Otherwise::
+
+        {
+          "total_bytes": int,            # Σ per-image virtual sizes (see NB)
+          "image_count": int,
+          "by_project": {project_id: {"bytes": int, "image_count": int}},
+          "unattributed_bytes": int,     # images with no ledger owner yet
+          "unattributed_image_count": int,
+        }
+
+    NB: image sizes are per-image VIRTUAL sizes; two images sharing a base
+    layer each count the shared bytes, so ``total_bytes`` over-counts a cache
+    with heavy layer reuse. This is attribution telemetry, not an exact disk
+    measurement — ``disk_free_bytes`` remains the source of truth that gates
+    the low-disk prune. Best-effort throughout: never raises.
+    """
+    ledger = _load_image_use_ledger() if _ledger is None else dict(_ledger)
+    try:
+        listing = _run(
+            ["docker", "image", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode != 0:
+        return None
+    image_ids = sorted({ln.strip() for ln in (listing.stdout or "").splitlines() if ln.strip()})
+    if not image_ids:
+        return {
+            "total_bytes": 0, "image_count": 0, "by_project": {},
+            "unattributed_bytes": 0, "unattributed_image_count": 0,
+        }
+
+    try:
+        inspected = _run(
+            [
+                "docker", "image", "inspect", "--format",
+                "{{.Id}}\t{{.Size}}\t{{.RepoTags}}",
+                *image_ids[:_IMAGE_CACHE_MAX_IMAGES],
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if inspected.returncode != 0:
+        return None
+
+    total = 0
+    image_count = 0
+    by_project: dict[str, dict] = {}
+    unattributed_bytes = 0
+    unattributed_count = 0
+    for line in (inspected.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        try:
+            size = max(0, int((fields[1] or "0").strip()))
+        except ValueError:
+            continue
+        repo_tags = _parse_repo_tags(fields[2] if len(fields) > 2 else "")
+        owner = None
+        for ref in repo_tags:
+            owner = _ledger_project_id(ledger.get(ref))
+            if owner:
+                break
+        total += size
+        image_count += 1
+        if owner:
+            bucket = by_project.setdefault(owner, {"bytes": 0, "image_count": 0})
+            bucket["bytes"] += size
+            bucket["image_count"] += 1
+        else:
+            unattributed_bytes += size
+            unattributed_count += 1
+
+    return {
+        "total_bytes": total,
+        "image_count": image_count,
+        "by_project": by_project,
+        "unattributed_bytes": unattributed_bytes,
+        "unattributed_image_count": unattributed_count,
     }
 
 
@@ -2366,6 +2509,15 @@ def _heartbeat_loop(
                 else None
             )
             gpu_memory = _gpu_memory_mib() if has_gpu else None
+            # Per-project docker image-cache accounting. Only probed when docker
+            # (or podman) is the selected compute backend — a bwrap-only / GCP
+            # runner has no docker image cache to account, and we skip the two
+            # subprocess calls entirely. Best-effort: None ⇒ field omitted.
+            image_cache = (
+                _docker_image_cache_by_project()
+                if compute_backend in (iso.BACKEND_DOCKER, iso.BACKEND_PODMAN)
+                else None
+            )
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
@@ -2391,6 +2543,11 @@ def _heartbeat_loop(
                 "last_successful_job_at": last_success_at,
                 "consecutive_job_failures": consecutive_failures,
                 "disk_free_bytes": _disk_free_bytes(workspace_root),
+                # Per-project docker image-cache accounting (multi-project
+                # runners share one image cache; this attributes its size back
+                # to the project that pulled each image). Omitted when docker is
+                # not the compute backend.
+                "image_cache_by_project": image_cache,
                 "cpu_load_avg": _cpu_load_avg(),
                 "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
@@ -3466,8 +3623,10 @@ def _run_compute_job(
         # Cache hygiene bookkeeping: stamp this image as USED now. Docker keeps no
         # last-use time, so without this stamp the low-disk prune could only see
         # the image's upstream CREATION date and would evict a base image this job
-        # just pulled (see _prune_docker_images).
-        _record_image_use(container_image)
+        # just pulled (see _prune_docker_images). Attribute the pull to the
+        # owning project so a multi-project runner's heartbeat can report which
+        # project's images fill its (small) image-layer disk.
+        _record_image_use(container_image, project_id=job_body.get("project_id"))
 
         # GPU-used enforcement: run a lightweight nvidia-smi -L probe INSIDE the
         # same sandbox before the real command, so (a) torch/TF cannot silently

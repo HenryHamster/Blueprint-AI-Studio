@@ -1331,6 +1331,61 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(telemetryEl?.className).toContain('amber');
   });
 
+  test('multi-project runner surfaces per-project image-cache size', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: 'all',
+          has_gpu: false,
+          max_concurrent: 2,
+          disk_free_bytes: 53687091200,
+          image_cache_by_project: {
+            total_bytes: 21474836480, // 20 GiB of images
+            image_count: 4,
+            by_project: {
+              'proj-a': { bytes: 16106127360, image_count: 2 },
+              'proj-b': { bytes: 5368709120, image_count: 2 },
+            },
+            unattributed_bytes: 0,
+            unattributed_image_count: 0,
+          },
+        },
+      },
+    ]);
+    const el = await mount();
+
+    const telemetryEl = el.querySelector('[data-testid="fleet-runner-telemetry"]');
+    const telemetry = telemetryEl?.textContent ?? '';
+    // Shared image cache surfaces its total plus the project split.
+    expect(telemetry).toContain('20 GiB images');
+    expect(telemetry).toContain('2 projects');
+  });
+
+  test('single-project runner omits the project-count suffix on image cache', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: 'all',
+          has_gpu: false,
+          max_concurrent: 2,
+          image_cache_by_project: {
+            total_bytes: 5368709120, // 5 GiB
+            image_count: 1,
+            by_project: { 'proj-a': { bytes: 5368709120, image_count: 1 } },
+            unattributed_bytes: 0,
+            unattributed_image_count: 0,
+          },
+        },
+      },
+    ]);
+    const el = await mount();
+    const telemetry = el.querySelector('[data-testid="fleet-runner-telemetry"]')?.textContent ?? '';
+    expect(telemetry).toContain('5 GiB images');
+    expect(telemetry).not.toContain('projects');
+  });
+
   test('empty state renders when no runners enrolled', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([]);
     const el = await mount();
