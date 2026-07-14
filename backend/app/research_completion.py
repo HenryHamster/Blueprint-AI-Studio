@@ -5549,6 +5549,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_task_id": str(task.id),
                 "salvage_source_task_id": str(task.id),
                 "salvage_finding_count": len(_salvage_candidates),
+                "audience": "strategist-internal",
             },
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",

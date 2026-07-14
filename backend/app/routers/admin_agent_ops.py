@@ -4202,6 +4202,51 @@ async def strategic_operation(
             }
         )
 
+    elif payload.op == "resolve_pending_confirm":
+        # Strategist clears its OWN pending_user_confirmation item: it obtained
+        # the credential/decision, or the condition became moot. First-class
+        # sibling of the create-only ``pending_confirm`` op — the strategist no
+        # longer has to wait for the operator to hand-dismiss a bookkeeping ask.
+        # Operator dismiss/accept remains the fallback.
+        from app.problem_model import parse_problem_model
+
+        target_id = ""
+        if isinstance(data, dict):
+            target_id = str(data.get("id") or "").strip()
+        elif isinstance(data, str):
+            target_id = data.strip()
+        if not target_id:
+            raise HTTPException(
+                status_code=400,
+                detail="resolve_pending_confirm requires an 'id' of the pending confirmation to clear",
+            )
+        current_model = parse_problem_model(project.problem_model)
+        before = list(current_model.pending_user_confirmation)
+        remaining = [p for p in before if p.id != target_id]
+        removed = len(before) - len(remaining)
+        if removed:
+            current_model.pending_user_confirmation = remaining
+            project.problem_model = current_model.model_dump()
+            flag_modified(project, "problem_model")
+            session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] resolve_pending_confirm '{target_id}' on project "
+            f"{project.id} — removed={bool(removed)}"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "resolve_pending_confirm",
+                "id": target_id,
+                "removed": bool(removed),
+            }
+        )
+
     elif payload.op == "set_retirement_critiques":
         # Store structured critique(s) of retired directions so the completion
         # handler can persist them in StrategicCycle metadata for future cycles.

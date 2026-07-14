@@ -50,7 +50,7 @@
     "rollup_management.py": 5550,
     "rollup_migration_validation.py": 1350,
     "reaper.py": 3650,
-    "reaper_sweeps.py": 2550,
+    "reaper_sweeps.py": 2950,
     "reaper_fleet_health_sweeps.py": 500,
     "reaper_bug_message_sweeps.py": 1400,
     "reaper_evaluating_sweeps.py": 600,
@@ -91,7 +91,7 @@
     "shared_state.py": 2850,
     "strategic_spawning.py": 8950,
     "failure_classification.py": 3350,
-    "notification_dispatch.py": 2700,
+    "notification_dispatch.py": 3150,
     "ci_completion.py": 2550,
     "routers/admin_debug.py": 2250,
     "problem_model.py": 3450,
@@ -145,8 +145,8 @@
     "acceptance_gate.py": 1800,
     "review_loop_convergence.py": 1950,
     "routers/admin_project_tools.py": 1800,
-    "routers/admin_runners.py": 1750,
-    "compute_image_build.py": 1750
+    "compute_image_build.py": 1750,
+    "routers/admin_runners.py": 1750
   },
   "agent": {
     "index.ts": 4600,

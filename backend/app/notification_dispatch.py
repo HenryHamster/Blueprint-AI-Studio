@@ -27,6 +27,8 @@ from app.url_security import _resolve_safe_external_url
 from app.field_encryption import encrypt_field, decrypt_field
 from app.shared_state import get_project_promotion_target
 
+from app.message_audience import PIPELINE_LOG, route_event
+
 from app.models import (
     MessageType,
     NotificationDeadLetter,
@@ -632,11 +634,39 @@ async def post_event_message(
     summary: str,
     context: Optional[dict[str, Any]] = None,
     task_id: Optional[uuid.UUID] = None,
-) -> ProjectMessage:
-    """Core helper — creates a system ProjectMessage with the given event_type in context."""
+) -> Optional[ProjectMessage]:
+    """Core helper — creates a system ProjectMessage with the given event_type in context.
+
+    Every created row is stamped with ``context["audience"]`` resolved from the
+    unified audience registry (:func:`app.message_audience.route_event`), so both
+    the ledger read paths and downstream surfaces can tell an operator-visible
+    message from a strategist-feed one:
+
+    * ``operator-action-needed`` / ``operator-fyi`` → operator-visible NOTE (as before).
+    * ``strategist-internal`` → a non-operator strategist-feed row is still created
+      (bookkeeping the strategist may want), but tagged so it never surfaces to the
+      operator. Unregistered event types fail closed to this class.
+    * ``pipeline-log`` → pure telemetry; **no** ledger row is created and ``None``
+      is returned.
+
+    Callers that forward the return value MUST handle ``None`` for the pipeline-log
+    case.
+    """
+    audience = route_event(event_type)
+    if audience == PIPELINE_LOG:
+        # Pure telemetry — no ledger row at all, logs/observability only.
+        logger.debug(
+            "[NOTIFY] Skipping ledger row for pipeline-log event_type=%s",
+            event_type,
+        )
+        return None
     ctx: dict[str, Any] = {"event_type": event_type}
     if context:
         ctx.update(context)
+    # Stamp the resolved audience so operator-facing surfaces can exclude
+    # non-operator (strategist-internal) rows. Canonical value wins over any
+    # audience the caller may have placed in ``context``.
+    ctx["audience"] = audience
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.NOTE,

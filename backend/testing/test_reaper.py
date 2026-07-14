@@ -13504,6 +13504,158 @@ async def test_linked_message_resurfaces_when_task_completed_but_never_landed(
     assert "did not land" in (ctx.get("_convergence_resurfaced_reason") or "")
 
 
+# ── Step 18b/18c: generalized linked-resolve + stale-open decay sweeps ─────────
+
+from app.reaper_sweeps import (  # noqa: E402
+    sweep_resolve_linked_messages,
+    sweep_decay_stale_open_messages,
+    STALE_OPEN_DECAY_DAYS,
+)
+
+
+async def _make_conversational_message(
+    db, project, *, msg_type=MessageType.NOTE, status="open", context=None,
+    created_at=None,
+):
+    kwargs = dict(
+        project_id=project.id,
+        message_type=msg_type,
+        from_type="strategic",
+        content="conversational item",
+        status=status,
+        context=context or {},
+    )
+    if created_at is not None:
+        kwargs["created_at"] = created_at
+    msg = ProjectMessage(**kwargs)
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_resolves_non_bug_on_landing(reaper_db):
+    """A non-bug 'linked' NOTE auto-resolves once its owning task lands."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    msg = await _make_conversational_message(reaper_db, project)
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "landed" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_skips_bug_class(reaper_db):
+    """Bug-class 'linked' messages stay owned by the Step-15 sweep (disjoint)."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    bug = await _make_bug_message(reaper_db, project)
+    link_message_to_outcome(bug, "task", str(task.id))
+    reaper_db.add(bug)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(bug)
+    assert bug.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_left_linked_when_not_landed(reaper_db):
+    """A non-bug 'linked' message is untouched when its owner has not landed."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION
+    )
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
+    """An OPEN NOTE with no activity past the decay window is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
+    """Recent NOTEs and any QUESTION/BLOCKER are never decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
+    recent_note = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE
+    )  # created now
+    live_question = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
+    live_blocker = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    for m in (recent_note, live_question, live_blocker):
+        await reaper_db.refresh(m)
+        assert m.status == "open"
+
+
 # ── Step 16: converge duplicate foundations ───────────────────────────────
 
 

@@ -1965,6 +1965,10 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append("intent updated")
     if caps := diff.get("capabilities_changed"):
         parts.append(f"{len(caps)} capability status changes")
+    if pending_deleted := diff.get("pending_user_confirmation_deleted"):
+        parts.append(
+            f"cleared {len(pending_deleted)} pending confirmation(s)"
+        )
     if consolidated := diff.get("capabilities_consolidated"):
         parts.append(f"consolidated {len(consolidated)} capability group(s)")
     if evicted := diff.get("archived_gaps_evicted"):
@@ -2880,6 +2884,7 @@ def apply_agent_update(
         ("gaps_deleted", "gaps"),
         ("capabilities_deleted", "capabilities"),
         ("friction_deleted", "friction"),
+        ("pending_user_confirmation_deleted", "pending_user_confirmation"),
     ):
         removed = sorted(_as_str_list(deletions, del_key))
         if removed:

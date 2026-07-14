@@ -295,6 +295,8 @@ from app.reaper_sweeps import (
     sweep_converge_duplicate_foundations,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
+    sweep_resolve_linked_messages,
+    sweep_decay_stale_open_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -3047,6 +3049,37 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stale-bug-message resolve sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18b: Generalized linked-message auto-resolve — resolve any
+                # NON-bug-class 'linked' message (NOTE/QUESTION/FEEDBACK) once its
+                # recorded _convergence_link target genuinely lands, clearing its
+                # needs-action derivation without operator involvement. Disjoint
+                # from Step 15 by message_type (bug-class stays owned there).
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_linked_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Linked-message resolve sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 18c: Stale-open conversational decay — auto-resolve any OPEN
+                # NOTE/FEEDBACK item with no activity for the decay window and no
+                # live linked condition (resolution='auto-decayed (stale)'), so dead
+                # conversation ages out. Genuinely-live QUESTION/BLOCKER untouched.
+                _mark_reaper_progress()
+                try:
+                    await sweep_decay_stale_open_messages(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale-open decay sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

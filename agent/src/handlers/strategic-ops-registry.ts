@@ -57,6 +57,8 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Record a strategic self-reflection note for the cycle.' },
   { op: 'pending_confirm', alias: 'pending-confirm', cli: true, prompt: true, internalReason: null,
     description: 'Queue a pending user-confirmation item on the problem model.' },
+  { op: 'resolve_pending_confirm', alias: 'resolve-pending-confirm', cli: true, prompt: true, internalReason: null,
+    description: 'Clear a pending user-confirmation item by id (strategist obtained the decision/credential or it became moot).' },
   { op: 'set_vision', alias: 'set-vision', cli: true, prompt: true, internalReason: null,
     description: 'Update the project vision (purpose, systems, priorities, context).' },
   { op: 'create_direction', alias: 'create-direction', cli: true, prompt: true, internalReason: null,

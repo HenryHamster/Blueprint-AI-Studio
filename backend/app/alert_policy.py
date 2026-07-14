@@ -17,6 +17,7 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.deploy_identity import project_is_deploy_repo
+from app.message_audience import is_operator_visible, route_event
 from app.models import Alert, AlertSeverity, Project, _utcnow
 
 
@@ -94,6 +95,7 @@ class AlertEventPolicy:
     route: str = ROUTE_ALERT
     allow_info: bool = False
     action_required: bool = True
+    audience: str | None = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +277,21 @@ def should_emit_project_alert(
 ) -> AlertDecision:
     policy = get_alert_event_policy(event_type)
     severity_value = severity.value if isinstance(severity, AlertSeverity) else str(severity)
+
+    # Audience gate: non-operator audiences suppress the alert (fail-closed).
+    # This is the alert-side analogue of the ledger-side audience check
+    # in notification_dispatch.post_event_message — both consult the same
+    # shared registry in message_audience.
+    audience = policy.audience or route_event(event_type)
+    if not is_operator_visible(audience):
+        return AlertDecision(
+            False,
+            policy.event_type,
+            policy.domain,
+            policy.route,
+            reason=f"audience:{audience}",
+        )
+
     if policy.route != ROUTE_ALERT:
         return AlertDecision(
             False,

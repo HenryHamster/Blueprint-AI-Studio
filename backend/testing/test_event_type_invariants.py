@@ -84,8 +84,9 @@ def test_snapshot_has_required_fields():
     with open(snapshot_path) as f:
         snapshot = json.load(f)
 
-    required_fields = {"name", "classification", "source_fn"}
+    required_fields = {"name", "classification", "source_fn", "audience"}
     valid_classifications = {"escalation", "high_signal", "routine"}
+    valid_audiences = {"operator-action-needed", "operator-fyi", "strategist-internal", "pipeline-log"}
 
     for entry in snapshot["event_types"]:
         missing = required_fields - set(entry.keys())
@@ -97,6 +98,34 @@ def test_snapshot_has_required_fields():
         assert classification in valid_classifications, (
             f"Event type '{entry['name']}' has invalid classification '{classification}'. "
             f"Must be one of: {valid_classifications}"
+        )
+
+        audience = entry.get("audience")
+        assert audience in valid_audiences, (
+            f"Event type '{entry['name']}' has invalid audience '{audience}'. "
+            f"Must be one of: {valid_audiences}"
+        )
+
+
+def test_all_snapshot_entries_have_audience():
+    """Every event type in the snapshot must carry an ``audience`` field.
+
+    This is the fail-closed guard for the ledger side: any event type without
+    ``audience`` would default to ``strategist-internal`` (suppressed for the
+    operator).  A new ``post_*_message`` function whose event type is missing
+    from the snapshot (or lacks ``audience``) fails CI — the same mechanism
+    that keeps ``HIGH_SIGNAL_NOTE_EVENT_TYPES`` honest today.
+    """
+    snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
+    with open(snapshot_path) as f:
+        snapshot = json.load(f)
+
+    valid_audiences = {"operator-action-needed", "operator-fyi", "strategist-internal", "pipeline-log"}
+    for entry in snapshot["event_types"]:
+        audience = entry.get("audience")
+        assert audience in valid_audiences, (
+            f"Event type '{entry['name']}' has missing or invalid audience='{audience}'. "
+            f"Every event type must declare an audience in {valid_audiences}."
         )
 
 

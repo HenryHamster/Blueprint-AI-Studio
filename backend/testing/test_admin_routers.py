@@ -4472,6 +4472,61 @@ class TestMessages:
         assert data["total"] == 0
 
     @pytest.mark.asyncio
+    async def test_list_messages_excludes_strategist_internal_audience(
+        self, client: AsyncClient, db_session
+    ):
+        """Ledger read path filters out strategist-internal-tagged rows.
+
+        post_event_message tags routine/unregistered NOTEs with a
+        strategist-internal audience (bookkeeping the strategist may want) but
+        those must never surface on the operator's Messages panel. Rows tagged
+        with an operator audience — and legacy rows with no audience key — stay
+        visible.
+        """
+        project = await _make_project(db_session)
+        # Strategist-internal bookkeeping row — must be hidden from the operator.
+        hidden = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="strategist bookkeeping",
+            status="open",
+            context={"event_type": "pr_merged", "audience": "strategist-internal"},
+        )
+        # Operator-visible row — must be returned.
+        visible = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="operator fyi",
+            status="open",
+            context={"event_type": "failure_alert", "audience": "operator-fyi"},
+        )
+        # Legacy row with no audience key — must remain visible (backward compat).
+        legacy = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="legacy untagged note",
+            status="open",
+            context={"event_type": "some_old_event"},
+        )
+        db_session.add_all([hidden, visible, legacy])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=all"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        contents = {m["content"] for m in data["messages"]}
+        assert "operator fyi" in contents
+        assert "legacy untagged note" in contents
+        assert "strategist bookkeeping" not in contents
+        # total count must also exclude the hidden strategist-internal row.
+        assert data["total"] == 2
+
+    @pytest.mark.asyncio
     async def test_create_message(self, client: AsyncClient, db_session):
         """User can post a message to a project they belong to."""
         project = await _make_project(db_session)
@@ -28783,6 +28838,104 @@ class TestStrategicPendingConfirmDedup:
             )
         assert resp.status_code == 429, resp.text
         assert "cap" in resp.text.lower() or str(PENDING_USER_CONFIRMATION_MAX) in resp.text
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_removes_item_by_id(self, db_session):
+        """resolve_pending_confirm clears the strategist's own pending item by id,
+        leaving siblings intact and reporting removed=True."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-clear-me",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "p-keep",
+                    "type": "access_needed",
+                    "proposal": "Keep me.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-clear-me"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "resolve_pending_confirm"
+        assert body["removed"] is True
+
+        await db_session.refresh(project)
+        ids = [
+            p["id"]
+            for p in (project.problem_model or {}).get("pending_user_confirmation", [])
+        ]
+        assert ids == ["p-keep"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_unknown_id_is_ok_removed_false(
+        self, db_session
+    ):
+        """Clearing an id that is not present is idempotent: ok with removed=False."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-does-not-exist"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["removed"] is False
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_requires_id(self, db_session):
+        """A resolve_pending_confirm with no id is a 400."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {},
+                },
+            )
+        assert resp.status_code == 400, resp.text
 
 
 class TestRecordFindingResolutionViaStrategicOp:

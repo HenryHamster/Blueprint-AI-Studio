@@ -724,10 +724,15 @@ def test_get_notification_stats_initial():
 @pytest.mark.asyncio
 async def test_post_event_message_basic(db_session):
     project_id = uuid.uuid4()
-    msg = await post_event_message(db_session, project_id, "test_event", "Test summary")
+    # "failure_alert" is a registered operator-visible (operator-fyi) event
+    # type, so post_event_message creates the operator-facing NOTE and stamps
+    # the resolved audience onto the row.
+    msg = await post_event_message(db_session, project_id, "failure_alert", "Test summary")
+    assert msg is not None
     assert msg.project_id == project_id
     assert msg.content == "Test summary"
-    assert msg.context["event_type"] == "test_event"
+    assert msg.context["event_type"] == "failure_alert"
+    assert msg.context["audience"] == "operator-fyi"
     assert msg.message_type == MessageType.NOTE
     assert msg.from_type == "system"
     assert msg.from_task_id is None
@@ -736,19 +741,48 @@ async def test_post_event_message_basic(db_session):
 
 
 @pytest.mark.asyncio
+async def test_post_event_message_unregistered_event_is_tagged_strategist_internal(db_session):
+    """Fail-closed: an unregistered event_type resolves to strategist-internal.
+
+    The row is still created (a non-operator strategist-feed row the strategist
+    may want) but is stamped ``audience="strategist-internal"`` so operator
+    surfaces can exclude it — it is never operator-visible.
+    """
+    project_id = uuid.uuid4()
+    msg = await post_event_message(db_session, project_id, "test_event", "Test summary")
+    assert msg is not None
+    assert msg.context["event_type"] == "test_event"
+    assert msg.context["audience"] == "strategist-internal"
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_event_message_registered_internal_event_is_tagged(db_session):
+    """A registered strategist-internal event type is created but tagged non-operator."""
+    project_id = uuid.uuid4()
+    # "pr_merged" is registered as strategist-internal bookkeeping.
+    msg = await post_event_message(db_session, project_id, "pr_merged", "Merged")
+    assert msg is not None
+    assert msg.context["audience"] == "strategist-internal"
+
+
+@pytest.mark.asyncio
 async def test_post_event_message_with_context_and_task_id(db_session):
     project_id = uuid.uuid4()
     task_id = uuid.uuid4()
     extra_ctx = {"key": "value", "num": 42}
+    # "question_answer" is a registered operator-visible (operator-fyi) event type.
     msg = await post_event_message(
         db_session,
         project_id,
-        "my_event",
+        "question_answer",
         "Summary",
         context=extra_ctx,
         task_id=task_id,
     )
-    assert msg.context["event_type"] == "my_event"
+    assert msg is not None
+    assert msg.context["event_type"] == "question_answer"
+    assert msg.context["audience"] == "operator-fyi"
     assert msg.context["key"] == "value"
     assert msg.context["num"] == 42
     assert msg.from_task_id == task_id

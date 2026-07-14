@@ -32,6 +32,14 @@
         "internal_reason": null
     },
     {
+        "op": "resolve_pending_confirm",
+        "alias": "resolve-pending-confirm",
+        "description": "Clear a pending user-confirmation item by id (strategist obtained the decision/credential or it became moot).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
         "op": "set_vision",
         "alias": "set-vision",
         "description": "Update the project vision (purpose, systems, priorities, context).",

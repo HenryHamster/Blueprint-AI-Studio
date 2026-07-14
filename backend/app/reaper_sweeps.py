@@ -1694,6 +1694,234 @@ async def sweep_orphaned_cross_base_children(session, *, batch_size: int = 500) 
     return cancelled
 
 
+# ── Stage-2 generalized message lifecycle sweeps (design d-7c851b3f) ──────────
+#
+# Two cadence sweeps that generalize the bug-class-only convergence machinery so
+# actionable operator items auto-clear when their underlying condition resolves
+# and dead conversation ages out — WITHOUT operator involvement:
+#
+#   1. sweep_resolve_linked_messages — resolves ANY 'linked' NON-bug-class
+#      message (NOTE / QUESTION / FEEDBACK) once its recorded _convergence_link
+#      target genuinely lands. Bug-class ('BUG_REPORT'/'BLOCKER') linked messages
+#      stay owned by sweep_converge_linked_bug_messages (Step 15), which ALSO
+#      resurfaces on failure; the two are disjoint by message_type and together
+#      cover every 'linked' message.
+#   2. sweep_decay_stale_open_messages — auto-resolves an OPEN conversational
+#      (NOTE/FEEDBACK) item with no activity for STALE_OPEN_DECAY_DAYS and no live
+#      linked condition, stamping resolution 'auto-decayed (stale)'. Genuinely-live
+#      QUESTION/BLOCKER items are never decayed.
+
+# Decay window (days) after which a stale open conversational message is
+# auto-resolved. Exposed as a module constant so the one-time backlog migration
+# reuses the SAME threshold; overridable at runtime via
+# runtime_config['stale_open_message_decay_days'].
+STALE_OPEN_DECAY_DAYS = 14
+
+
+async def sweep_resolve_linked_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Resolve NON-bug-class 'linked' messages whose owning outcome landed.
+
+    Generalizes the positive-convergence half of Step 15 to NOTE/QUESTION/
+    FEEDBACK: a 'linked' message is terminally resolved once its recorded
+    ``_convergence_link`` target genuinely LANDS (direction 'completed' or task
+    merged-completion), clearing its needs-action derivation without operator
+    involvement. Disjoint from Step 15 by message_type (bug-class stays owned by
+    ``sweep_converge_linked_bug_messages``, which also resurfaces on failure).
+
+    An outcome that has not landed leaves the message 'linked' — manual resolve
+    and the bug-class resurfacing sweep remain the fallback. Fail-safe per
+    message (one bad row never aborts the batch), idempotent (resolution moves
+    status off 'linked'), and broadcasts a ``message_updated`` envelope per row.
+
+    Returns the number of messages auto-resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        LINKED_STATUS,
+        linked_outcome_landed_resolution,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == LINKED_STATUS,
+                    ProjectMessage.message_type.notin_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] linked-message resolve sweep hit cap=%d linked messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Fail-safe: one malformed/unreadable owner must never abort the batch.
+        try:
+            audit = await linked_outcome_landed_resolution(session, msg, now=now)
+        except Exception:
+            logger.warning(
+                "[REAPER] linked-message resolve failed for message %s — "
+                "leaving linked",
+                msg.id,
+                exc_info=True,
+            )
+            continue
+        if audit is None:
+            continue
+        mark_message_resolved(msg, now, f"Owned outcome landed: {audit}")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] linked-message resolve: auto-resolved message %s — %s",
+            msg.id,
+            audit,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] linked-message resolve broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] linked-message resolve: auto-resolved %d linked message(s)",
+            resolved,
+        )
+    return resolved
+
+
+async def sweep_decay_stale_open_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Auto-resolve dead conversational (NOTE/FEEDBACK) open threads.
+
+    Ages out any OPEN NOTE/FEEDBACK item with no activity for the decay window
+    (``STALE_OPEN_DECAY_DAYS``, overridable via
+    ``runtime_config['stale_open_message_decay_days']``) and no live linked
+    condition, stamping ``resolution='auto-decayed (stale)'``. Genuinely-live
+    QUESTION/BLOCKER items and any message carrying a live ``_convergence_link``
+    are left untouched.
+
+    Fail-safe per message, idempotent (resolution moves status off 'open'), and
+    broadcasts a ``message_updated`` envelope per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        CONVERSATIONAL_DECAY_MESSAGE_TYPES,
+        OPEN_STATUS,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get("stale_open_message_decay_days", STALE_OPEN_DECAY_DAYS)
+    )
+    cutoff = now - timedelta(days=decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type.in_(
+                        list(CONVERSATIONAL_DECAY_MESSAGE_TYPES)
+                    ),
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-open decay sweep hit cap=%d open conversational "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Never decay an open item that still carries a live linked condition
+        # (defensive — open items are normally unlinked, but a resurfaced link
+        # can leave the stale forward pointer behind).
+        if get_message_link(msg) is not None:
+            continue
+        mark_message_resolved(msg, now, "auto-decayed (stale)")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] stale-open decay: auto-resolved message %s (no activity "
+            "for >=%dd)",
+            msg.id,
+            decay_days,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] stale-open decay broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] stale-open decay: auto-resolved %d stale open message(s)",
+            resolved,
+        )
+    return resolved
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
@@ -2475,6 +2703,9 @@ __all__ = [
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",
+    "sweep_resolve_linked_messages",
+    "sweep_decay_stale_open_messages",
+    "STALE_OPEN_DECAY_DAYS",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",

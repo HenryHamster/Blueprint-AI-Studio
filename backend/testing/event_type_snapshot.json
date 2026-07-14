@@ -4,241 +4,281 @@
       "name": "pr_merged",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_pr_merged_message"
+      "source_fn": "post_pr_merged_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "direction_milestone",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_direction_milestone_message"
+      "source_fn": "post_direction_milestone_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "cycle_summary",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_cycle_summary_message"
+      "source_fn": "post_cycle_summary_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "failure_alert",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_failure_alert_message"
+      "source_fn": "post_failure_alert_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "account_model_regression_quarantined",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_account_model_regression_message"
+      "source_fn": "post_account_model_regression_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "account_model_regression_recovered",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_account_model_regression_recovered_message"
+      "source_fn": "post_account_model_regression_recovered_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "auto_fix_spawned",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_auto_fix_spawned_message"
+      "source_fn": "post_auto_fix_spawned_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "auto_fix_result",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_auto_fix_result_message"
+      "source_fn": "post_auto_fix_result_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "auto_fix_escalated",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_auto_fix_escalation_message"
+      "source_fn": "post_auto_fix_escalation_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "residual_fix_spawned",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_residual_fix_spawned_message"
+      "source_fn": "post_residual_fix_spawned_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "residual_fix_result",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_residual_fix_result_message"
+      "source_fn": "post_residual_fix_result_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "residual_fix_escalated",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_residual_fix_escalation_message"
+      "source_fn": "post_residual_fix_escalation_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "residual_fix_unsuspended",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_residual_fix_unsuspend_message"
+      "source_fn": "post_residual_fix_unsuspend_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "residual_fix_audit_deferred",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_residual_fix_audit_deferred_escalation_message"
+      "source_fn": "post_residual_fix_audit_deferred_escalation_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "residual_case_auto_resolved",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "close_residual_case_resolved"
+      "source_fn": "close_residual_case_resolved",
+      "audience": "strategist-internal"
     },
     {
       "name": "remediation_escalated",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_remediation_escalation_message"
+      "source_fn": "post_remediation_escalation_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "issue_implementation_spawned",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_issue_implementation_spawned_message"
+      "source_fn": "post_issue_implementation_spawned_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "review_feedback",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_review_feedback_message"
+      "source_fn": "post_review_feedback_message",
+      "audience": "strategist-internal"
     },
     {
       "name": "rollback_recommended",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_rollback_recommendation_message"
+      "source_fn": "post_rollback_recommendation_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "feedback_acknowledgment",
       "classification": "routine",
       "message_type": "NOTE",
-      "source_fn": "post_feedback_acknowledgment"
+      "source_fn": "post_feedback_acknowledgment",
+      "audience": "strategist-internal"
     },
     {
       "name": "fix_loop_divergence_regressed",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_fix_loop_divergence_regression_message"
+      "source_fn": "post_fix_loop_divergence_regression_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "release_calcifying",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_calcification_message"
+      "source_fn": "post_version_calcification_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "release_build_stalled",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_build_stalled_message"
+      "source_fn": "post_version_build_stalled_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "release_stabilize_stalled",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_stabilize_stalled_message"
+      "source_fn": "post_version_stabilize_stalled_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "release_ci_unresolved_stall",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_ci_unresolved_stall_message"
+      "source_fn": "post_version_ci_unresolved_stall_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "direction_burn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_direction_burn_pause_message"
+      "source_fn": "post_direction_burn_pause_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "direction_outcome_stalled",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_direction_outcome_stalled_message"
+      "source_fn": "post_direction_outcome_stalled_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "direction_staged_activated",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_staged_directions_activated_message"
+      "source_fn": "post_staged_directions_activated_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "direction_outcome_scaffolding_escalation",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_direction_outcome_scaffolding_escalation_message"
+      "source_fn": "post_direction_outcome_scaffolding_escalation_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "direction_churn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",
-      "source_fn": "post_direction_churn_pause_message"
+      "source_fn": "post_direction_churn_pause_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "promotion_readiness_reached",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_promotion_readiness_message"
+      "source_fn": "post_version_promotion_readiness_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "release_auto_merge_stalled",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_version_auto_merge_stall_message"
+      "source_fn": "post_version_auto_merge_stall_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "strategic_steering_deferred",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_strategic_steering_deferred_message"
+      "source_fn": "post_strategic_steering_deferred_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "strategic_steering_acted",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_strategic_steering_acted_message"
+      "source_fn": "post_strategic_steering_acted_message",
+      "audience": "operator-fyi"
     },
     {
       "name": "capability_trial_stalled",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "raise_stalled_trial_notice"
+      "source_fn": "raise_stalled_trial_notice",
+      "audience": "operator-fyi"
     },
     {
       "name": "capability_verdict_decided",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "raise_capability_verdict_notice"
+      "source_fn": "raise_capability_verdict_notice",
+      "audience": "operator-fyi"
     },
     {
       "name": "capability_trial_ambiguous_lift_escalation",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "raise_ambiguous_lift_escalation_notice"
+      "source_fn": "raise_ambiguous_lift_escalation_notice",
+      "audience": "operator-fyi"
     },
     {
       "name": "question_answer",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_question_answer"
+      "source_fn": "post_question_answer",
+      "audience": "operator-fyi"
     },
     {
       "name": "criterion_retracted",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_criterion_retracted_message"
+      "source_fn": "post_criterion_retracted_message",
+      "audience": "operator-action-needed"
     },
     {
       "name": "criterion_superseded",
       "classification": "high_signal",
       "message_type": "NOTE",
-      "source_fn": "post_criterion_superseded_message"
+      "source_fn": "post_criterion_superseded_message",
+      "audience": "operator-action-needed"
     }
   ]
 }

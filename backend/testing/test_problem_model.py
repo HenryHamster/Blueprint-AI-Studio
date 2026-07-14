@@ -3359,6 +3359,33 @@ def test_explicit_deletions_remove_named_agent_owned_entries():
     assert diff.get("friction_deleted") == ["f-gone"]
 
 
+def test_pending_user_confirmation_deletion_is_auditable_in_diff():
+    """A strategist clearing a pending confirmation via _deletions must be
+    auditable — the deletion surfaces in the structured revision-log diff so it
+    is not an invisible mutation (Stage 2 lifecycle, design d-7c851b3f)."""
+    current = {
+        "revision": 1,
+        "pending_user_confirmation": [
+            {
+                "id": "p-creds",
+                "type": "credentials_needed",
+                "proposal": "need a token",
+                "created_at": "2026-06-01T00:00:00",
+            },
+            {
+                "id": "p-keep",
+                "type": "access_needed",
+                "proposal": "keep me",
+                "created_at": "2026-06-01T00:00:00",
+            },
+        ],
+    }
+    proposed = {"_deletions": {"pending_user_confirmation": ["p-creds"]}}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-keep"}
+    assert diff.get("pending_user_confirmation_deleted") == ["p-creds"]
+
+
 def test_deletions_removes_archived_gap_by_id():
     current = {
         "revision": 1,

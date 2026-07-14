@@ -97,6 +97,8 @@ from app.rollup_migration_validation import (
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
+from app.message_audience import is_operator_visible, route_event
+
 logger = logging.getLogger(__name__)
 
 # Priority for the conflict-resolution task — expedited (design doc:
@@ -281,6 +283,14 @@ async def _emit_size_violation_alerts(
     ERROR alerts the title is stable (no bucket) so the dedup is project-wide
     and persistent until dismissed.
     """
+    # Audience gate: size violations are strategist-internal bookkeeping and
+    # must never reach the operator.  This check keeps the function fast
+    # (does nothing) so the registry is the single policy source.
+    if not is_operator_visible(route_event("hotfix_backmerge.size_violation")):
+        logger.debug(
+            "[BACKMERGE] Size-violation alerts suppressed (audience=strategist-internal)"
+        )
+        return
     # ── Pre-load existing alert titles for dedup ──────────────────────
     all_possible_titles: list[str] = []
     for _v in violations:

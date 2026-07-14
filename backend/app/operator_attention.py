@@ -1988,7 +1988,16 @@ async def build_operator_attention(
                     else_=0,
                 )).label("approval"),
                 func.sum(case(
-                    (Task.status == TaskStatus.FAILED, 1),
+                    (
+                        and_(
+                            Task.status == TaskStatus.FAILED,
+                            not_(and_(
+                                Task.context["audience"].isnot(None),
+                                Task.context["audience"].as_string() == "strategist-internal",
+                            )),
+                        ),
+                        1,
+                    ),
                     else_=0,
                 )).label("failed"),
                 func.sum(case(
@@ -2241,6 +2250,10 @@ async def build_operator_attention(
                     Task.archived.is_(False),
                     Task.status == TaskStatus.FAILED,
                     Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
+                    not_(and_(
+                        Task.context["audience"].isnot(None),
+                        Task.context["audience"].as_string() == "strategist-internal",
+                    )),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
