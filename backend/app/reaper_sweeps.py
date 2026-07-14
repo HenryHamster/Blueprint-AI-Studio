@@ -1732,6 +1732,82 @@ _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
 _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
 _last_compute_image_gc_guard_sweep: datetime | None = None
 
+# Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
+# an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
+# gcloud binary / Artifact Registry API error / non-zero exit), so a failed apply
+# used to be entirely silent: not logged, not counted, not alerted. A missing
+# ``inuse-`` tag means registry time/count retention — which cannot query the DB —
+# can reclaim a digest a live/recent compute job (or the project's DB-pinned
+# default image) still depends on. This surfaces that as an actionable alert.
+_COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE = (
+    "Compute-image GC protection tag failed to apply"
+)
+
+
+async def _alert_compute_image_protection_failures(
+    session, project_ids, *, apply_failed: int, now: datetime
+) -> int:
+    """Raise a deduped WARNING alert per project whose ``inuse-`` tag apply failed.
+
+    ``apply_registry_protection_tag`` is fail-open: on a missing gcloud binary, an
+    Artifact Registry API error, or a non-zero exit it returns ``None`` rather than
+    raising. Previously the sweep just did not increment its applied counter, so
+    the failure vanished. Because the registry's retention policy is purely
+    time/count-based and cannot see the DB, a digest that never got its ``inuse-``
+    protection tag can be GC'd out from under the very job/pin that still references
+    it. One open alert per affected project (deduped on an open row with the same
+    title) until an operator dismisses it. Returns the number of NEW alerts created.
+    """
+    from app.models import Alert, AlertSeverity
+
+    project_ids = [p for p in dict.fromkeys(project_ids) if p is not None]
+    if not project_ids:
+        return 0
+
+    # Single batched existence query (no per-project N+1): which of these projects
+    # already carry an OPEN alert with our title.
+    already = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.title == _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE,
+                    Alert.dismissed_at.is_(None),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    created = 0
+    for pid in project_ids:
+        if pid in already:
+            continue
+        session.add(
+            Alert(
+                project_id=pid,
+                severity=AlertSeverity.WARNING,
+                title=_COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE,
+                message=(
+                    "The hourly compute-image GC-protection sweep could not apply an "
+                    "inuse- registry protection tag to at least one digest this project "
+                    "references (fail-open gcloud / Artifact Registry error). Until the "
+                    "tag is applied on a later sweep, registry time/count retention "
+                    "could reclaim a digest a live/recent compute job — or this "
+                    "project's pinned default image — still depends on, breaking "
+                    "reproducibility. Check gcloud availability and Artifact Registry "
+                    "API health on the orchestrator host."
+                )[:1000],
+            )
+        )
+        created += 1
+    if created:
+        await session.commit()
+    return created
+
 
 def _split_pinned_ref(ref: str) -> tuple[str, str] | None:
     """Split a digest-pinned image ref into ``(full_repo, digest)``.
@@ -1861,7 +1937,7 @@ async def sweep_protect_referenced_compute_image_digests(
         _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
         _now,
     ):
-        return {"applied": 0, "pruned": 0, "skipped_cadence": 1}
+        return {"applied": 0, "pruned": 0, "apply_failed": 0, "skipped_cadence": 1}
     _last_compute_image_gc_guard_sweep = _now
 
     apply_tag = _apply_tag or apply_registry_protection_tag
@@ -1950,10 +2026,18 @@ async def sweep_protect_referenced_compute_image_digests(
     #     very job that was still pulling it, which is precisely the failure this
     #     sweep's docstring promises to prevent.
     targets: set[tuple[str, str]] = set()
+    # Map each protection target back to the project that pins it, so a FAILED
+    # apply can be surfaced as an actionable alert on the affected project. Only
+    # ProjectComputeImage-derived targets carry a project_id here; job-only refs
+    # (no build row) still count toward apply_failed and log, but have no single
+    # owning project to alert.
+    target_project: dict[tuple[str, str], uuid.UUID] = {}
 
     for img in images:
         if img.digest and img.digest in referenced:
-            targets.add((f"{img.registry_repo}/{img.image_name}", img.digest))
+            key = (f"{img.registry_repo}/{img.image_name}", img.digest)
+            targets.add(key)
+            target_project.setdefault(key, img.project_id)
 
     job_refs = await _referenced_compute_image_repo_digests(session, since=cutoff)
     for full_repo, digest in job_refs:
@@ -1961,6 +2045,8 @@ async def sweep_protect_referenced_compute_image_digests(
             targets.add((full_repo, digest))
 
     applied = 0
+    apply_failed = 0
+    failed_projects: list[uuid.UUID] = []
     pruned = 0
     # Every repo we know about gets its stale protection tags pruned — including
     # repos we only learned about from a job's container_image.
@@ -1972,6 +2058,16 @@ async def sweep_protect_referenced_compute_image_digests(
         # sweep cannot stall API responsiveness or heartbeat processing.
         if await asyncio.to_thread(apply_tag, full_repo, digest):
             applied += 1
+        else:
+            # apply_registry_protection_tag is fail-open (None on missing gcloud /
+            # AR API error / non-zero exit). This used to vanish silently — no
+            # warning, no count, no alert — while the referenced digest lost its
+            # only GC protection. Count it, and remember the owning project so the
+            # failure can be alerted below.
+            apply_failed += 1
+            owner = target_project.get((full_repo, digest))
+            if owner is not None:
+                failed_projects.append(owner)
 
     for full_repo in repos:
         try:
@@ -1983,7 +2079,37 @@ async def sweep_protect_referenced_compute_image_digests(
                 if await asyncio.to_thread(delete_tag, full_repo, tag):
                     pruned += 1
 
-    return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
+    # Surface fail-open apply failures — the whole point is that they are no longer
+    # silent. A missing inuse- tag means registry retention can reclaim a digest a
+    # live/recent job or DB-pinned default still references.
+    if apply_failed:
+        logger.warning(
+            "sweep_protect_referenced_compute_image_digests: %d of %d protection-tag "
+            "apply(s) FAILED fail-open (no inuse- tag written) — referenced compute-"
+            "image digest(s) may be GC'd out from under a live/recent job or a DB-"
+            "pinned project default. applied=%d",
+            apply_failed,
+            len(targets),
+            applied,
+        )
+        try:
+            await _alert_compute_image_protection_failures(
+                session, failed_projects, apply_failed=apply_failed, now=_now
+            )
+        except Exception:  # noqa: BLE001 — alerting must never crash the sweep
+            logger.exception(
+                "sweep_protect_referenced_compute_image_digests: failed to raise "
+                "protection-failure alert(s)"
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    return {
+        "applied": applied,
+        "pruned": pruned,
+        "apply_failed": apply_failed,
+        "skipped_cadence": 0,
+    }
 
 
 # ── Auto-rebuild project compute images on manifest change ────────────────────

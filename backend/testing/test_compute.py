@@ -16971,6 +16971,55 @@ def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
     assert len(layer_scan_called_with) == 1
 
 
+def test_build_and_push_config_env_baked_secret_blocked_before_push(tmp_path):
+    """End-to-end: a platform secret baked into the built image's .config.Env is
+    blocked by the REAL layer scanner before any push.
+
+    A ``RUNNER_TOKEN`` inherited from a base image / injected via --build-arg lands
+    in ``.config.Env`` without appearing in the source Dockerfile (which is clean
+    here) or as a credential PATTERN in any layer file. This exercises the actual
+    ``scan_image_layers_for_credentials`` config-env path through ``build_and_push``
+    — not an injected fake — proving the "no platform creds baked into project
+    images" guard is enforced, not merely a design note.
+    """
+    repo = _write_repo(tmp_path)  # clean Dockerfile (input scan passes)
+    # docker-save archive: clean layer file, config.Env bakes a platform secret.
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/bin", "RUNNER_TOKEN=baked-into-the-runtime-env"]
+    )
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        # `docker save -o <path> <ref>` streams the archive to the -o destination;
+        # the real scanner reads it back and finds the baked secret.
+        if "save" in cmd and "-o" in cmd:
+            with open(cmd[cmd.index("-o") + 1], "wb") as fh:
+                fh.write(archive)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return P()
+
+    with pytest.raises(_bci.CredentialLeakError, match="built image layers"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _assert_network_fn=lambda *a, **k: None,
+        )
+    flat = [" ".join(c) for c in cmds]
+    assert any(c.startswith("docker build") for c in flat)
+    assert not any(c.startswith("docker push") for c in flat)
+
+
 # ---------------------------------------------------------------------------
 # Build-network confinement: a repo-controlled Dockerfile's RUN steps run on the
 # ORCHESTRATOR HOST. With the default docker build network they can reach

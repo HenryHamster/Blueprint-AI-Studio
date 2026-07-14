@@ -313,6 +313,125 @@ async def test_apply_tag_failure_does_not_count_toward_applied(db):
     assert result["applied"] == 0
 
 
+@pytest.mark.asyncio
+async def test_apply_failures_are_counted_and_returned(db):
+    """Every fail-open apply is counted in the returned ``apply_failed`` field.
+
+    Regression for the silent-failure bug: when apply_registry_protection_tag
+    returns None the sweep used to neither count nor surface it. Two referenced
+    digests whose apply fails must yield apply_failed=2 (not a silent 0).
+    """
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW)
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: None,  # every apply fails
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    assert result["applied"] == 0
+    assert result["apply_failed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_failure_raises_deduped_project_alert(db):
+    """A fail-open apply raises exactly one open WARNING alert for the owning project."""
+    from app.models import Alert, AlertSeverity
+    from app.reaper_sweeps import _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE
+
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    async def _run_sweep():
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            return await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: None,  # fails -> alert
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+    await _run_sweep()
+
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.title == _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one protection-failure alert expected"
+    assert alerts[0].project_id == project.id
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    # A second sweep with the alert still open must NOT create a duplicate.
+    await _run_sweep()
+    alerts_after = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.title == _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_after) == 1, "open alert must be deduped, not duplicated"
+
+
+@pytest.mark.asyncio
+async def test_successful_apply_raises_no_failure_alert(db):
+    """When every apply succeeds, apply_failed=0 and no alert is raised."""
+    from app.models import Alert
+    from app.reaper_sweeps import _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE
+
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: "inuse-tag",  # always succeeds
+            _list_tags=lambda repo: [],
+            _delete_tag=lambda repo, tag: False,
+        )
+
+    assert result["apply_failed"] == 0
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.title == _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
 # ── Fail-open semantics ───────────────────────────────────────────────────────
 
 
@@ -570,7 +689,12 @@ async def test_no_images_returns_zero_counts(db):
             _delete_tag=lambda repo, tag: False,
         )
 
-    assert result == {"applied": 0, "pruned": 0, "skipped_cadence": 0}
+    assert result == {
+        "applied": 0,
+        "pruned": 0,
+        "apply_failed": 0,
+        "skipped_cadence": 0,
+    }
 
 
 # ── Job-referenced digests with NO ProjectComputeImage row ────────────────────
