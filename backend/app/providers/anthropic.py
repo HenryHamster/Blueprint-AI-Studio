@@ -99,6 +99,13 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     # + rerouted. Also listed in _QUOTA_EXHAUSTED_PATTERNS so it earns the flat
     # 24h cooldown (the weekly reset is ~a day out, not a 5-hour throttle).
     "weekly limit reached",
+    # Org billing cap: "You've hit your org's monthly spend limit · ask your
+    # admin to raise it at claude.ai/settings/usage". Matched on the
+    # apostrophe-free tail so a curly-quote "org's" can't break the substring
+    # match. Also in _QUOTA_EXHAUSTED_PATTERNS — a spend cap is a billing wall
+    # (doesn't self-reset until the billing month rolls or an admin raises it),
+    # so it must earn the flat 24h cooldown, not the 5-hour exponential.
+    "monthly spend limit",
 )
 
 # Weekly / 7-day caps resolve on a ~24h clock, not within the short exponential
@@ -108,6 +115,7 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
 _QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
     "you've hit your weekly limit",
     "weekly limit reached",
+    "monthly spend limit",
 )
 
 # Substrings in Claude CLI stderr that prove the OAuth token is permanently

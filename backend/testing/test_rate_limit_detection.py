@@ -54,6 +54,11 @@ VERBATIM_POSITIVES = [
     # Anthropic API 429
     "API Error: Rate limit reached",
     "This request would exceed your account's rate limit. Please try again later.",
+    # Org monthly spend cap (Claude Code CLI banner). Uses curly apostrophes
+    # (’) verbatim — the pattern matches on the apostrophe-free tail
+    # "monthly spend limit" so quote style can't break detection.
+    "You’ve hit your org’s monthly spend limit · ask your admin to raise it at claude.ai/settings/usage",
+    "You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage",
 ]
 
 
@@ -85,6 +90,25 @@ def test_weekly_limit_routes_to_quota_exhausted_kind(msg):
     )
     assert sig.kind == "quota_exhausted", (
         f"weekly-limit message should be quota_exhausted (24h cooldown), got {sig.kind!r}"
+    )
+
+
+def test_monthly_spend_limit_routes_to_quota_exhausted_kind():
+    """An org monthly spend cap is a billing wall — it doesn't self-reset until
+    the billing month rolls over or an admin raises it, so it must classify as
+    kind='quota_exhausted' (flat 24h cooldown), not the 5-hour exponential
+    that would re-cycle tasks against a still-capped org every few hours."""
+    from app.providers.anthropic import AnthropicProvider
+    from app.providers.base import LLMAuthMode
+
+    msg = (
+        "You’ve hit your org’s monthly spend limit · "
+        "ask your admin to raise it at claude.ai/settings/usage"
+    )
+    sig = AnthropicProvider().classify_rate_limit_signal(LLMAuthMode.OAUTH, msg.lower())
+    assert sig is not None, "monthly spend-limit banner not recognized as rate limit"
+    assert sig.kind == "quota_exhausted", (
+        f"spend-limit banner should be quota_exhausted (24h cooldown), got {sig.kind!r}"
     )
 
 
