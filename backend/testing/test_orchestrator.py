@@ -9,6 +9,7 @@ Tests three areas:
 
 import os
 
+import asyncio
 import pytest
 import json
 import uuid
@@ -890,6 +891,220 @@ def test_select_eligible_runner_no_container_image_ignores_container_cap():
         "a non-container runner must still be selectable when no "
         "container_image is declared"
     )
+
+
+# ── Disk-fit gating for container-image jobs ──────────────────────────────────
+
+
+def _disk_floor_bytes():
+    from app.orchestrator_runner_dispatch import _container_image_min_free_disk_bytes
+
+    return _container_image_min_free_disk_bytes()
+
+
+def test_runner_has_free_disk_present_absent_malformed():
+    """_runner_has_free_disk gates only on real, sufficient disk data."""
+    from app.runner_eligibility import _runner_has_free_disk, RunnerDispatchSnapshot
+
+    floor = 10_000
+
+    roomy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": 20_000},
+    )
+    full = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": 5_000},
+    )
+    absent = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities={},
+    )
+    malformed = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": "lots"},
+    )
+
+    assert _runner_has_free_disk(roomy, floor) is True
+    assert _runner_has_free_disk(full, floor) is False
+    # Absent telemetry ⇒ eligible (backward compatible), like _runner_has_free_vram.
+    assert _runner_has_free_disk(absent, floor) is True
+    # Malformed telemetry ⇒ not gated (do not trust unparseable data).
+    assert _runner_has_free_disk(malformed, floor) is True
+    # A non-positive floor is no floor.
+    assert _runner_has_free_disk(full, 0) is True
+
+
+def test_select_eligible_runner_disk_filter_excludes_full_runner():
+    """A container-image job is NOT dispatched to a container-capable runner whose
+    reported free disk is below the fit floor."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,  # ~1 MB free — below the multi-GB floor
+        },
+    )
+    cache = {project_id: [full_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "a container-capable but nearly-full runner must be excluded so the "
+        "multi-GB image job holds instead of dying mid-pull"
+    )
+
+
+def test_select_eligible_runner_disk_filter_selects_roomy_runner():
+    """Between a full and a roomy container-capable runner, the roomy one wins."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    floor = _disk_floor_bytes()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,
+        },
+    )
+    roomy_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": floor + 1_000_000_000,
+        },
+    )
+    cache = {project_id: [full_runner, roomy_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == roomy_runner.id
+
+
+def test_select_eligible_runner_disk_absent_telemetry_passes():
+    """A container-capable runner that does not report disk_free_bytes is still
+    eligible (backward compatible — never gate on missing telemetry)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            # no disk_free_bytes reported
+        },
+    )
+    cache = {project_id: [old_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == old_runner.id
+
+
+def test_select_eligible_runner_no_container_image_ignores_disk():
+    """Without a container_image, the disk-fit gate does not apply — a nearly-full
+    runner is still eligible for a non-image compute job."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000,
+        },
+    )
+    cache = {project_id: [full_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,
+    )
+    assert selected is not None
+    assert selected.id == full_runner.id
+
+
+def test_diagnose_strict_pin_hold_reports_insufficient_disk():
+    """A strict pin to a container-capable-but-full runner reports the honest
+    insufficient_disk reason (not the generic not_eligible)."""
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=runner_id,
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,
+        },
+    )
+    cache = {project_id: [full_runner]}
+    reason, detail = asyncio.run(
+        _diagnose_strict_runner_pin_hold(
+            session=None,
+            active_runners_cache=cache,
+            project_id=project_id,
+            pinned_runner_id=str(runner_id),
+            task_type="compute_experiment",
+            accelerator=None,
+            container_image="my-image:latest",
+            runner_pins_this_cycle={},
+        )
+    )
+    assert reason == "insufficient_disk", (
+        f"expected insufficient_disk, got {reason!r}: {detail}"
+    )
+    assert "free disk" in detail
 
 
 # ── GPU-in-container-capability gating (image + accelerator) ──────────────────

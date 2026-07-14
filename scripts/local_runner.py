@@ -3871,6 +3871,21 @@ def _compute_poll_loop(
                 time.sleep(poll_interval)
                 continue
 
+            # Low-disk guard: don't claim compute work when the workspace
+            # filesystem is nearly full. A baked container-image job must PULL a
+            # multi-GB image before it can start; claiming it on a nearly-full
+            # box means the pull dies "no space left on device" and the claim is
+            # wasted. Mirrors the agent poll loop's guard; disabled by default (0).
+            if _disk_below_min(_workspace_root(), _min_free_disk_bytes()):
+                _release_capacity(capacity)
+                print(
+                    f"[compute] low disk on {_workspace_root()} "
+                    f"(< {_min_free_disk_bytes()} bytes free) — skipping compute claim.",
+                    flush=True,
+                )
+                time.sleep(poll_interval)
+                continue
+
             # Host-load guard: skip claiming when GPU is saturated.
             if max_gpu_util_pct > 0:
                 util = _gpu_utilization_pct()

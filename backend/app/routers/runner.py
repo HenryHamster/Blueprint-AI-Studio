@@ -1626,6 +1626,36 @@ async def next_compute_job(
         response.status_code = status.HTTP_204_NO_CONTENT
         return response
 
+    # Claim-time disk-fit re-check for container-image jobs. Server-side dispatch
+    # gates on the heartbeat disk_free_bytes at PIN time, but the runner's free
+    # disk can fall between pin and this poll. A baked image is multi-GB and must
+    # be pulled before the job starts; claiming it on a runner that can no longer
+    # fit it wastes the claim (the pull dies "no space left on device"). Re-check
+    # the freshest heartbeat here and, if the runner is now below the fit floor,
+    # LEAVE the job STARTING (do not transition to RUNNING) and return 204 so it
+    # re-dispatches to a runner (or cloud backend) that can fit it. Runners that
+    # do not report disk_free_bytes are not gated (backward compatible).
+    if (job.polling_metadata or {}).get("container_image"):
+        from app.orchestrator_runner_dispatch import (
+            _container_image_min_free_disk_bytes,
+        )
+        from app.runner_eligibility import _runner_has_free_disk
+
+        disk_floor = _container_image_min_free_disk_bytes()
+        if not _runner_has_free_disk(runner, disk_floor):
+            reported = (runner.capabilities or {}).get("disk_free_bytes")
+            logger.warning(
+                "[RUNNERS] Not dispatching container-image compute job %s to runner "
+                "%s: reports only %s free disk bytes, below the %s-byte fit floor; "
+                "leaving STARTING for re-dispatch",
+                job.id,
+                runner.id,
+                reported,
+                disk_floor,
+            )
+            response.status_code = status.HTTP_204_NO_CONTENT
+            return response
+
     job.status = ComputeJobStatus.RUNNING
     job.started_at = job.started_at or now
     job.last_heartbeat_at = now

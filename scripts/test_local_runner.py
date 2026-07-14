@@ -542,6 +542,63 @@ class TestHostLoadThrottle(unittest.TestCase):
         )
         self.assertTrue(len(calls) >= 1)
 
+    def test_low_disk_skips_compute_claim(self):
+        """Compute poll skips claiming when workspace free disk is below the guard.
+
+        A baked container-image job must pull a multi-GB image before starting;
+        claiming on a nearly-full box wastes the claim, so the loop must not
+        even POST to next-compute-job while disk is below the floor.
+        """
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return (204, None, None)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
+             patch.object(local_runner, "_disk_below_min", return_value=True), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        self.assertEqual(calls, [], "must not poll for compute work while disk is low")
+
+    def test_disk_ok_allows_compute_claim(self):
+        """Compute poll proceeds when workspace free disk is above the guard."""
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return (204, None, None)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
+             patch.object(local_runner, "_disk_below_min", return_value=False), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        self.assertTrue(len(calls) >= 1)
+
 
 # ── Live-safe config applied from heartbeat response ──────────────────────────
 

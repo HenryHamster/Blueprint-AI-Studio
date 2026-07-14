@@ -294,10 +294,34 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_gpu_in_container_capable,
     _runner_handles_task_type,
     _runner_has_container_capability,
+    _runner_has_free_disk,
     _runner_has_free_vram,
     _runner_max_concurrent_compute,
     _runner_meets_min_compute_capability,
 )
+
+# Free-disk floor a runner must clear to be sent a container-image compute job.
+# A baked compute image is multi-GB and must be PULLED before the job starts;
+# a runner below this floor would die mid-pull ("no space left on device"),
+# wasting the claim. This is a DISPATCH-FIT floor distinct from the (smaller)
+# ``_RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT`` alert threshold — the alert warns
+# an operator, this gate keeps a doomed job from ever being claimed. Overridable
+# via runtime_config ``container_image_min_free_disk_bytes``. Absent
+# ``disk_free_bytes`` telemetry is treated as eligible (backward compatible).
+_CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT = 10_737_418_240  # 10 GiB
+
+
+def _container_image_min_free_disk_bytes() -> int:
+    """The dispatch-fit free-disk floor for container-image jobs (config-overridable)."""
+    try:
+        return int(
+            _runtime_config.get(
+                "container_image_min_free_disk_bytes",
+                _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT
 
 
 async def _load_active_runners_cache(
@@ -956,6 +980,17 @@ async def _diagnose_strict_runner_pin_hold(
                 f"job declares container_image {container_image!r} but the "
                 "runner advertises no container isolation backend",
             )
+        if container_image:
+            disk_floor = _container_image_min_free_disk_bytes()
+            if not _runner_has_free_disk(snapshot, disk_floor):
+                reported = (snapshot.capabilities or {}).get("disk_free_bytes")
+                return (
+                    "insufficient_disk",
+                    f"job declares container_image {container_image!r} (a multi-GB "
+                    f"image pull) but the runner reports only {reported} free disk "
+                    f"bytes, below the {disk_floor}-byte fit floor — the pull would "
+                    "fail mid-download",
+                )
         if min_compute_capability and not _runner_meets_min_compute_capability(
             snapshot, min_compute_capability
         ):
@@ -1131,6 +1166,14 @@ def _select_eligible_runner(
             out = [r for r in out if _runner_gpu_capable(r)]
         if container_image:
             out = [r for r in out if _runner_has_container_capability(r)]
+            # Disk-fit gate: a baked container image is multi-GB and must be
+            # pulled before the job starts. Exclude runners whose reported free
+            # disk is below the fit floor so a doomed pull is never claimed —
+            # the job holds for a runner that can fit it (or the cloud backend)
+            # instead of dying mid-pull. Runners that do not report
+            # disk_free_bytes are not gated (backward compatible).
+            disk_floor = _container_image_min_free_disk_bytes()
+            out = [r for r in out if _runner_has_free_disk(r, disk_floor)]
         if accelerator and container_image:
             # Combined gate: when BOTH a container image AND an accelerator are
             # required, the runner must be GPU-in-container capable — merely
@@ -1914,6 +1957,53 @@ async def _dispatch_compute_experiment_directly(
                 "%.1f declared but no GPU-arch-compatible runner available",
                 task.id,
                 min_compute_capability,
+            )
+            return "held"
+
+    # ── Disk-fit hold: image declared + at least one container-capable runner
+    # exists but every such runner reports too little free disk to fit the
+    # multi-GB pull → keep QUEUED with an honest "waiting for disk headroom"
+    # reason instead of dispatching to a box where the pull would die
+    # ("no space left on device") and waste the claim. Placed BEFORE the
+    # container-image hold so a container-capable-but-full fleet reports the
+    # accurate disk reason rather than the misleading "no container-capable
+    # runner" one. Fires only when a container-capable runner exists whose only
+    # failing gate is disk (so this is a genuine, recoverable blocker — the
+    # operator frees space and the same fleet takes the job). Reuses the
+    # container-runner hold stamp so the existing bounded-wait sweep covers it.
+    if runner is None and container_image:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        disk_floor = _container_image_min_free_disk_bytes()
+        disk_blocked = any(
+            _runner_has_container_capability(r)
+            and not _runner_has_free_disk(r, disk_floor)
+            for r in project_runners
+        )
+        if disk_blocked:
+            hold_msg = (
+                "Waiting for a runner with enough free disk: job declares "
+                f"container_image={container_image!r} (a multi-GB image pull) but "
+                "every container-capable runner reports free disk below the "
+                f"{disk_floor}-byte fit floor. Free space on a runner and it will "
+                "claim the job."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image declared "
+                "(%r) but no container-capable runner has enough free disk",
+                task.id,
+                container_image,
             )
             return "held"
 

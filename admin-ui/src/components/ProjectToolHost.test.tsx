@@ -15,6 +15,7 @@ vi.mock('../api/projectTools', async () => {
     updateProjectTool: vi.fn(),
     seedProjectTools: vi.fn(),
     fetchAssetToken: vi.fn(),
+    fetchComputeImageStatus: vi.fn(),
   };
 });
 
@@ -24,10 +25,12 @@ import {
   fetchToolKinds,
   updateProjectTool,
   fetchAssetToken,
+  fetchComputeImageStatus,
   type FetchProjectToolsResult,
   type ProjectTool,
   type ProjectToolManifestEntry,
   type ToolKindConfig,
+  type ComputeImageStatusResponse,
 } from '../api/projectTools';
 import { loadHiddenManifestSlugs } from './projectToolHidden';
 
@@ -108,6 +111,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
     vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL });
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
   });
 
   afterEach(() => {
@@ -214,6 +218,7 @@ describe('ProjectToolHost — manifest tool Hide persistence', () => {
     // The iframe mints an asset token on mount; resolve it so no unhandled
     // rejection leaks into the test (the Hide button lives outside the iframe).
     vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-11T12:00:00Z' });
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
   });
 
   afterEach(() => {
@@ -253,5 +258,118 @@ describe('ProjectToolHost — manifest tool Hide persistence', () => {
     await act(async () => { requireButton('Show hidden').click(); });
     expect(findButton('Hide')).toBeTruthy();
     expect(loadHiddenManifestSlugs('proj-a').size).toBe(0);
+  });
+});
+
+const BUILT_STATUS: ComputeImageStatusResponse = {
+  status: 'built',
+  pinned_ref: 'sha256:abc123',
+  digest: 'sha256:abc123',
+  dep_hash: 'dephash001',
+  tag: 'latest',
+  built: true,
+  created_at: '2026-07-14T10:00:00Z',
+  updated_at: '2026-07-14T10:00:00Z',
+  is_digest_pinned: true,
+};
+
+const MUTABLE_STATUS: ComputeImageStatusResponse = {
+  status: 'built',
+  pinned_ref: 'latest',
+  digest: null,
+  dep_hash: 'dephash002',
+  tag: 'latest',
+  built: true,
+  created_at: '2026-07-13T08:00:00Z',
+  updated_at: '2026-07-13T08:00:00Z',
+  is_digest_pinned: false,
+};
+
+describe('ProjectToolHost — compute image status panel', () => {
+  beforeEach(() => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  test('owner sees baked compute image status panel', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue(BUILT_STATUS);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(h().textContent).toContain('Baked compute image');
+    expect(h().textContent).toContain('sha256:abc123');
+  });
+
+  test('member does not see compute image panel', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue(BUILT_STATUS);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="member" />);
+    expect(h().textContent).not.toContain('Baked compute image');
+  });
+
+  test('shows warning badge when digest is null / mutable tag', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue(MUTABLE_STATUS);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(h().textContent).toContain('Baked compute image');
+    expect(h().textContent).toContain('MUTABLE');
+  });
+
+  test('shows never_built status message', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'never_built' });
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(h().textContent).toContain('Baked compute image');
+    expect(h().textContent).toContain('never built');
+  });
+
+  test('shows no_compute_image_declared message', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(h().textContent).toContain('Baked compute image');
+    expect(h().textContent).toContain('No compute image declared');
+  });
+
+  test('check drift button triggers drift fetch', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValueOnce(BUILT_STATUS);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    // Wait for initial fetch
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    // Button appears when drift hasn't been checked yet
+    const checkDriftBtn = findButton('Check drift');
+    expect(checkDriftBtn).toBeTruthy();
+    // Click and ensure fetchComputeImageStatus was called with check_drift=true
+    vi.mocked(fetchComputeImageStatus).mockClear();
+    await act(async () => { checkDriftBtn!.click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    expect(vi.mocked(fetchComputeImageStatus)).toHaveBeenCalledWith('proj-a', true);
+  });
+
+  test('fetch error is surfaced without breaking tool content', async () => {
+    vi.mocked(fetchComputeImageStatus).mockRejectedValue(new Error('Network error'));
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    expect(h().textContent).toContain('Compute image');
+    expect(h().textContent).toContain('Network error');
+  });
+
+  test('shows up-to-date label when drift check finds no drift', async () => {
+    vi.mocked(fetchComputeImageStatus).mockResolvedValueOnce(BUILT_STATUS);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    const btn = findButton('Check drift');
+    expect(btn).toBeTruthy();
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({
+      ...BUILT_STATUS,
+      drift: { drifted: false, current_dep_hash: 'dephash001', stored_dep_hash: 'dephash001' },
+    });
+    await act(async () => { btn!.click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    expect(h().textContent).toContain('Up to date');
   });
 });

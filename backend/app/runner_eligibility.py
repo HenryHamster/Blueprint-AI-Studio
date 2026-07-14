@@ -191,6 +191,39 @@ def _runner_has_free_vram(
     return any(mib >= required_mib for mib in free_mib_list)
 
 
+def _runner_has_free_disk(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    required_bytes: int,
+) -> bool:
+    """Whether this runner has at least ``required_bytes`` of free disk.
+
+    A container-image compute job must PULL a multi-GB image onto the runner
+    before it can start. Sent to a nearly-full box the pull dies part-way
+    ("no space left on device") and the claim is wasted — the job should have
+    held for a runner (or cloud backend) that can fit it.
+
+    Reads the heartbeat-reported ``disk_free_bytes`` (the free bytes on the
+    runner's image/workspace filesystem, the same field the low-disk health
+    sweep consults). As with :func:`_runner_has_free_vram`, absence of
+    telemetry is NOT a disqualification: a runner that never reports
+    ``disk_free_bytes`` (older runner) is treated as eligible — we gate
+    dispatch only on real contradicting data, never on missing data, so a
+    legitimately-configured runner is never demoted (backward compatible). A
+    malformed value is likewise ignored. A non-positive floor is no floor.
+    """
+    if required_bytes <= 0:
+        return True
+    caps = runner.capabilities or {}
+    disk_free = caps.get("disk_free_bytes")
+    if disk_free is None:
+        return True
+    try:
+        return int(disk_free) >= required_bytes
+    except (TypeError, ValueError):
+        # Malformed telemetry — do not gate on data we cannot trust.
+        return True
+
+
 def _runner_meets_min_compute_capability(
     runner: LocalRunner | RunnerDispatchSnapshot,
     min_cc: float,

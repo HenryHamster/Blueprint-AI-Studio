@@ -16,10 +16,11 @@ vi.mock('../api/projectTools', async () => {
     fetchToolContent: vi.fn(),
     saveToolContent: vi.fn(),
     updateProjectTool: vi.fn(),
+    fetchComputeImageStatus: vi.fn(),
   };
 });
 
-import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent, updateProjectTool } from '../api/projectTools';
+import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent, updateProjectTool, fetchComputeImageStatus } from '../api/projectTools';
 import type { FetchProjectToolsResult } from '../api/projectTools';
 import NotesTool from './NotesTool';
 
@@ -85,6 +86,7 @@ describe('ProjectToolHost — viewport regression', () => {
     // that don't exercise the manifest path still behave predictably.
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchAssetToken).mockResolvedValue({ token: 'mock-token', expires_at: '2026-07-11T12:00:00Z' });
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
   });
 
   afterEach(() => {

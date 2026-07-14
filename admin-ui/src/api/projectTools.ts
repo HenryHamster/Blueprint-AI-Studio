@@ -249,3 +249,56 @@ export function buildToolAssetUrl(
   const encodedPath = entryPath.split('/').map(seg => encodeURIComponent(seg)).join('/');
   return `${base}/api/admin/projects/${proj}/tools/${slug}/assets/${encodedPath}?token=${encodeURIComponent(token)}`;
 }
+
+// ── Compute image status (owner-only baked-image read surface) ──────────────
+
+export interface ComputeImageDrift {
+  drifted: boolean | null;
+  current_dep_hash?: string;
+  stored_dep_hash?: string;
+  reason?: string;
+}
+
+export interface ComputeImageBuiltStatus {
+  status: 'built';
+  pinned_ref: string;
+  digest: string | null;
+  dep_hash: string;
+  tag: string;
+  built: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  is_digest_pinned: boolean;
+  drift?: ComputeImageDrift;
+}
+
+export interface ComputeImageNoDeclareStatus {
+  status: 'no_compute_image_declared';
+}
+
+export interface ComputeImageNeverBuiltStatus {
+  status: 'never_built';
+}
+
+export type ComputeImageStatusResponse =
+  | ComputeImageBuiltStatus
+  | ComputeImageNoDeclareStatus
+  | ComputeImageNeverBuiltStatus;
+
+/**
+ * Fetch the baked compute-image build record for a project.
+ *
+ * When ``checkDrift`` is true the backend clones the repo and computes the
+ * current dependency hash (expensive) to report whether it has drifted from
+ * the stored build record.  Omit ``checkDrift`` (or pass false) for the cheap
+ * status-only read.
+ */
+export async function fetchComputeImageStatus(
+  projectId: string,
+  checkDrift?: boolean,
+): Promise<ComputeImageStatusResponse> {
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/compute-image/status${checkDrift ? '?check_drift=true' : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch compute image status: ${res.status}`);
+  return res.json();
+}

@@ -7,11 +7,13 @@ import {
   fetchToolKinds,
   fetchProjectToolManifest,
   seedProjectTools as seedProjectToolsApi,
+  fetchComputeImageStatus,
   TOOL_PLACEMENTS,
   type ProjectTool,
   type ProjectToolManifestEntry,
   type ProjectSkillManifestEntry,
   type ToolKindConfig,
+  type ComputeImageStatusResponse,
 } from '../api/projectTools';
 import { getToolComponent } from '../toolRegistry';
 import { WorkbenchPanel } from './WorkbenchLayout';
@@ -46,8 +48,29 @@ type ManifestState =
   | { status: 'error'; message: string }
   | { status: 'ok'; tools: ProjectToolManifestEntry[]; skills: ProjectSkillManifestEntry[]; warning?: string };
 
+type ComputeImageFetchState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ok'; data: ComputeImageStatusResponse; hasDrift: boolean };
+
 const actionBtn =
   'inline-flex min-h-11 items-center gap-1.5 rounded-md border px-3 text-xs font-semibold transition-colors';
+
+function formatDateTime(iso: string | null): string {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
 
 /**
  * Coerce a raw text input into the type the config schema expects.
@@ -73,6 +96,8 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [state, setState] = useState<FetchState>({ status: 'loading', projectId });
   const [manifestState, setManifestState] = useState<ManifestState>({ status: 'loading' });
   const abortRef = useRef<AbortController | null>(null);
+  const [computeImageState, setComputeImageState] = useState<ComputeImageFetchState>({ status: 'idle' });
+  const [driftLoading, setDriftLoading] = useState(false);
 
   // Management UI state
   const [showAddForm, setShowAddForm] = useState(false);
@@ -159,6 +184,27 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     void loadManifest();
     return () => { controller.abort(); };
   }, [projectId]);
+
+  // Fetch compute image status on mount when user is project owner.
+  // This is a cheap read (no git clone) — the expensive drift check is
+  // triggered on demand by the user clicking "Check drift".
+  useEffect(() => {
+    if (!isOwner) return;
+    let cancelled = false;
+    fetchComputeImageStatus(projectId)
+      .then(data => {
+        if (!cancelled) setComputeImageState({ status: 'ok', data, hasDrift: false });
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setComputeImageState({
+            status: 'error',
+            message: err instanceof Error ? err.message : 'Failed to fetch compute image status',
+          });
+        }
+      });
+    return () => { cancelled = true; };
+  }, [projectId, isOwner]);
 
   // Hide a manifest tool and persist the choice.
   function hideManifestTool(slug: string) {
@@ -325,6 +371,21 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     }
   }
 
+  async function handleCheckDrift() {
+    setDriftLoading(true);
+    try {
+      const data = await fetchComputeImageStatus(projectId, true);
+      setComputeImageState({ status: 'ok', data, hasDrift: true });
+    } catch (err) {
+      setComputeImageState({
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Failed to check drift',
+      });
+    } finally {
+      setDriftLoading(false);
+    }
+  }
+
   const effective: FetchState = state.projectId === projectId
     ? state
     : { status: 'loading', projectId };
@@ -354,6 +415,123 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
           </button>
         </div>
         )}
+      </div>
+    );
+  }
+
+  // ── Owner-only baked compute-image status panel ───────────────────────
+
+  function renderComputeImagePanel() {
+    if (!isOwner || computeImageState.status === 'idle') return null;
+
+    if (computeImageState.status === 'loading') {
+      return (
+        <div className="flex items-center gap-2 text-sm text-neutral-500">
+          <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-600 border-t-neutral-300" />
+          Loading compute image status…
+        </div>
+      );
+    }
+
+    if (computeImageState.status === 'error') {
+      return (
+        <div className="rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
+          Compute image: {computeImageState.message}
+        </div>
+      );
+    }
+
+    const { data } = computeImageState;
+
+    if (data.status === 'no_compute_image_declared') {
+      return (
+        <div className="space-y-1">
+          <h2 className="text-sm font-semibold text-neutral-100">Baked compute image</h2>
+          <p className="text-sm text-neutral-500">No compute image declared for this project.</p>
+        </div>
+      );
+    }
+
+    if (data.status === 'never_built') {
+      return (
+        <div className="space-y-1">
+          <h2 className="text-sm font-semibold text-neutral-100">Baked compute image</h2>
+          <p className="text-sm text-neutral-500">Compute image declared but never built.</p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-1">
+        <h2 className="text-sm font-semibold text-neutral-100">Baked compute image</h2>
+        <div className="workbench-card space-y-2 rounded-md border p-3">
+          {/* Digest / pinning status */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-400">Ref:</span>
+            {data.is_digest_pinned && data.digest ? (
+              <code className="truncate text-xs text-neutral-200">{data.digest}</code>
+            ) : (
+              <span className="inline-flex items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 text-xs font-medium text-red-400">
+                MUTABLE tag — reproducibility not guaranteed
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-400">Tag:</span>
+            <code className="text-xs text-neutral-200">{data.tag}</code>
+          </div>
+
+          {/* Built flag */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-400">Built:</span>
+            <span className={`text-xs font-medium ${data.built ? 'text-green-400' : 'text-amber-400'}`}>
+              {data.built ? 'Yes' : 'No'}
+            </span>
+          </div>
+
+          {/* Build time */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-400">Last build:</span>
+            <span className="text-xs text-neutral-200">{formatDateTime(data.updated_at)}</span>
+          </div>
+
+          {/* Drift section */}
+          {data.drift && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-400">Drift:</span>
+              <span
+                className={`text-xs font-medium ${
+                  data.drift.drifted === true
+                    ? 'text-amber-400'
+                    : data.drift.drifted === false
+                      ? 'text-green-400'
+                      : 'text-neutral-400'
+                }`}
+              >
+                {data.drift.drifted === true
+                  ? 'Drifted'
+                  : data.drift.drifted === false
+                    ? 'Up to date'
+                    : 'Unknown'}
+              </span>
+              {data.drift.reason && (
+                <span className="text-xs text-neutral-500">({data.drift.reason})</span>
+              )}
+            </div>
+          )}
+
+          {/* Drift check control (only shown when no drift data yet, or to re-check) */}
+          <button
+            type="button"
+            data-viewport-allow-small-target
+            onClick={handleCheckDrift}
+            disabled={driftLoading}
+            className={`${actionBtn} border-neutral-700 bg-transparent text-neutral-400 hover:text-neutral-200 disabled:opacity-50`}
+          >
+            {driftLoading ? 'Checking…' : data.drift ? 'Re-check drift' : 'Check drift'}
+          </button>
+        </div>
       </div>
     );
   }
@@ -697,6 +875,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     <div className="space-y-3">
       {renderManagementBar()}
       {actionError && <p className="text-sm text-red-400">{actionError}</p>}
+      {renderComputeImagePanel()}
       {renderAddForm()}
       {renderError()}
       {renderLoading()}

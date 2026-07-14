@@ -30501,3 +30501,458 @@ class TestComputeImageBuildTrigger:
         assert resp.status_code == 422, resp.text
         assert "metadata server" in resp.text
         assert not apt._compute_image_build_semaphore.locked()
+
+
+class TestComputeImageStatus:
+    """Read-only baked-image status/drift endpoint (owner-gated)."""
+
+    @staticmethod
+    def _patch_manifest(monkeypatch, *, compute_image=None):
+        """Stub manifest discovery to return the given compute image."""
+        from app.routers import admin_project_tools as apt
+
+        async def fake_manifest(_project):
+            return {
+                "tools": [],
+                "skills": [],
+                "compute": {"image": compute_image},
+                "error": None,
+            }
+
+        monkeypatch.setattr(apt, "_discover_manifest_tools", fake_manifest)
+        return apt
+
+    @pytest.mark.asyncio
+    async def test_status_no_compute_image(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """No compute section in manifest -> no_compute_image_declared."""
+        self._patch_manifest(monkeypatch, compute_image=None)
+        project = await _make_project(db_session, name="NoCI Project")
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"status": "no_compute_image_declared"}
+
+    @pytest.mark.asyncio
+    async def test_status_never_built(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Has compute image but no ProjectComputeImage row -> never_built."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Unbuilt Project")
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"status": "never_built"}
+
+    @pytest.mark.asyncio
+    async def test_status_returns_build_record(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Existing ProjectComputeImage row -> full status with is_digest_pinned."""
+        from datetime import timezone
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Built Project")
+        now = datetime.now(timezone.utc)
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="deadbeef12345678",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "a" * 64,
+            digest="sha256:" + "a" * 64,
+            built=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+        assert body["pinned_ref"] == row.pinned_ref
+        assert body["digest"] == row.digest
+        assert body["dep_hash"] == row.dep_hash
+        assert body["tag"] == row.tag
+        assert body["built"] is True
+        assert body["is_digest_pinned"] is True
+        assert body["created_at"] is not None
+        assert body["updated_at"] is not None
+        # No drift when check_drift not requested.
+        assert "drift" not in body
+
+    @pytest.mark.asyncio
+    async def test_status_digest_pinned_true(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Row with non-null digest -> is_digest_pinned True."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Pinned Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="desdhsh12345678",
+            tag="desdhsh",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "b" * 64,
+            digest="sha256:" + "b" * 64,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["is_digest_pinned"] is True
+
+    @pytest.mark.asyncio
+    async def test_status_mutable_tag_fallback(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Row with null digest -> is_digest_pinned False (mutable tag fallback)."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="MutableTag Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="cafebabe87654321",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj:latest",
+            digest=None,
+            built=False,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["is_digest_pinned"] is False
+        assert body["digest"] is None
+        assert body["status"] == "built"
+
+    @pytest.mark.asyncio
+    async def test_status_owner_required(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Member (not owner) -> 403."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(
+            db_session, name="Member Project", role="member"
+        )
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_status_returns_latest_row(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Multiple rows for same image -> returns the most recent by updated_at."""
+        from datetime import timedelta, timezone
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="MultiRow Project")
+        old_now = datetime.now(timezone.utc) - timedelta(days=1)
+
+        old_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="oldhash",
+            tag="oldtag",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "c" * 64,
+            digest="sha256:" + "c" * 64,
+            built=True,
+            created_at=old_now,
+            updated_at=old_now,
+        )
+        db_session.add(old_row)
+        new_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="newhash",
+            tag="newtag",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "d" * 64,
+            digest="sha256:" + "d" * 64,
+            built=True,
+        )
+        db_session.add(new_row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["dep_hash"] == "newhash"
+
+    @pytest.mark.asyncio
+    async def test_status_drift_matches(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true with matching hashes -> drifted: false."""
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+        from app.routers import admin_project_tools as apt
+
+        common_hash = "matchhash12345678"
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+
+        async def mock_build(*a, **k):
+            return BuildResult(
+                pinned_ref=(
+                    "us-docker.pkg.dev/p/compute-images/proj:"
+                    + common_hash
+                ),
+                tag=common_hash,
+                dep_hash=common_hash,
+                already_present=True,
+                built=False,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", mock_build
+        )
+
+        project = await _make_project(db_session, name="DriftMatch Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash=common_hash,
+            tag=common_hash,
+            pinned_ref=(
+                "us-docker.pkg.dev/p/compute-images/proj@" + common_hash
+            ),
+            digest="sha256:" + common_hash,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+        drift = body["drift"]
+        assert drift["drifted"] is False
+        assert drift["current_dep_hash"] == common_hash
+        assert drift["stored_dep_hash"] == common_hash
+
+    @pytest.mark.asyncio
+    async def test_status_drift_differs(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true with differing hashes -> drifted: true."""
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+        from app.routers import admin_project_tools as apt
+
+        stored_hash = "storedhash12345"
+        current_hash = "currenthash67890"
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+
+        async def mock_build_diff(*a, **k):
+            return BuildResult(
+                pinned_ref=(
+                    "us-docker.pkg.dev/p/compute-images/proj:"
+                    + current_hash
+                ),
+                tag=current_hash,
+                dep_hash=current_hash,
+                already_present=True,
+                built=False,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", mock_build_diff
+        )
+
+        project = await _make_project(db_session, name="DriftDiff Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash=stored_hash,
+            tag=stored_hash,
+            pinned_ref=(
+                "us-docker.pkg.dev/p/compute-images/proj@" + stored_hash
+            ),
+            digest="sha256:" + stored_hash,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        drift = body["drift"]
+        assert drift["drifted"] is True
+        assert drift["current_dep_hash"] == current_hash
+        assert drift["stored_dep_hash"] == stored_hash
+
+    @pytest.mark.asyncio
+    async def test_status_drift_no_build_section(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true but no build section -> drifted: null + reason."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                # No 'build' key.
+            },
+        )
+        project = await _make_project(db_session, name="DriftNoBuild Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="somehash",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj:latest",
+            digest=None,
+            built=False,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["drift"]["drifted"] is None
+        assert "reason" in body["drift"]
+
+    @pytest.mark.asyncio
+    async def test_status_drift_never_built(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true but no build record -> status never_built, no drift."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+        project = await _make_project(
+            db_session, name="DriftNeverBuilt Project"
+        )
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "never_built"
+        assert "drift" not in body

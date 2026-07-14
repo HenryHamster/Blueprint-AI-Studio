@@ -4996,6 +4996,123 @@ def _build_multipart(archive: bytes, file_count: int, total_bytes: int):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
+class TestNextComputeJobDiskFit:
+    """Claim-time disk-fit re-check for container-image compute jobs."""
+
+    async def _make_starting_job(self, session, project_id, runner_id, *, metadata):
+        job = ComputeJob(
+            project_id=project_id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={"runner_target_id": str(runner_id), **metadata},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        return job
+
+    @pytest.mark.asyncio
+    async def test_container_image_job_204_when_runner_disk_below_floor(
+        self, client: AsyncClient, db_session
+    ):
+        """A container-image job pinned to a runner whose freshest heartbeat
+        disk_free_bytes is below the fit floor is NOT claimed: the endpoint
+        returns 204 and leaves the job STARTING for re-dispatch."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 1_000_000,  # ~1 MB — far below the multi-GB floor
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"container_image": "my-image:latest", "command": "run.sh"},
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 204
+
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.STARTING, (
+            "job must remain STARTING so it re-dispatches to a runner that fits it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_container_image_job_claimed_when_disk_above_floor(
+        self, client: AsyncClient, db_session
+    ):
+        """A roomy runner still claims the container-image job (200 → RUNNING)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 500_000_000_000,  # ~500 GB free
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"container_image": "my-image:latest", "command": "run.sh"},
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == str(job.id)
+
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_non_image_job_claimed_despite_low_disk(
+        self, client: AsyncClient, db_session
+    ):
+        """The disk-fit re-check applies ONLY to container-image jobs: a plain
+        job on a low-disk runner is still claimed."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 1_000,
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"command": "run.sh"},  # no container_image
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+
+
 class TestMultipartParser:
     """Unit coverage for the dependency-free multipart parser used by the
     artifact endpoint (avoids requiring python-multipart, which FastAPI File/Form

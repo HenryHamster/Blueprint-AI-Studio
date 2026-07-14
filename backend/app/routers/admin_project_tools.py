@@ -1566,3 +1566,190 @@ async def trigger_project_compute_image_build(
         "built": row.built,
         "already_present": already_present,
     }
+
+
+# ── Compute-image status endpoint ─────────────────────────────────────────────
+#
+# A read-only, owner-gated endpoint that surfaces the persisted build record
+# (pinned_ref, digest, dep_hash, tag, built, timestamps) and reports whether the
+# stored reference is genuinely digest-pinned vs. a mutable-tag fallback.  An
+# optional ``?check_drift=true`` query param triggers a repo clone + hash cycle
+# (identical to the build path's hash computation) to detect staleness.
+
+
+@router.get("/projects/{project_id}/compute-image/status")
+async def get_project_compute_image_status(
+    project_id: uuid.UUID,
+    check_drift: bool = Query(
+        False,
+        description=(
+            "When true, clone the repo and compute the current dependency hash "
+            "(identical to the build path) and report whether it differs from "
+            "the stored build record's dep_hash.  This is an expensive operation "
+            "(git clone + file discovery + hashing) and competes with the build "
+            "concurrency slot — a build in flight causes drift to return as "
+            "'unknown' with a reason rather than waiting."
+        ),
+    ),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the persisted baked-image build record for this project (owner).
+
+    Returns the ``ProjectComputeImage`` row state for the project's declared
+    compute image.  ``is_digest_pinned`` distinguishes a genuine digest-pinned
+    ref from the mutable-tag fallback path (previously a log-only signal).  When
+    no build has ever been triggered the endpoint reports ``never_built``, and
+    when the project does not declare a compute image it reports
+    ``no_compute_image_declared`` — both as clean status values, not errors.
+
+    The optional ``?check_drift=true`` param adds a ``drift`` object to the
+    response, computed by cloning the project repo and running the same
+    dependency-hash computation as the build pipeline (``dry_run=True``).  The
+    clone uses the build concurrency slot and is bounded by a 5-minute timeout.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    manifest = await _discover_manifest_tools(project)
+    compute_section = manifest.get("compute") or {}
+    compute_image = compute_section.get("image")
+
+    if compute_image is None:
+        return {"status": "no_compute_image_declared"}
+
+    name = compute_image.get("name", "")
+    registry_repo, image_name, _ = _cb._split_image_ref(name)
+
+    # Query the latest ProjectComputeImage row matching this project/image.
+    row = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.image_name == image_name,
+                ProjectComputeImage.registry_repo == registry_repo,
+            )
+            .order_by(ProjectComputeImage.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        return {"status": "never_built"}
+
+    result: Dict[str, Any] = {
+        "status": "built",
+        "pinned_ref": row.pinned_ref,
+        "digest": row.digest,
+        "dep_hash": row.dep_hash,
+        "tag": row.tag,
+        "built": bool(row.built),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "is_digest_pinned": row.digest is not None,
+    }
+
+    if check_drift:
+        drift = await _compute_build_drift(
+            project, registry_repo, compute_image, row
+        )
+        result["drift"] = drift
+
+    return result
+
+
+async def _compute_build_drift(
+    project: Project,
+    registry_repo: str,
+    compute_image: Dict[str, Any],
+    stored_row: ProjectComputeImage,
+) -> Dict[str, Any]:
+    """Compute whether the project's dependency hash has drifted from the build record.
+
+    Returns a dict with ``drifted`` (True/False/None) and, when drifted is not
+    None, both ``current_dep_hash`` and ``stored_dep_hash``.  When drift cannot
+    be determined, ``drifted`` is None and ``reason`` explains why.
+
+    This clones the project repo and runs the same file-discovery +
+    content-hashing logic as the build pipeline (identical input set), so the
+    comparison is apples-to-apples.  It competes for the build concurrency slot
+    to bound concurrent clones, and is fail-open: a build in flight, a missing
+    GitHub token, or a missing ``build`` section all produce ``drifted: None``
+    with a ``reason`` rather than a 500.
+    """
+    build_config = _cb.resolve_project_compute_image_build(
+        {"image": compute_image}
+    )
+    if build_config is None:
+        return {
+            "drifted": None,
+            "reason": (
+                "Project declares no compute.image.build section "
+                "— cannot recompute dependency hash"
+            ),
+        }
+
+    # Fail-open: if a build is in flight, don't queue behind it — return
+    # unknown drift rather than potentially blocking an operator-facing request.
+    if _compute_image_build_semaphore.locked():
+        return {
+            "drifted": None,
+            "reason": (
+                "A compute-image build is in progress — drift check would "
+                "contend with it"
+            ),
+        }
+
+    try:
+        await asyncio.wait_for(
+            _compute_image_build_semaphore.acquire(),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "drifted": None,
+            "reason": "Could not acquire build slot for drift computation",
+        }
+
+    try:
+        result = await asyncio.wait_for(
+            _cb.build_project_compute_image(
+                project,
+                registry_repo=registry_repo,
+                build_config=build_config,
+                dry_run=True,
+            ),
+            timeout=300,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "drifted": None,
+            "reason": "Drift computation timed out while computing dependency hash",
+        }
+    except Exception as e:
+        logger.warning(
+            "[compute-image-status] drift computation failed for project=%s: %s",
+            getattr(project, "id", "?"),
+            e,
+        )
+        return {
+            "drifted": None,
+            "reason": f"Could not compute current dependency hash: {e}",
+        }
+    finally:
+        _compute_image_build_semaphore.release()
+
+    current_hash = getattr(result, "dep_hash", None)
+    if not current_hash:
+        return {
+            "drifted": None,
+            "reason": "Build pipeline returned no dep_hash",
+        }
+
+    return {
+        "drifted": current_hash != stored_row.dep_hash,
+        "current_dep_hash": current_hash,
+        "stored_dep_hash": stored_row.dep_hash,
+    }
