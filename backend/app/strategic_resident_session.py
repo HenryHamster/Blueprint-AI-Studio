@@ -57,7 +57,10 @@ from app.models import (
 )
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
-from app.strategic_payload_summaries import _fetch_open_messages
+from app.strategic_payload_summaries import (
+    _fetch_open_messages,
+    _fetch_recent_handled_conversation,
+)
 from app.shared_state import limiter, runtime_config
 from app.task_locking import (
     project_lock,
@@ -2468,6 +2471,12 @@ async def agent_fetch_checkpoint_state(
     """
     project = await _resolve_agent_project(project_id, token, session)
     open_messages = await _fetch_open_messages(session, project.id)
+    # Recently-answered operator conversation tail (status handled/resolved) so a
+    # marker-less correction the operator just made survives the compaction
+    # restart instead of vanishing with the open feed. Read-only, non-actionable.
+    recent_handled_conversation = await _fetch_recent_handled_conversation(
+        session, project.id
+    )
     # Apply the SAME agent-view trims the session bootstrap applies so the
     # refreshed compaction grounding matches the shape the session started from.
     # The bootstrap ships _agent_view_problem_model(project.problem_model) and
@@ -2485,6 +2494,7 @@ async def agent_fetch_checkpoint_state(
         "running_update": project.running_update or "",
         "vision": _agent_visible_vision(project.vision),
         "open_messages": open_messages,
+        "recent_handled_conversation": recent_handled_conversation,
     }
 
 

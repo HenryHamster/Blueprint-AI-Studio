@@ -285,6 +285,7 @@ const {
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
+    'formatRecentHandledConversation',
   ] satisfies StrategicSectionsExportKey[],
     TELEMETRY_EXPORT_NAMES: [
     'buildPromptSizeTelemetry',
@@ -524,6 +525,7 @@ vi.mock('./strategic-sections.js', () => ({
   buildFeedbackSection: () => '',
   buildQuestionSection: () => '',
   buildOpenMessagesText: () => '',
+  formatRecentHandledConversation: () => '',
   // Echo the authoritative count args so wiring tests can assert the handler
   // threads payload.direction_counts through to these builders.
   buildDirSummaryText: (_d: unknown, authoritativeActiveCount?: number) =>

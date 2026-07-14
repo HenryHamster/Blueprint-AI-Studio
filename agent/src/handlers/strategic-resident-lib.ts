@@ -412,6 +412,10 @@ export interface CheckpointStateResponse {
    *  open_messages). Present on backends that have shipped this field; absent
    *  on older responses — caller degrades gracefully. */
   open_messages?: unknown;
+  /** Recently-answered operator conversation tail (status handled/resolved).
+   *  Present on backends that have shipped this field; absent on older
+   *  responses — caller degrades gracefully. */
+  recent_handled_conversation?: unknown;
 }
 
 /** The self-model grounding fields the compaction checkpoint carries. */
@@ -423,6 +427,10 @@ export interface CheckpointGrounding {
   /** Formatted open operator messages text (from open_messages). Absent when
    *  not yet computed (older path) or when there are no open messages. */
   openMessagesText?: string;
+  /** Formatted recently-answered operator conversation tail (from
+   *  recent_handled_conversation). Absent when not yet computed (older path) or
+   *  when there is no recent handled conversation. */
+  recentHandledConversationText?: string;
 }
 
 /**
@@ -443,6 +451,7 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
     openMessagesText: '',
+    recentHandledConversationText: '',
   };
 }
 
@@ -463,10 +472,11 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
  *    or vision to a momentary empty refetch is a coherence loss we refuse to
  *    take; a genuine mid-session edit still refreshes because it returns a
  *    non-empty value.
- *  - openMessagesText is the EXCEPTION: a refreshed EMPTY open-messages list
- *    must WIN over the stale bootstrap snapshot. Messages the operator's turn
- *    just handled should DISAPPEAR from the checkpoint, so here empty-refreshed
- *    beats snapshot rather than falling back to it.
+ *  - openMessagesText and recentHandledConversationText are the EXCEPTION: a
+ *    refreshed EMPTY value must WIN over the stale bootstrap snapshot. Messages
+ *    the operator's turn just handled should DISAPPEAR from the open feed (and
+ *    appear in the fresh recently-answered tail), so here empty-refreshed beats
+ *    snapshot rather than falling back to it.
  *
  * Empty strings collapse to `undefined` so the checkpoint omits that
  * sub-section, matching the existing `refreshedDirectionGrounding` fallback.
@@ -480,6 +490,7 @@ export function resolveCheckpointGrounding(
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
   openMessagesText?: string;
+  recentHandledConversationText?: string;
 } {
   // No refetch → whole-snapshot fallback (unchanged behavior).
   if (refreshed == null) {
@@ -489,6 +500,7 @@ export function resolveCheckpointGrounding(
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
       runningUpdate: snapshot.runningUpdate || undefined,
       openMessagesText: snapshot.openMessagesText || undefined,
+      recentHandledConversationText: snapshot.recentHandledConversationText || undefined,
     };
   }
   // Refetch succeeded. Structural fields fall back to the snapshot when the
@@ -502,6 +514,10 @@ export function resolveCheckpointGrounding(
     strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
     runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
     openMessagesText: refreshed.openMessagesText || undefined,
+    // Same rule as openMessagesText: the refreshed recently-answered tail is the
+    // current source of truth, so let it WIN over the session-start snapshot
+    // (including when a successful refetch returns an empty tail).
+    recentHandledConversationText: refreshed.recentHandledConversationText || undefined,
   };
 }
 
@@ -526,6 +542,9 @@ export interface CompactionCheckpointContext {
   strategicMemoryNotesText?: string;
   /** Formatted open operator messages text (payload.open_messages). */
   openMessagesText?: string;
+  /** Formatted recently-answered operator conversation tail
+   *  (payload.recent_handled_conversation). Read-only, non-actionable. */
+  recentHandledConversationText?: string;
   /** Prior session context text (ctx._session_summary). */
   priorSessionContextText?: string;
   /** Formatted active directions summary (payload.directions_summary). */
@@ -636,6 +655,17 @@ ${ctx.autonomousState.trim()}`);
 > the latest state.`;
       sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
     }
+  }
+
+  // (v-b) Recently-answered operator conversation tail — READ-ONLY. These
+  // messages are already handled/resolved; they are here only so a correction
+  // the operator made that was never captured as an OPERATOR-DECISION survives
+  // this restart. Do NOT re-answer or re-act on them.
+  if (ctx.recentHandledConversationText?.trim()) {
+    sections.push(`## Recently answered operator conversation (read-only — already handled, do NOT re-answer)
+If any of these settled or corrected a course but is NOT already reflected in your decisions register above, treat it as settled — do not re-propose it.
+
+${ctx.recentHandledConversationText.trim()}`);
   }
 
   // (vi) Durable decisions register — preserved across restarts.
@@ -1047,6 +1077,12 @@ export interface BootstrapContext {
   strategicMemoryNotesText?: string;
   visionJson: string;
   openMessagesText: string;
+  /** Formatted recently-answered operator conversation tail
+   *  (payload.recent_handled_conversation). Rendered as a read-only,
+   *  non-actionable section so a marker-less operator correction survives a full
+   *  session restart. Empty string or whitespace → section omitted. Absent or
+   *  omitted defaults to ''. */
+  recentHandledConversationText?: string;
   sessionId: string;
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
@@ -1178,6 +1214,17 @@ ${ctx.toolContentText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  // Recently-answered operator conversation tail — READ-ONLY. These messages are
+  // already handled/resolved, so they are NOT an inbox and must not be
+  // re-answered. Rendered so a correction the operator made that was never
+  // captured as an OPERATOR-DECISION still survives this full restart and the
+  // strategist stops re-proposing what the operator already settled.
+  if (ctx.recentHandledConversationText?.trim()) {
+    sections.push(`## Recently answered operator conversation (read-only — already handled, do NOT re-answer)
+If any of these settled or corrected a course but is NOT already reflected in your decisions register below, treat it as settled — do not re-propose it.
+
+${ctx.recentHandledConversationText.trim()}`);
   }
   // Durable decisions register — settled cross-tick decisions restored from the
   // persisted context on a full session restart. Rendered here (mirroring the

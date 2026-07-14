@@ -196,6 +196,10 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _fetch_operator_context_refs,
     _open_message_citation_summary,
     _fetch_open_messages,
+    _fetch_recent_handled_conversation,
+    _RECENT_HANDLED_KEEP,
+    _RECENT_HANDLED_FETCH_LIMIT,
+    _RECENT_HANDLED_EXCERPT_MAX_CHARS,
     _summarize_recent_interventions,
     _summarize_capability_trial_verdicts,
     _OPERATOR_OVERRIDES_SUMMARIZE_KEEP,
@@ -2232,6 +2236,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "floor": _floor_open_messages,
         "fetch_verb": "message",
     },
+    # Recently-answered operator conversation tail (non-actionable). Already
+    # hard-bounded at build time (≤8 messages, per-message excerpt cap), so the
+    # packer drops it whole under byte pressure rather than trimming — a coherence
+    # aid, never load-bearing, so a low priority + exempt bound is correct.
+    "recent_handled_conversation": {"priority": "medium", "exempt": True},
     "running_update": {"priority": "high", "exempt": True},
     "running_update_acknowledged_at": {"priority": "high", "exempt": True},
     "user_last_active_at": {"priority": "high", "exempt": True},
@@ -5650,6 +5659,13 @@ async def _spawn_strategic_review(
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
+        # Recently-answered operator conversation tail — DB-only, bounded, and
+        # explicitly non-actionable. Surfaces a correction the operator just made
+        # (now marked handled/resolved, so gone from the open feed) so a restarted
+        # resident session does not re-propose what the operator already settled.
+        _res_recent_handled = await _fetch_recent_handled_conversation(
+            session, project.id
+        )
         # Ship the resident-session pacing knobs from _runtime_config onto the
         # payload so the agent's residentConfig() reads LIVE, operator-tunable
         # values instead of falling back to hardcoded defaults. All six knobs are
@@ -5709,6 +5725,11 @@ async def _spawn_strategic_review(
                     # first-poll cursor that would otherwise be missed entirely.
                     "open_message_count": len(_res_open_messages),
                     "open_messages": _res_open_messages,
+                    **(
+                        {"recent_handled_conversation": _res_recent_handled}
+                        if _res_recent_handled
+                        else {}
+                    ),
                     **({"model": review_model} if review_model else {}),
                     **({"effort": review_effort} if review_effort else {}),
                     # Live, operator-tunable resident-session pacing knobs.

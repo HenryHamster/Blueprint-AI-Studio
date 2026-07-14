@@ -70,6 +70,13 @@ vi.mock('./strategic-sections.js', () => ({
     Array.isArray(msgs) && msgs.length > 0
       ? msgs.map((m) => `MSG:${m.content ?? ''}`).join('\n')
       : ''),
+  // Render each recently-answered message so the checkpoint / bootstrap
+  // read-only tail reflects exactly the handled conversation the backend
+  // surfaces at fetch time.
+  formatRecentHandledConversation: vi.fn((msgs: Array<{ content?: string }> | undefined) =>
+    Array.isArray(msgs) && msgs.length > 0
+      ? msgs.map((m) => `HANDLED:${m.content ?? ''}`).join('\n')
+      : ''),
   buildDirectionPortfolioSection: vi.fn(() => ''),
   buildPendingFollowupsSection: vi.fn(() => ''),
 }));

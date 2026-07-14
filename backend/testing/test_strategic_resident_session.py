@@ -3677,6 +3677,82 @@ async def test_heartbeat_returns_active_direction_ids(db_session):
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_state_surfaces_recent_handled_conversation(
+    client: AsyncClient, db_session, enable_strategic_session_flag
+):
+    """The checkpoint-state endpoint carries a recently-ANSWERED operator
+    conversation tail so a correction the operator made — now marked handled and
+    gone from the open feed — survives a compaction restart.
+
+    Invariants asserted:
+      * a handled operator message appears in recent_handled_conversation but NOT
+        in open_messages (the two feeds are disjoint by status);
+      * an OPEN message appears in open_messages but NOT in the handled tail;
+      * a `system` (internal bookkeeping) message is excluded from the tail even
+        when handled — the tail is operator conversation only.
+    """
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project, vm="agent-vm-rh")
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    await db_session.refresh(task)
+
+    # A handled operator message — the just-answered correction. Marked handled so
+    # it has dropped out of the open feed entirely.
+    handled = await _make_operator_message(
+        db_session, project, content="actually, drop the caching idea"
+    )
+    handled.status = "handled"
+    db_session.add(handled)
+    # A still-open operator message — belongs in open_messages, not the tail.
+    still_open = await _make_operator_message(
+        db_session, project, content="what is the ETA on the runner fix?"
+    )
+    # A handled SYSTEM message — internal bookkeeping, must never reach the tail.
+    sys_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="system",
+        content="internal: cycle rollover bookkeeping",
+        status="handled",
+        message_type=MessageType.NOTE,
+    )
+    db_session.add(sys_msg)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert "recent_handled_conversation" in body, (
+        "checkpoint-state must include recent_handled_conversation key"
+    )
+    tail = body["recent_handled_conversation"]
+    assert isinstance(tail, list)
+    tail_ids = {m["id"] for m in tail}
+    tail_contents = {m["content"] for m in tail}
+    open_ids = {m["id"] for m in body["open_messages"]}
+
+    # The handled operator correction is in the tail, and NOT in the open feed.
+    assert str(handled.id) in tail_ids
+    assert "actually, drop the caching idea" in tail_contents
+    assert str(handled.id) not in open_ids
+
+    # The still-open message is in the open feed, and NOT in the handled tail.
+    assert str(still_open.id) in open_ids
+    assert str(still_open.id) not in tail_ids
+
+    # The handled system message is internal bookkeeping — excluded from the tail.
+    assert str(sys_msg.id) not in tail_ids
+    assert "internal: cycle rollover bookkeeping" not in tail_contents
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_state_endpoint_returns_current_data(
     client: AsyncClient, db_session, enable_strategic_session_flag
 ):

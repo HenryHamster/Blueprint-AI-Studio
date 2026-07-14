@@ -712,6 +712,24 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('Already-staged (next-version) directions');
   });
 
+  it('renders the recently-answered operator conversation as a read-only section', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      recentHandledConversationText: '- [FEEDBACK] (id: h1, from: user, answered) drop the caching idea',
+    });
+    expect(p).toContain('Recently answered operator conversation');
+    expect(p).toContain('read-only — already handled, do NOT re-answer');
+    expect(p).toContain('drop the caching idea');
+    expect(p).toContain('do not re-propose it');
+  });
+
+  it('omits the recently-answered conversation section when blank/absent', () => {
+    expect(buildBootstrapPrompt(base)).not.toContain('Recently answered operator conversation');
+    expect(
+      buildBootstrapPrompt({ ...base, recentHandledConversationText: '   ' }),
+    ).not.toContain('Recently answered operator conversation');
+  });
+
   it('includes standing behavioral lessons when memory notes are provided', () => {
     const p = buildBootstrapPrompt({
       ...base,
@@ -2007,6 +2025,32 @@ describe('buildCompactionCheckpoint', () => {
     expect(result).toContain('Examination tick: 0');
   });
 
+  it('buildCompactionCheckpoint renders the recently-answered conversation as a read-only section', () => {
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'You are the resident strategist for Acme.',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      recentHandledConversationText: '- [FEEDBACK] (id: h1, from: user, answered) drop the caching idea',
+    };
+    const result = buildCompactionCheckpoint(ctx);
+    expect(result).toContain('## Recently answered operator conversation');
+    expect(result).toContain('read-only — already handled, do NOT re-answer');
+    expect(result).toContain('drop the caching idea');
+    expect(result).toContain('do not re-propose it');
+  });
+
+  it('buildCompactionCheckpoint omits the recently-answered conversation section when blank', () => {
+    const ctx: CompactionCheckpointContext = {
+      roleIdentity: 'role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+      recentHandledConversationText: '   ',
+    };
+    expect(buildCompactionCheckpoint(ctx)).not.toContain('Recently answered operator conversation');
+  });
+
   it('test_checkpoint_grounding_marked_snapshot_not_current', () => {
     // Grounding IS populated — verify it is marked as a session-start snapshot
     // and includes a directive to ./fetch current state rather than rely on stale data.
@@ -2343,6 +2387,59 @@ describe('resolveCheckpointGrounding open_messages', () => {
     };
     const resolved = resolveCheckpointGrounding(snapshotNoMsgs, null);
     expect(resolved.openMessagesText).toBeUndefined();
+  });
+});
+
+describe('formatCheckpointState recent_handled_conversation field', () => {
+  it('sets recentHandledConversationText to empty string regardless of input (caller fills it)', () => {
+    // Like openMessagesText, formatCheckpointState always leaves this '' and the
+    // handler overrides it with formatRecentHandledConversation after the call.
+    expect(formatCheckpointState({ problem_model: { k: 'v' } }).recentHandledConversationText).toBe('');
+    expect(formatCheckpointState({ recent_handled_conversation: [] }).recentHandledConversationText).toBe('');
+    expect(
+      formatCheckpointState({
+        recent_handled_conversation: [{ id: 'h1', content: 'x', type: 'NOTE', from: 'user' }],
+      }).recentHandledConversationText,
+    ).toBe('');
+  });
+});
+
+describe('resolveCheckpointGrounding recent_handled_conversation', () => {
+  const snapshot: CheckpointGrounding = {
+    problemModelJson: '{}',
+    visionJson: '{}',
+    strategicMemoryNotesText: '',
+    runningUpdate: '',
+    recentHandledConversationText: 'STALE handled tail',
+  };
+
+  it('refreshed recentHandledConversationText wins over the snapshot', () => {
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      recentHandledConversationText: 'FRESH handled tail',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.recentHandledConversationText).toBe('FRESH handled tail');
+  });
+
+  it('empty refreshed recentHandledConversationText collapses to undefined (fresh wins over stale)', () => {
+    const refreshed: CheckpointGrounding = {
+      problemModelJson: '{}',
+      visionJson: '{}',
+      strategicMemoryNotesText: '',
+      runningUpdate: '',
+      recentHandledConversationText: '',
+    };
+    const resolved = resolveCheckpointGrounding(snapshot, refreshed);
+    expect(resolved.recentHandledConversationText).toBeUndefined();
+  });
+
+  it('falls back to the snapshot recentHandledConversationText when refresh is null', () => {
+    const resolved = resolveCheckpointGrounding(snapshot, null);
+    expect(resolved.recentHandledConversationText).toBe('STALE handled tail');
   });
 });
 

@@ -23,6 +23,7 @@ import {
 import {
   buildDirSummaryText,
   buildOpenMessagesText,
+  formatRecentHandledConversation,
 } from './strategic-sections.js';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
@@ -385,6 +386,11 @@ export async function handleStrategicResident(
     ? directionCounts.active : undefined;
   const openMessages = Array.isArray(payload.open_messages)
     ? payload.open_messages as Array<Record<string, unknown>> : [];
+  // Recently-answered operator conversation tail (status handled/resolved).
+  // Read-only, non-actionable — surfaced so a marker-less operator correction
+  // survives a full session restart. Absent on older backends → [] (no section).
+  const recentHandledConversation = Array.isArray(payload.recent_handled_conversation)
+    ? payload.recent_handled_conversation as Array<Record<string, unknown>> : [];
   const retiredDirections = Array.isArray(payload.retired_directions_summary)
     ? payload.retired_directions_summary as Array<Record<string, unknown>> : [];
   const stagedDirections = Array.isArray(payload.staged_directions)
@@ -481,6 +487,7 @@ export async function handleStrategicResident(
     strategicMemoryNotesText,
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
+    recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
@@ -591,6 +598,7 @@ export async function handleStrategicResident(
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
         openMessagesText: buildOpenMessagesText(openMessages),
+        recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
       },
       refreshedGrounding,
     );
@@ -600,6 +608,7 @@ export async function handleStrategicResident(
       visionJson: grounding.visionJson,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
       openMessagesText: grounding.openMessagesText,
+      recentHandledConversationText: grounding.recentHandledConversationText,
       priorSessionContextText: priorSessionContextText || undefined,
       directionsText: refreshedDirectionGrounding
         ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
@@ -777,6 +786,13 @@ export async function handleStrategicResident(
           ? state.open_messages as Array<Record<string, unknown>>
           : [];
         refreshedGrounding.openMessagesText = buildOpenMessagesText(refreshedOpenMsgs);
+        // Same treatment for the recently-answered conversation tail: format from
+        // the fresh checkpoint-state response so a correction the operator made
+        // mid-session (now handled) survives the compaction restart.
+        const refreshedRecentHandled = Array.isArray(state.recent_handled_conversation)
+          ? state.recent_handled_conversation as Array<Record<string, unknown>>
+          : [];
+        refreshedGrounding.recentHandledConversationText = formatRecentHandledConversation(refreshedRecentHandled);
         sendLog(ws, '[resident] compaction grounding refreshed from checkpoint-state endpoint\n');
       }
     } catch (e) {

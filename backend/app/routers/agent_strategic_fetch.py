@@ -1280,6 +1280,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "strategic_session_autonomous_turn_timeout_seconds": None,
     # Medium — no recovery (require complex async or ephemeral session data)
     "conversation_thread": None,
+    "recent_handled_conversation": None,  # exempt; recently-answered operator tail, bounded at build time
     "recent_interventions": None,   # requires GitHub API fan-out
     "drift_signals": None,          # requires async DB compute
     "memo_citations": None,         # requires cycle-scoped Task query

@@ -20166,6 +20166,107 @@ async def test_fetch_open_messages_excludes_session_handoff_resolved_messages(db
 
 
 @pytest.mark.asyncio
+async def test_fetch_recent_handled_conversation_bounds_and_order(db_session):
+    """``_fetch_recent_handled_conversation`` returns a bounded, chronological,
+    excerpt-capped tail of the recently-ANSWERED operator conversation.
+
+    Asserts the observable contract:
+      * only status handled/resolved conversational rows are returned (open and
+        system rows are excluded);
+      * at most ``_RECENT_HANDLED_KEEP`` rows survive, keeping the NEWEST;
+      * the survivors are ordered oldest-first (stable transcript read);
+      * each content excerpt is capped at ``_RECENT_HANDLED_EXCERPT_MAX_CHARS``.
+    """
+    from app.strategic_spawning import (
+        _fetch_recent_handled_conversation,
+        _RECENT_HANDLED_KEEP,
+        _RECENT_HANDLED_EXCERPT_MAX_CHARS,
+    )
+
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+    # 12 handled operator messages, ascending created_at (so idx 11 is newest).
+    handled_msgs = []
+    for i in range(12):
+        m = ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.NOTE,
+            content=f"handled-{i:02d}",
+            status="handled",
+        )
+        db_session.add(m)
+        handled_msgs.append(m)
+    # A long resolved message to exercise the excerpt cap (newest of all).
+    long_content = "x" * (_RECENT_HANDLED_EXCERPT_MAX_CHARS + 500)
+    long_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="strategic",
+        message_type=MessageType.NOTE,
+        content=long_content,
+        status="resolved",
+    )
+    db_session.add(long_msg)
+    # Excluded rows: an OPEN message and a handled SYSTEM (bookkeeping) message.
+    open_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="still-open",
+        status="open",
+    )
+    sys_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="system",
+        message_type=MessageType.NOTE,
+        content="internal bookkeeping",
+        status="handled",
+    )
+    db_session.add_all([open_msg, sys_msg])
+    await db_session.commit()
+
+    # Stamp deterministic ascending timestamps so ordering is unambiguous.
+    for i, m in enumerate(handled_msgs):
+        m.created_at = base + timedelta(minutes=i)
+        db_session.add(m)
+    long_msg.created_at = base + timedelta(minutes=100)  # newest overall
+    db_session.add(long_msg)
+    await db_session.commit()
+
+    tail = await _fetch_recent_handled_conversation(db_session, project.id)
+
+    # Bounded to the KEEP count.
+    assert len(tail) == _RECENT_HANDLED_KEEP
+    contents = [m["content"] for m in tail]
+    ids = {m["id"] for m in tail}
+
+    # Excluded rows never appear.
+    assert "still-open" not in contents
+    assert str(open_msg.id) not in ids
+    assert "internal bookkeeping" not in contents
+    assert str(sys_msg.id) not in ids
+
+    # The newest survivors are kept: long_msg (t+100) plus the newest handled
+    # operator rows; the oldest handled rows are dropped under the bound.
+    assert str(long_msg.id) in ids
+    assert "handled-00" not in contents  # oldest, dropped
+    assert "handled-11" in contents  # newest handled operator row, kept
+
+    # Chronological (oldest-first) order among the survivors.
+    created = [m["created_at"] for m in tail]
+    assert created == sorted(created)
+    # long_msg is the newest → it sorts LAST in the oldest-first tail.
+    assert tail[-1]["id"] == str(long_msg.id)
+
+    # Excerpt cap enforced on the long message.
+    assert len(tail[-1]["content"]) == _RECENT_HANDLED_EXCERPT_MAX_CHARS
+
+
+@pytest.mark.asyncio
 async def test_handoff_session_messages_write_path(db_session):
     """handoff_session_messages must resolve messages stamped with the ending
     session_id: status='resolved', resolution='session_handoff', resolved_at set,
