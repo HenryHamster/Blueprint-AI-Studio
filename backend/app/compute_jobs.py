@@ -1347,6 +1347,87 @@ def _status_reports_no_usable_gpu(status: ComputeStatusResult) -> bool:
     return any(marker in lowered for marker in _NO_USABLE_GPU_LOG_MARKERS)
 
 
+def _resolved_metric_names(
+    job: ComputeJob, status: ComputeStatusResult
+) -> set[str]:
+    """Metric names measurable from a job's FULLY-resolved terminal metric set.
+
+    Mirrors exactly what :func:`_apply_polled_compute_job_result` will persist and
+    what :func:`build_compute_result_logs` (which the success-criterion gate reads)
+    then resolves, so this guard sees the same names the gate will:
+
+    * ``result_metrics`` — the current poll's ``status.metrics`` when non-empty,
+      else the value a PRIOR poll persisted (``_apply_polled_compute_job_result``
+      only overwrites ``result_metrics`` on a truthy ``status.metrics``, so a metric
+      captured earlier stays resolvable — matching the sticky persistence and
+      preventing a false-positive FAILURE on a final metric-less poll);
+    * the per-arm block used by the best-arm evaluator (any numeric key inside any
+      arm of ``result_metrics['arms']``); and
+    * the stdout JSON fallback — but only when ``result_metrics`` is absent/empty,
+      the exact condition under which the artifact builder consults it.
+
+    Defensive: tolerates missing/malformed metadata and only ever counts values
+    that coerce to a real number, matching how the evaluator decides ``measurable``.
+    """
+    meta = job.polling_metadata or {}
+    result_metrics = (
+        dict(status.metrics)
+        if isinstance(status.metrics, dict) and status.metrics
+        else meta.get("result_metrics")
+    )
+    result_metrics = result_metrics if isinstance(result_metrics, dict) else {}
+    command_log = (
+        dict(status.command_log)
+        if isinstance(status.command_log, dict) and status.command_log
+        else meta.get("command_log")
+    )
+    names: set[str] = set()
+    for key, value in result_metrics.items():
+        if key == "arms":
+            continue
+        if _coerce_metric_number(value) is not None:
+            names.add(str(key))
+    arms = result_metrics.get("arms")
+    if isinstance(arms, dict):
+        for arm in arms.values():
+            if isinstance(arm, dict):
+                for key, value in arm.items():
+                    if _coerce_metric_number(value) is not None:
+                        names.add(str(key))
+    # stdout fallback fires ONLY when result-file metrics are absent/empty — the
+    # same gate build_compute_result_logs applies before scanning stdout.
+    if not result_metrics:
+        cl = {"command_log": command_log} if isinstance(command_log, dict) else {}
+        fallback = _stdout_metrics_fallback(cl)
+        if isinstance(fallback, dict):
+            for key, value in fallback.items():
+                if _coerce_metric_number(value) is not None:
+                    names.add(str(key))
+    return names
+
+
+def _declared_metric_unmeasured(job: ComputeJob, status: ComputeStatusResult) -> bool:
+    """True when ``job`` declared a metric its terminal result never captured.
+
+    The general form of the ``_status_reports_no_usable_gpu`` special case: a
+    backend-reported SUCCEEDED that declared a metric (from the compute_experiment
+    launch contract / success_criterion) but produced no value for it — after all
+    existing metric resolution (result file, per-arm block, stdout fallback) — did
+    not actually measure its hypothesis and must not record a clean SUCCESS.
+
+    Fail-safe, mirroring the watchdog and the no-usable-GPU guard: returns False
+    when the job declared no metric (metric-less jobs are byte-for-byte unaffected)
+    or when the declared metric IS present in the fully-resolved set. Comparison is
+    case-insensitive to match the success-criterion evaluator's case-insensitive
+    metric lookup.
+    """
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return False
+    resolved = {name.lower() for name in _resolved_metric_names(job, status)}
+    return metric.strip().lower() not in resolved
+
+
 def _status_has_no_reported_metrics(status: ComputeStatusResult) -> bool:
     """True when a terminal status carries no self-reported result metrics.
 
@@ -2495,12 +2576,25 @@ async def _process_single_compute_job(
         # Guarded by _job_expects_data so pure side-effect commands (no metric, no
         # arms) are NOT false-rejected. Artifact detection is best-effort and never
         # raises (collect_terminal_artifact_reference is fail-soft by contract).
+        #
+        # For a job with a contract-declared SCALAR metric, defer to the precise
+        # _declared_metric_unmeasured resolver, which mirrors the success-criterion
+        # gate's FULL resolution (result file, per-arm block, stdout fallback, and
+        # the sticky metric a PRIOR poll persisted). That prevents the coarse
+        # current-poll metrics check from false-rejecting a run whose metric was
+        # only ever reported via stdout, inside an arm, or on an earlier poll. Jobs
+        # with no declared scalar metric (arms-only sweeps, criterion-only tasks)
+        # keep the original coarse no-data check.
         no_data = (
             not timeout_like
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
             and _status_has_no_reported_metrics(status)
             and _job_expects_data(job, task)
+            and (
+                _declared_progress_metric(job) is None
+                or _declared_metric_unmeasured(job, status)
+            )
             and await collect_terminal_artifact_reference(job) is None
         )
         if timeout_like:

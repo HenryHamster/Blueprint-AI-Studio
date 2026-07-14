@@ -3011,6 +3011,277 @@ async def test_process_compute_jobs_once_reclassifies_no_usable_gpu_as_failure(
     assert "no usable GPU" in (job.terminal_reason or "")
 
 
+def _job_with_declared_metric(metric: str | None) -> ComputeJob:
+    meta: dict = {}
+    if metric is not None:
+        meta["declared_metric"] = metric
+    return ComputeJob(
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata=meta,
+    )
+
+
+def test_declared_metric_unmeasured_present_in_result_file():
+    # Declared metric captured directly in $BLUEPRINT_RESULT_FILE metrics → measured.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": 0.91, "loss": 0.2},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_present_in_one_arm():
+    # Multi-arm result: the declared metric lives inside an arm block (best-arm
+    # semantics the success-criterion evaluator uses) → measured.
+    job = _job_with_declared_metric("median_matmul_ms")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={
+            "arms": {
+                "fp32": {"median_matmul_ms": 12.4, "elapsed_seconds": 5.0},
+                "fp16": {"median_matmul_ms": 6.1, "elapsed_seconds": 5.0},
+            }
+        },
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_present_via_stdout_fallback():
+    # No result-file metrics, but the command printed its result object to stdout —
+    # the stdout fallback recovers it exactly as build_compute_result_logs does.
+    job = _job_with_declared_metric("throughput_tflops")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        command_log={"text": "run complete\n{\"throughput_tflops\": 42.0}\n"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_case_insensitive_match():
+    # Matches the evaluator's case-insensitive metric lookup.
+    job = _job_with_declared_metric("Accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": 0.5},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_absent_everywhere():
+    # Declared metric captured NOWHERE — result file empty, no arm, no stdout → the
+    # unmeasured case that must be reclassified.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"loss": 0.2},
+        command_log={"text": "training finished, no accuracy printed"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is True
+
+
+def test_declared_metric_unmeasured_no_declared_metric_is_false():
+    # A job that declares NO metric is never unmeasured (byte-for-byte unaffected).
+    job = _job_with_declared_metric(None)
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED, exit_code=0, metrics=None
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_tolerates_malformed_status():
+    # Missing/malformed metrics and command_log must be tolerated, not raise.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics=None,
+        command_log={"text": None},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is True
+    # Non-numeric declared value does not count as measured (matches evaluator).
+    job2 = _job_with_declared_metric("accuracy")
+    status2 = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": "n/a"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job2, status2) is True
+
+
+@pytest.mark.asyncio
+async def test_declared_metric_missing_reclassified_not_success(
+    db_session, monkeypatch
+):
+    """A declared-metric job that exits 0 writing NO metric is FAILURE, not SUCCESS.
+
+    Regression guard for the recurring silent-SUCCESS waste class (operator bug
+    reports b8879c55 / daa28062 / 87baf5fe): a multi-hour runner-subprocess run
+    declared a metric, exited 0, but never wrote that metric anywhere — result
+    file, per-arm block, or stdout. It was recorded outcome=SUCCESS despite
+    measuring nothing. It must reclassify to FAILURE via the no-data guard, whose
+    precise resolver confirms the declared scalar metric is unmeasured.
+    """
+    project = Project(name="Metric Missing Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="declared-metric experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+        declared_metric="val_accuracy",
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "metricless-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="metricless-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            # Exited 0, produced NO metric anywhere — the silent waste case.
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=None,
+                command_log={"text": "epoch 1..10 done\n"},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Reclassified: FAILURE, not a clean SUCCESS.
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    # Unified no-data terminal reason (the declared scalar metric was unmeasured).
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_declared_metric_written_still_success(db_session, monkeypatch):
+    """A declared-metric job that WRITES the metric stays SUCCESS (no false positive)."""
+    project = Project(name="Metric Written Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="declared-metric experiment measured",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+        declared_metric="val_accuracy",
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "measured-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="measured-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics={"val_accuracy": 0.87},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
 @pytest.mark.parametrize(
     "metrics,expected",
     [
@@ -3191,6 +3462,82 @@ async def test_no_data_guard_respects_reported_metrics(db_session, monkeypatch):
         status_metrics={"accuracy": 0.91},
         artifact_reference=None,
     )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_no_declared_metric_metricless_still_success(db_session, monkeypatch):
+    """A job that declares NO metric and writes none stays SUCCESS (no regression)."""
+    project = Project(name="No Metric Declared Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="no declared metric experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+    # No declared metric was persisted.
+    assert "declared_metric" not in (job.polling_metadata or {})
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-declared-metric-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="no-declared-metric-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=None,
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
 
