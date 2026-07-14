@@ -1588,11 +1588,31 @@ export function nextFocus(
 }
 
 /**
+ * Strip leading markdown decoration (blockquote `>`, one list bullet `- * + •`,
+ * and an emphasis-open `** __ * _`) plus a trailing emphasis-close from a
+ * candidate marker line, so a model that renders `**TICK-VERDICT: CLEAR ...**`,
+ * `- OPERATOR-DECISION: ...`, or `> TICK-VERDICT: FOUND ...` still parses. Only
+ * line-leading list/quote/emphasis tokens are removed — an inline mention like
+ * "you asked about OPERATOR-DECISION:" keeps its leading prose, so the tight
+ * `^\s*<LABEL>:` anchors below still reject it (mid-reply mentions stay ignored).
+ */
+export function stripMarkerDecoration(line: string): string {
+  return line
+    // leading blockquote markers, then at most one list bullet
+    .replace(/^\s*(?:>\s*)*(?:[-*+•]\s+)?/, '')
+    // leading emphasis-open (**, __, *, _) left after the bullet, if any
+    .replace(/^\s*[*_]{1,3}\s*/, '')
+    // trailing emphasis-close (**, __, *, _)
+    .replace(/\s*[*_]{1,3}\s*$/, '');
+}
+
+/**
  * Parse the trailing TICK-VERDICT marker line from a turn's result text. Scans
  * from the LAST line so a mid-turn mention cannot be mistaken for the verdict.
  * ADVANCED carries no surface (it is about applied ops); FOUND/CLEAR name the ONE
- * surface examined. Returns null when no valid marker is present (missing/garbled
- * → treated as a contract violation by classifyTickOutcome).
+ * surface examined. Markdown decoration around the marker (bold/bullet/blockquote)
+ * is tolerated via stripMarkerDecoration. Returns null when no valid marker is
+ * present (missing/garbled → treated as a contract violation by classifyTickOutcome).
  */
 export function parseTickVerdict(
   resultText: string,
@@ -1600,7 +1620,7 @@ export function parseTickVerdict(
   if (typeof resultText !== 'string') return null;
   const lines = resultText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = /^\s*TICK-VERDICT:\s*(ADVANCED|FOUND|CLEAR)\b\s*(.*)$/i.exec(lines[i]);
+    const m = /^\s*TICK-VERDICT:\s*(ADVANCED|FOUND|CLEAR)\b\s*(.*)$/i.exec(stripMarkerDecoration(lines[i]));
     if (!m) continue;
     const verdict = m[1].toLowerCase() as 'advanced' | 'found' | 'clear';
     const rest = m[2].trim();
@@ -1630,15 +1650,16 @@ export function parseTickVerdict(
  * result text. The resident strategist is instructed (bootstrap prompt) to end a
  * reply with `OPERATOR-DECISION: <settled fact>` whenever the operator corrects
  * or settles a course in live chat. Scans from the LAST line so a mid-reply
- * mention cannot be mistaken for the marker. Returns the settled-fact note
- * (leading dash stripped), or null when no marker is present or its note is
- * empty. Pure — unit-testable in isolation.
+ * mention cannot be mistaken for the marker. Markdown decoration around the
+ * marker (bold/bullet/blockquote) is tolerated via stripMarkerDecoration.
+ * Returns the settled-fact note (leading dash stripped), or null when no marker
+ * is present or its note is empty. Pure — unit-testable in isolation.
  */
 export function parseOperatorDecision(resultText: string): string | null {
   if (typeof resultText !== 'string') return null;
   const lines = resultText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(lines[i]);
+    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(stripMarkerDecoration(lines[i]));
     if (!m) continue;
     const note = m[1].replace(/^[—–-]\s*/, '').trim();
     return note.length > 0 ? note : null;
@@ -1647,9 +1668,13 @@ export function parseOperatorDecision(resultText: string): string | null {
 }
 
 /** Whether a turn declared more actionable work remains (a literal AGENDA-CONTINUE
- *  line), gating an immediate re-tick in shouldRunAutonomousTurn. */
+ *  line), gating an immediate re-tick in shouldRunAutonomousTurn. Tolerates the
+ *  same leading markdown decoration (blockquote/bullet/emphasis) as the verdict
+ *  and operator-decision markers so a decorated line is not silently dropped. */
 export function parseAgendaContinue(resultText: string): boolean {
-  return /^\s*AGENDA-CONTINUE\b/im.test(typeof resultText === 'string' ? resultText : '');
+  return /^\s*(?:>\s*)*(?:[-*+•]\s+)?(?:[*_]{1,3}\s*)?AGENDA-CONTINUE\b/im.test(
+    typeof resultText === 'string' ? resultText : '',
+  );
 }
 
 /** The FOUND leads still open — the latest record per surface that is a FOUND

@@ -1149,6 +1149,24 @@ describe('parseOperatorDecision (operator-settled corrections)', () => {
     expect(parseOperatorDecision(undefined)).toBeNull();
   });
 
+  it('tolerates markdown-decorated OPERATOR-DECISION marker lines', () => {
+    // Bold-wrapped: leading/trailing ** must not leak into the note.
+    expect(parseOperatorDecision('**OPERATOR-DECISION: Ship the fix behind a flag.**'))
+      .toBe('Ship the fix behind a flag.');
+    // Bullet-prefixed.
+    expect(parseOperatorDecision('- OPERATOR-DECISION: Drop the images-first rewrite.'))
+      .toBe('Drop the images-first rewrite.');
+    // Blockquote + bold, plus a leading dash inside the note.
+    expect(parseOperatorDecision('> **OPERATOR-DECISION: — reverse the retirement of d-abc**'))
+      .toBe('reverse the retirement of d-abc');
+    // Decorated marker mid-turn followed by a markerless closing wrap is still captured.
+    const text = [
+      '**OPERATOR-DECISION: keep the table-based compute path.**',
+      'Let me know if anything else comes up.',
+    ].join('\n');
+    expect(parseOperatorDecision(text)).toBe('keep the table-based compute path.');
+  });
+
   it('an operator verdict is admitted to the durable register and survives round-trip', () => {
     expect(isSettledDecisionVerdict(OPERATOR_DECISION_VERDICT)).toBe(true);
     const entry: DecisionsRegisterEntry = {
@@ -1481,12 +1499,52 @@ describe('parseTickVerdict', () => {
     // @ts-expect-error — defensive: non-string input degrades to null.
     expect(parseTickVerdict(null)).toBeNull();
   });
+
+  it('parseTickVerdict tolerates markdown-decorated marker lines', () => {
+    // Bold-wrapped CLEAR: leading/trailing ** must not leak into surface/note.
+    expect(parseTickVerdict('**TICK-VERDICT: CLEAR code:backend — looks fine**'))
+      .toEqual({ verdict: 'clear', surfaceKey: 'code:backend', note: 'looks fine' });
+    // Bullet-prefixed ADVANCED.
+    expect(parseTickVerdict('- TICK-VERDICT: ADVANCED — spawned a plan task'))
+      .toEqual({ verdict: 'advanced', surfaceKey: '', note: 'spawned a plan task' });
+    // Blockquote-prefixed FOUND keeps the hyphenated surface key intact.
+    expect(parseTickVerdict('> TICK-VERDICT: FOUND direction:d-21efb120 — lead here'))
+      .toEqual({ verdict: 'found', surfaceKey: 'direction:d-21efb120', note: 'lead here' });
+    // Blockquote + bold together, italic single-star wrap, and no stray decoration.
+    expect(parseTickVerdict('> **TICK-VERDICT: CLEAR qualification — nothing actionable**'))
+      .toEqual({ verdict: 'clear', surfaceKey: 'qualification', note: 'nothing actionable' });
+    expect(parseTickVerdict('*TICK-VERDICT: ADVANCED — did the thing*'))
+      .toEqual({ verdict: 'advanced', surfaceKey: '', note: 'did the thing' });
+  });
+
+  it('captures a decorated mid-turn marker even when the turn ends markerless (d-ca17d9cb)', () => {
+    // The decorated marker appears before a plain closing wrap; last-line scan
+    // must still find it rather than returning null.
+    const text = [
+      '**TICK-VERDICT: CLEAR code:backend — read orchestrator.py, nothing actionable**',
+      '',
+      'That concludes this tick — resuming rotation.',
+    ].join('\n');
+    expect(parseTickVerdict(text))
+      .toEqual({ verdict: 'clear', surfaceKey: 'code:backend', note: 'read orchestrator.py, nothing actionable' });
+  });
+
+  it('still ignores an inline TICK-VERDICT mention that is not line-leading', () => {
+    expect(parseTickVerdict('I will note the TICK-VERDICT: CLEAR convention next time.')).toBeNull();
+  });
 });
 
 describe('parseAgendaContinue', () => {
   it('detects a literal AGENDA-CONTINUE line', () => {
     expect(parseAgendaContinue('did work\nAGENDA-CONTINUE\nTICK-VERDICT: ADVANCED — x')).toBe(true);
     expect(parseAgendaContinue('no more to do here')).toBe(false);
+  });
+
+  it('tolerates markdown-decorated AGENDA-CONTINUE lines', () => {
+    expect(parseAgendaContinue('did work\n- AGENDA-CONTINUE\nmore')).toBe(true);
+    expect(parseAgendaContinue('did work\n> **AGENDA-CONTINUE**\nmore')).toBe(true);
+    // An inline mention that is not line-leading must not trip it.
+    expect(parseAgendaContinue('I considered AGENDA-CONTINUE but there is no more work.')).toBe(false);
   });
 });
 
