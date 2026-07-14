@@ -1607,7 +1607,33 @@ describe('formatCriteriaRubric', () => {
   it('makes the NO-criteria case explicit (thinker section 8 authors only when none exist)', () => {
     // Regression guard: if "none authored" renders identically to "not rendered",
     // the thinker re-authors the rubric every cycle.
+    // present criterion_coverage with an EMPTY list → genuinely no criteria authored.
     const out = formatCriteriaRubric(withCriteria([])).join('\n');
+    expect(out).toContain('None authored yet');
+    expect(out).not.toContain('floored out');
+  });
+
+  it('distinguishes floored-out (criterion_coverage key absent) from no-criteria', () => {
+    // Trust-surface regression guard: when the packer floors version_phase for budget
+    // it can drop the criterion_coverage key entirely. Rendering "None authored yet"
+    // then conflates "floored out" with "no criteria exist" and drives the thinker to
+    // re-author a rubric that is actually live — a duplicate-authoring hazard.
+    const out = formatCriteriaRubric({ version_number: 26, phase: 'stabilize' }).join('\n');
+    expect(out).not.toContain('None authored yet');
+    expect(out).toContain('floored out');
+    // Points the strategist at the recovery path instead of a false empty state.
+    expect(out).toContain('./fetch version-phase');
+  });
+
+  it('treats criterion_coverage present-but-not-a-dict as floored-out, not no-criteria', () => {
+    // The key IS present (so not floored-out per the absence check) but carries no
+    // usable list — still must not render "None authored yet" if there is a list-less
+    // shape; here the key is present with an empty-criteria coverage object → no-criteria.
+    const out = formatCriteriaRubric({
+      version_number: 26,
+      phase: 'stabilize',
+      criterion_coverage: { criteria: [] },
+    }).join('\n');
     expect(out).toContain('None authored yet');
   });
 

@@ -323,6 +323,22 @@ const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
  * the burn-down framing itself.
  */
 export function formatCriteriaRubric(versionPhase: Record<string, unknown>): string[] {
+  const parts: string[] = [];
+  parts.push('\n### Acceptance criteria (authored rubric)');
+
+  // Distinguish "the criterion_coverage key was never packed into this version_phase"
+  // (floored out for budget — the packer trims evidence bulk under pressure) from
+  // "the key is present but no criteria exist". Collapsing these two is a trust-surface
+  // bug: it produced a false "None authored yet" line while healthy criteria were live,
+  // and — because thinker.ts §8 authors criteria only when none exist — a
+  // duplicate-authoring hazard. See the packer floor path, which preserves the criteria
+  // list precisely so this stays truthful under budget pressure.
+  const coverageAbsent = !('criterion_coverage' in versionPhase);
+  if (coverageAbsent) {
+    parts.push('_Criteria not shipped this cycle (floored out for budget) — run `./fetch version-phase` to see the live rubric._');
+    return parts;
+  }
+
   const coverageRaw = versionPhase.criterion_coverage;
   const coverage = coverageRaw && typeof coverageRaw === 'object' && !Array.isArray(coverageRaw)
     ? coverageRaw as Record<string, unknown>
@@ -335,12 +351,11 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
     && (c as Record<string, unknown>).status === 'active'
     && typeof (c as Record<string, unknown>).criterion_key === 'string');
 
-  const parts: string[] = [];
-  parts.push('\n### Acceptance criteria (authored rubric)');
-
   if (active.length === 0) {
     // Must be EXPLICIT: thinker.ts §8 authors criteria only when none exist yet, so
-    // "no criteria" and "criteria not rendered" must never look the same.
+    // "no criteria" and "criteria not rendered" must never look the same. The
+    // key-absent (floored-out) case is handled above; reaching here means the key is
+    // present and genuinely empty — no criteria have been authored for this version.
     parts.push('_None authored yet for this version._');
     return parts;
   }

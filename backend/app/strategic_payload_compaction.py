@@ -468,7 +468,13 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
                     if not isinstance(c, dict):
                         continue
                     entry: dict[str, Any] = {}
-                    for fkey in ("criterion_key", "coverage", "stuck_reason"):
+                    # ``status`` is load-bearing: the strategic renderer
+                    # (formatCriteriaRubric) filters the rubric to
+                    # ``status == 'active'`` criteria, so a floored entry without it
+                    # renders as "None authored yet" — the exact floored-out/no-criteria
+                    # conflation this floor path exists to avoid. Keep it (plus the small
+                    # identity/text/stuck fields) so the rubric stays truthful under budget.
+                    for fkey in ("criterion_key", "coverage", "status", "stuck_reason"):
                         if fkey in c:
                             entry[fkey] = c[fkey]
                     text = _bounded_text(c.get("text"), _VERSION_PHASE_TEXT_FLOOR_CAP)
