@@ -143,7 +143,8 @@
     "routers/runner.py": 2300,
     "capability_trial_verdict.py": 1750,
     "acceptance_gate.py": 1800,
-    "review_loop_convergence.py": 1950
+    "review_loop_convergence.py": 1950,
+    "routers/admin_project_tools.py": 1800
   },
   "agent": {
     "index.ts": 4600,
