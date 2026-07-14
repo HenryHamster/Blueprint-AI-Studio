@@ -3716,11 +3716,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _dirs_to_prefetch.add(_pf_did)
     if _dirs_to_prefetch:
         try:
-            from app.directions_repo import get_direction_row as _get_dir_row
+            from app.directions_repo import get_direction_rows as _get_dir_rows
 
-            for _pf_dir_id in _dirs_to_prefetch:
+            # Single batched SELECT for every direction we need, keyed for O(1)
+            # lookup — avoids one round-trip per direction (N+1).
+            _pf_rows = await _get_dir_rows(
+                session, task.project_id, _dirs_to_prefetch
+            )
+            for _pf_dir_id, _pf_row in _pf_rows.items():
                 try:
-                    _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
                     if _pf_row is not None and _pf_row.criterion_keys:
                         from app.acceptance_criteria import (
                             filter_active_criterion_keys as _filter_active,

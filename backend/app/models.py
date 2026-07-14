@@ -2941,6 +2941,10 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_event_type", "project_id", "event_type"),
         Index("ix_alert_project_source", "project_id", "source"),
         Index("ix_alert_project_created_at", "project_id", "created_at"),
+        # title is filtered in dedupe/existence WHERE clauses across many alert
+        # call sites; index it alongside project_id to avoid a seq-scan after
+        # the project_id filter on every check.
+        Index("ix_alert_project_title", "project_id", "title"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",
@@ -4084,6 +4088,12 @@ class KnowledgeDocument(SQLModel, table=True):
             "lifecycle_status",
         ),
         Index("ix_knowledge_document_project_lifecycle_created", "project_id", "lifecycle_status", "created_at"),
+        # Covers the common list path: filter by project_id then ORDER BY
+        # created_at, when no lifecycle_status predicate is present (the
+        # existing project_lifecycle_created composite cannot serve those
+        # queries). Used across knowledge_query.py and
+        # strategic_context_package.py document-list loads.
+        Index("ix_knowledge_document_project_created", "project_id", "created_at"),
     )
 
 
@@ -5088,6 +5098,11 @@ class LocalRunner(SQLModel, table=True):
             "project_id",
             "status",
         ),
+        # Cross-project fleet health scan (admin_runners.py) filters on
+        # status alone (status != 'deleted') without a project_id predicate,
+        # which the composite above cannot serve. Standalone status index
+        # avoids a full sequential scan over the runners table.
+        Index("ix_localrunner_status", "status"),
     )
 
 

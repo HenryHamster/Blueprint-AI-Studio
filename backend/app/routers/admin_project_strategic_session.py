@@ -1450,23 +1450,20 @@ async def get_project_strategic_state(
     # Sequential session.execute() calls: AsyncSession does not support
     # concurrent coroutine-based calls (asyncpg raises InterfaceError when
     # a second query is issued before the first completes).
-    _active_cycle_res = await session.execute(
+    # Both the most-recent active cycle and the most-recent non-active
+    # ("latest") cycle in one round-trip via DISTINCT ON the is-active flag:
+    # Postgres keeps one row per distinct flag value, and the ORDER BY (flag
+    # leading, then phase1_started_at DESC) makes that the newest of each group.
+    # Equivalent to the two prior limit-1 queries but halves the round-trips.
+    _is_active_cycle = StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES))
+    _cycle_res = await session.execute(
         select(StrategicCycle)
-        .where(
-            StrategicCycle.project_id == project.id,
-            StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
+        .where(StrategicCycle.project_id == project.id)
+        .order_by(
+            _is_active_cycle.desc(),
+            StrategicCycle.phase1_started_at.desc(),
         )
-        .order_by(StrategicCycle.phase1_started_at.desc())
-        .limit(1)
-    )
-    _latest_cycle_res = await session.execute(
-        select(StrategicCycle)
-        .where(
-            StrategicCycle.project_id == project.id,
-            ~StrategicCycle.outcome.in_(list(strategic_cycle.ACTIVE_OUTCOMES)),
-        )
-        .order_by(StrategicCycle.phase1_started_at.desc())
-        .limit(1)
+        .distinct(_is_active_cycle)
     )
     _task_status_rows_res = await session.execute(
         select(Task.status, func.count())
@@ -1501,8 +1498,15 @@ async def get_project_strategic_state(
         .order_by(ReleaseVersion.opened_at.desc())
         .limit(1)
     )
-    active_cycle = _active_cycle_res.scalar_one_or_none()
-    latest_cycle = _latest_cycle_res.scalar_one_or_none()
+    _cycle_rows = _cycle_res.scalars().all()
+    active_cycle = next(
+        (c for c in _cycle_rows if c.outcome in strategic_cycle.ACTIVE_OUTCOMES),
+        None,
+    )
+    latest_cycle = next(
+        (c for c in _cycle_rows if c.outcome not in strategic_cycle.ACTIVE_OUTCOMES),
+        None,
+    )
     task_status_rows = _task_status_rows_res.all()
     message_rows = _message_rows_res.scalars().all()
     message_count_rows = _message_count_rows_res.all()

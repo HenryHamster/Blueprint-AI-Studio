@@ -195,6 +195,36 @@ async def get_direction_row(
     ).scalar_one_or_none()
 
 
+async def get_direction_rows(
+    session: AsyncSession, project_id, direction_keys
+) -> "Dict[str, Direction]":
+    """Batch-fetch Direction ORM rows for many keys in ONE query.
+
+    Returns a dict keyed by ``direction_key`` for O(1) lookup, containing only
+    the keys that resolved to a row. Empty input yields an empty dict without
+    touching the database. This is the batched equivalent of
+    :func:`get_direction_row` — it avoids the N round-trips a per-key loop
+    incurs.
+    """
+    keys = [k for k in dict.fromkeys(direction_keys) if k]
+    if not keys:
+        return {}
+    pid = _coerce_project_id(project_id)
+    rows = (
+        (
+            await session.execute(
+                select(Direction).where(
+                    Direction.project_id == pid,
+                    Direction.direction_key.in_(keys),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {row.direction_key: row for row in rows}
+
+
 async def upsert_direction(
     session: AsyncSession, project_id, direction: Dict[str, Any]
 ) -> None:
