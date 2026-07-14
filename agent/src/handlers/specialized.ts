@@ -1182,6 +1182,39 @@ Output ONLY the JSON object now — with top-level "summary", "root_cause", "aff
 }
 
 /**
+ * Assemble the repo-bootstrap prompt so the automatically-cacheable prefix is
+ * maximized: all stable literal/config guidance (core bootstrap instructions,
+ * default tool guidance, fetch guidance, CLAUDE.md, playbook guidance + note)
+ * forms one contiguous leading prefix, and all task-variable content
+ * (contextSection, retryContext) forms a contiguous trailing tail. This is a
+ * byte-ORDER change only — every section that shipped before still ships; only
+ * its position moves. Anthropic prefix caching bills a cache read at ~10% of base
+ * input, so a task-variable byte appearing early would bust the automatic prefix
+ * match for everything after it. Because none of the prefix sections read the
+ * clock or git HEAD, two builds of an identical payload produce a BYTE-IDENTICAL
+ * stable prefix. Mirrors assembleStandardPrompt in standard.ts (direction
+ * d-27685510).
+ */
+export function assembleRepoBootstrapPrompt(s: {
+  bootstrapCoreBody: string;
+  fetchGuidance: string;
+  claudeMdSection: string;
+  playbookNote: string;
+  contextSection: string;
+  retryContext: string;
+}): { stablePrefix: string; variableBody: string; fullPrompt: string } {
+  const stablePrefix =
+    s.bootstrapCoreBody
+    + `\n${DEFAULT_TOOL_GUIDANCE}`
+    + s.fetchGuidance
+    + s.claudeMdSection
+    + PLAYBOOK_GUIDANCE
+    + s.playbookNote;
+  const variableBody = s.contextSection + s.retryContext;
+  return { stablePrefix, variableBody, fullPrompt: stablePrefix + variableBody };
+}
+
+/**
  * First-cycle repo bootstrap: reads project structure, confirms build/test commands,
  * and seeds design doc sections before implementation tasks fan out.
  *
@@ -1282,14 +1315,23 @@ Also read any detected build/CI manifests you find.
 
 5. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` and \`domain_overview\` populated. If you cannot read the repo or run commands, still complete with whatever you found.`;
 
-  const bootstrapPrompt = `${contextSection}${bootstrapCoreBody}\n${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
-
   const promptFingerprint = computePromptFingerprint('repo_bootstrap');
   setCurrentPromptFingerprint(promptFingerprint);
   sendHeartbeatSync(taskId, 'Running repo bootstrap...', { prompt_fingerprint: promptFingerprint });
 
   const bootstrapPlaybookNote = '\nNote: Save reusable setup/environment knowledge to the playbook — environment setup steps, build quirks, version requirements, install workarounds, required env vars, and test-setup knowledge a future agent would otherwise rediscover.\n';
-  const bootstrapFullPrompt = bootstrapPrompt + PLAYBOOK_GUIDANCE + bootstrapPlaybookNote;
+  // Cache-optimized assembly: stable guidance leads, task-variable content
+  // (contextSection, retryContext) is relocated to a contiguous trailing tail so
+  // the leading prefix is byte-identical across wall-clock/HEAD (direction
+  // d-27685510). See assembleRepoBootstrapPrompt.
+  const { fullPrompt: bootstrapFullPrompt } = assembleRepoBootstrapPrompt({
+    bootstrapCoreBody,
+    fetchGuidance,
+    claudeMdSection,
+    playbookNote: bootstrapPlaybookNote,
+    contextSection,
+    retryContext,
+  });
   const bootstrapTelemetry = buildPromptSizeTelemetry(bootstrapFullPrompt, [
     ['context', contextSection],
     ['core_prompt', bootstrapCoreBody],

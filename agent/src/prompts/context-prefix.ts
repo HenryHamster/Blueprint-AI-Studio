@@ -441,7 +441,13 @@ export function formatStrategicIntent(intent: Record<string, unknown> | undefine
   return lines.join('\n') + '\n';
 }
 
-export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppressTaskLists?: boolean }): string {
+export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppressTaskLists?: boolean; nowMs?: number }): string {
+  // Deterministic reference epoch for relative-time rendering (see the
+  // "Avoid (already tried and failed)" block). undefined → relativeTimeFromIso
+  // falls back to its live wall-clock default.
+  const relativeTimeReference = typeof opts?.nowMs === 'number' && Number.isFinite(opts.nowMs)
+    ? new Date(opts.nowMs)
+    : undefined;
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] as Record<string, unknown> | undefined;
@@ -761,7 +767,14 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
             const headParts = [`- ${text}`];
             if (ftype) headParts.push(`[${ftype}]`);
             const qualifiers: string[] = [];
-            const rel = relativeTimeFromIso(failedAt);
+            // Render relative to a caller-supplied deterministic reference epoch
+            // (the backend-baked payload timestamp) when provided, NOT the VM
+            // wall clock — so this text stays byte-identical across two builds of
+            // an identical payload and never busts a cacheable prompt prefix it
+            // lands in (v24 cost lever, direction d-27685510). Handlers that place
+            // this block only in their task-variable tail pass no nowMs; passing
+            // undefined lets relativeTimeFromIso keep its live wall-clock default.
+            const rel = relativeTimeFromIso(failedAt, relativeTimeReference);
             if (rel) qualifiers.push(rel);
             if (stage) qualifiers.push(`failed at ${stage}`);
             if (qualifiers.length > 0) headParts.push(`(${qualifiers.join(', ')})`);

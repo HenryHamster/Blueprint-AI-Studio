@@ -90,6 +90,37 @@ export function renderStrategicPromptSuffix(payload: Record<string, unknown>): s
 }
 
 /**
+ * Render an ISO timestamp as a deterministic recency string relative to a
+ * caller-supplied reference epoch (`refMs`) — NOT the VM wall clock. Passing the
+ * same `(iso, refMs)` always yields the same bytes, so a strategic prompt built
+ * twice from an identical payload stays byte-identical regardless of the current
+ * time. This is the v24 prompt-cache cost lever (direction d-27685510): Anthropic
+ * prefix-cache reads bill at ~10% of base input, and a single wall-clock byte in
+ * the prompt would bust the automatic prefix match for everything after it.
+ *
+ * `refMs` should be the backend-baked payload-generation epoch. When it is not a
+ * finite number (the backend supplied no timestamp) the recency signal is still
+ * preserved but rendered as the absolute UTC date, which is likewise clock-free —
+ * never the live wall clock. Returns '' for empty/unparseable input.
+ */
+export function formatRelativeDays(iso: string, refMs: number): string {
+  if (!iso) return '';
+  try {
+    const d = parseBackendTimestamp(iso);
+    if (!d) return '';
+    if (!Number.isFinite(refMs)) {
+      // No deterministic reference — fall back to the absolute UTC date so the
+      // text never reads the VM wall clock (which would bust the cache prefix).
+      return `on ${d.toISOString().slice(0, 10)}`;
+    }
+    const days = Math.max(0, Math.floor((refMs - d.getTime()) / 86400000));
+    if (days === 0) return 'today';
+    if (days === 1) return '1 day ago';
+    return `${days} days ago`;
+  } catch { return ''; }
+}
+
+/**
  * Render the backend-supplied `staged_directions` block as a prompt section so
  * the strategist sees what work is already STAGED for the next version (inert
  * until that version promotes) and does NOT re-propose it. Returns '' when
@@ -342,7 +373,22 @@ export async function handleStrategic(
   const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
 
-  const contextPrefix = buildContextPrefix(task);
+  // Deterministic reference epoch for every relative-time string rendered into
+  // this prompt (failed-approach "Nd ago" in contextPrefix, userStateLine
+  // "N days ago"). Sourced from the backend-baked payload timestamp — NOT the VM
+  // wall clock — so two builds of an identical payload produce a byte-identical
+  // cacheable prefix (v24 cost lever, direction d-27685510: prefix-cache reads
+  // bill at ~10% of base input). NaN when the backend supplied no timestamp, in
+  // which case the relative-time renderers degrade to a clock-free absolute date.
+  const payloadStaleness = payload.payload_staleness && typeof payload.payload_staleness === 'object'
+    ? payload.payload_staleness as Record<string, unknown>
+    : undefined;
+  const payloadClockRefIso =
+    strVal(payloadStaleness?.generated_at) || strVal(payloadStaleness?.checked_at);
+  const payloadClockRefDate = payloadClockRefIso ? parseBackendTimestamp(payloadClockRefIso) : null;
+  const payloadClockRefMs = payloadClockRefDate ? payloadClockRefDate.getTime() : NaN;
+
+  const contextPrefix = buildContextPrefix(task, { nowMs: payloadClockRefMs });
 
   // ── Strategic mode: product-level vision review ────────────────────────
     const vision = payload.vision as Record<string, unknown> | undefined;
@@ -601,20 +647,11 @@ export async function handleStrategic(
       return lines.join('\n');
     };
 
-    const formatRelativeDays = (iso: string): string => {
-      if (!iso) return '';
-      try {
-        const d = parseBackendTimestamp(iso);
-        if (!d) return '';
-        const days = Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
-        if (days === 0) return 'today';
-        if (days === 1) return '1 day ago';
-        return `${days} days ago`;
-      } catch { return ''; }
-    };
-
-    const userActiveRel = formatRelativeDays(userLastActiveAt);
-    const ackRel = formatRelativeDays(runningUpdateAckAt);
+    // formatRelativeDays is a clock-free module-scope helper: it renders relative
+    // to the deterministic payload epoch (payloadClockRefMs), so userStateLine
+    // stays byte-identical across two builds of an identical payload.
+    const userActiveRel = formatRelativeDays(userLastActiveAt, payloadClockRefMs);
+    const ackRel = formatRelativeDays(runningUpdateAckAt, payloadClockRefMs);
     const userStateLine = (userActiveRel || ackRel)
       ? `User last active: ${userActiveRel || 'unknown'}${ackRel ? ` | last acknowledged running_update: ${ackRel}` : ''}`
       : 'User activity: no record yet';
@@ -748,9 +785,8 @@ export async function handleStrategic(
     const cycleStartReconciliationSection = buildCycleStartReconciliationSection(
       payload.cycle_start_reconciliation as Record<string, unknown> | undefined,
     );
-    const payloadStaleness = payload.payload_staleness && typeof payload.payload_staleness === 'object'
-      ? payload.payload_staleness as Record<string, unknown>
-      : undefined;
+    // payloadStaleness (extracted above for the deterministic clock reference) is
+    // reused here for its rendered section.
     const payloadStalenessSection = buildPayloadStalenessSection(payloadStaleness);
     const pruneCandidatesSection = buildPruneCandidatesSection(
       payload.prune_candidates as Record<string, unknown> | undefined,

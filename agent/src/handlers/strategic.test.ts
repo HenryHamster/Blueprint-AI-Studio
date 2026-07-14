@@ -425,9 +425,15 @@ vi.mock('./strategic-helpers.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../utils/time.js', () => ({
-  parseBackendTimestamp: () => null,
-}));
+// Use the real parseBackendTimestamp: it is a pure, timezone-safe ISO parser, and
+// the prompt-cache tests below assert the exact relative-day rendering it feeds
+// (formatRelativeDays / userStateLine). A null stub would make those assertions
+// vacuous. Delegating to importOriginal also keeps the mock covering every actual
+// export (see expectMockCoversActualNamedExports).
+vi.mock('../utils/time.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/time.js')>();
+  return { ...actual };
+});
 
 vi.mock('../utils/design-doc-presence.js', () => ({
   ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
@@ -587,6 +593,7 @@ import {
   buildStagedDirectionsSection,
   renderDesignDocIndexOverview,
   handleStrategic,
+  formatRelativeDays,
 } from './strategic.js';
 import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
@@ -738,6 +745,89 @@ describe('renderStrategicPromptSuffix', () => {
   it('returns empty string when prompt_suffix is absent', () => {
     expect(renderStrategicPromptSuffix({})).toBe('');
     expect(renderStrategicPromptSuffix({ prompt_suffix: '' })).toBe('');
+  });
+});
+
+// ── Prompt-cache prefix stability (v24 cost lever, direction d-27685510) ─────
+// formatRelativeDays previously read the VM wall clock (Date.now()), so an
+// identical strategic payload rendered a different userStateLine each day — a
+// single wall-clock byte that busts the automatically-cacheable prompt prefix
+// (Anthropic prefix-cache reads bill at ~10% of base input). It now renders
+// relative to a caller-supplied deterministic reference epoch (the backend-baked
+// payload timestamp), so two builds of an identical payload are byte-identical.
+describe('formatRelativeDays', () => {
+  const iso = '2026-01-01T00:00:00Z';
+  const isoMs = Date.parse(iso);
+
+  it('renders days relative to the injected reference epoch, not the wall clock', () => {
+    expect(formatRelativeDays(iso, isoMs)).toBe('today');
+    expect(formatRelativeDays(iso, isoMs + 86_400_000)).toBe('1 day ago');
+    expect(formatRelativeDays(iso, isoMs + 5 * 86_400_000)).toBe('5 days ago');
+  });
+
+  it('is deterministic across wall-clock changes for the same (iso, refMs)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2027-01-01T00:00:00Z'));
+      const a = formatRelativeDays(iso, isoMs + 3 * 86_400_000);
+      vi.setSystemTime(new Date('2031-06-15T00:00:00Z'));
+      const b = formatRelativeDays(iso, isoMs + 3 * 86_400_000);
+      expect(a).toBe(b);
+      expect(a).toBe('3 days ago');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never returns a negative day count when the reference precedes the timestamp', () => {
+    expect(formatRelativeDays(iso, isoMs - 10 * 86_400_000)).toBe('today');
+  });
+
+  it('falls back to a clock-free absolute UTC date when no finite reference is supplied', () => {
+    expect(formatRelativeDays(iso, NaN)).toBe('on 2026-01-01');
+  });
+
+  it('returns empty string for empty or unparseable input', () => {
+    expect(formatRelativeDays('', 123)).toBe('');
+    expect(formatRelativeDays('not-a-date', 123)).toBe('');
+  });
+});
+
+describe('handleStrategic userStateLine is byte-identical across wall-clock for an identical payload', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('renders userStateLine deterministically from the payload timestamp, not Date.now()', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      user_last_active_at: '2026-07-08T00:00:00Z',
+      running_update_acknowledged_at: '2026-07-11T00:00:00Z',
+      // Backend-baked payload-generation timestamp — the deterministic reference.
+      payload_staleness: { verdict: 'unknown', generated_at: '2026-07-14T00:00:00Z' },
+    };
+
+    vi.useFakeTimers();
+    try {
+      // Build 1 — one wall clock.
+      vi.setSystemTime(new Date('2026-07-14T09:00:00Z'));
+      await handleStrategic('task-usl-1', payload, {}, 'tok', 'owner', 'repo', null, { value: '' });
+      const line1 = String(capturedThinkerParams?.userStateLine);
+
+      // Build 2 — same payload, wall clock advanced 40 days. The mocked
+      // buildThinkerPrompt overwrites capturedThinkerParams on every call.
+      vi.setSystemTime(new Date('2026-08-23T09:00:00Z'));
+      await handleStrategic('task-usl-2', payload, {}, 'tok', 'owner', 'repo', null, { value: '' });
+      const line2 = String(capturedThinkerParams?.userStateLine);
+
+      expect(line1).toBe(line2);
+      // Rendered relative to the payload epoch (2026-07-14): active 6 days prior,
+      // acknowledged 3 days prior.
+      expect(line1).toContain('User last active: 6 days ago');
+      expect(line1).toContain('last acknowledged running_update: 3 days ago');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

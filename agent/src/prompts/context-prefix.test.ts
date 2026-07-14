@@ -1,7 +1,62 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildContextPrefix, formatRejectionPatternsSection, formatDomainOverview, REVIEW_GATED_TASK_TYPES } from './context-prefix.js';
+
+// ── Prompt-cache prefix stability (v24 cost lever, direction d-27685510) ─────
+// The "Avoid (already tried and failed)" block renders each failed approach's
+// age via relativeTimeFromIso, which defaults to the VM wall clock. When this
+// block lands in a handler's cacheable prefix (e.g. the strategic thinker
+// prompt), a live wall-clock string busts the automatic prefix match. Passing a
+// deterministic reference epoch (`nowMs`) — the backend-baked payload timestamp —
+// makes the rendered age byte-identical across builds of an identical payload.
+describe('buildContextPrefix failed-approach age is cache-stable with an injected reference epoch', () => {
+  const taskWithFailedApproach = (failedAt: string) => ({
+    payloads: [{ type: 'strategic_review' }],
+    direction_context: {
+      title: 'Harden prompt context',
+      failed_approaches: [
+        { text: 'tried the naive reorder', failure_type: 'CODE_ERROR', failed_at: failedAt },
+      ],
+    },
+  });
+
+  it('renders the age relative to the injected epoch, not the wall clock', () => {
+    const failedAt = '2026-01-01T00:00:00Z';
+    const refMs = Date.parse('2026-01-04T00:00:00Z'); // 3 days later
+    const prefix = buildContextPrefix(taskWithFailedApproach(failedAt), { nowMs: refMs });
+    expect(prefix).toContain('tried the naive reorder');
+    expect(prefix).toContain('3d ago');
+  });
+
+  it('is byte-identical across wall-clock changes when the same reference epoch is supplied', () => {
+    const failedAt = '2026-01-01T00:00:00Z';
+    const refMs = Date.parse('2026-01-08T00:00:00Z'); // 7 days later → "1w ago"
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2027-06-01T00:00:00Z'));
+      const a = buildContextPrefix(taskWithFailedApproach(failedAt), { nowMs: refMs });
+      vi.setSystemTime(new Date('2030-12-25T00:00:00Z'));
+      const b = buildContextPrefix(taskWithFailedApproach(failedAt), { nowMs: refMs });
+      expect(a).toBe(b);
+      expect(a).toContain('1w ago');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to the live wall clock when no reference epoch is supplied (unchanged for tail-only handlers)', () => {
+    const failedAt = '2026-01-01T00:00:00Z';
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-03T00:00:00Z')); // 2 days later
+      const prefix = buildContextPrefix(taskWithFailedApproach(failedAt));
+      expect(prefix).toContain('2d ago');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('buildContextPrefix', () => {
   it('preserves strategic intent when project context is present', () => {
