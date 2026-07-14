@@ -3666,17 +3666,21 @@ class TestOnboardDetectionIncompleteMarker:
 
 
 class TestClassifyRepoEmptiness:
-    """Unit tests for the pure _classify_repo_emptiness helper."""
+    """Unit tests for the pure _classify_repo_emptiness helper.
+
+    The helper now returns ``(is_empty, source_file_count)``; the count is the
+    authoritative real-source total persisted for the agent to compare against.
+    """
 
     def test_truly_empty_repo(self):
-        assert _classify_repo_emptiness([]) is True
+        assert _classify_repo_emptiness([]) == (True, 0)
 
     def test_readme_and_license_only(self):
         items = [
             {"name": "README.md", "type": "file"},
             {"name": "LICENSE", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_ci_and_config_dotfiles_only(self):
         items = [
@@ -3686,7 +3690,7 @@ class TestClassifyRepoEmptiness:
             {"name": "CONTRIBUTING.md", "type": "file"},
             {"name": "CODE_OF_CONDUCT.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_source_directory_with_one_file_is_still_empty_below_threshold(self):
         items = [
@@ -3694,34 +3698,39 @@ class TestClassifyRepoEmptiness:
             {"name": "src", "type": "dir"},
             {"name": "main.py", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 1)
 
     def test_source_manifest_is_empty_below_threshold(self):
         items = [
             {"name": "pyproject.toml", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_threshold_source_file_count_is_still_empty(self):
         items = [
             {"name": f"src/file{i}.py", "type": "file"}
             for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD)
         ]
-        assert _classify_repo_emptiness(items) is True
+        empty, count = _classify_repo_emptiness(items)
+        assert empty is True
+        assert count == GREENFIELD_SOURCE_FILE_THRESHOLD
 
     def test_over_threshold_source_file_count_is_non_empty(self):
         items = [
             {"name": f"src/file{i}.py", "type": "file"}
             for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD + 1)
         ]
-        assert _classify_repo_emptiness(items) is False
+        empty, count = _classify_repo_emptiness(items)
+        assert empty is False
+        # The full count is reported even past the emptiness threshold.
+        assert count == GREENFIELD_SOURCE_FILE_THRESHOLD + 1
 
     def test_git_dir_ignored(self):
         items = [
             {"name": ".git", "type": "dir"},
             {"name": "README.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_malformed_items_skipped(self):
         items = [
@@ -3730,18 +3739,18 @@ class TestClassifyRepoEmptiness:
             {"name": "", "type": "file"},
             {"name": "README.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_incomplete_listing_is_not_empty(self):
         """An incomplete read can never be classified as greenfield."""
         # Even an empty fetched listing degrades to not-empty when the read
-        # was incomplete (a subdir fetch failed).
-        assert _classify_repo_emptiness([], listing_complete=False) is False
+        # was incomplete (a subdir fetch failed). No count is asserted.
+        assert _classify_repo_emptiness([], listing_complete=False) == (False, None)
 
     def test_incomplete_listing_overrides_below_threshold(self):
         """Below-threshold source + incomplete read => still not empty."""
         items = [{"name": "README.md", "type": "file"}]
-        assert _classify_repo_emptiness(items, listing_complete=False) is False
+        assert _classify_repo_emptiness(items, listing_complete=False) == (False, None)
 
 
 class TestOnboardRepoBootstrapSpawn:

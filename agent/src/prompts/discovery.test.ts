@@ -18,7 +18,7 @@ vi.mock('fs', () => ({
 
 import { execFileSync } from 'child_process';
 import fs from 'fs';
-import { countSourceFiles, detectGreenfield, isGreenfieldRepo, verifyCloneDelivered, buildRepoMap, clearTrackedFilesCache, clearRepoMapCache } from './discovery.js';
+import { countSourceFiles, detectGreenfield, isGreenfieldRepo, buildGreenfieldCitationGuidance, verifyCloneDelivered, buildRepoMap, clearTrackedFilesCache, clearRepoMapCache } from './discovery.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 const setLsFiles = (files: string[]) =>
@@ -64,6 +64,24 @@ describe('countSourceFiles', () => {
       throw new Error('not a git repo');
     });
     expect(countSourceFiles()).toBeNull();
+  });
+
+  it('excludes the same scaffolding basenames/prefixes as the backend classifier', () => {
+    // These are exactly the entries the backend's _is_real_source_file drops:
+    // go.mod, LICENCE (British spelling), and the readme/contributing/changelog/
+    // security prefixes regardless of extension. None must count as source, so
+    // the durable onboarding count and this live count agree like-for-like.
+    setLsFiles([
+      'go.mod', // basename exclusion (no telling extension)
+      'LICENCE', // British-spelling basename
+      'README', // prefix exclusion, no extension
+      'README.rst', // prefix exclusion, non-config extension
+      'CONTRIBUTING', // prefix exclusion
+      'CHANGELOG', // prefix exclusion
+      'SECURITY', // prefix exclusion
+      'src/index.ts', // the only real source file
+    ]);
+    expect(countSourceFiles()).toBe(1);
   });
 });
 
@@ -144,6 +162,43 @@ describe('isGreenfieldRepo', () => {
     expect(isGreenfieldRepo({ repo_is_empty: true })).toBe(true);
     expect(isGreenfieldRepo({ repo_is_empty: false })).toBe(false);
     expect(isGreenfieldRepo({})).toBe(false);
+  });
+});
+
+describe('buildGreenfieldCitationGuidance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
+  });
+
+  it('steers a greenfield design to web/external citations and away from invented file paths', () => {
+    // Durable signal says empty → greenfield regardless of the live tree.
+    const guidance = buildGreenfieldCitationGuidance({ repo_is_empty: true });
+    expect(guidance).not.toBe('');
+    // The grounding fix: cite external/web sources instead of nonexistent files.
+    expect(guidance).toMatch(/https:\/\//);
+    expect(guidance).toMatch(/EXTERNAL \/ WEB sources/);
+    // And it must explicitly forbid inventing repo file paths — the exact cause
+    // of the grounding-gate discard on an empty repo.
+    expect(guidance.toLowerCase()).toContain('do not invent repository file paths');
+    expect(guidance).toContain('GREENFIELD CITATION MODE');
+  });
+
+  it('is greenfield via the live scan when the durable signal is absent', () => {
+    // Config-only tree, no durable signal → live detectGreenfield() short-circuit.
+    setLsFiles(['package.json', 'README.md', 'tsconfig.json', '.gitignore']);
+    expect(buildGreenfieldCitationGuidance({})).toContain('GREENFIELD CITATION MODE');
+  });
+
+  it('returns empty string on a mature repo so the default file-citation posture is unchanged', () => {
+    // Durable signal explicitly non-empty → not greenfield → no guidance noise.
+    setLsFiles(['package.json', 'README.md', 'tsconfig.json', '.gitignore']);
+    expect(buildGreenfieldCitationGuidance({ repo_is_empty: false })).toBe('');
+    // Source-rich live tree with no durable signal is also mature.
+    const files = Array.from({ length: GREENFIELD_SOURCE_FILE_THRESHOLD + 1 }, (_, i) => `src/m${i}.ts`);
+    setLsFiles(files);
+    expect(buildGreenfieldCitationGuidance({})).toBe('');
   });
 });
 
@@ -254,6 +309,30 @@ describe('verifyCloneDelivered', () => {
   it('skips the branch check when no branch is provided', () => {
     routeGit({ head: 'abc123', lsFiles: populatedTree });
     expect(() => { verifyCloneDelivered({ repo_is_empty: false }); }).not.toThrow();
+  });
+
+  it('quotes the persisted authoritative source_file_count in the clone_failed message', () => {
+    // The backend persisted a real count; on a durable/live disagreement the
+    // failure names that count so the mismatch is explicit and like-for-like.
+    routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
+    try {
+      verifyCloneDelivered({ repo_is_empty: false, source_file_count: 42 }, 'main');
+      throw new Error('expected verifyCloneDelivered to throw');
+    } catch (e) {
+      expect((e as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
+      expect((e as Error).message).toContain('the onboarding scan counted 42 source file(s)');
+      expect((e as Error).message).toContain('under the same exclusion rules');
+    }
+  });
+
+  it('falls back to the boolean basis when no persisted count is present', () => {
+    routeGit({ head: 'abc123', originHead: 'abc123', lsFiles: nearEmptyTree });
+    try {
+      verifyCloneDelivered({ repo_is_empty: false }, 'main');
+      throw new Error('expected verifyCloneDelivered to throw');
+    } catch (e) {
+      expect((e as Error).message).toContain('the durable onboarding signal says the repo is NOT empty');
+    }
   });
 });
 

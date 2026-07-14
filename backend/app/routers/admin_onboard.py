@@ -211,25 +211,34 @@ def _empty_repo_build_config() -> Dict[str, Any]:
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "repo_is_empty": True,
+        "source_file_count": 0,
         "has_ci": False,
     }
 
 
 def _classify_repo_emptiness(
     root_items: list[Dict[str, Any]], listing_complete: bool = True
-) -> bool:
+) -> tuple[bool, int | None]:
     """Classify a repo as empty / near-empty from fetched contents listings.
 
-    Returns True ONLY when the repository was read successfully and completely
-    AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across
-    the fetched root listing and every nested directory listing the detector
-    walked. Documentation/config/data files, dotfiles, and common manifests are
-    not counted as source.
+    Returns ``(is_empty, source_file_count)``.
+
+    ``is_empty`` is True ONLY when the repository was read successfully and
+    completely AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source
+    files across the fetched root listing and every nested directory listing the
+    detector walked. Documentation/config/data files, dotfiles, and common
+    manifests are not counted as source.
+
+    ``source_file_count`` is the authoritative real-source total from that same
+    walk, persisted so the agent's live clone-time detector can compare
+    like-for-like against this count rather than recomputing under its own,
+    possibly divergent, exclusion rules. It is None when ``listing_complete`` is
+    False (emptiness is indeterminate, so no count is asserted).
 
     ``listing_complete`` is the positive confirmation that every listing needed
     to make this determination was fetched. When it is False (e.g. a nested
     directory listing failed to fetch or the bounded scan hit unread deeper
-    paths), emptiness is indeterminate and this returns False
+    paths), emptiness is indeterminate and this returns ``(False, None)``
     (treat-as-non-empty) — a repo whose real source lives in a subdirectory we
     could not read must never be bootstrapped as greenfield on a transient
     fetch error.
@@ -238,7 +247,7 @@ def _classify_repo_emptiness(
     :func:`_detect_build_config`, so it adds zero GitHub cost.
     """
     if not listing_complete:
-        return False
+        return False, None
 
     source_file_count = 0
     for item in root_items:
@@ -252,10 +261,8 @@ def _classify_repo_emptiness(
             continue
         if _is_real_source_file(name):
             source_file_count += 1
-            if source_file_count > GREENFIELD_SOURCE_FILE_THRESHOLD:
-                return False
 
-    return True
+    return source_file_count <= GREENFIELD_SOURCE_FILE_THRESHOLD, source_file_count
 
 
 async def _detect_build_config(
@@ -753,6 +760,9 @@ async def _detect_build_config(
     else:
         language = "mixed"
 
+    repo_is_empty, source_file_count = _classify_repo_emptiness(
+        source_items, listing_complete=listing_complete
+    )
     config: Dict[str, Any] = {
         "language": language,
         "directories": directories,
@@ -762,9 +772,12 @@ async def _detect_build_config(
         # contents walk (zero extra GitHub cost beyond detection). Must stay
         # aligned with agent/src/prompts/discovery.ts and the threshold in
         # agent/src/constants.ts.
-        "repo_is_empty": _classify_repo_emptiness(
-            source_items, listing_complete=listing_complete
-        ),
+        "repo_is_empty": repo_is_empty,
+        # The authoritative real-source count from the same walk, persisted so
+        # the agent's clone-time detector compares against this number instead of
+        # recomputing under its own exclusion rules. None when the read was
+        # incomplete (emptiness indeterminate).
+        "source_file_count": source_file_count,
     }
 
     # Tri-state CI-presence signal derived from the same bounded walk (zero

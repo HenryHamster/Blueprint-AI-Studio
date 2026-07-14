@@ -2497,6 +2497,16 @@ async def claim_task(
         response["repo_is_empty"] = bool(
             (project_for_playbook.build_config or {}).get("repo_is_empty")
         )
+        # The authoritative real-source count persisted at onboarding (same
+        # bounded walk that set repo_is_empty). Echoed so the agent's clone-time
+        # detector (verifyCloneDelivered) compares its live tree against this
+        # backend-computed number instead of recomputing under its own exclusion
+        # rules. Only forwarded when a real count was persisted (int, not None).
+        _source_file_count = (project_for_playbook.build_config or {}).get(
+            "source_file_count"
+        )
+        if isinstance(_source_file_count, int):
+            response["source_file_count"] = _source_file_count
         if playbook_entries:
             response["playbook"] = playbook_entries
             # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response

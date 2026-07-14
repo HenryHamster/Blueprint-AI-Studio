@@ -695,6 +695,20 @@ describe('buildCitationRepairPrompt', () => {
     expect(prompt).not.toContain('- made/up/path20.py');
     expect(prompt).toContain('(+5 more)');
   });
+
+  it('on greenfield steers to web citations instead of fixing to real file paths', () => {
+    const nonGreenfield = buildCitationRepairPrompt(['src/does/not/exist.ts'], '/tmp/doc.json', false);
+    // Default (mature repo) branch tells the agent to point at a real file.
+    expect(nonGreenfield).toContain('repository-relative path of a real file');
+
+    const greenfield = buildCitationRepairPrompt(['src/does/not/exist.ts'], '/tmp/doc.json', true);
+    // Greenfield branch must NOT ask for a real file path (impossible on an
+    // empty repo) — it must steer to external/web citations.
+    expect(greenfield).not.toContain('repository-relative path of a real file');
+    expect(greenfield).toContain('REMOVE the invented file paths');
+    expect(greenfield).toMatch(/https:\/\//);
+    expect(greenfield).toContain('At least one https:// citation is required');
+  });
 });
 
 describe('groundDesignCitations', () => {

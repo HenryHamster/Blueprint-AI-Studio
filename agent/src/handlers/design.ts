@@ -28,6 +28,7 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   configureAgentPermissions, computePromptFingerprint, buildFileTree,
+  isGreenfieldRepo, buildGreenfieldCitationGuidance,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
@@ -110,16 +111,23 @@ const MAX_UNRESOLVED_IN_PROMPT = 20;
 // WHICH format/path it got wrong, and constrains the fix to the
 // source_citations array only.
 export function buildCitationRepairPrompt(
-  unresolved: string[], documentPath: string,
+  unresolved: string[], documentPath: string, greenfield = false,
 ): string {
   const shown = unresolved.slice(0, MAX_UNRESOLVED_IN_PROMPT);
   const more = unresolved.length - shown.length;
   const list = shown.map((c) => `- ${c}`).join('\n');
+  // On a greenfield repo the unresolvable citations are invented paths for files
+  // that do not exist yet — steering the agent to "fix them to a real file path"
+  // is impossible and would loop. Instead steer it to REPLACE them with external
+  // web sources (which the grounding gate accepts on their own).
+  const fixInstruction = greenfield
+    ? `Fix ONLY the source_citations array — keep title, summary, body, tags, and topic unchanged. This repo is GREENFIELD (empty / near-empty), so those files do not exist yet and CANNOT be cited. REMOVE the invented file paths and replace them with EXTERNAL/WEB citations: https:// URLs to docs, specifications, RFCs, standards, or prior-art projects that justify the design. Do NOT cite any repository file path that is not already present on disk. At least one https:// citation is required.`
+    : `Fix ONLY the source_citations array — keep title, summary, body, tags, and topic unchanged. Each file citation must be the repository-relative path of a real file you actually read, exactly as it exists on disk (verify each with ls): bare like src/example.py or prefixed like file:src/example.py. Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths.`;
   return `Your design document was written, but NONE of its file citations resolve to real paths in the repository working tree, so the quality gate will DISCARD the document as ungrounded. The unresolved citations, exactly as you wrote them:
 
 ${list}${more > 0 ? `\n(+${more} more)` : ''}
 
-Fix ONLY the source_citations array — keep title, summary, body, tags, and topic unchanged. Each file citation must be the repository-relative path of a real file you actually read, exactly as it exists on disk (verify each with ls): bare like src/example.py or prefixed like file:src/example.py. Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths.
+${fixInstruction}
 
 Rewrite the FULL corrected document JSON to ${documentPath} (use Bash — the Write tool is disabled), and ALSO output the same complete JSON object as the VERY LAST thing in your response.`;
 }
@@ -135,7 +143,7 @@ Rewrite the FULL corrected document JSON to ${documentPath} (use Bash — the Wr
 async function repairUngroundedCitations(
   document: Record<string, unknown>, taskId: string, documentPath: string,
   ws: WebSocket | null, statusRef: { value: string },
-  model?: string, effort?: string, disallowedTools?: string[],
+  model?: string, effort?: string, disallowedTools?: string[], greenfield = false,
 ): Promise<Record<string, unknown>> {
   const grounding = document._citation_grounding as
     { file_citations?: number; grounded?: number; unresolved?: unknown } | undefined;
@@ -147,9 +155,9 @@ async function repairUngroundedCitations(
     : [];
   // The unresolved strings go to the VM log too — they are otherwise lost when
   // the backend gate fails the task (the fail path persists only the counts).
-  sendLog(ws, `[WARNING] None of the ${fileCitations} file citation(s) resolve in the working tree (unresolved: ${unresolved.join(' | ')}) — reopening once so the agent can correct them\n`);
+  sendLog(ws, `[WARNING] None of the ${fileCitations} file citation(s) resolve in the working tree (unresolved: ${unresolved.join(' | ')}) — reopening once so the agent can ${greenfield ? 'replace them with web citations (greenfield repo)' : 'correct them'}\n`);
   statusRef.value = 'Correcting unresolved design citations...';
-  const repairPrompt = buildCitationRepairPrompt(unresolved, documentPath);
+  const repairPrompt = buildCitationRepairPrompt(unresolved, documentPath, greenfield);
   // Do NOT call setPromptSizeTelemetry here — the repair prompt is small
   // (~hundreds of bytes) and would overwrite the main design prompt telemetry
   // (~thousands of bytes, set by handleDesign before the Claude run). The
@@ -181,9 +189,25 @@ async function repairUngroundedCitations(
     // The repaired document must still satisfy the backend's structural gate.
     if (!strVal(candidate.title) || !strVal(candidate.summary) || !strVal(candidate.body)) continue;
     groundDesignCitations(candidate);
-    const repairedGrounding = candidate._citation_grounding as { grounded?: number };
-    if ((repairedGrounding.grounded ?? 0) > 0) {
-      sendLog(ws, `[INFO] Citation repair succeeded: ${repairedGrounding.grounded} file citation(s) now resolve\n`);
+    const repairedGrounding = candidate._citation_grounding as
+      { file_citations?: number; grounded?: number; unresolved?: unknown };
+    const repairedGrounded = repairedGrounding.grounded ?? 0;
+    const repairedUnresolved = Array.isArray(repairedGrounding.unresolved)
+      ? repairedGrounding.unresolved.length : 0;
+    const citationCount = Array.isArray(candidate.source_citations)
+      ? candidate.source_citations.length : 0;
+    // Non-greenfield: adopt only when a file citation now resolves (the original
+    // intent — the design must be code-grounded). Greenfield: the correct repair
+    // is web-only citations (zero file citations), which the grounding gate
+    // accepts on its own — adopt when nothing is left unresolvable and at least
+    // one citation remains.
+    const accepted = greenfield
+      ? (repairedUnresolved === 0 && citationCount > 0)
+      : (repairedGrounded > 0);
+    if (accepted) {
+      sendLog(ws, greenfield
+        ? `[INFO] Citation repair succeeded: ${citationCount} citation(s), no unresolvable file paths remain (greenfield → web-grounded)\n`
+        : `[INFO] Citation repair succeeded: ${repairedGrounded} file citation(s) now resolve\n`);
       return candidate;
     }
   }
@@ -267,6 +291,19 @@ export async function handleDesign(
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const topicLine = topic ? `Topic: ${topic}\n\n` : '';
 
+  // On a greenfield (empty / near-empty) repo the files this design describes do
+  // not exist yet, so the default "cite the actual files" posture makes the agent
+  // invent unresolvable file paths and the grounding gate discards the doc. Detect
+  // greenfield once and steer the agent to cite external/web sources instead. Both
+  // the injected guidance block and the swapped citation rule use the identical
+  // predicate so they can never disagree; both collapse to the default on a
+  // mature repo (greenfieldCitationGuidance === '').
+  const greenfield = isGreenfieldRepo(task);
+  const greenfieldCitationGuidance = buildGreenfieldCitationGuidance(task);
+  const citationDefaultRule = greenfield
+    ? 'Because this repo is GREENFIELD (empty / near-empty), the files this design describes do NOT exist yet — cite EXTERNAL/WEB sources (https:// URLs to docs, specs, RFCs, prior art) that justify the design. Do NOT invent repository file paths for files that are not already on disk; an unresolvable file citation is DISCARDED by the gate.'
+    : 'FILE references are the default — cite the actual files your design is grounded in (file:path or a path like path/to/file.py). Web URLs (https://...) are also accepted.';
+
   const documentPath = `/tmp/design_document_${taskId}.json`;
   const progressPath = `/tmp/design_progress_${taskId}.md`;
 
@@ -299,7 +336,7 @@ export async function handleDesign(
 ${topicLine}Design question:
 ${prompt}
 
-${priorKnowledgeSection}${designAvailableCapabilitiesSection}# HOW TO DESIGN
+${priorKnowledgeSection}${designAvailableCapabilitiesSection}${greenfieldCitationGuidance}# HOW TO DESIGN
 1. Explore the codebase THOROUGHLY — read the real modules, types, and call sites relevant to the question. Use subagents for parallel exploration.
 2. Ground every design decision in what the code ACTUALLY does today. Reference concrete files and symbols; do not invent structure that isn't there.
 3. Propose a concrete, reviewable design: the components involved, how they interact, the data/contract shapes, the trade-offs, and the migration/rollout path where relevant.
@@ -319,7 +356,7 @@ Write your document as a JSON object to ${documentPath} (use Bash to write the f
 
 Rules:
 - title, summary, and body are REQUIRED and must be non-empty strings. body must be substantive markdown grounded in the code you read.
-- source_citations is REQUIRED and must contain at least one usable citation. FILE references are the default — cite the actual files your design is grounded in (file:path or a path like path/to/file.py). Web URLs (https://...) are also accepted. An ungrounded design with no usable citation FAILS the forward-quality gate and is discarded.
+- source_citations is REQUIRED and must contain at least one usable citation. ${citationDefaultRule} An ungrounded design with no usable citation FAILS the forward-quality gate and is discarded.
 - file citations are MACHINE-CHECKED against the working tree: each must be a repository-relative path exactly as it exists on disk (verify with ls before emitting). Do NOT wrap paths in backticks or quotes, do NOT append descriptions or line ranges, and do NOT use absolute paths — a design whose file citations ALL fail to resolve is DISCARDED.
 - tags and topic are optional but recommended; tags is a list of short strings.
 - Also emit the same JSON object as the VERY LAST thing in your response (in addition to writing the file), so it can be recovered if the file write fails.
@@ -402,7 +439,7 @@ Read full design-doc section prose on demand with \`./design-doc get <key>\` (li
       // bounded reopen so the agent can fix its citation format before the
       // completion posts. Skipped on a CLI crash — same setup, wasted slot.
       document = await repairUngroundedCitations(
-        document, taskId, documentPath, ws, statusRef, model, effort, disallowedTools,
+        document, taskId, documentPath, ws, statusRef, model, effort, disallowedTools, greenfield,
       );
     }
     logs = sanitize(JSON.stringify({ ...document, ...provenance }));

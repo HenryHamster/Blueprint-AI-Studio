@@ -1088,6 +1088,13 @@ class BuildConfig(BaseModel):
     # agree. Default False so pre-existing projects (and any repo with detected
     # source) degrade gracefully.
     repo_is_empty: bool = False
+    # The authoritative real-source-file count from the same bounded onboarding
+    # walk that produced ``repo_is_empty`` (documentation/config/dotfiles/common
+    # manifests excluded by the shared exclusion rules). Persisted so the agent's
+    # live clone-time detector can compare like-for-like against the backend's
+    # count instead of recomputing under its own rules. None when the read was
+    # incomplete (emptiness indeterminate) or for configs predating this field.
+    source_file_count: int | None = None
     # Marker that build-config detection did NOT complete at onboarding time —
     # set True only when ``_detect_build_config`` returned an empty/falsy result
     # or raised (a transient GitHub failure: 5xx, rate-limit, network blip, or a

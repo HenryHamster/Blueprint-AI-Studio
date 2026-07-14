@@ -5676,6 +5676,9 @@ class TestFailureClassificationInvariants:
                 # Administrative cancellation (cascade cancel / supersession) —
                 # not a code defect or genuine LLM hang.
                 ADMIN_CANCEL,
+                # Repo has no commits / never initialized — an environmental
+                # provisioning fault (nothing to clone), not a code defect.
+                REPO_UNINITIALIZED,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

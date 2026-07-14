@@ -27,6 +27,8 @@ from app.github_refs import ensure_repo_initialized, repo_has_commits
 from app.models import Project
 from app.repo_bootstrap import spawn_bootstrap_task
 from app.routers.admin_onboard import (
+    GREENFIELD_SOURCE_FILE_THRESHOLD,
+    _classify_repo_emptiness,
     _detect_build_config,
     _empty_repo_build_config,
     _is_empty_repository_response,
@@ -205,6 +207,116 @@ class TestEmptyRepoDetection:
             config = await _detect_build_config("tok", "owner", "repo")
 
         assert config == {}
+
+
+# ── Cross-classifier agreement (backend vs. agent) ──────────────────────────
+# The agent's clone-time detector (agent/src/prompts/discovery.ts
+# countSourceFiles) and the backend onboarding classifier
+# (_classify_repo_emptiness) must apply the SAME "real source" exclusion rules,
+# or the same repo is counted empty by one and non-empty by the other — the
+# false-positive source for the clone_failed wedge. This block pins the two
+# together by modelling the agent's exclusion rules independently (they are
+# validated on the TS side in agent/src/prompts/discovery.test.ts) and asserting
+# the backend agrees on the historically-divergent cases.
+
+# Exact mirror of the agent's post-fix exclusion sets in discovery.ts.
+_AGENT_NON_SOURCE_EXT = (
+    ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini",
+    ".txt", ".lock", ".lockb",
+)
+_AGENT_NON_SOURCE_BASENAMES = {
+    "license", "licence", "notice", "authors", "codeowners", "dockerfile",
+    "makefile", "procfile", "go.mod", ".gitignore", ".gitattributes",
+    ".dockerignore", ".editorconfig", ".npmrc", ".nvmrc", ".prettierrc",
+    ".eslintrc",
+}
+_AGENT_NON_SOURCE_PREFIXES = ("readme", "contributing", "changelog", "security")
+
+
+def _agent_count_source_files(names: list[str]) -> int:
+    """Independent Python mirror of the agent's countSourceFiles rules."""
+    count = 0
+    for name in names:
+        base = name.rsplit("/", 1)[-1].strip().lower()
+        if not base or base.startswith("."):
+            continue
+        if base in _AGENT_NON_SOURCE_BASENAMES:
+            continue
+        if any(base.startswith(p) for p in _AGENT_NON_SOURCE_PREFIXES):
+            continue
+        if any(base.endswith(ext) for ext in _AGENT_NON_SOURCE_EXT):
+            continue
+        count += 1
+    return count
+
+
+def _agent_is_empty(names: list[str]) -> bool:
+    return _agent_count_source_files(names) <= GREENFIELD_SOURCE_FILE_THRESHOLD
+
+
+# Each case is (label, list-of-basenames). These are exactly the files the
+# backend excluded but the agent used to COUNT — the divergence this fix closes.
+# The agent side must now also exclude them.
+_DIVERGENT_CASES = [
+    ("go.mod only", ["go.mod"]),
+    ("British-spelling licence only", ["LICENCE"]),
+    ("readme-prefixed only", ["README", "README.rst"]),
+    ("contributing/changelog/security prefixes",
+     ["CONTRIBUTING", "CHANGELOG", "SECURITY"]),
+    ("mixed scaffolding, no real source",
+     ["go.mod", "LICENCE", "README", "SECURITY", ".gitignore"]),
+    ("scaffolding plus one real source file",
+     ["go.mod", "README.md", "src/main.go"]),
+]
+
+
+class TestClassifierAgreement:
+    """The backend and agent classifiers agree like-for-like across the cases
+    that previously diverged (go.mod, licence, readme-prefixed)."""
+
+    def _backend_verdict(self, names: list[str]) -> tuple[bool, int]:
+        items = [{"name": n, "type": "file"} for n in names]
+        return _classify_repo_emptiness(items)
+
+    @pytest.mark.parametrize("label,names", _DIVERGENT_CASES)
+    def test_backend_and_agent_agree_on_emptiness(self, label, names):
+        backend_empty, backend_count = self._backend_verdict(names)
+        assert backend_empty is _agent_is_empty(names), (
+            f"classifiers disagree on emptiness for case: {label}"
+        )
+        assert backend_count == _agent_count_source_files(names), (
+            f"classifiers disagree on the source count for case: {label}"
+        )
+
+    def test_divergent_scaffolding_counts_as_zero_source(self):
+        # go.mod, licence, and the readme/contributing/changelog/security
+        # prefixes are all excluded — a repo of only these is empty (count 0).
+        _, count = self._backend_verdict(
+            ["go.mod", "LICENCE", "README", "CONTRIBUTING", "CHANGELOG", "SECURITY"]
+        )
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_detector_persists_source_file_count(self):
+        # The authoritative count is persisted into build_config so the agent
+        # can compare like-for-like. A single real source file among scaffolding.
+        listing = [
+            {"name": "go.mod", "type": "file"},
+            {"name": "README.md", "type": "file"},
+            {"name": "main.go", "type": "file"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            return_value=_resp(200, listing),
+        ):
+            config = await _detect_build_config("tok", "owner", "repo")
+
+        assert config.get("source_file_count") == 1
+        assert config.get("repo_is_empty") is True
+
+    def test_empty_repo_build_config_carries_zero_count(self):
+        assert _empty_repo_build_config()["source_file_count"] == 0
 
 
 class TestBootstrapGuardIsReachable:

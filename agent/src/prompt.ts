@@ -18,6 +18,7 @@ export {
   countSourceFiles,
   detectGreenfield,
   isGreenfieldRepo,
+  buildGreenfieldCitationGuidance,
   verifyCloneDelivered,
   extractTestConventions,
   discoverRelatedTests,
