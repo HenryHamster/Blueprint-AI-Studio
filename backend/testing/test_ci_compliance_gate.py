@@ -456,6 +456,49 @@ def test_cap_bump_resolves_d18e8b14_breaches(target_rel):
     )
 
 
+def test_cap_bump_resolves_github_refs_breach():
+    """After bumping caps via check_size_limits --fix, github_refs.py must be within
+    its new cap on the real file tree.
+
+    This is the breach the 2026-07-14 ci-compliance remediation targets: automain
+    HEAD f4907e36 reported backend/github_refs.py at 1042 lines over its old cap of
+    1000. The fix bumps that cap in module_size_limits.json; this merge-test gate
+    proves the bumped JSON is consistent with the actual file size on disk, so the
+    test fails if the cap is reverted (or the file grows past the new cap) before
+    the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "github_refs.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_capped_backend_modules_within_cap_on_disk():
     """Every capped backend module must be at or under its cap on the real tree.
 
