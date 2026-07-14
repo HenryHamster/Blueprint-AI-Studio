@@ -1547,3 +1547,30 @@ async def agent_fetch_project_skills(
 
     manifest = await _discover_manifest_tools(project)
     return {"skills": manifest.get("skills", [])}
+
+
+@router.get("/projects/{project_id}/tools")
+@limiter.limit("60/minute")
+async def agent_fetch_project_tools(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Fetch the serialized content of the project's ENABLED built-in tools.
+
+    Returns ``{"tools": [...]}`` where each entry has ``slug``, ``title``,
+    ``kind``, and ``text`` — the notes markdown text or a whiteboard
+    presence/stroke-count summary (see :func:`load_project_tool_context`).
+    Tools with empty content are skipped and the overall payload is size-capped.
+    An empty array means no enabled tool has renderable content. Authenticated
+    via agent JWT; cross-project access returns 404.
+
+    This endpoint is the backend for the strategic resident's ``./fetch tools``
+    verb — the operator-facing companion to the task-claim ``project_tools``
+    injection, so the resident strategist can read the operator's notes/sketches.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.project_tool_context import load_project_tool_context  # noqa: PLC0415
+
+    return {"tools": await load_project_tool_context(session, project.id)}

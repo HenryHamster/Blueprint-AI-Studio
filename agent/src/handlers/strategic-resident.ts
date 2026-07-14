@@ -423,6 +423,28 @@ export async function handleStrategicResident(
       .join('\n');
   })();
 
+  // Format the project's built-in tool content (notes markdown, whiteboard
+  // summary) for the bootstrap context. Mirrors skillsText: reads the
+  // best-effort `project_tools` array the backend claim injects (each entry is
+  // {slug, title, kind, text}); empty/absent → '' so the section is a no-op.
+  const toolContentText = ((): string => {
+    const raw = task.project_tools;
+    if (!Array.isArray(raw) || raw.length === 0) return '';
+    return raw
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .map((e) => {
+        const slug = strVal(e.slug);
+        const title = strVal(e.title) || slug;
+        const kind = strVal(e.kind);
+        const text = strVal(e.text).trim();
+        if (!text) return '';
+        const heading = `### ${title}${kind ? ` (${kind})` : ''}`;
+        return `${heading}\n${text}`;
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  })();
+
   // ── Durable decisions register ──────────────────────────────────────────
   // Full-fidelity cross-tick memory of settled decisions, preserved across
   // compaction AND full session restarts (VM recycles, process crashes) so
@@ -453,6 +475,7 @@ export async function handleStrategicResident(
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
     skillsText,
+    toolContentText,
     decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
   });
 

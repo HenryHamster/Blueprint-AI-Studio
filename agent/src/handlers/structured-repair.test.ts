@@ -15,6 +15,7 @@ vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
   SHARED_LIFECYCLE_REMAINDER: '',
   formatSkills: vi.fn(() => ''),
+  formatProjectTools: vi.fn(() => ''),
   writeSkillHelpers: vi.fn(),
 }));
 

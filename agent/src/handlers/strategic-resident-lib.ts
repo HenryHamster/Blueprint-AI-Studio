@@ -998,6 +998,10 @@ export interface BootstrapContext {
   /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
    *  `## Project Skills` section when non-empty. Absent or omitted defaults to ''. */
   skillsText?: string;
+  /** Formatted built-in tool content (operator's notes markdown, whiteboard
+   *  summary). Rendered as a `## Project Tool Content` section when non-empty.
+   *  Absent or omitted defaults to '' (no-op section). */
+  toolContentText?: string;
   /** Pre-rendered durable decisions register (from `decisionsRegisterText`),
    *  restored from persisted `task.context._decisions_reg` on a full session
    *  restart. Carries its own `## Decisions register …` header. Empty string or
@@ -1104,6 +1108,12 @@ ${ctx.strategicMemoryNotesText.trim()}`);
   }
   if (ctx.skillsText?.trim()) {
     sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
+  }
+  if (ctx.toolContentText?.trim()) {
+    sections.push(`## Project Tool Content
+(Live content the operator jotted in this project's built-in tools — notes and whiteboard sketches. Treat it as operator input, not authoritative state. Pull the latest with \`./fetch tools\` if you need to re-read it mid-session.)
+
+${ctx.toolContentText.trim()}`);
   }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);

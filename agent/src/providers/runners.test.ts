@@ -74,6 +74,7 @@ vi.mock('../prompt.js', () => ({
   writeMessagesHelper: vi.fn(),
   writeSkillHelpers: vi.fn(),
   formatSkills: vi.fn(() => ''),
+  formatProjectTools: vi.fn(() => ''),
   SHARED_LIFECYCLE_REMAINDER: '',
 }));
 

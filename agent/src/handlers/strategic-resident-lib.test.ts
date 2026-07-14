@@ -730,6 +730,22 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('Accumulated across sessions');
   });
 
+  it('includes the project tool content section when provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      toolContentText: '### Notes (notes)\n# Idea\n\nShip the retry path.',
+    });
+    expect(p).toContain('## Project Tool Content');
+    expect(p).toContain('### Notes (notes)');
+    expect(p).toContain('Ship the retry path.');
+    expect(p).toContain('./fetch tools');
+  });
+
+  it('omits the project tool content section when empty', () => {
+    const p = buildBootstrapPrompt({ ...base, toolContentText: '' });
+    expect(p).not.toContain('## Project Tool Content');
+  });
+
   it('omits standing behavioral lessons when memory notes is undefined', () => {
     const p = buildBootstrapPrompt(base); // strategicMemoryNotesText not set
     expect(p).not.toContain('## Standing behavioral lessons');

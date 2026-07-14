@@ -2371,6 +2371,124 @@ async def test_claim_omits_skills_when_no_manifest(client, db_session):
             )
 
 
+@pytest.mark.asyncio
+async def test_project_tool_content_reaches_agent_context(client, db_session):
+    """A project's enabled built-in notes tool content reaches the claim response.
+
+    This is the end-to-end acceptance proof for the tool-content bridge: an
+    operator writes markdown in a project's notes tool, and an agent claiming a
+    task for that project sees that text under the additive ``project_tools``
+    key — mirroring how manifest skills already reach agents.
+    """
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    project = await _make_project_member(db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    notes_markdown = "# Working hypothesis\n\nThe retry loop double-counts on 429s."
+    # Enabled notes tool with real markdown content.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="notes",
+            title="Research Notes",
+            enabled=True,
+            content={"text": notes_markdown},
+        )
+    )
+    # A disabled tool that must NOT leak into the agent context.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="secret",
+            title="Disabled",
+            enabled=False,
+            content={"text": "should never appear"},
+        )
+    )
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="test-vm-tool-content",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "Build feature X"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "test-vm-tool-content")
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "project_tools" in body, (
+        f"Claim response missing 'project_tools' key. "
+        f"Available keys: {sorted(body.keys())}"
+    )
+    tools = body["project_tools"]
+    assert len(tools) == 1, f"expected only the enabled tool, got {tools}"
+    tool = tools[0]
+    assert tool["slug"] == "notes"
+    assert tool["title"] == "Research Notes"
+    assert tool["kind"] == "notes"
+    assert tool["text"] == notes_markdown
+    # The disabled tool's content must not appear anywhere in the payload.
+    assert "should never appear" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_project_tools_when_none_enabled(client, db_session):
+    """When no enabled tool has content, the claim omits the project_tools key."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    project = await _make_project_member(db_session)
+    # An enabled but EMPTY-content notes tool contributes nothing.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="notes",
+            title="Empty",
+            enabled=True,
+            content={"text": "   "},
+        )
+    )
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="test-vm-no-tools",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "Build feature X"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "test-vm-no-tools")
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if "project_tools" in body:
+        assert body["project_tools"] == [], (
+            "project_tools should be empty/absent when no enabled tool has content"
+        )
+
+
 # ===========================================================================
 # Compute image: manifest compute.image section parsing
 # ===========================================================================
@@ -2635,3 +2753,114 @@ async def test_research_claim_includes_project_skills(client, db_session):
             assert len(skills) == 1
             assert skills[0]["slug"] == "benchmark"
             assert skills[0]["command"] == "bash bench.sh"
+
+
+# ---------------------------------------------------------------------------
+# Agent-token fetch endpoint: GET /api/agent/projects/{id}/tools
+# (operator-facing strategic resident reads project tool content via ./fetch tools)
+# ---------------------------------------------------------------------------
+
+
+async def _make_project_with_task(session, name: str):
+    """Create a project plus a task whose agent token authorizes fetch calls."""
+    from app.models import Task
+
+    project = Project(name=name, user_id=TEST_USER_ID)
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-tools")
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_returns_enabled_content(client: AsyncClient, db_session):
+    """The agent-token /tools fetch returns serialized enabled-tool content."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_project_with_task(db_session, "AgentFetch-Tools")
+    db_session.add_all(
+        [
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="notes",
+                title="Notes", enabled=True,
+                content={"text": "# Plan\n\nShip the retry path."},
+            ),
+            ProjectTool(
+                project_id=project.id, kind="whiteboard", slug="wb",
+                title="Sketch", enabled=True,
+                content={"strokes": [{"points": [1, 2]}, {"points": [3, 4]}]},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    tools = body["tools"]
+    by_slug = {t["slug"]: t for t in tools}
+    assert by_slug["notes"]["text"] == "# Plan\n\nShip the retry path."
+    assert by_slug["notes"]["kind"] == "notes"
+    # Whiteboard renders as a presence/summary line, never raw stroke JSON.
+    assert "2 strokes" in by_slug["wb"]["text"]
+    assert "points" not in by_slug["wb"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_empty_when_none_enabled(client: AsyncClient, db_session):
+    """Disabled/empty tools yield an empty list rather than an error."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_project_with_task(db_session, "AgentFetch-ToolsEmpty")
+    db_session.add_all(
+        [
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="off",
+                title="Off", enabled=False, content={"text": "hidden"},
+            ),
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="blank",
+                title="Blank", enabled=True, content={"text": "   "},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"tools": []}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_cross_project_404(client: AsyncClient, db_session):
+    """An agent token for project A must not read project B's tool content."""
+    from app.auth import create_agent_token
+
+    project_a, task_a = await _make_project_with_task(db_session, "AgentFetch-ToolsA")
+    project_b, _ = await _make_project_with_task(db_session, "AgentFetch-ToolsB")
+    db_session.add(
+        ProjectTool(
+            project_id=project_b.id, kind="notes", slug="secret",
+            title="Secret", enabled=True, content={"text": "B-only note"},
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task_a.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project_b.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404

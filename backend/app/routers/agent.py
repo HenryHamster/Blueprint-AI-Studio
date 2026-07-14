@@ -3914,6 +3914,27 @@ async def claim_task(
                 "[AGENT] Failed to inject project skills (non-critical)"
             )
 
+    # Inject the content of the project's built-in tools (whiteboard, notes)
+    # so the agent can actually USE what the operator wrote in them. Unlike
+    # manifest skills (shell procedures declared in .blueprint/tools.json),
+    # this content is DB-backed (ProjectTool.content). Gated on the same task
+    # types as skills and wrapped in the same best-effort guard so a failure
+    # never breaks claim. The key is additive and omitted when there is no
+    # enabled tool with content, so existing behavior is unchanged.
+    if project_for_playbook and task_type in _SKILLS_TASK_TYPES:
+        try:
+            from app.project_tool_context import load_project_tool_context
+
+            _tool_content = await load_project_tool_context(
+                session, project_for_playbook.id
+            )
+            if _tool_content:
+                response["project_tools"] = _tool_content
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject project tool content (non-critical)"
+            )
+
     # Inject strategic intent so tactical agents understand the "why" behind
     # their work. Useful for every task type. Prefer the LIVE, operator-editable
     # problem model (onboarding + Problem Model editor write here) so current

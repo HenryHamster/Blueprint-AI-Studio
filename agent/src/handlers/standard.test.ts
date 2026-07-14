@@ -1087,6 +1087,7 @@ describe('stable prompt prefix is byte-identical across wall-clock and HEAD', ()
       acceptanceEvidenceNotice: '',
       playbookSection: '',
       skillsSection: '',
+      projectToolsSection: '',
       retryContext: '',
       provenanceNotice: '',
       corePrompt: 'CORE_TASK_PROMPT',

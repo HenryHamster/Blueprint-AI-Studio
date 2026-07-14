@@ -1065,6 +1065,36 @@ export function formatSkills(skills: TaskSkill[] | undefined): string {
   return `## Project Skills\n\nThese are project-declared shell procedures available in this workspace as executable scripts. Use them for project-specific operations (deploy, test, lint, format, etc.).\n\n${lines}\n\n`;
 }
 
+export interface TaskToolContent {
+  slug: string;
+  title: string;
+  kind: string;
+  text: string;
+}
+
+/**
+ * Render a `## Project Tool Content` markdown block from the task's
+ * project_tools array — the content of the project's built-in tools
+ * (notes, whiteboard) that the operator wrote in the workspace UI.
+ * Each tool becomes a titled subsection with its serialized text.
+ * Returns '' when the input is undefined/empty so the prompt stays
+ * unchanged for tasks whose project has no tool content.
+ */
+export function formatProjectTools(tools: TaskToolContent[] | undefined): string {
+  if (!tools || tools.length === 0) return '';
+  const blocks = tools.map(tool => {
+    const slug = typeof tool.slug === 'string' ? tool.slug : '';
+    const title = typeof tool.title === 'string' ? tool.title : slug;
+    const kind = typeof tool.kind === 'string' ? tool.kind : '';
+    const text = typeof tool.text === 'string' ? tool.text.trim() : '';
+    if (!text) return '';
+    const heading = kind ? `### ${title} (${kind})` : `### ${title}`;
+    return `${heading}\n\n${text}`;
+  }).filter(block => block.length > 0);
+  if (blocks.length === 0) return '';
+  return `## Project Tool Content\n\nThe operator has written the following in this project's built-in tools. Treat it as project-specific context (notes, hypotheses, sketches) that may inform your work.\n\n${blocks.join('\n\n')}\n\n`;
+}
+
 /**
  * Write each project skill as an executable ``skill-<slug>`` bash script in the
  * workspace. Validates that each skill's slug is a safe shell token (alphanumeric
