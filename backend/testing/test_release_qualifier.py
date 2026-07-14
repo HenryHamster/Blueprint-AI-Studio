@@ -10148,7 +10148,8 @@ async def test_finalize_infra_failure_persists_partial_dimension_results(
 
     # The finalize was held as an infra failure -- not promoted.
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_identity_check_unavailable"
+    assert result["error"].startswith("migration_identity_check_unavailable")
+    assert "GitHub 502" in result["error"]
     promote_spy.assert_not_called()
 
     # Query the per-dimension ledger.
@@ -13776,7 +13777,8 @@ async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, moc
 
     # Held as an infra failure — no quality verdict, never promoted.
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_identity_check_unavailable"
+    assert result["error"].startswith("migration_identity_check_unavailable")
+    assert "GitHub 502" in result["error"]
     promote_spy.assert_not_called()
 
     await db_session.refresh(version)
@@ -14393,7 +14395,8 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     await db_session.commit()
 
     assert result["status"] == "infra_failure"
-    assert result["error"] == "migration_apply_check_unavailable"
+    assert result["error"].startswith("migration_apply_check_unavailable")
+    assert "could not read production" in result["error"]
     promote_spy.assert_not_called()
 
     await db_session.refresh(version)
