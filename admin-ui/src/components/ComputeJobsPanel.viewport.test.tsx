@@ -661,6 +661,97 @@ describe('ComputeJobsPanel — viewport regression', () => {
     );
   });
 
+  test('renders watchdog protection badge on active job at 1280px', async () => {
+    jobsToReturn = [
+      {
+        id: 'job-watchdog-protected',
+        project_id: 'proj-1',
+        task_id: 'task-watchdog-1',
+        backend: 'local-gpu',
+        external_compute_id: null,
+        machine_type: 'a3-highgpu-1g',
+        status: 'RUNNING',
+        terminal_reason: null,
+        outcome: null,
+        accelerator_type: 'H100',
+        accelerator_count: 1,
+        spend_cap_usd: 50.0,
+        wall_clock_deadline: new Date(Date.now() + 20 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 3_600_000).toISOString(),
+        updated_at: new Date(Date.now() - 60_000).toISOString(),
+        started_at: new Date(Date.now() - 3_590_000).toISOString(),
+        completed_at: null,
+        last_polled_at: new Date(Date.now() - 60_000).toISOString(),
+        accrued_cost_usd: 3.5,
+        final_cost_usd: null,
+        result_reference: null,
+        task_title: 'compute_experiment: RL training — watchdog protected',
+        task_type: 'compute_experiment',
+        experiment: 'rl-reward-v3',
+        watchdog_active: true,
+        no_progress_timeout_seconds: 1800,
+        last_progress_at: new Date(Date.now() - 300_000).toISOString(),
+        progress_series: [
+          { t: new Date(Date.now() - 3_000_000).toISOString(), name: 'reward', value: 0.05 },
+          { t: new Date(Date.now() - 2_400_000).toISOString(), name: 'reward', value: 0.15 },
+          { t: new Date(Date.now() - 1_800_000).toISOString(), name: 'reward', value: 0.28 },
+          { t: new Date(Date.now() - 1_200_000).toISOString(), name: 'reward', value: 0.41 },
+          { t: new Date(Date.now() - 600_000).toISOString(), name: 'reward', value: 0.55 },
+        ],
+      },
+      {
+        id: 'job-watchdog-unprotected',
+        project_id: 'proj-1',
+        task_id: 'task-watchdog-2',
+        backend: 'local-gpu',
+        external_compute_id: null,
+        machine_type: 'a3-highgpu-1g',
+        status: 'RUNNING',
+        terminal_reason: null,
+        outcome: null,
+        accelerator_type: 'H100',
+        accelerator_count: 1,
+        spend_cap_usd: 100.0,
+        wall_clock_deadline: new Date(Date.now() + 23 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 7_200_000).toISOString(),
+        updated_at: new Date(Date.now() - 120_000).toISOString(),
+        started_at: new Date(Date.now() - 7_190_000).toISOString(),
+        completed_at: null,
+        last_polled_at: new Date(Date.now() - 120_000).toISOString(),
+        accrued_cost_usd: 8.2,
+        final_cost_usd: null,
+        result_reference: null,
+        task_title: 'compute_experiment: RL training — no metric declared, watchdog inert',
+        task_type: 'compute_experiment',
+        experiment: 'rl-reward-v4',
+        watchdog_active: false,
+        watchdog_inert_reason: 'no_declared_metric',
+        no_progress_timeout_seconds: null,
+        last_progress_at: null,
+      },
+    ];
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('Protected')) throw new Error('Protected badge not rendered');
+        if (!text.includes('Unprotected')) throw new Error('Unprotected badge not rendered');
+        if (!text.includes('no_declared_metric')) throw new Error('inert reason not rendered');
+        if (!text.includes('Watchdog will NOT cut')) throw new Error('watchdog warning not rendered');
+      },
+      { waitMs: 60 },
+    );
+  });
+
   test('renders progress series sparkline and no-progress stall tag at 1280px', async () => {
     jobsToReturn = progressSeriesJobs;
     await expectFullViewportAt(

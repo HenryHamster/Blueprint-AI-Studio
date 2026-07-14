@@ -1291,6 +1291,89 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     return spread <= tolerance
 
 
+def derive_watchdog_protection_status(polling_metadata: dict | None) -> dict:
+    """Derive the four watchdog-protection status fields from a job's polling_metadata.
+
+    Intended for inclusion in serialized compute-job response payloads.  The
+    derivation mirrors ``_no_progress_stalled`` exactly so operators see the same
+    effective timeout the watchdog would use — there is no forked definition.
+
+    Returns a dict with:
+      watchdog_active (bool): True when the job has a declared progress metric
+          AND an effective non-progress window > 0.
+      no_progress_timeout_seconds (int|None): Effective timeout in seconds
+          (per-job override if set, else global default). None when no metric declared.
+      last_progress_at (str|None): ISO timestamp of the most recent
+          progress_series sample matching the declared metric, or None.
+      watchdog_inert_reason (str|None): Why the watchdog will not fire —
+          'no_declared_metric' or 'metric_name_mismatch'. None when active.
+    """
+    from types import SimpleNamespace
+
+    meta = polling_metadata or {}
+    _job = SimpleNamespace(polling_metadata=meta)
+
+    # Resolve effective timeout — identical to the resolution in _no_progress_stalled.
+    raw_per_job = meta.get("no_progress_timeout_seconds")
+    per_job_seconds: float | None = None
+    if raw_per_job is not None:
+        try:
+            per_job_seconds = float(raw_per_job)
+        except (TypeError, ValueError):
+            pass
+    effective_seconds = (
+        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+    )
+
+    metric = _declared_progress_metric(_job)
+
+    if metric is None:
+        return {
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": None,
+            "last_progress_at": None,
+            "watchdog_inert_reason": "no_declared_metric",
+        }
+
+    if effective_seconds <= 0:
+        return {
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "timeout_disabled",
+        }
+
+    # Find the most recent sample in progress_series matching the declared metric.
+    series = meta.get("progress_series")
+    last_t: str | None = None
+    if isinstance(series, list):
+        last_ts: datetime | None = None
+        for sample in series:
+            if not isinstance(sample, dict) or sample.get("name") != metric:
+                continue
+            t_str = sample.get("t")
+            ts = _parse_naive_iso_datetime(t_str)
+            if ts is None:
+                continue
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+                last_t = t_str
+
+    # Detect metric-name mismatch: samples exist but none match the declared metric.
+    inert_reason: str | None = None
+    if last_t is None:
+        mismatch = _watchdog_metric_name_mismatch(_job)
+        if mismatch:
+            inert_reason = "metric_name_mismatch"
+
+    return {
+        "watchdog_active": inert_reason is None,
+        "no_progress_timeout_seconds": int(effective_seconds),
+        "last_progress_at": last_t,
+        "watchdog_inert_reason": inert_reason,
+    }
+
+
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
     # Use the short provisioning sub-deadline stored at job creation. Fall back
     # to wall_clock_deadline for legacy rows that predate the sub-deadline field.

@@ -16817,6 +16817,129 @@ def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
     data = serialize_compute_job_response_safe(job)
     assert data["terminal_kind"] is None
     assert data["progress_series"] is None
+
+
+def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
+    """serialize_compute_job_response_safe promotes the four watchdog-protection status
+    fields as first-class fields on the operator-facing payload.
+
+    Three sub-cases:
+    (1) Protected running job: declared metric + effective timeout -> watchdog_active=True,
+        correct no_progress_timeout_seconds, last_progress_at equals newest matching sample.
+    (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
+    (3) Metric-name mismatch: samples exist but none match declared metric ->
+        watchdog_inert_reason='metric_name_mismatch'.
+    """
+    from app.schemas import serialize_compute_job_response_safe
+
+    # --- Case 1: protected job with declared metric and matching samples ---
+    progress_series = [
+        {"t": "2026-01-01T00:00:00", "name": "reward", "value": 1.0},
+        {"t": "2026-01-01T00:01:00", "name": "reward", "value": 1.1},
+    ]
+    job_protected = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "declared_metric": "reward",
+            "no_progress_timeout_seconds": 3600,
+            "progress_series": progress_series,
+        },
+    )
+    data = serialize_compute_job_response_safe(job_protected)
+    assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
+    assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
+    assert data["last_progress_at"] == "2026-01-01T00:01:00", "must return newest matching sample"
+    assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
+
+    # --- Case 2: no declared metric ---
+    job_no_metric = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    data2 = serialize_compute_job_response_safe(job_no_metric)
+    assert data2["watchdog_active"] is False
+    assert data2["watchdog_inert_reason"] == "no_declared_metric"
+    assert data2["no_progress_timeout_seconds"] is None
+    assert data2["last_progress_at"] is None
+
+    # --- Case 3: declared metric but all samples carry a different metric name ---
+    job_mismatch = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "declared_metric": "reward",
+            "progress_series": [
+                {"t": "2026-01-01T00:00:00", "name": "loss", "value": 0.5},
+                {"t": "2026-01-01T00:01:00", "name": "loss", "value": 0.4},
+            ],
+        },
+    )
+    data3 = serialize_compute_job_response_safe(job_mismatch)
+    assert data3["watchdog_active"] is False
+    assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
+    assert data3["last_progress_at"] is None
+
+
+def test_runner_bridge_last_progress_at_reflects_written_samples():
+    """Regression: runner-written progress samples bridge into progress_series and
+    are reflected by last_progress_at in the serialized response — no residual
+    key-mismatch path silently drops progress."""
+    from app.routers.runner import _merge_progress_report
+    from app.compute_jobs import append_progress_sample
+    from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
+
+    now = _utcnow()
+    raw_report = {
+        "records": [
+            {"metric": "reward", "value": 10.0, "ts": "2026-06-01T00:00:00"},
+            {"metric": "reward", "value": 11.0, "ts": "2026-06-01T00:01:00"},
+        ],
+        "count": 2,
+    }
+    _merged, new_records = _merge_progress_report(None, raw_report, now)
+    assert len(new_records) == 2, "bridge must yield both records"
+
+    # Bridge into progress_series exactly as the /report route handler does.
+    meta: dict = {"declared_metric": "reward"}
+    for rec in new_records:
+        meta = append_progress_sample(
+            meta,
+            metric=rec["metric"],
+            value=rec["value"],
+            t=rec.get("ts") or now.isoformat(),
+        )
+
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata=meta,
+    )
+    data = serialize_compute_job_response_safe(job)
+
+    # The bridge wrote samples under key 'name'; the watchdog reads 'name'.
+    # last_progress_at must reflect the most recent bridged sample.
+    assert data["last_progress_at"] == "2026-06-01T00:01:00", (
+        "last_progress_at must equal the most recent runner-bridged sample timestamp"
+    )
+    assert data["watchdog_active"] is True, "watchdog must be active after bridge populates progress_series"
+    assert data["watchdog_inert_reason"] is None
+
+
 @pytest.mark.asyncio
 async def test_compute_experiment_defaults_container_image_to_project_image(
     db_session, mocker

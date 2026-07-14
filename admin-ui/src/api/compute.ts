@@ -896,6 +896,22 @@ export interface ComputeJob {
    *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
    *  natural failure ('failure'). Absent on legacy rows. */
   terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
+  /** True when the server-side no-progress watchdog is actively monitoring this
+   *  job (i.e. a declared_metric was found and the metric-name bridge is intact).
+   *  False when the watchdog exists but is inert. Absent on legacy rows or when
+   *  the watchdog subsystem is not involved. */
+  watchdog_active?: boolean | null;
+  /** Effective no-progress timeout in seconds enforced for this job, derived
+   *  from the per-job override if set, otherwise the global default. Null when
+   *  the watchdog is not configured for this job. */
+  no_progress_timeout_seconds?: number | null;
+  /** ISO timestamp of the most recent progress sample recorded for this job.
+   *  Null when no progress samples have been emitted yet. */
+  last_progress_at?: string | null;
+  /** Human-readable reason the watchdog is NOT protecting this job, e.g.
+   *  'no_declared_metric' or 'metric_name_mismatch'. Null when watchdog_active
+   *  is true or when the watchdog is not involved. */
+  watchdog_inert_reason?: string | null;
 }
 
 export interface ComputeJobsSummary {

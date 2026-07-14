@@ -557,6 +557,99 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
   });
 });
 
+describe('ComputeJobsPanel watchdog protection status', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  function setupMocks() {
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+  }
+
+  test('active job with watchdog_active:true renders Protected badge with timeout', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: true,
+        no_progress_timeout_seconds: 1800,
+        last_progress_at: new Date(Date.now() - 120_000).toISOString(),
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-protected"]')).toBeTruthy();
+    expect(el.textContent).toContain('Protected');
+    expect(el.textContent).toContain('30m');
+    expect(el.textContent).toContain('last progress');
+  });
+
+  test('active job with watchdog_active:false and no inert reason renders Unprotected badge', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        no_progress_timeout_seconds: null,
+        watchdog_inert_reason: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')).toBeTruthy();
+    expect(el.textContent).toContain('Unprotected');
+    expect(el.querySelector('[data-testid="compute-watchdog-inert-warning"]')).toBeNull();
+  });
+
+  test('active job with watchdog_active:false and inert reason renders warning block', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        watchdog_inert_reason: 'no_declared_metric',
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    const warning = el.querySelector('[data-testid="compute-watchdog-inert-warning"]');
+    expect(warning).toBeTruthy();
+    expect(warning?.textContent).toContain('no_declared_metric');
+    expect(warning?.textContent).toContain('Watchdog will NOT cut this job');
+  });
+
+  test('active job without watchdog fields renders no watchdog indicator (backward compat)', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({ status: 'RUNNING' })]));
+    const { findByText, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(container.querySelector('[data-testid="compute-watchdog-status"]')).toBeNull();
+  });
+
+  test('terminal job does not render watchdog indicator even when fields are present', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        completed_at: new Date().toISOString(),
+        watchdog_active: true,
+        no_progress_timeout_seconds: 1800,
+      }),
+    ]));
+    const { findByText, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(container.querySelector('[data-testid="compute-watchdog-status"]')).toBeNull();
+  });
+});
+
 describe('ComputeJobsPanel render + kill', () => {
   afterEach(() => {
     fetchComputeJobs.mockReset();
