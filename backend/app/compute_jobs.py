@@ -1260,6 +1260,8 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
 _NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
     "no supported gpu(s) detected to run this container",
     "gpu, which is not supported by this container",
+    # CUDA error 209: image lacks device code for the host GPU arch (e.g. sm_70/Volta)
+    "no kernel image is available for execution on the device",
 )
 _NO_USABLE_GPU_TERMINAL_REASON = (
     "container reported no usable GPU — host GPU/image compatibility mismatch"

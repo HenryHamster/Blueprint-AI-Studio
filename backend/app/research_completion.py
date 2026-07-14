@@ -763,6 +763,126 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
     return downgrades
 
 
+# Terminal reason for a deliver task whose declared deliverable is a sent
+# message or a written report but which produced neither (and no findings). This
+# is the task-orchestrator peer of compute's _NO_DATA_TERMINAL_REASON: a green
+# COMPLETED here would mask a zero-output outcome (the a70fe988 pathology —
+# 'no actionable findings (degraded: provider capacity)' recorded as SUCCESS).
+_NO_DELIVERED_OUTPUT_TERMINAL_REASON = (
+    "deliver task declared a message/report deliverable but produced none — "
+    "zero findings, no message sent, and no report written; recorded as FAILED "
+    "rather than a green completion that masks the empty outcome"
+)
+
+# Explicit phrases that DECLARE a task's deliverable to BE a sent message or a
+# written report (as opposed to the usual research findings). The match is kept
+# deliberately explicit/conservative — mirroring compute's fail-soft
+# _job_expects_data guard — so an ordinary research task whose prose merely
+# mentions the words 'report' or 'message' is never mis-flagged and false-failed.
+_DELIVERED_OUTPUT_DELIVERABLE_PHRASES = (
+    "message/report deliverable",
+    "report/message deliverable",
+    "deliverable of this task is a sent message",
+    "deliverable of this task is a message",
+    "deliverable of this task is a report",
+    "deliverable of this task is a written report",
+    "deliverable is a sent message",
+    "deliverable is a message",
+    "deliverable is a report",
+    "deliverable is a written report",
+    "declared deliverable is a sent message",
+    "declared deliverable is a message",
+    "declared deliverable is a report",
+    "message deliverable",
+    "report deliverable",
+)
+
+# Structured deliverable-kind values (context/payload) that declare a delivered
+# output rather than parsed findings. Preferred over prose matching; this is what
+# forward-looking spawners should stamp.
+_DELIVERED_OUTPUT_DELIVERABLE_KINDS = {"message", "report", "message_or_report"}
+
+
+def _declares_delivered_output_deliverable(task: Task) -> bool:
+    """True when the task DECLARED that its deliverable is a sent message or a
+    written report/document, rather than parsed research findings.
+
+    Most research tasks deliver findings; an empty-but-honest finding set is a
+    legitimate green completion for those, so this predicate must NOT fire for
+    them. A subset of research/deliver tasks instead declare their deliverable to
+    BE a sent operator message or a written report (e.g. operator-requested
+    state-of-internals reports like task a70fe988). For those, a zero-findings
+    run that ALSO sent no message and wrote no report produced nothing — the
+    green-status-masks-empty-outcome pathology the no-output guard closes.
+
+    Detection is conservative (mirrors compute's fail-soft ``_job_expects_data``):
+    it fires only on an EXPLICIT structured field or an explicit deliverable
+    phrase, never on incidental prose.
+    """
+    payload = task.first_payload or {}
+    context = task.context or {}
+    # 1. Structured declaration (preferred; what future spawners should set).
+    for source in (context, payload):
+        if not isinstance(source, dict):
+            continue
+        kind = source.get("deliverable_kind")
+        if (
+            isinstance(kind, str)
+            and kind.strip().lower() in _DELIVERED_OUTPUT_DELIVERABLE_KINDS
+        ):
+            return True
+        if source.get("requires_delivered_output") is True:
+            return True
+    # 2. Explicit prose declaration in the description / prompt / acceptance
+    #    evidence observable_behavior.
+    texts: list[str] = [task.description or "", str(payload.get("prompt") or "")]
+    evidence = payload.get("acceptance_evidence")
+    if isinstance(evidence, dict):
+        texts.append(
+            str(evidence.get("description") or evidence.get("observable_behavior") or "")
+        )
+    haystack = " ".join(texts).lower()
+    return any(phrase in haystack for phrase in _DELIVERED_OUTPUT_DELIVERABLE_PHRASES)
+
+
+async def _delivered_output_present(task: Task, session: AsyncSession) -> bool:
+    """True when this task produced a durable delivered output.
+
+    A delivered output is either a sent operator message (``ProjectMessage`` with
+    ``from_task_id == task.id``) or a written report/document (``KnowledgeDocument``
+    with ``source_task_id == task.id``). Used by the no-output guard to tell a
+    genuinely-empty deliver task apart from one that sent/wrote its deliverable
+    even though it parsed no findings.
+    """
+    from app.models import KnowledgeDocument, ProjectMessage
+
+    message_id = (
+        (
+            await session.execute(
+                select(ProjectMessage.id)
+                .where(ProjectMessage.from_task_id == task.id)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if message_id is not None:
+        return True
+    document_id = (
+        (
+            await session.execute(
+                select(KnowledgeDocument.id)
+                .where(KnowledgeDocument.source_task_id == task.id)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return document_id is not None
+
+
 def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
     """Record the honest research success signal on the task at dispatch time.
 
@@ -1756,7 +1876,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"{len(_stored_findings)} stored finding(s)"
                 )[:500]
     if not findings:
-        if _capacity_degradation_reason:
+        # No-output guard: a task whose DECLARED deliverable is a sent message or
+        # a written report, but which parsed zero findings AND sent no message AND
+        # wrote no report, produced nothing. Record it as a terminal FAILURE
+        # instead of the green COMPLETED it inherited — otherwise the empty
+        # outcome is masked as success (task a70fe988: 'no actionable findings
+        # (degraded: provider capacity)' recorded green). Ordinary research tasks
+        # (no declared message/report deliverable) stay green on an honest empty
+        # finding set — the predicate is conservative to avoid false failures.
+        _expects_delivered_output = _declares_delivered_output_deliverable(task)
+        _delivered_output = (
+            await _delivered_output_present(task, session)
+            if _expects_delivered_output
+            else False
+        )
+        _no_output_downgrade = _expects_delivered_output and not _delivered_output
+
+        if _no_output_downgrade:
+            _reason = _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+            if _capacity_degradation_reason:
+                _reason = f"{_reason} (degraded: {_capacity_degradation_reason})"
+                _mark_capacity_degraded(task, _capacity_degradation_reason)
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = _reason[:500]
+        elif _capacity_degradation_reason:
             task.latest_status_message = (
                 "Research completed with no actionable findings "
                 f"(degraded: {_capacity_degradation_reason} — results may be incomplete)"
@@ -1772,6 +1915,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await _stamp_no_findings_refractory(task, session)
         session.add(task)
         await session.commit()
+        if _no_output_downgrade:
+            # Mirror the forward-quality FAIL path: record the failure on the
+            # direction's research_history so direction-health can observe the
+            # empty deliver task. Guarded so accounting can never crash the
+            # handler (the task is already terminally FAILED and committed).
+            try:
+                await _record_research_task_failure(task, session)
+            except Exception:  # noqa: BLE001 — accounting must not crash the gate
+                logger.debug(
+                    "[RESEARCH] failure accounting after no-delivered-output "
+                    "downgrade raised",
+                    exc_info=True,
+                )
         # Evergreen-fill completion adapter: zero findings → verified_stale.
         # This early-return path bypasses the main adapter call below, so we
         # must fire it here.

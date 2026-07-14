@@ -2884,6 +2884,11 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         ("Detected A40 GPU, which is not supported by this container", True),
         # A normal successful run is not a false positive.
         ("throughput_tflops: 42.0\nrun complete", False),
+        # CUDA error 209: image lacks device code for host GPU arch (e.g. sm_70/Volta).
+        (
+            "CUDA error: no kernel image is available for execution on the device",
+            True,
+        ),
         # Non-fatal mentions of "gpu" and "supported" must not trip it.
         ("Using GPU 0; mixed precision supported", False),
     ],

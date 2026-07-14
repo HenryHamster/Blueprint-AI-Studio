@@ -26,10 +26,13 @@ from app.source_ref_validation import (
 from app.research_completion import (
     _DOWNGRADED_VERIFICATION_BASIS,
     _HIGH_EVIDENCE_BASES,
+    _NO_DELIVERED_OUTPUT_TERMINAL_REASON,
     VALID_VERIFICATION_BASES,
     _annotate_capability_declarations,
     _apply_structural_actionability_downgrade,
     _build_salvage_payload,
+    _declares_delivered_output_deliverable,
+    _delivered_output_present,
     _handle_research_completion,
     _reconcile_verification_basis,
     _record_research_survival_signal,
@@ -639,6 +642,204 @@ async def test_salvage_activity_context_recorded_on_parent_task(db_session, mock
         "filter_breakdown should include salvaged count"
     )
     assert _fb["salvaged"] == 1
+
+
+class TestDeclaresDeliveredOutputDeliverable:
+    """_declares_delivered_output_deliverable: conservative message/report predicate."""
+
+    def _task(self, *, description="", payload=None, context=None):
+        return _Task(
+            project_id=uuid.uuid4(),
+            title="t",
+            description=description,
+            payloads=[payload or {"type": "research"}],
+            context=context or {},
+            status=TaskStatus.COMPLETED,
+        )
+
+    def test_prose_sent_message_deliverable_declared(self):
+        task = self._task(
+            description="The deliverable of THIS task is a SENT MESSAGE, not a green task status."
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_prose_message_report_deliverable_declared(self):
+        task = self._task(
+            description=(
+                "A task declaring a message/report deliverable that finishes with "
+                "zero messages sent and no report written is recorded as failed."
+            )
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_structured_deliverable_kind_declared(self):
+        task = self._task(payload={"type": "research", "deliverable_kind": "report"})
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_structured_requires_delivered_output_flag(self):
+        task = self._task(context={"requires_delivered_output": True})
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_acceptance_evidence_observable_behavior_declared(self):
+        task = self._task(
+            payload={
+                "type": "research",
+                "acceptance_evidence": {
+                    "kind": "observable_behavior",
+                    "description": "the declared deliverable is a report and it is written",
+                },
+            }
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_ordinary_research_not_flagged(self):
+        # Mentions 'report' and 'message' incidentally but declares no deliverable.
+        task = self._task(
+            description=(
+                "Analyze the messaging subsystem and report on latency in the "
+                "codebase; produce findings."
+            )
+        )
+        assert _declares_delivered_output_deliverable(task) is False
+
+    def test_empty_task_not_flagged(self):
+        assert _declares_delivered_output_deliverable(self._task()) is False
+
+
+class TestNoOutputDowngrade:
+    """Zero-findings deliver task with no message/report is FAILED, not green COMPLETED."""
+
+    async def _run_empty(self, db_session, mocker, task):
+        from test_autonomous_research import _patch_research_externals
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[]
+        )
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+    @_pytest.mark.asyncio
+    async def test_declared_deliverable_zero_output_downgrades_to_failed(
+        self, db_session, mocker
+    ):
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput01"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE, not a green task status."
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.FAILED, (
+            "a declared message/report deliverable producing nothing must FAIL"
+        )
+        assert task.latest_status_message == _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+
+    @_pytest.mark.asyncio
+    async def test_plain_research_zero_findings_stays_completed(
+        self, db_session, mocker
+    ):
+        # No declared deliverable — an honest empty finding set stays green.
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput02"
+        )
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.latest_status_message == (
+            "Research completed with no actionable findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_capacity_degraded_declared_deliverable_zero_output_fails(
+        self, db_session, mocker
+    ):
+        # Reproduces the a70fe988 signature: degraded provider capacity + a
+        # declared deliverable + zero output → non-green terminal, not SUCCESS.
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput03"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE."
+        db_session.add(task)
+        await db_session.commit()
+
+        mocker.patch(
+            "app.research_completion._check_capacity_degradation",
+            return_value="provider capacity/rate-limit error",
+        )
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.FAILED
+        assert task.latest_status_message.startswith(
+            _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+        )
+        assert "provider capacity" in task.latest_status_message
+
+    @_pytest.mark.asyncio
+    async def test_declared_deliverable_with_message_sent_stays_completed(
+        self, db_session, mocker
+    ):
+        # Zero findings BUT the task sent a ProjectMessage — output WAS delivered.
+        from app.models import ProjectMessage
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput04"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE."
+        db_session.add(task)
+        message = ProjectMessage(
+            project_id=_project.id,
+            from_task_id=task.id,
+            from_type="agent",
+            content="Here is the frank state-of-internals report you asked for.",
+        )
+        db_session.add(message)
+        await db_session.commit()
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.COMPLETED, (
+            "a delivered message must keep the task green even with zero findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_delivered_output_present_detects_message_and_document(
+        self, db_session
+    ):
+        from app.models import KnowledgeDocument, ProjectMessage
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput05"
+        )
+        assert await _delivered_output_present(task, db_session) is False
+
+        db_session.add(
+            ProjectMessage(
+                project_id=_project.id, from_task_id=task.id, content="sent"
+            )
+        )
+        await db_session.commit()
+        assert await _delivered_output_present(task, db_session) is True
+
+        # Also detects a written report (KnowledgeDocument) alone.
+        _project2, _d2, task2 = await _grader_project_and_task(
+            db_session, "d-nooutput06"
+        )
+        assert await _delivered_output_present(task2, db_session) is False
+        db_session.add(
+            KnowledgeDocument(
+                project_id=_project2.id,
+                source_task_id=task2.id,
+                title="Report",
+                summary="s",
+                body="b",
+            )
+        )
+        await db_session.commit()
+        assert await _delivered_output_present(task2, db_session) is True
 
 
 class TestDedupFilteredFindingsAddedToSalvage:
