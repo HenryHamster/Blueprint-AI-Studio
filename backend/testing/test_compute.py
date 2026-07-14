@@ -8962,10 +8962,8 @@ async def test_wake_delivery_missing_job_is_truthfully_classified(db_session):
 # ---------------------------------------------------------------------------
 # Park/wake safety-net tests and race-contention proof
 # ---------------------------------------------------------------------------
-
-USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
-    "DATABASE_URL", ""
-).startswith("postgresql")
+# (USE_POSTGRES is imported from testing.conftest above — it was re-derived here
+# with the identical expression, which shadowed the import.)
 
 
 @pytest.mark.skipif(
@@ -15119,11 +15117,9 @@ async def test_retry_provisioning_timeout_extends_deadline(db_session, monkeypat
         expire_on_commit=False,
         class_=AsyncSession,
     )
-    now = _utcnow()
-
     # First retry should succeed.
     result = await compute_jobs._maybe_retry_provisioning_timeout(
-        session_factory, job.id, now
+        session_factory, job.id
     )
     assert result is True
 
@@ -15180,7 +15176,7 @@ async def test_retry_provisioning_timeout_exhausted(db_session, monkeypatch):
     )
 
     result = await compute_jobs._maybe_retry_provisioning_timeout(
-        session_factory, job.id, _utcnow()
+        session_factory, job.id
     )
     assert result is False
 
@@ -15228,7 +15224,7 @@ async def test_retry_provisioning_timeout_already_terminal(db_session, monkeypat
     )
 
     result = await compute_jobs._maybe_retry_provisioning_timeout(
-        session_factory, job.id, _utcnow()
+        session_factory, job.id
     )
     assert result is True
 
@@ -18547,12 +18543,28 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
     Returns a dict tallying ``downloads`` and ``uploads`` so a test can assert the
     pipeline fetched the bundle EXACTLY ONCE — the core of the duplicate-pipeline
     fix — rather than the 2x it used to.
+
+    The pipeline STREAMS the bundle to a temp file (it never pulls the whole
+    archive into the orchestrator's heap), so the fetch seam patched here is
+    ``_download_artifact_bundle_to_path``: the fake writes the in-memory test
+    bundle to the destination path the pipeline streams into. Any code path that
+    reached for the whole-bundle ``storage.download_compute_job_artifact_bundle``
+    instead would BLOW UP here — it is patched to fail — which is what keeps the
+    OOM-shaped fetch from creeping back into the viewable pass.
     """
     calls: dict = {"downloads": 0, "uploads": []}
 
-    async def _fake_download(job_id):
+    def _fake_stream_download(_job_id, dest_path):
         calls["downloads"] += 1
-        return bundle
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle)
+        return True
+
+    async def _forbid_whole_bundle_download(_job_id):
+        raise AssertionError(
+            "the viewable pass must STREAM the bundle to disk "
+            "(_download_artifact_bundle_to_path), never load it whole into memory"
+        )
 
     async def _fake_upload(job_id, basename, data, content_type):
         if fail_on is not None and fail_on in basename:
@@ -18569,7 +18581,12 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
         )
 
     monkeypatch.setattr(
-        storage, "download_compute_job_artifact_bundle", _fake_download
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        _fake_stream_download,
+    )
+    monkeypatch.setattr(
+        storage, "download_compute_job_artifact_bundle", _forbid_whole_bundle_download
     )
     monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_upload)
     return calls
@@ -19661,3 +19678,438 @@ async def test_compute_job_input_artifact_endpoint_404_without_source(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert dl.status_code == 404
+
+
+# ===========================================================================
+# Release-audit fixes: stale-snapshot VM kill, DOA retry deadline,
+# whole-bundle viewable download, unreachable watchdog SIGKILL.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_monitor_rereads_task_before_terminal_kill_so_midtick_restore_is_respected(
+    db_session, monkeypatch
+):
+    """A task restored DURING the tick must not have its live VM killed.
+
+    The monitor batch-selects up to 50 jobs and then processes them one at a
+    time, each doing backend RPCs — so a job late in the batch is reached long
+    after its row (and its task's row) was read. The task-terminal VM kill is
+    irreversible, so it must be decided on the AUTHORITATIVE task row, never on
+    the tick-start snapshot.
+
+    The mid-tick change here is real, driven through the real tick: job A's poll
+    (which runs while the tick is in flight) restores job B's task from FAILED
+    back to RUNNING — exactly the operator "PATCH a falsely-FAILED task back to
+    QUEUED" move. B's VM must survive: no terminate, no CANCELLED.
+    """
+    project = Project(name=f"midtick-{uuid.uuid4().hex[:8]}", user_id="test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        type="compute_experiment",
+        prompt="a",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task_b = Task(
+        project_id=project.id,
+        type="compute_experiment",
+        prompt="b",
+        status=TaskStatus.IN_PROGRESS,  # flipped to FAILED below, once its job exists
+    )
+    db_session.add_all([task_a, task_b])
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    async def _running_job(task, external_id):
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo ok",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        job.status = ComputeJobStatus.RUNNING
+        job.external_compute_id = external_id
+        meta = dict(job.polling_metadata or {})
+        meta["preflight_smoke_done"] = True
+        job.polling_metadata = meta
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return job
+
+    job_a = await _running_job(task_a, "vm-a")
+    job_b = await _running_job(task_b, "vm-b")
+    # Pin the batch order (the tick sorts by created_at, id): A is processed
+    # first, so its poll is what lands the mid-tick change on B's task.
+    job_a.created_at = _utcnow() - timedelta(minutes=5)
+    job_b.created_at = _utcnow() - timedelta(minutes=1)
+    # B's task is terminal as the tick STARTS — this is what the tick's snapshot
+    # sees, and what the (unfixed) monitor would kill B's VM on.
+    task_b.status = TaskStatus.FAILED
+    db_session.add_all([job_a, job_b, task_b])
+    await db_session.commit()
+    assert job_a.created_at < job_b.created_at
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    terminated: list = []
+
+    class MidTickBackend:
+        def external_id_for(self, persisted_job):
+            return persisted_job.external_compute_id or "vm-x"
+
+        async def launch(self, spec):  # pragma: no cover - both jobs are RUNNING
+            raise AssertionError("launch must not be called")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            if persisted_job.external_compute_id == "vm-a":
+                # THE MID-TICK CHANGE: task B is restored while the tick is in
+                # flight — after the tick's batch snapshot was taken.
+                async with session_factory() as session:
+                    live_b = await session.get(Task, task_b.id)
+                    live_b.status = TaskStatus.IN_PROGRESS
+                    session.add(live_b)
+                    await session.commit()
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            terminated.append((persisted_job.external_compute_id or "", reason))
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: MidTickBackend()
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job_b)
+    await db_session.refresh(task_b)
+    assert task_b.status == TaskStatus.IN_PROGRESS  # the restore landed mid-tick
+    assert terminated == [], (
+        "job B's VM was killed on the STALE batch snapshot — the task-terminal "
+        f"kill must re-read the authoritative task row (terminate calls: {terminated})"
+    )
+    assert job_b.status == ComputeJobStatus.RUNNING
+    assert job_b.outcome != ComputeJobOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_provisioning_retry_deadline_starts_at_retry_time_not_stale_tick_start(
+    db_session,
+):
+    """Retry 1 must not be dead on arrival after a slow launch.
+
+    The caller reaches the retry only AFTER waiting out the launch leg (an LRO
+    that can burn the entire provisioning window) plus a terminate RPC — so the
+    tick-start ``now`` is long stale by then. Deriving the new provisioning
+    deadline from it wrote a deadline that was already in the PAST: the next tick
+    computed ``_provisioning_timeout_seconds() == 0``, re-timed-out the job
+    WITHOUT ever attempting a fresh launch, and the whole retry budget evaporated
+    in seconds.
+
+    The persisted deadline must be in the future by ~the backoff, measured from
+    the real time at retry.
+    """
+    project = Project(name=f"doa-{uuid.uuid4().hex[:8]}", user_id="test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        type="compute_experiment",
+        prompt="p",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo ok",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.STARTING
+    db_session.add(job)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    before = _utcnow()
+    assert await compute_jobs._maybe_retry_provisioning_timeout(session_factory, job.id)
+    after = _utcnow()
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("provisioning_retry_count") == 1
+    deadline = compute_jobs._parse_naive_iso_datetime(
+        meta.get("provisioning_deadline_at")
+    )
+    assert deadline is not None
+
+    # 1. The deadline is in the FUTURE — the next tick gets a real launch window.
+    assert deadline > after, (
+        f"retry deadline {deadline.isoformat()} is not in the future "
+        f"(now={after.isoformat()}) — retry 1 is dead on arrival"
+    )
+    assert compute_jobs._provisioning_timeout_seconds(job, now=after) > 0.0, (
+        "the next tick sees provisioning_timeout_seconds == 0 and re-times-out "
+        "the job WITHOUT ever attempting a fresh launch"
+    )
+    # 2. It is the backoff measured from the retry itself — the deadline sits
+    #    within [now, now + backoff(+jitter)], so a caller whose tick-start clock
+    #    is minutes old (a slow launch LRO) cannot shrink it, let alone push it
+    #    into the past.
+    backoff = compute_jobs.exponential_backoff(
+        1,
+        base=compute_jobs.PROVISIONING_RETRY_BACKOFF_BASE_SECONDS,
+        cap=600.0,
+    )
+    max_backoff = backoff / 0.8 * 1.2  # undo the jitter band both ways
+    assert (deadline - before).total_seconds() <= max_backoff + 5
+
+
+def test_viewable_pipeline_streams_bundle_and_peak_memory_is_bounded(tmp_path):
+    """The viewable pass must never hold a job's whole artifact bundle in RAM.
+
+    This is the OOM, as a measurement. A results bundle is unbounded (checkpoints,
+    videos, logs), and the unified viewable pass pulled the ENTIRE object into the
+    orchestrator (``blob.download_as_bytes()``) — one fat bundle OOMs the API
+    process. It must stream to disk and read only the (count-capped) viewable
+    members.
+
+    Both transports are modelled HONESTLY, which is what makes the assertion mean
+    something:
+
+    * the streaming seam (``_download_artifact_bundle_to_path``) copies the object
+      to its destination file — nothing passes through Python memory;
+    * the whole-bundle seam (``storage.download_compute_job_artifact_bundle``) does
+      what it really does — materialize the object as ``bytes``. That allocation
+      lands inside the measurement window, so an implementation that reaches for it
+      is caught paying for it.
+    """
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+    # INCOMPRESSIBLE, like a real checkpoint/video: the wire bytes a whole-bundle
+    # download would have to hold are the full 48 MiB, not a gzip artefact of it.
+    big_payload = os.urandom(48 * 1024 * 1024)
+    src = tmp_path / "bundle.tar.gz"
+    # Written straight to disk (compresslevel=1) so the TEST never holds the
+    # archive either — only the pipeline's own allocations land in the window.
+    with tarfile.open(str(src), mode="w:gz", compresslevel=1) as tar:
+        for name, payload in (
+            ("./checkpoint/model.pt", big_payload),
+            ("./plot.png", png),
+            ("./arm1/reward.png", png + b"-a1"),
+            ("./notes.txt", b"not viewable"),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    del big_payload
+    bundle_size = src.stat().st_size
+    assert bundle_size > 32 * 1024 * 1024, (
+        f"the bundle ({bundle_size} bytes) must dwarf the memory ceiling"
+    )
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(str(src), dest_path)  # to disk; no Python-level buffer
+        return True
+
+    async def _fake_whole_bundle_download(_job_id):
+        return src.read_bytes()  # a real whole-object fetch: 48+ MiB resident
+
+    uploaded: list = []
+
+    async def _fake_upload(job_id, filename, data, content_type):
+        uploaded.append(filename)
+        return storage.compute_job_viewable_uri(job_id, filename)
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.GCP_BACKEND_NAME
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.storage,
+        "download_compute_job_artifact_bundle",
+        _fake_whole_bundle_download,
+    ), patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        _fake_upload,
+    ):
+        tracemalloc.start()
+        try:
+            manifest, dropped = asyncio.run(
+                compute_backends_module.persist_viewable_artifacts(job)
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    # The pass still WORKS: both viewable files are found inside the fat bundle,
+    # under their canonical (subdir-preserving) names; non-viewable members skipped.
+    assert sorted(m["filename"] for m in manifest) == ["arm1__reward.png", "plot.png"]
+    assert dropped == 0
+    assert sorted(uploaded) == ["arm1__reward.png", "plot.png"]
+
+    # And it did not pay for the bundle's size in RAM. The ceiling is generous
+    # (well under half the archive), so this pins the SHAPE — bounded, not
+    # proportional — rather than a brittle exact number.
+    ceiling = 16 * 1024 * 1024
+    assert peak < ceiling, (
+        f"the viewable pass peaked at {peak / 1024 / 1024:.1f} MiB on a "
+        f"{bundle_size / 1024 / 1024:.1f} MiB bundle — it is pulling the whole "
+        "bundle into the orchestrator instead of streaming it (this is the OOM)"
+    )
+
+
+def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
+    tmp_path, monkeypatch
+):
+    """A command that ignores SIGTERM must still be reaped by the no-progress watchdog.
+
+    The watchdog is a background subshell of the job's process-group leader, so the
+    ``kill -TERM -$$`` it fires at the group lands on the WATCHDOG ITSELF. It died
+    right there — and the SIGKILL escalation two lines below never ran. A command
+    that traps/ignores SIGTERM therefore kept running (and kept billing) after the
+    watchdog had already written the ``no_progress_timeout`` terminal record: the
+    no-progress kill silently did not kill.
+
+    Runs the REAL emitted wrapper against a REAL SIGTERM-ignoring process; only a
+    reachable SIGKILL escalation can pass.
+    """
+    import subprocess
+    import sys
+    import time
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("process-group signalling + `stat -c` target the Linux substrate")
+
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "np-sigkill-e2e"
+    pid_file = tmp_path / "stubborn.pid"
+    stubborn = tmp_path / "stubborn.py"
+    stubborn.write_text(
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "    fh.flush()\n"
+        "time.sleep(600)\n",
+        encoding="utf-8",
+    )
+
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        f"python3 {shlex.quote(str(stubborn))} {shlex.quote(str(pid_file))}",
+        external_id=external_id,
+        no_progress_timeout_seconds=5,  # the command never touches the progress file
+    )
+
+    def _alive(pid: int) -> bool:
+        """True while the process exists and is not an unreaped zombie."""
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return False
+        return state != "Z"
+
+    proc = subprocess.Popen(
+        ["bash", "-lc", wrapper],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,  # exactly how the backend spawns it: $$ == the pgid
+    )
+    stubborn_pid = None
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            raw_pid = (
+                pid_file.read_text(encoding="utf-8").strip()
+                if pid_file.exists()
+                else ""
+            )
+            if raw_pid:
+                stubborn_pid = int(raw_pid)
+                break
+            time.sleep(0.1)
+        assert stubborn_pid, "the SIGTERM-ignoring command never started"
+
+        # The watchdog fires at ~5s (no progress), TERMs the group (which the
+        # command ignores), and must escalate to SIGKILL ~2s later.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and _alive(stubborn_pid):
+            time.sleep(0.2)
+
+        assert not _alive(stubborn_pid), (
+            "the SIGTERM-ignoring command SURVIVED the no-progress watchdog — its "
+            "SIGKILL escalation is unreachable (the watchdog killed itself with the "
+            "group SIGTERM it sent), so a stalled job keeps running, and keeps "
+            "billing, after being reported dead"
+        )
+
+        state_dir = compute_backends_module._local_state_dir_for_external_id(external_id)
+        terminal_path = compute_backends_module._local_terminal_path_for_external_id(
+            external_id
+        )
+        assert os.path.exists(terminal_path), f"no terminal record in {state_dir}"
+        raw = open(terminal_path, encoding="utf-8").read()
+        assert "REASON=no_progress_timeout" in raw, raw
+        assert "EXIT_CODE=125" in raw, raw
+    finally:
+        if stubborn_pid and _alive(stubborn_pid):
+            try:
+                os.kill(stubborn_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+
+
+def test_no_progress_watchdog_shields_itself_from_its_own_group_term():
+    """Shape guard pairing with the e2e test above: the watchdog must ignore TERM
+    before it group-TERMs, or its SIGKILL escalation is dead code."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo ok", external_id="np-shape", no_progress_timeout_seconds=120
+    )
+    lines = [line.strip() for line in wrapper.splitlines()]
+    term_line = "kill -TERM -$$ 2>/dev/null || true"
+    kill_line = "kill -KILL -$$ 2>/dev/null || true"
+    assert "trap '' TERM" in lines, (
+        "the watchdog subshell shares the process group it signals — without "
+        "ignoring TERM first it kills itself and never reaches the SIGKILL escalation"
+    )
+    assert lines.index("trap '' TERM") < lines.index(term_line)
+    assert lines.index(term_line) < lines.index(kill_line)

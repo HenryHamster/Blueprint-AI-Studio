@@ -539,6 +539,27 @@ def test_extract_viewable_candidates_excludes_nonviewable_and_oversized(monkeypa
     assert cands[0].kind == "image"
 
 
+def _patch_bundle_stream(mocker, bundle: bytes | None):
+    """Point the viewable pass's STREAMING bundle fetch at an in-memory bundle.
+
+    The pass never pulls the archive into the orchestrator's heap: it streams the
+    object to a temp file and selects from disk. So the seam a test patches is
+    ``_download_artifact_bundle_to_path`` (write the bytes to the destination the
+    pass streams into); ``bundle=None`` models an object that does not exist.
+    """
+
+    def _fake(_job_id, dest_path):
+        if bundle is None:
+            return False
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle)
+        return True
+
+    return mocker.patch.object(
+        compute_backends, "_download_artifact_bundle_to_path", side_effect=_fake
+    )
+
+
 @pytest.mark.asyncio
 async def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch, mocker):
     """The total-count cap is enforced by ``_collect_viewable_artifact_candidates``,
@@ -554,9 +575,7 @@ async def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch,
     assert (
         len(compute_backends._extract_viewable_candidates_from_bundle(bundle)) == 5
     )
-    mocker.patch(
-        "app.storage.download_compute_job_artifact_bundle", return_value=bundle
-    )
+    _patch_bundle_stream(mocker, bundle)
 
     job = MagicMock()
     job.id = uuid.uuid4()
@@ -647,7 +666,7 @@ async def test_persist_viewable_artifacts_builds_manifest(db_session, mocker):
     bundle = _make_tar_gz_bundle(
         {"./plot.png": _PNG_BYTES, "./clip.mp4": _MP4_BYTES, "./log.txt": b"skip"}
     )
-    mocker.patch("app.storage.download_compute_job_artifact_bundle", return_value=bundle)
+    _patch_bundle_stream(mocker, bundle)
     # Real upload helper runs against a mocked GCS client (no network).
     gcs_client = mocker.patch("app.storage.storage.Client")
     blob = gcs_client.return_value.bucket.return_value.blob.return_value
@@ -680,10 +699,7 @@ async def test_persist_viewable_artifacts_corrupt_bundle_degrades(db_session, mo
     task = await _make_task(db_session, project)
     job = await _make_bundle_backed_job(db_session, project, task, backend="runner-subprocess")
 
-    mocker.patch(
-        "app.storage.download_compute_job_artifact_bundle",
-        return_value=b"corrupt-not-a-tar",
-    )
+    _patch_bundle_stream(mocker, b"corrupt-not-a-tar")
     upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
 
     manifest, dropped = await compute_backends.persist_viewable_artifacts(job)
@@ -697,7 +713,7 @@ async def test_persist_viewable_artifacts_missing_bundle_degrades(db_session, mo
     task = await _make_task(db_session, project)
     job = await _make_bundle_backed_job(db_session, project, task)
 
-    mocker.patch("app.storage.download_compute_job_artifact_bundle", return_value=None)
+    _patch_bundle_stream(mocker, None)
     upload = mocker.patch("app.storage.upload_compute_job_viewable_file")
 
     manifest, dropped = await compute_backends.persist_viewable_artifacts(job)

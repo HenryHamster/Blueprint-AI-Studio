@@ -1736,24 +1736,21 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
             result = await session.execute(stmt)
             jobs = result.scalars().all()
 
-            # Batch-load tasks for the fetched jobs to avoid N+1 per-job lookups.
-            task_ids = [j.task_id for j in jobs if j.task_id]
-            task_map: dict[uuid.UUID, Task] = {}
-            if task_ids:
-                task_rows = await session.execute(
-                    select(Task).where(Task.id.in_(task_ids))
-                )
-                task_map = {t.id: t for t in task_rows.scalars().all()}
+        # NOTE: the job rows above are a SNAPSHOT taken at tick start. Processing
+        # a full batch takes as long as up-to-50 backend RPCs, so by the time a
+        # late job in the batch is reached its row (and its task's row) may be
+        # minutes old. Nothing here may act on that snapshot: the authoritative
+        # rows are re-read per job in _process_single_compute_job, which is where
+        # the (irreversible) task-terminal VM kill is decided. Deliberately NOT
+        # batch-prefetching the tasks: a prefetched task snapshot would be exactly
+        # the stale input the kill must never be decided on.
 
         if not jobs:
             break
 
         for job in jobs:
             try:
-                prefetched_task = task_map.get(job.task_id) if job.task_id else None
-                await _process_single_compute_job(
-                    job, session_factory=session_factory, task=prefetched_task
-                )
+                await _process_single_compute_job(job, session_factory=session_factory)
             except Exception as exc:  # noqa: PERF203
                 logger.exception(
                     "[COMPUTE_JOB] monitor failed for job=%s: %s",
@@ -1918,7 +1915,6 @@ async def _run_and_apply_preflight_smoke(
 async def _maybe_retry_provisioning_timeout(
     session_factory,
     job_id: uuid.UUID,
-    now: datetime,
 ) -> bool:
     """Check if a provisioning-timeout job should be retried with backoff.
 
@@ -1934,8 +1930,17 @@ async def _maybe_retry_provisioning_timeout(
     terminal transition).
 
     The retry count is stored in ``polling_metadata['provisioning_retry_count']``;
-    the provisioning deadline is reset to ``now + backoff`` so the next monitor
-    tick attempts a fresh launch.
+    the provisioning deadline is reset to ``<time of THIS retry> + backoff`` so
+    the next monitor tick attempts a fresh launch.
+
+    The retry clock starts NOW, never at the caller's tick-start ``now``. The
+    caller reaches this function only AFTER a slow leg it just waited out — a
+    launch LRO that ran to the full provisioning timeout (minutes), or a
+    ``backend.terminate`` RPC. Deriving the new deadline from the tick-start
+    timestamp made every retry deadline that much shorter than the backoff
+    (routinely already in the PAST when it was written): retry 1 was dead on
+    arrival, and the very next tick re-timed-it-out without ever attempting a
+    fresh launch, burning the whole retry budget in seconds.
     """
     async with session_factory() as session:
         live = await _lock_compute_job(session, job_id)
@@ -1951,14 +1956,16 @@ async def _maybe_retry_provisioning_timeout(
             base=PROVISIONING_RETRY_BACKOFF_BASE_SECONDS,
             cap=600.0,
         )
-        new_deadline = now + timedelta(seconds=backoff)
+        # Real time AT RETRY — not the (already stale) tick-start timestamp.
+        retry_at = _utcnow()
+        new_deadline = retry_at + timedelta(seconds=backoff)
         meta["provisioning_retry_count"] = retry_count
         meta["provisioning_deadline_at"] = new_deadline.isoformat()
         meta["status_message"] = (
             f"provisioning timed out (retry {retry_count}/{MAX_PROVISIONING_RETRY_COUNT})"
         )
         live.polling_metadata = meta
-        live.updated_at = now
+        live.updated_at = retry_at
         session.add(live)
         await session.commit()
     logger.info(
@@ -1971,20 +1978,35 @@ async def _maybe_retry_provisioning_timeout(
     return True
 
 
-_MISSING = object()
-
-
 async def _process_single_compute_job(
-    job: ComputeJob, *, session_factory=AsyncSessionLocal, task=_MISSING
+    job: ComputeJob, *, session_factory=AsyncSessionLocal
 ) -> None:
     now = _utcnow()
     backend = get_compute_backend(job.backend)
 
-    if task is _MISSING:
-        task = None
-        if job.task_id:
-            async with session_factory() as session:
-                task = await session.get(Task, job.task_id)
+    task = None
+    if job.task_id is not None:
+        # AUTHORITATIVE RE-READ before the (irreversible) task-terminal VM kill.
+        #
+        # ``job`` is a row from the monitor's batch snapshot: the tick selects up
+        # to _COMPUTE_JOB_BATCH_SIZE jobs, then processes them one by one, each
+        # doing backend RPCs. A job late in the batch is therefore decided on data
+        # that can be many minutes old. Two ways that goes wrong, both fixed by
+        # reading the rows again HERE, at the moment of decision:
+        #   * the task was terminal at snapshot time but has since been restored
+        #     (an operator PATCHes a falsely-FAILED task back to QUEUED) — the
+        #     stale snapshot would KILL the VM of a task that is alive again;
+        #   * the task went terminal DURING the tick — the stale snapshot would
+        #     MISS the kill and keep billing the VM until the next tick.
+        # The job row is re-read in the same round trip: a peer (operator kill,
+        # another leader) may already have driven it terminal, in which case there
+        # is nothing left for this tick to do.
+        async with session_factory() as session:
+            live = await session.get(ComputeJob, job.id)
+            if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+                return
+            job = live
+            task = await session.get(Task, job.task_id)
 
     if job.task_id is not None and (
         task is None or task.status in _TASK_TERMINAL_STATUSES
@@ -2071,9 +2093,7 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
-            if await _maybe_retry_provisioning_timeout(
-                session_factory, job.id, now
-            ):
+            if await _maybe_retry_provisioning_timeout(session_factory, job.id):
                 return
             await _apply_polled_compute_job_result(
                 session_factory,
@@ -2166,9 +2186,7 @@ async def _process_single_compute_job(
                     next_retry_at=None,
                     reason="provisioning",
                 )
-            if await _maybe_retry_provisioning_timeout(
-                session_factory, job.id, now
-            ):
+            if await _maybe_retry_provisioning_timeout(session_factory, job.id):
                 return
             await _apply_polled_compute_job_result(
                 session_factory,
@@ -3668,11 +3686,13 @@ async def _link_terminal_artifact(session, job: ComputeJob) -> None:
 # There used to be TWO overlapping viewable-artifact pipelines, BOTH running at
 # every terminal transition of a gcp/runner-subprocess job:
 #
-#   * ``persist_viewable_artifacts`` (app.compute_backends) — downloads the bundle,
-#     sanitizes member paths with ``storage.sanitize_viewable_relpath`` (subdir
-#     context folded to ``__``), caps at 8 MiB/file and 25 files (applied to a
-#     deterministically SORTED candidate list), uploads to the
-#     ``artifacts/viewable/`` prefix, and returns the ``viewable_files`` manifest.
+#   * ``persist_viewable_artifacts`` (app.compute_backends) — STREAMS the bundle to
+#     a temp file (never into the orchestrator's heap; a results bundle has no size
+#     bound), sanitizes member paths with ``storage.sanitize_viewable_relpath``
+#     (subdir context folded to ``__``), caps at 8 MiB/file and 25 files (applied to
+#     a deterministically SORTED candidate list, BEFORE any member bytes are read),
+#     uploads to the ``artifacts/viewable/`` prefix, and returns the
+#     ``viewable_files`` manifest.
 #   * a second extractor that lived HERE — downloaded the SAME bundle AGAIN,
 #     sanitized with a DIFFERENT sanitizer (kept ``/`` separators), capped at
 #     25 MB/file and 50 files (first-50 in arbitrary TAR ORDER), and uploaded every
@@ -3770,10 +3790,11 @@ async def persist_viewable_files_for_job(
     """Persist a terminal job's viewable files — the SINGLE viewable pipeline.
 
     Delegates selection and upload to :func:`persist_viewable_artifacts`, the
-    canonical backend-aware pass (ONE bundle download for gcp/runner-subprocess, an
-    on-disk walk for local backends; ``storage.sanitize_viewable_relpath``; 8 MiB
-    per-file and 25-file caps over a deterministically sorted candidate list), then
-    records that ONE result on both durable surfaces:
+    canonical backend-aware pass (ONE bundle download for gcp/runner-subprocess —
+    STREAMED to a temp file, never held in the orchestrator's heap — an on-disk walk
+    for local backends; ``storage.sanitize_viewable_relpath``; 8 MiB per-file and
+    25-file caps over a deterministically sorted candidate list), then records that
+    ONE result on both durable surfaces:
 
     * ``polling_metadata['viewable_files']`` (plus ``viewable_files_dropped`` and
       ``viewable_file_count``) — read by the admin UI (``viewable_artifacts``) and

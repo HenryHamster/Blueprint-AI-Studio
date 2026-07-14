@@ -199,6 +199,11 @@ _MAX_TERMINAL_RECORD_DECODED_BYTES = 131072
 # unbounded per-file objects. Files over the size cap stay inside the bundle.
 _MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+# Transfer chunk for STREAMING a durable artifact bundle to disk. A results
+# bundle has no size bound (checkpoints, videos, logs), so it is never pulled
+# into the orchestrator's heap: peak memory during the viewable pass is bounded
+# by this chunk, not by the bundle.
+_BUNDLE_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MiB
 # Hard ceiling on the artifact upload so an oversized tree can never wedge
 # poweroff — the upload is abandoned (best-effort) once it elapses.
 _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 180
@@ -1546,6 +1551,19 @@ METRICS=
 COMMAND_LOG=
 RELEASE_ECHO=
 NP_EOF
+      # The watchdog runs in the SAME process group it is about to signal (it is
+      # a background subshell of the job's group leader, $$). Without this trap
+      # the group SIGTERM below lands on the watchdog itself, killing it instantly
+      # — so the SIGKILL escalation two lines down was unreachable and a command
+      # that ignores/blocks SIGTERM (a trap handler, an uninterruptible
+      # docker-exec'd trainer) simply kept running, and kept billing, after the
+      # watchdog had already written the no_progress_timeout terminal record.
+      # Ignoring TERM *only here* (never in the outer wrapper) lets the watchdog
+      # outlive the TERM it sends, wait out the grace window, and then land the
+      # SIGKILL that actually reaps the group. The SIGKILL reaps this subshell
+      # too — kill(2) delivers to every member of the group before the caller
+      # dies — which is fine: its job is done by then.
+      trap '' TERM
       kill -TERM -$$ 2>/dev/null || true
       sleep 2
       kill -KILL -$$ 2>/dev/null || true
@@ -1918,10 +1936,181 @@ class ViewableArtifactCandidate:
     size_bytes: int
 
 
+def _classify_viewable_member(
+    name: str, size: int
+) -> tuple[str, str, str] | None:
+    """Return ``(sanitized_relname, content_type, kind)`` for a viewable archive
+    member, or ``None`` when it does not qualify.
+
+    The single classification rule shared by every viewable selection pass (the
+    in-memory extractor and the streaming two-pass selector): viewable extension,
+    positive size within the per-file cap, and a traversal-safe sanitized
+    *relative* path (an absolute/``..`` member path sanitizes to ``None`` and is
+    skipped).
+    """
+    classified = storage.viewable_content_type_for_filename(name)
+    if classified is None:
+        return None
+    if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+        return None
+    relname = storage.sanitize_viewable_relpath(name)
+    if relname is None:
+        return None
+    content_type, kind = classified
+    return relname, content_type, kind
+
+
+def _read_capped_member(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes | None:
+    """Read ONE archive member's bytes, refusing anything over the per-file cap."""
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        return None
+    data = extracted.read(_MAX_VIEWABLE_FILE_BYTES + 1)
+    if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
+        return None
+    return data
+
+
+def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
+    """STREAM a job's durable ``bundle.tar.gz`` to *dest_path* on disk.
+
+    The memory-safe counterpart of ``storage.download_compute_job_artifact_bundle``
+    (which returns the whole object as one ``bytes`` — fine for the small
+    ``terminal.json`` recovery read, an OOM risk for a multi-GB results bundle).
+    ``blob.download_to_file`` writes the object through in chunks, so the
+    orchestrator's peak memory is bounded by ``chunk_size``, not by the bundle
+    size. Returns False when the object does not exist. Raises on transport
+    errors — the caller (``_stream_viewable_candidates_from_bundle``) is the
+    fail-soft boundary.
+    """
+    client = gcs_storage.Client(project=storage.GCP_PROJECT_ID)
+    bucket = client.bucket(storage.ARTIFACT_BUCKET_NAME)
+    blob = bucket.blob(storage.compute_job_artifact_object_name(job_id))
+    if not blob.exists():
+        return False
+    blob.chunk_size = _BUNDLE_DOWNLOAD_CHUNK_BYTES
+    with open(dest_path, "wb") as handle:
+        blob.download_to_file(handle)
+    return True
+
+
+def _select_viewable_candidates_from_bundle_path(
+    path: str,
+) -> tuple[list[ViewableArtifactCandidate], int]:
+    """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
+
+    Two passes over the (seekable) archive file:
+
+      1. **Metadata pass** — classify every member by name/size ONLY. No member
+         bytes are read, so an archive with thousands of images costs nothing but
+         its member headers. Yields the full qualifying set, sorted by sanitized
+         name, which is then capped at ``_MAX_VIEWABLE_FILE_COUNT``.
+      2. **Data pass** — read the bytes of ONLY the selected members.
+
+    Capping BEFORE reading is what bounds peak memory: the selected set can never
+    exceed ``_MAX_VIEWABLE_FILE_COUNT * _MAX_VIEWABLE_FILE_BYTES``, and nothing
+    else about the bundle (its total size, its non-viewable payload, its count of
+    rejected images) is ever resident. Returns ``(selected, dropped)`` with the
+    same contract as the in-memory extractor's caller.
+
+    Defensive by contract: a non-gzip/non-tar file or ANY parse error yields
+    ``([], 0)``.
+    """
+    try:
+        refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
+        seen: set[str] = set()
+        with tarfile.open(path, mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                classified = _classify_viewable_member(member.name, member.size)
+                if classified is None:
+                    continue
+                relname, content_type, kind = classified
+                if relname in seen:
+                    continue
+                seen.add(relname)
+                refs.append((relname, member.name, content_type, kind))
+
+        refs.sort(key=lambda ref: ref[0])
+        selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
+        dropped = len(refs) - len(selected_refs)
+        if not selected_refs:
+            return [], dropped
+
+        wanted = {ref[1]: ref for ref in selected_refs}
+        out: dict[str, ViewableArtifactCandidate] = {}
+        with tarfile.open(path, mode="r:gz") as tar:
+            for member in tar:
+                if not member.isfile() or member.name not in wanted:
+                    continue
+                relname, _member_name, content_type, kind = wanted[member.name]
+                if relname in out:
+                    continue  # first occurrence wins (matches the metadata pass)
+                data = _read_capped_member(tar, member)
+                if data is None:
+                    continue
+                out[relname] = ViewableArtifactCandidate(
+                    filename=relname,
+                    content_type=content_type,
+                    kind=kind,
+                    data=data,
+                    size_bytes=len(data),
+                )
+                if len(out) == len(selected_refs):
+                    break
+    except (tarfile.TarError, OSError, EOFError, ValueError):
+        return [], 0
+    return sorted(out.values(), key=lambda c: c.filename), dropped
+
+
+async def _stream_viewable_candidates_from_bundle(
+    job_id,
+) -> tuple[list[ViewableArtifactCandidate], int]:
+    """Fetch + select a bundle-backed job's viewable files without ever holding
+    the bundle in memory.
+
+    The bundle is streamed to a temp file, selected from on disk (two-pass,
+    count-capped BEFORE any member bytes are read), and the temp file is always
+    removed. Fail-soft: a missing bundle or ANY download/parse error degrades to
+    ``([], 0)``.
+    """
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-", suffix=".tar.gz")
+    os.close(handle)
+    try:
+        downloaded = await asyncio.to_thread(
+            _download_artifact_bundle_to_path, job_id, tmp_path
+        )
+        if not downloaded:
+            return [], 0
+        return await asyncio.to_thread(
+            _select_viewable_candidates_from_bundle_path, tmp_path
+        )
+    except Exception:
+        logger.warning(
+            "Failed to stream durable artifact bundle for compute job %s; "
+            "completing with no viewable manifest",
+            job_id,
+            exc_info=True,
+        )
+        return [], 0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _extract_viewable_candidates_from_bundle(
     raw: bytes,
 ) -> list[ViewableArtifactCandidate]:
-    """Select viewable files from a ``.tar.gz`` bundle IN MEMORY (no extract-to-disk).
+    """Select viewable files from an IN-MEMORY ``.tar.gz`` bundle (no extract-to-disk).
+
+    The in-memory analogue of :func:`_select_viewable_candidates_from_bundle_path`,
+    for callers that already hold the bundle bytes. The durable-bundle backends
+    (gcp / runner-subprocess) do NOT use this — a results bundle can be
+    arbitrarily large and materializing it in the orchestrator is an OOM — they
+    go through :func:`_stream_viewable_candidates_from_bundle`.
 
     Mirrors the safe path-matching pattern in
     :func:`_extract_terminal_record_from_bundle`: iterate members, classify by
@@ -1948,21 +2137,15 @@ def _extract_viewable_candidates_from_bundle(
             for member in tar:
                 if not member.isfile():
                     continue
-                classified = storage.viewable_content_type_for_filename(member.name)
+                classified = _classify_viewable_member(member.name, member.size)
                 if classified is None:
                     continue
-                if member.size <= 0 or member.size > _MAX_VIEWABLE_FILE_BYTES:
+                relname, content_type, kind = classified
+                if relname in seen:
                     continue
-                relname = storage.sanitize_viewable_relpath(member.name)
-                if relname is None or relname in seen:
+                data = _read_capped_member(tar, member)
+                if data is None:
                     continue
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-                data = extracted.read(_MAX_VIEWABLE_FILE_BYTES + 1)
-                if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
-                    continue
-                content_type, kind = classified
                 seen.add(relname)
                 out.append(
                     ViewableArtifactCandidate(
@@ -2090,8 +2273,10 @@ async def _collect_viewable_artifact_candidates(
 
     Local/local-gpu jobs are read from the on-disk artifact dir that survives the
     subprocess; gcp and runner-subprocess jobs are read from the durable
-    ``bundle.tar.gz`` (downloaded once, iterated in memory). Returns
-    ``([], 0)`` for an unrecognised backend or a missing bundle.
+    ``bundle.tar.gz`` — STREAMED to a temp file and selected from disk, never
+    materialized in the orchestrator's heap (a results bundle has no size bound;
+    pulling one into the API process is an OOM). Returns ``([], 0)`` for an
+    unrecognised backend or a missing bundle.
 
     Candidates are sorted by sanitized filename for deterministic selection when
     the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
@@ -2106,12 +2291,9 @@ async def _collect_viewable_artifact_candidates(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
     elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
-        raw = await storage.download_compute_job_artifact_bundle(job.id)
-        if not raw:
-            return [], 0
-        all_candidates = await asyncio.to_thread(
-            _extract_viewable_candidates_from_bundle, raw
-        )
+        # Already sorted + count-capped on disk (cap applied BEFORE any member
+        # bytes are read), so it returns the final (selected, dropped) directly.
+        return await _stream_viewable_candidates_from_bundle(job.id)
     else:
         return [], 0
     all_candidates.sort(key=lambda c: c.filename)
