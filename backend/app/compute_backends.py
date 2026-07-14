@@ -3075,11 +3075,16 @@ def _build_gcp_startup_script(
     # signed GET URL and extract it into the artifact dir BEFORE the command runs,
     # so a resumed job sees the prior checkpoint already present. Kept to
     # single-line curl / python3 / tar invocations (no heredoc nesting) per the
-    # repo's "generating code for one language from another" guidance. Honest by
-    # design: a failed download/extract writes a `resume_hydration.failed` marker
-    # (never claims resume happened) and lets the command run from scratch; a
-    # success writes `resume_hydration.ok`. Both markers land in the uploaded
-    # bundle. Stale run-status files from the predecessor (result.json /
+    # repo's "generating code for one language from another" guidance. Fail-closed
+    # by design, mirroring the in-process backend's `_rehydrate_input_artifact_bundle`
+    # (which RAISES on a missing/unreadable predecessor bundle): a failed
+    # download/extract writes a `resume_hydration.failed` marker and then ABORTS the
+    # run — durable terminal record `resume_hydration_failed`, serial FAILED markers,
+    # artifact upload, poweroff — rather than silently running from an empty
+    # workspace and burning the whole deadline redoing (or misreporting) work the
+    # resume was meant to skip. A success writes `resume_hydration.ok` and continues.
+    # Both markers land in the uploaded bundle. Stale run-status files from the
+    # predecessor (result.json /
     # command.log.json / terminal.json / live_tail.b64) are removed after extract
     # so they cannot contaminate THIS run's terminal detection; the boot beacon
     # below then re-lays a fresh terminal.json.
@@ -3123,8 +3128,18 @@ def _build_gcp_startup_script(
             f'artifact dir"\n'
             f"else\n"
             f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
-            f'  echo "[resume] predecessor checkpoint hydration FAILED — '
-            f'running from scratch"\n'
+            f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
+            f'run (fail-closed; refusing to run against an empty workspace)"\n'
+            f'  echo "{_SERIAL_REASON_PREFIX}resume_hydration_failed"\n'
+            f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f"  python3 /tmp/blueprint_terminal_record.py "
+            f"{artifact_dir} FAILED 1 resume_hydration_failed "
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f"  upload_artifacts\n"
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f"  poweroff || shutdown -h now || true\n"
+            f"  exit 1\n"
             f"fi\n"
             f"rm -f {_resume_bundle_q}"
         )

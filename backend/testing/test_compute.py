@@ -1324,6 +1324,61 @@ def test_gcp_startup_script_no_progress_watchdog_inert_when_unset():
     assert "_NP_TIMEOUT_SECONDS=0" in script
 
 
+def test_gcp_startup_script_resume_hydration_is_fail_closed():
+    """Cross-job resume must FAIL CLOSED on download/extract failure — aborting the
+    run with a durable terminal record — mirroring the in-process backend's
+    ``_rehydrate_input_artifact_bundle`` (which raises), NOT silently running from
+    an empty workspace and burning the deadline redoing the resumed work."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url="https://storage.example.com/resume-bundle",
+    )
+    # The resume block is present with its provenance markers.
+    assert "resume_hydration.ok" in script
+    assert "resume_hydration.failed" in script
+    # On failure the run ABORTS loudly: durable terminal record with a parseable
+    # reason, serial FAILED markers, artifact upload, and poweroff — the exact
+    # fail-closed sequence the container-pull-fail branch uses.
+    assert "FAILED 1 resume_hydration_failed" in script
+    assert f"{compute_backends_module._SERIAL_REASON_PREFIX}resume_hydration_failed" in script
+    assert f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED" in script
+    fail_idx = script.index("FAILED 1 resume_hydration_failed")
+    tail = script[fail_idx:]
+    assert "upload_artifacts" in tail
+    assert "poweroff || shutdown -h now || true" in tail
+    assert "exit 1" in tail
+    # It must NOT silently continue from an empty workspace.
+    assert "running from scratch" not in script
+    # The rendered script is still syntactically valid bash.
+    _assert_bash_syntax_ok(script)
+
+
+def test_gcp_startup_script_no_resume_block_without_download_url():
+    """Without a resume source, no resume-hydration block (or its fail-closed
+    abort) is emitted — the fail-closed path is scoped to actual resume jobs."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "resume_hydration" not in script
+
+
 def test_extract_terminal_record_from_bundle_roundtrips_and_failsoft():
     extract = compute_backends_module._extract_terminal_record_from_bundle
     # A faithful multi-file bundle: terminal.json is picked out by basename even
@@ -2489,6 +2544,26 @@ def test_gcp_startup_script_refuses_env_keys_that_are_not_shell_identifiers(bad_
 # ENV_KEY_RE must not silently weaken the check that catches its output.
 _WELL_FORMED_EXPORT_RE = re.compile(r"^export [A-Za-z_][A-Za-z0-9_]*=", re.M)
 _ANY_EXPORT_RE = re.compile(r"^export ", re.M)
+
+
+def _assert_bash_syntax_ok(script: str) -> None:
+    """Fail if ``bash -n`` rejects the rendered startup script's syntax.
+
+    Skips (does not fail) when no ``bash`` binary is on this host, so the check is
+    a no-op on a minimal CI image but a real gate wherever bash exists.
+    """
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - environment-dependent
+        pytest.skip("bash not available to run `bash -n`")
+    proc = subprocess.run(
+        [bash, "-n"],
+        input=script,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"bash -n rejected the script: {proc.stderr}"
 
 
 def _multi_line_exports(script: str) -> list[str]:

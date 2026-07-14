@@ -34,7 +34,10 @@ from app.compute_backends import (
 from app.compute_jobs import (
     NO_PROGRESS_TERMINAL_REASON,
     COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS,
+    _WATCHDOG_STATUS_META_KEY,
+    _apply_watchdog_metric_mismatch_marker,
     _no_progress_stalled,
+    _watchdog_metric_name_mismatch,
     append_progress_sample,
 )
 from app.database import resolve_async_engine
@@ -389,6 +392,95 @@ def test_no_progress_stalled_terminal_reason_constant_distinct_from_deadline():
 
 
 # ---------------------------------------------------------------------------
+# ── WATCHDOG-INERT DETECTION: _watchdog_metric_name_mismatch predicate ──────
+# The watchdog keys on EXACT metric-name equality, so a job that reports
+# progress only under a name other than its declared metric leaves the watchdog
+# silently inert. These prove the poller can surface that instead of failing
+# silent.
+# ---------------------------------------------------------------------------
+
+
+def test_metric_mismatch_flags_progress_under_other_name():
+    # Declares "val/loss" but every sample is reported under "train/loss".
+    job, _now = _make_stub_job(
+        metric="val/loss",
+        samples=_flat_samples("train/loss"),
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == ["train/loss"]
+
+
+def test_metric_mismatch_empty_when_declared_metric_is_reported():
+    job, _now = _make_stub_job(
+        metric="val/loss",
+        samples=_flat_samples("val/loss"),
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == []
+
+
+def test_metric_mismatch_empty_when_declared_metric_present_among_others():
+    # Declared metric IS reported (alongside others) → watchdog is live, no flag.
+    samples = [
+        (2000, "train/loss", 1.0),
+        (1500, "val/loss", 1.0),
+        (1000, "train/loss", 1.0),
+    ]
+    job, _now = _make_stub_job(
+        metric="val/loss",
+        samples=samples,
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == []
+
+
+def test_metric_mismatch_empty_without_declared_metric():
+    job, _now = _make_stub_job(
+        metric=None,
+        samples=_flat_samples("train/loss"),
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == []
+
+
+def test_metric_mismatch_empty_when_no_samples_at_all():
+    # A genuinely silent job (no telemetry) is the watchdog's fail-open domain,
+    # NOT a name mismatch — it must not be flagged.
+    job, _now = _make_stub_job(
+        metric="val/loss",
+        samples=[],
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == []
+
+
+def test_metric_mismatch_dedupes_and_sorts_observed_names():
+    samples = [
+        (2000, "z_metric", 1.0),
+        (1500, "a_metric", 1.0),
+        (1000, "z_metric", 2.0),
+    ]
+    job, _now = _make_stub_job(
+        metric="val/loss",
+        samples=samples,
+        started_offset_seconds=int(COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS) + 3600,
+    )
+    assert _watchdog_metric_name_mismatch(job) == ["a_metric", "z_metric"]
+
+
+def test_apply_mismatch_marker_stamps_and_clears():
+    job = SimpleNamespace(polling_metadata={"declared_metric": "val/loss"})
+    _apply_watchdog_metric_mismatch_marker(job, ["train/loss"])
+    marker = job.polling_metadata[_WATCHDOG_STATUS_META_KEY]
+    assert marker["state"] == "inert_metric_name_mismatch"
+    assert marker["declared_metric"] == "val/loss"
+    assert marker["observed_metrics"] == ["train/loss"]
+    # A later poll where the declared metric is finally reported clears the marker.
+    _apply_watchdog_metric_mismatch_marker(job, [])
+    assert _WATCHDOG_STATUS_META_KEY not in job.polling_metadata
+
+
+# ---------------------------------------------------------------------------
 # ── PROGRESS-METRIC CONTRACT: create_compute_job parameter validation ────────
 # DB-backed: use the same db_session fixture as test_compute.py
 # ---------------------------------------------------------------------------
@@ -621,3 +713,72 @@ async def test_process_once_does_not_kill_advancing_metric_job(db_session, monke
 
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_process_once_surfaces_metric_name_mismatch_without_killing(
+    db_session, monkeypatch
+):
+    """A running job that reports progress ONLY under a name other than its
+    declared metric leaves the watchdog inert. The poller must NOT kill it, but
+    MUST stamp the honest inert-watchdog marker so the mismatch is observable."""
+    task = await _setup_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,
+        declared_metric="val/loss",
+    )
+    now = _utcnow()
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    meta["runtime_deadline_at"] = (now + timedelta(hours=20)).isoformat()
+    # Steady progress, but every sample is under "train/loss", NOT the declared
+    # "val/loss" — the watchdog would never accumulate a single sample to act on.
+    meta["progress_series"] = [
+        {
+            "t": (now - timedelta(seconds=age)).isoformat(),
+            "name": "train/loss",
+            "value": 2.71828,
+        }
+        for age in _SPAN_AGES_SECONDS
+    ]
+    job.polling_metadata = meta
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "mismatch-job-xyz"
+    job.started_at = now - timedelta(hours=5)
+    await db_session.commit()
+
+    class _FakeBackend:
+        def external_id_for(self, j):
+            return "mismatch-job-xyz"
+
+        async def poll_cost(self, j, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.01, measured_at=as_of)
+
+        async def poll_status(self, j):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, j, *, reason):
+            raise AssertionError(
+                f"name-mismatch job must not be terminated (reason={reason!r})"
+            )
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _: _FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    marker = (job.polling_metadata or {}).get(_WATCHDOG_STATUS_META_KEY)
+    assert marker is not None, "inert-watchdog mismatch marker must be stamped"
+    assert marker["state"] == "inert_metric_name_mismatch"
+    assert marker["declared_metric"] == "val/loss"
+    assert marker["observed_metrics"] == ["train/loss"]

@@ -1182,6 +1182,49 @@ def _watched_progress_samples(
     return out
 
 
+def _watchdog_metric_name_mismatch(job: ComputeJob) -> list[str]:
+    """Return the observed progress-metric names when the no-progress watchdog is
+    INERT purely because of a metric-name mismatch, else ``[]``.
+
+    The watchdog keys on exact name equality between the contract-declared metric
+    (:func:`_declared_progress_metric`) and the ``name`` of each recorded progress
+    sample (:func:`_watched_progress_samples`). A job that declares metric ``X`` but
+    only ever reports progress under some other name ``Y`` accumulates ZERO samples
+    for ``X``, so the watchdog can never fire — the waste-prevention lever the
+    operator explicitly asked for is SILENTLY inert. This predicate detects exactly
+    that case so the poller can surface it honestly (a durable marker + a warning
+    log) instead of the lever failing silent.
+
+    Returns the sorted, de-duplicated set of metric names actually present in the
+    progress ring buffer when ALL of the following hold; otherwise ``[]``:
+
+    * the job declares a metric to watch;
+    * the ring buffer holds at least one well-formed sample (the job IS reporting
+      progress, so a genuinely silent job — no telemetry at all — is never flagged;
+      that case is the watchdog's normal fail-open domain, not a name mismatch); and
+    * none of those samples carry the declared metric's name.
+    """
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return []
+    series = (job.polling_metadata or {}).get("progress_series")
+    if not isinstance(series, list):
+        return []
+    observed: set[str] = set()
+    for sample in series:
+        if not isinstance(sample, dict):
+            continue
+        name = sample.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if _coerce_metric_number(sample.get("value")) is None:
+            continue
+        observed.add(name)
+    if not observed or metric in observed:
+        return []
+    return sorted(observed)
+
+
 def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     """True when a declared-metric job has stopped making measurable progress.
 
@@ -2799,6 +2842,23 @@ async def _process_single_compute_job(
         )
         return
 
+    # Honesty check: the watchdog above keys on EXACT metric-name equality, so a
+    # job that reports progress only under name(s) other than its declared metric
+    # leaves the watchdog silently inert — it can never fire and the operator's
+    # waste-prevention lever protects nothing. Surface that mismatch (durable
+    # marker + one warning log) instead of failing silent. Never itself kills a
+    # job; it only makes the inert-watchdog condition observable.
+    metric_mismatch = _watchdog_metric_name_mismatch(job)
+    if metric_mismatch:
+        logger.warning(
+            "[COMPUTE_JOB] no-progress watchdog INERT for job=%s: declared metric "
+            "%r is never reported; progress arrives only under %s — the watchdog "
+            "cannot fire, so this run has no no-progress protection",
+            job.id,
+            _declared_progress_metric(job),
+            metric_mismatch,
+        )
+
     await _apply_polled_compute_job_result(
         session_factory,
         job.id,
@@ -2807,6 +2867,7 @@ async def _process_single_compute_job(
         next_poll_at=next_poll_at,
         status=status,
         accrued_cost_usd=accrued_cost_usd,
+        progress_metric_mismatch=metric_mismatch,
     )
 
 
@@ -2930,6 +2991,7 @@ async def _apply_polled_compute_job_result(
     terminate_ok: bool = True,
     terminal_kind: str | None = None,
     compute_rpc_diagnostic: dict[str, Any] | None = None,
+    progress_metric_mismatch: list[str] | None = None,
 ) -> bool:
     async with session_factory() as session:
         live = await _lock_compute_job(session, job_id)
@@ -2981,6 +3043,7 @@ async def _apply_polled_compute_job_result(
                 _set_meta(live, status_message=status.message)
             if status.live_output is not None:
                 _set_meta(live, live_output=dict(status.live_output))
+            _apply_watchdog_metric_mismatch_marker(live, progress_metric_mismatch)
         await session.commit()
         return True
 
@@ -3203,6 +3266,36 @@ def _set_meta(
         meta["status_message"] = status_message
     meta.update(extra)
     job.polling_metadata = meta
+
+
+# polling_metadata key under which the poller records that the no-progress
+# watchdog is inert because the job reports progress under name(s) other than its
+# declared metric. Surfaced to the operator via serialize_compute_job_response so
+# the silent-degradation edge is observable and fixable, not invisible.
+_WATCHDOG_STATUS_META_KEY = "no_progress_watchdog_status"
+
+
+def _apply_watchdog_metric_mismatch_marker(
+    job: ComputeJob, observed_metrics: list[str] | None
+) -> None:
+    """Stamp (or clear) the metric-name-mismatch watchdog marker on a running job.
+
+    ``observed_metrics`` is the non-empty list returned by
+    :func:`_watchdog_metric_name_mismatch` when the declared metric is never
+    reported; a falsy value clears any previously-stamped marker (the job started
+    reporting its declared metric, so the watchdog is live again).
+    """
+    meta = dict(job.polling_metadata or {})
+    if observed_metrics:
+        meta[_WATCHDOG_STATUS_META_KEY] = {
+            "state": "inert_metric_name_mismatch",
+            "declared_metric": _declared_progress_metric(job),
+            "observed_metrics": observed_metrics,
+        }
+        job.polling_metadata = meta
+    elif _WATCHDOG_STATUS_META_KEY in meta:
+        meta.pop(_WATCHDOG_STATUS_META_KEY, None)
+        job.polling_metadata = meta
 
 
 def _clear_compute_rpc_diagnostic(job: ComputeJob) -> None:
