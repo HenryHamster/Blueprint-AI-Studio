@@ -7180,5 +7180,197 @@ class GpuSandboxSmokeTests(unittest.TestCase):
         self.assertFalse(os.path.isdir(captured["workspace"]))
 
 
+class TestCrossProjectGpuLedger(unittest.TestCase):
+    """No-double-booking on the unified single-daemon GPU ledger.
+
+    The multi-project local-runner runs ONE daemon per physical box that serves
+    compute jobs from every allow-listed project through one process-wide
+    ``gpu_state`` (see ``_make_gpu_state`` / ``_assign_gpus`` / ``_release_gpus``
+    in local_runner.py). The whole point of collapsing the old per-project
+    daemons into one is to close the double-booking bug: two daemons on the same
+    box would each keep a private ``in_use`` set and could hand the SAME physical
+    GPU index to two concurrently-running jobs. These tests prove the unified
+    ledger never assigns the same index to two live jobs regardless of which
+    project each job belongs to.
+    """
+
+    @staticmethod
+    def _shared_state(allowed, per_job=1):
+        return {
+            "allowed": list(allowed),
+            "in_use": set(),
+            "per_job": per_job,
+            "lock": threading.Lock(),
+        }
+
+    def test_two_projects_never_share_a_gpu_via_ledger(self):
+        """Jobs from different projects draw disjoint indices from one ledger."""
+        state = self._shared_state([0, 1])
+
+        a = local_runner._assign_gpus(state)  # project-A job
+        b = local_runner._assign_gpus(state)  # project-B job
+
+        self.assertEqual(a, [0])
+        self.assertEqual(b, [1])
+        self.assertEqual(set(a) & set(b), set(), "cross-project GPU double-book")
+        self.assertEqual(state["in_use"], {0, 1})
+
+        # A third project's job finds the shared ledger saturated → no GPU.
+        c = local_runner._assign_gpus(state)
+        self.assertEqual(c, [])
+        self.assertEqual(state["in_use"], {0, 1})
+
+    def test_release_by_one_project_frees_index_for_another(self):
+        """Releasing a project's job returns its index to the shared pool."""
+        state = self._shared_state([0])
+
+        a = local_runner._assign_gpus(state)  # project-A holds GPU 0
+        self.assertEqual(a, [0])
+        # Project-B is starved while A holds the only device.
+        self.assertEqual(local_runner._assign_gpus(state), [])
+
+        local_runner._release_gpus(state, a)  # project-A job finishes
+        self.assertEqual(state["in_use"], set())
+
+        b = local_runner._assign_gpus(state)  # project-B reuses the freed index
+        self.assertEqual(b, [0])
+        self.assertEqual(state["in_use"], {0})
+
+    def test_per_job_multi_gpu_across_projects_stays_disjoint(self):
+        """With per_job>1 each project's job gets a disjoint multi-GPU block."""
+        state = self._shared_state([0, 1, 2, 3], per_job=2)
+
+        a = local_runner._assign_gpus(state)  # project-A
+        b = local_runner._assign_gpus(state)  # project-B
+
+        self.assertEqual(a, [0, 1])
+        self.assertEqual(b, [2, 3])
+        self.assertEqual(set(a) & set(b), set())
+        self.assertEqual(state["in_use"], {0, 1, 2, 3})
+        # Pool exhausted: a third project's two-GPU request cannot be honored.
+        self.assertEqual(local_runner._assign_gpus(state), [])
+
+    def test_unified_gpu_ledger_no_cross_project_double_booking(self):
+        """End-to-end: two concurrent _run_compute_job workers for DIFFERENT
+        projects, sharing ONE gpu_state, never receive the same GPU index.
+
+        A barrier-blocked fake plan holds BOTH jobs inside execution
+        simultaneously (each after its ledger assignment), so the two jobs are
+        genuinely live at the same instant — the exact condition under which two
+        old per-project daemons would have double-booked. We capture the
+        ``gpu_indices`` each job was planned with and assert they are disjoint,
+        both non-empty, and together account for the whole two-GPU ledger.
+        """
+        state = self._shared_state([0, 1])
+        caps = _bwrap_caps(gpu_indices=(0, 1))
+
+        barrier = threading.Barrier(2, timeout=10)
+        capture_lock = threading.Lock()
+        captured = []  # list of (container_name, tuple(gpu_indices))
+
+        def fake_plan(**kw):
+            # Record the GPUs this job was assigned from the shared ledger.
+            with capture_lock:
+                captured.append(
+                    (kw.get("container_name"), tuple(kw.get("gpu_indices") or ()))
+                )
+            # Block until BOTH jobs have assigned + reached here, so both hold
+            # their GPUs at the same time — the double-book window.
+            barrier.wait()
+            env = os.environ.copy()
+            env["BLUEPRINT_RESULT_FILE"] = kw["result_file_host"]
+            env["BLUEPRINT_ARTIFACT_DIR"] = kw["artifact_dir_host"]
+            return iso.ExecutionPlan(
+                backend="bwrap",
+                argv=["bash", "-lc", "true"],
+                env=env,
+            )
+
+        def noop_report(*a, **k):
+            return False
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+
+        def run_for_project(pid):
+            job = {
+                "job_id": f"{pid}-job",
+                "project_id": pid,  # informational; assignment is project-agnostic
+                "command": "true",
+            }
+            active_jobs.add(job["job_id"])
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", active_jobs, lock,
+                capabilities=caps, gpu_state=state,
+            )
+
+        with patch.object(local_runner, "_report_compute_job", noop_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", fake_plan):
+            t_a = threading.Thread(target=run_for_project, args=("proj-A",))
+            t_b = threading.Thread(target=run_for_project, args=("proj-B",))
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=15)
+            t_b.join(timeout=15)
+
+        self.assertFalse(t_a.is_alive() or t_b.is_alive(), "workers did not finish")
+        self.assertEqual(len(captured), 2, "both jobs should have been planned")
+
+        gpus = [g for _, g in captured]
+        self.assertTrue(all(len(g) == 1 for g in gpus), f"expected 1 GPU each: {gpus}")
+        self.assertEqual(
+            set(gpus[0]) & set(gpus[1]), set(),
+            f"same GPU handed to two live cross-project jobs: {captured}",
+        )
+        # The two disjoint assignments together consume the whole ledger.
+        self.assertEqual(set(gpus[0]) | set(gpus[1]), {0, 1})
+        # Both jobs finished → the ledger drained back to empty (no leak).
+        self.assertEqual(state["in_use"], set())
+
+    def test_assign_refuses_to_double_book_on_inconsistent_ledger(self):
+        """Defense-in-depth: if the underlying assigner ever returns an index
+        already marked in-use (ledger corruption / future-refactor bug),
+        ``_assign_gpus`` refuses it rather than SILENTLY double-booking a GPU
+        across projects."""
+        state = self._shared_state([0, 1])
+        state["in_use"].add(0)  # project-A already holds GPU 0
+
+        # Force the low-level assigner to (wrongly) hand back the in-use index.
+        with patch.object(local_runner.iso, "assign_gpu_indices", return_value=[0]):
+            result = local_runner._assign_gpus(state)
+
+        self.assertEqual(result, [], "must not double-book an already-held GPU")
+        # The other project's reservation is left exactly as it was — untouched.
+        self.assertEqual(state["in_use"], {0})
+
+    def test_saturated_ledger_lets_extra_project_run_without_a_gpu(self):
+        """A single-GPU ledger already held by one project: a second project's
+        job still RUNS (GPU-less) rather than crashing or double-booking."""
+        state = self._shared_state([0])
+        state["in_use"].add(0)  # project-A already holds the only GPU
+        caps = _bwrap_caps(gpu_indices=(0,))
+
+        captured: dict = {}
+
+        def noop_report(*a, **k):
+            return False
+
+        job = {"job_id": "proj-B-job", "project_id": "proj-B", "command": "true"}
+        active_jobs: set = {"proj-B-job"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", noop_report), \
+             patch.object(local_runner.iso, "plan_compute_execution",
+                          _bare_plan_factory(captured)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", active_jobs, lock,
+                capabilities=caps, gpu_state=state,
+            )
+
+        # Second project got NO device (project-A still holds it) but still ran.
+        self.assertEqual(tuple(captured.get("gpu_indices") or ()), ())
+        self.assertEqual(state["in_use"], {0}, "project-A's GPU must be untouched")
+
+
 if __name__ == "__main__":
     unittest.main()

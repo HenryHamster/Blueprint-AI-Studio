@@ -2706,6 +2706,24 @@ def _assign_gpus(gpu_state: dict | None) -> list[int]:
         )
         if not assigned:
             return []
+        # Defense-in-depth for the unified multi-project ledger. One daemon per
+        # box serves jobs from every allow-listed project through this single
+        # ``in_use`` set precisely so two jobs — from ANY projects — can never
+        # hold the same physical GPU (the double-booking bug two per-project
+        # daemons created). ``assign_gpu_indices`` already excludes in-use
+        # indices, but a corrupted ledger or a future refactor must never
+        # SILENTLY double-book a device: refuse the assignment (job runs without
+        # a fresh GPU) rather than hand out an index another project already
+        # holds.
+        overlap = set(assigned) & gpu_state["in_use"]
+        if overlap:
+            print(
+                f"[compute] GPU ledger inconsistency: index(es) {sorted(overlap)} "
+                "already in use; refusing to double-book — job runs without a "
+                "fresh device",
+                flush=True,
+            )
+            return []
         gpu_state["in_use"].update(assigned)
         return assigned
 
