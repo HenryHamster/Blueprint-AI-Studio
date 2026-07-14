@@ -29,7 +29,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
 )
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user
 from app.ci_resolution import compute_merge_verification_verdict
 from app.schemas import OnboardPayload
 from app.task_locking import with_design_doc_locked
@@ -812,9 +812,19 @@ async def onboard_project(
     request: Request,
     payload: OnboardPayload,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(get_current_user),
 ):
     """Create a new project, seed membership, and persist detected build config.
+
+    Any allowlisted (authenticated, email-verified) user may onboard a project;
+    they are recorded as its ``owner`` via ``ProjectMember`` below and all
+    project-scoped reads (e.g. ``GET /projects``) are filtered by that
+    membership, so ownership — not platform-admin role — is what grants access.
+    Gating this on ``require_admin`` dead-ended first-run onboarding: a freshly
+    allowlisted user defaults to ``role="user"`` (see ``AllowedUser`` /
+    ``_UserCreate``), lands on the WelcomeScreen, and its "Create your first
+    project" action 403'd here even though the rest of the stack supports
+    non-admin ownership. The allowlist itself remains the access boundary.
 
     Flow:
     1. Create the Project row in DEPLOYING state.

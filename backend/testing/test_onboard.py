@@ -191,6 +191,83 @@ def override_auth():
     app.dependency_overrides.pop(require_admin, None)
 
 
+class TestOnboardNonAdminOwnership:
+    """A freshly allowlisted non-admin user must be able to onboard its first project.
+
+    Regression guard for the first-run signup dead-end: newly added users default
+    to ``role="user"`` (see ``AllowedUser`` / ``_UserCreate``) and the WelcomeScreen
+    invites *any* authenticated user to "Create your first project". Onboarding used
+    to require ``require_admin`` and 403'd that action; the fix gates it on
+    ``get_current_user`` (allowlist membership) and records the caller as project
+    ``owner`` so ``GET /projects`` (membership-scoped) then surfaces it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_admin_user_can_onboard_and_becomes_owner(
+        self, client: AsyncClient, db_session
+    ):
+        async def _plain_user():
+            return {
+                "user_id": "fresh-user-999",
+                "email": "newcomer@example.com",
+                "role": "user",
+            }
+
+        # Override the autouse admin identity with a plain allowlisted user for
+        # the duration of this request.
+        app.dependency_overrides[get_current_user] = _plain_user
+        try:
+            with (
+                patch(
+                    "app.routers.admin_onboard._detect_build_config",
+                    new_callable=AsyncMock,
+                    return_value={"language": "python"},
+                ),
+                patch(
+                    "app.github.get_repo_installation_token",
+                    new_callable=AsyncMock,
+                    return_value="tok",
+                ),
+                patch(
+                    "app.github.get_repo_default_branch",
+                    new_callable=AsyncMock,
+                    return_value="main",
+                ),
+            ):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "firstproj"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "project_id" in data
+
+        from sqlalchemy import select
+        from app.models import ProjectMember
+
+        project = await db_session.get(Project, data["project_id"])
+        assert project is not None
+        assert project.user_id == "fresh-user-999"
+
+        member = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == project.id,
+                    ProjectMember.user_id == "fresh-user-999",
+                )
+            )
+        ).scalars().first()
+        assert member is not None
+        assert member.role == "owner"
+
+
+async def _restore_admin_override():
+    return {"user_id": TEST_USER_ID, "email": "admin@example.com", "role": "admin"}
+
+
 class TestOnboardAutoRemediation:
     @pytest.mark.asyncio
     async def test_onboard_sets_auto_remediation_defaults(
