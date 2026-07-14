@@ -187,6 +187,118 @@ def is_operator_visible(audience: str) -> bool:
     return audience in _AUDIENCES_THAT_REACH_OPERATOR
 
 
+def stamp_message_audience(
+    context: dict | None,
+    event_type: str,
+    *,
+    message_type: str | None = None,
+) -> dict:
+    """Return a copy of *context* with a canonical ``audience`` stamp.
+
+    This is the shared primitive every operator-reaching emitter routes
+    through so that no ``ProjectMessage``/``Alert`` row leaves the process
+    without a fail-closed audience classification.  The ledger choke-point
+    (:func:`app.notification_dispatch.post_event_message`) stamps inline via
+    :func:`route_event`; the directly-constructed BLOCKER/system escalation
+    rows call this helper so they carry the *same* stamp instead of bypassing
+    the gate.
+
+    The returned dict is a shallow copy (the caller's dict is never mutated).
+    ``event_type`` is preserved on the context (set if absent) and the
+    ``audience`` key is always overwritten with the canonical resolution — a
+    caller-supplied ``audience`` never wins over the registry.
+    """
+    ctx: dict = dict(context or {})
+    ctx.setdefault("event_type", event_type)
+    ctx["audience"] = route_event(event_type, message_type=message_type)
+    return ctx
+
+
 def get_registered_event_types() -> frozenset[str]:
     """Return every event_type currently in the registry (testing hook)."""
     return frozenset(_EVENT_AUDIENCE_REGISTRY)
+
+
+# ── External-webhook namespace ──────────────────────────────────────────
+#
+# The external notification webhook (``notification_dispatch.dispatch_external_notification``)
+# is a THIRD operator-reaching channel, alongside the strategic message ledger
+# and the alert/task-notification channel.  Its event identifiers are an uppercase
+# namespace (``PR_MERGED``, ``DIRECTION_MILESTONE``, ``RUNNER_DEACTIVATED``) that is
+# distinct from the lowercase/dotted registry keys above, so it needs its own
+# name→audience table.  This table shares the same four-audience taxonomy and the
+# same ``is_operator_visible`` policy as the ledger and alert channels, so all three
+# operator-reaching channels now obey one fail-closed gate.
+#
+# The universe mirrored here is the operator-selectable ``_VALID_NOTIFICATION_EVENTS``
+# set validated in ``admin_settings`` — the only events that can be present in
+# ``notification_config.enabled_events`` and therefore the only events that can be
+# POSTed externally.  Anything not listed fails closed to ``STRATEGIST_INTERNAL`` and
+# is dropped, so a strategist-internal/pipeline-log event never leaks even when a
+# (legacy) config has it enabled.
+_WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
+    # --- Operator-facing terminal / decision events — keep delivering. ---
+    "TASK_FAILED": OPERATOR_FYI,
+    "TASK_COMPLETED": OPERATOR_FYI,
+    "APPROVAL_NEEDED": OPERATOR_ACTION_NEEDED,
+    "DEPLOY_HEALTH_ALERT": OPERATOR_FYI,
+    "BUDGET_EXCEEDED": OPERATOR_ACTION_NEEDED,
+    "AUTO_FIX_ESCALATED": OPERATOR_ACTION_NEEDED,
+    "REMEDIATION_ESCALATED": OPERATOR_ACTION_NEEDED,
+    "RESIDUAL_FIX_ESCALATED": OPERATOR_ACTION_NEEDED,
+    "RESIDUAL_FIX_AUDIT_DEFERRED": OPERATOR_ACTION_NEEDED,
+    "DIRECTION_BURN_PAUSE": OPERATOR_ACTION_NEEDED,
+    "MERGE_UNVERIFIED": OPERATOR_ACTION_NEEDED,
+    "SPEND_HOLD_CREATED": OPERATOR_ACTION_NEEDED,
+    "SPEND_HOLD_EXPIRING": OPERATOR_ACTION_NEEDED,
+    # --- Runner-health fleet incidents — operator-actionable outages. ---
+    "RUNNER_DEACTIVATED": OPERATOR_ACTION_NEEDED,
+    "RUNNER_DEGRADED": OPERATOR_FYI,
+    "RUNNER_DEGRADED_ESCALATED": OPERATOR_ACTION_NEEDED,
+    "RUNNER_FLEET_OFFLINE": OPERATOR_ACTION_NEEDED,
+    "RUNNER_LOW_DISK": OPERATOR_FYI,
+    "RUNNER_OUTAGE_ESCALATED": OPERATOR_ACTION_NEEDED,
+    "RUNNER_LOCAL_HOLD": OPERATOR_ACTION_NEEDED,
+    "RUNNER_CONTAINER_HOLD": OPERATOR_ACTION_NEEDED,
+    # --- Strategist-internal bookkeeping — MUST NOT leak to the external
+    # webhook, even when a legacy notification_config has enabled them. ---
+    "PR_MERGED": STRATEGIST_INTERNAL,
+    "DIRECTION_MILESTONE": STRATEGIST_INTERNAL,
+    "AUTO_FIX_SPAWNED": STRATEGIST_INTERNAL,
+    "AUTO_FIX_MERGED": STRATEGIST_INTERNAL,
+    "RESIDUAL_FIX_SPAWNED": STRATEGIST_INTERNAL,
+    "RESIDUAL_FIX_MERGED": STRATEGIST_INTERNAL,
+    "RESIDUAL_FIX_UNSUSPENDED": STRATEGIST_INTERNAL,
+}
+
+
+def route_external_webhook_event(webhook_event_type: str) -> str:
+    """Resolve the audience for an external-webhook *webhook_event_type*.
+
+    Fail-closed: returns ``STRATEGIST_INTERNAL`` for any webhook event name that
+    is not registered in :data:`_WEBHOOK_EVENT_AUDIENCE`, so an unmapped or
+    strategist-internal event never reaches the external webhook.
+    """
+    normalized = (webhook_event_type or "").strip()
+    if not normalized:
+        return STRATEGIST_INTERNAL
+    return _WEBHOOK_EVENT_AUDIENCE.get(normalized, STRATEGIST_INTERNAL)
+
+
+def is_external_webhook_operator_visible(webhook_event_type: str) -> bool:
+    """Return True when the external-webhook *webhook_event_type* is operator-visible.
+
+    Operator-visible means the resolved audience is ``operator-action-needed`` or
+    ``operator-fyi``; strategist-internal / pipeline-log / unmapped events return
+    False and are gated out of the external webhook.
+    """
+    return is_operator_visible(route_external_webhook_event(webhook_event_type))
+
+
+def get_operator_visible_webhook_events() -> frozenset[str]:
+    """Return every webhook event name that resolves operator-visible (testing hook)."""
+    return frozenset(
+        name
+        for name, audience in _WEBHOOK_EVENT_AUDIENCE.items()
+        if is_operator_visible(audience)
+    )

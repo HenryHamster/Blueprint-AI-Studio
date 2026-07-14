@@ -27,7 +27,12 @@ from app.url_security import _resolve_safe_external_url
 from app.field_encryption import encrypt_field, decrypt_field
 from app.shared_state import get_project_promotion_target
 
-from app.message_audience import PIPELINE_LOG, route_event
+from app.message_audience import (
+    PIPELINE_LOG,
+    is_external_webhook_operator_visible,
+    route_event,
+    stamp_message_audience,
+)
 
 from app.models import (
     MessageType,
@@ -530,6 +535,19 @@ async def dispatch_external_notification(
         if not webhook_url:
             return
         if event_type not in enabled_events:
+            return
+        # Unified audience gate: the external webhook is a third operator-reaching
+        # channel and must obey the same fail-closed policy as the ledger and the
+        # alert channel. A strategist-internal / pipeline-log event (e.g. PR_MERGED,
+        # DIRECTION_MILESTONE, AUTO_FIX_SPAWNED) is dropped here even when the
+        # operator's enabled_events (legacy config) still lists it — internal
+        # bookkeeping never leaks to an external system.
+        if not is_external_webhook_operator_visible(event_type):
+            logger.debug(
+                "[NOTIFY] Dropping non-operator external webhook event_type=%s "
+                "(strategist-internal/pipeline-log — audience gate)",
+                event_type,
+            )
             return
         # SSRF guard: only allow http(s) and block internal/metadata IPs
         from urllib.parse import urlparse
@@ -1471,6 +1489,7 @@ async def post_auto_fix_escalation_message(
         "consecutive_failures": failure_count,
         "dedupe_key": dedupe_key,
     }
+    ctx = stamp_message_audience(ctx, "auto_fix_escalated")
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
@@ -1777,6 +1796,7 @@ async def post_residual_fix_escalation_message(
         "consecutive_failures": failure_count,
         "dedupe_key": dedupe_key,
     }
+    ctx = stamp_message_audience(ctx, "residual_fix_escalated")
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
@@ -1928,6 +1948,7 @@ async def post_residual_fix_audit_deferred_escalation_message(
         "audit_defer_count": defer_count,
         "threshold": threshold,
     }
+    ctx = stamp_message_audience(ctx, "residual_fix_audit_deferred")
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
@@ -2014,6 +2035,7 @@ async def post_remediation_escalation_message(
         "attempts": attempts,
         "remediation_summary": remediation_summary[:240],
     }
+    ctx = stamp_message_audience(ctx, "remediation_escalated")
     msg = ProjectMessage(
         project_id=project_id,
         message_type=MessageType.BLOCKER,
@@ -2087,6 +2109,7 @@ async def post_direction_burn_pause_message(
         "direction_id": direction_id,
         "manual_intervention_required": True,
     }
+    ctx = stamp_message_audience(ctx, "direction_burn_pause")
     if dedupe_key:
         ctx["dedupe_key"] = dedupe_key
     if evidence:
@@ -2163,6 +2186,7 @@ async def post_direction_churn_pause_message(
         "reason": reason,
         "direction_id": direction_id,
     }
+    ctx = stamp_message_audience(ctx, "direction_churn_pause")
     if dedupe_key:
         ctx["dedupe_key"] = dedupe_key
     if evidence:
@@ -2284,6 +2308,7 @@ async def post_direction_outcome_scaffolding_escalation_message(
         "flagged_cycles": flagged_cycles,
         "manual_intervention_required": True,
     }
+    ctx = stamp_message_audience(ctx, "direction_outcome_scaffolding_escalation")
     if evidence:
         ctx["evidence"] = evidence
     msg = ProjectMessage(

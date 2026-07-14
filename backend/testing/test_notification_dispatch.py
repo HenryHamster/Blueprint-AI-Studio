@@ -64,7 +64,7 @@ def _make_runtime_config(
             "webhook_url": webhook_url,
             "enabled_events": enabled_events
             if enabled_events is not None
-            else ["test_event"],
+            else ["RUNNER_DEACTIVATED"],
             "throttle_seconds": throttle_seconds,
         }
     }
@@ -96,7 +96,7 @@ async def test_dispatch_increments_dispatched_and_delivered_on_success():
             new=AsyncMock(return_value=200),
         ),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
     assert stats["total_delivered"] == 1
@@ -175,6 +175,62 @@ async def test_runner_event_dropped_when_not_enabled():
 
 
 @pytest.mark.asyncio
+async def test_external_dispatch_drops_strategist_internal_event():
+    """A strategist-internal event is dropped by the audience gate even when the
+    operator's enabled_events (legacy config) still lists it.
+
+    The external webhook is a third operator-reaching channel and must obey the
+    same fail-closed audience policy as the ledger and alert channels: PR_MERGED,
+    DIRECTION_MILESTONE and AUTO_FIX_SPAWNED resolve to strategist-internal, so no
+    external POST is made regardless of enablement.
+    """
+    internal_events = ["PR_MERGED", "DIRECTION_MILESTONE", "AUTO_FIX_SPAWNED"]
+    for event in internal_events:
+        _reset_stats()
+        deliver = AsyncMock(return_value=200)
+        with (
+            patch(
+                "app.shared_state.runtime_config",
+                # Operator has (legacy) enabled the internal event — it must
+                # still be gated out of the external webhook.
+                _make_runtime_config(enabled_events=internal_events),
+            ),
+            patch("app.notification_dispatch._attempt_delivery", new=deliver),
+        ):
+            await dispatch_external_notification(
+                uuid.uuid4(), event, {"pr_number": 123}
+            )
+        stats = get_notification_stats()
+        assert stats["total_dispatched"] == 0, f"{event} leaked (dispatched)"
+        assert stats["retry_queue_depth"] == 0, f"{event} enqueued a retry"
+        assert deliver.await_count == 0, f"{event} was POSTed externally"
+
+
+@pytest.mark.asyncio
+async def test_external_dispatch_delivers_operator_visible_event():
+    """Operator-facing webhook events (action-needed and fyi) still deliver through
+    the audience gate — the gate drops only strategist-internal/pipeline-log."""
+    operator_events = ["AUTO_FIX_ESCALATED", "BUDGET_EXCEEDED", "RUNNER_DEGRADED"]
+    for event in operator_events:
+        _reset_stats()
+        deliver = AsyncMock(return_value=200)
+        with (
+            patch(
+                "app.shared_state.runtime_config",
+                _make_runtime_config(enabled_events=operator_events),
+            ),
+            patch("app.notification_dispatch._attempt_delivery", new=deliver),
+        ):
+            await dispatch_external_notification(uuid.uuid4(), event, {"k": "v"})
+        stats = get_notification_stats()
+        assert stats["total_dispatched"] == 1, f"{event} not dispatched"
+        assert stats["total_delivered"] == 1, f"{event} not delivered"
+        assert deliver.await_count == 1, f"{event} not POSTed"
+        _url, body = deliver.await_args.args
+        assert body["event_type"] == event
+
+
+@pytest.mark.asyncio
 async def test_dispatch_enqueues_retry_on_502():
     _reset_stats()
     with (
@@ -185,14 +241,14 @@ async def test_dispatch_enqueues_retry_on_502():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
     assert stats["total_delivered"] == 0
     assert stats["retry_queue_depth"] == 1
     entry = nd._retry_queue[0]
     assert entry.attempts == 0
-    assert entry.event_type == "test_event"
+    assert entry.event_type == "RUNNER_DEACTIVATED"
 
 
 @pytest.mark.asyncio
@@ -206,7 +262,7 @@ async def test_dispatch_no_retry_on_404():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {"k": "v"})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
     assert stats["total_failed"] == 1
@@ -225,7 +281,7 @@ async def test_dispatch_no_retry_on_401():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {})
     stats = get_notification_stats()
     assert stats["total_failed"] == 1
     assert stats["retry_queue_depth"] == 0
@@ -242,7 +298,7 @@ async def test_dispatch_no_retry_on_403():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {})
     stats = get_notification_stats()
     assert stats["total_failed"] == 1
     assert stats["retry_queue_depth"] == 0
@@ -261,7 +317,7 @@ async def test_dispatch_enqueues_retry_on_network_error():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {})
     stats = get_notification_stats()
     assert stats["total_dispatched"] == 1
     assert stats["retry_queue_depth"] == 1
@@ -285,9 +341,9 @@ async def test_get_notification_stats_per_project():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(pid, "test_event", {"k": "v"})
-        await dispatch_external_notification(pid, "test_event", {"k": "v2"})
-        await dispatch_external_notification(other_pid, "test_event", {"k": "v3"})
+        await dispatch_external_notification(pid, "RUNNER_DEACTIVATED", {"k": "v"})
+        await dispatch_external_notification(pid, "RUNNER_DEACTIVATED", {"k": "v2"})
+        await dispatch_external_notification(other_pid, "RUNNER_DEACTIVATED", {"k": "v3"})
 
     pstats = get_notification_stats(project_id=pid)
     assert pstats["total_dispatched"] == 2
@@ -314,7 +370,7 @@ async def test_get_notification_stats_per_project_failure():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(pid, "test_event", {})
+        await dispatch_external_notification(pid, "RUNNER_DEACTIVATED", {})
 
     pstats = get_notification_stats(project_id=pid)
     assert pstats["total_failed"] == 1
@@ -341,9 +397,9 @@ async def test_dispatch_throttle_is_project_scoped():
         patch("app.notification_dispatch._attempt_delivery", new=deliver),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(pid, "test_event", {"k": "first"})
-        await dispatch_external_notification(pid, "test_event", {"k": "suppressed"})
-        await dispatch_external_notification(other_pid, "test_event", {"k": "other"})
+        await dispatch_external_notification(pid, "RUNNER_DEACTIVATED", {"k": "first"})
+        await dispatch_external_notification(pid, "RUNNER_DEACTIVATED", {"k": "suppressed"})
+        await dispatch_external_notification(other_pid, "RUNNER_DEACTIVATED", {"k": "other"})
 
     assert deliver.await_count == 2
     pstats = get_notification_stats(project_id=pid)
@@ -514,7 +570,7 @@ async def test_dispatch_records_webhook_url_on_retry_entry():
         ),
         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
     ):
-        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+        await dispatch_external_notification(uuid.uuid4(), "RUNNER_DEACTIVATED", {"k": "v"})
     assert len(nd._retry_queue) == 1
     assert nd._retry_queue[0].webhook_url == "https://dest.example.com/hook"
 
