@@ -577,6 +577,34 @@ describe('ComputeJobsPanel — viewport regression', () => {
     );
   });
 
+  test('renders the evidence-tier filter control in the filter bar at 1280px', async () => {
+    jobsToReturn = criterionJobs;
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const tierFilter = host.querySelector('[data-testid="compute-tier-filter"]');
+        if (!tierFilter) throw new Error('compute-tier-filter not rendered in filter bar');
+        // Both coarse groupings the operator triages on must be visible.
+        if (!host.querySelector('[data-testid="compute-tier-machine-verified"]')) {
+          throw new Error('machine-verified tier filter option not rendered');
+        }
+        if (!host.querySelector('[data-testid="compute-tier-low-trust"]')) {
+          throw new Error('low-trust tier filter option not rendered');
+        }
+      },
+      { waitMs: 60 },
+    );
+  });
+
   test('renders artifact preview gallery in job card at 1100px', async () => {
     jobsToReturn = [
       {

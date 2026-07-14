@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, waitFor, act, fireEvent, within } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel, CompactJobsTable } from './ComputeJobsPanel';
 import {
@@ -305,11 +305,13 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     fetchHeldComputeExperiments.mockResolvedValue([]);
     fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
     fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
-    const { getByText } = render(
+    const { getByTestId } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
+    // Scope to the jobs list: the panel's tier FILTER control also renders the
+    // text 'Machine verified', so an unscoped query would be ambiguous.
     await waitFor(() => {
-      expect(getByText('Machine verified')).toBeTruthy();
+      expect(within(getByTestId('compute-jobs-list')).getByText('Machine verified')).toBeTruthy();
     });
   });
 
@@ -324,12 +326,13 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     fetchHeldComputeExperiments.mockResolvedValue([]);
     fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
     fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
-    const { queryByText } = render(
+    const { findByText, getByTestId } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
-    await waitFor(() => {
-      expect(queryByText('Machine verified')).toBeNull();
-    });
+    // Wait for the active job to render, then confirm no tier badge in the jobs
+    // list (scoped so the filter control's 'Machine verified' label is excluded).
+    await findByText('compute_experiment: sweep');
+    expect(within(getByTestId('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
   });
 
   test('compact jobs table renders evidence-tier badge and runner id for terminal jobs', async () => {
@@ -348,11 +351,16 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     fetchHeldComputeExperiments.mockResolvedValue([]);
     fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
     fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
-    const { findByTestId, findByText } = render(
+    const { findByTestId } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
-    // Wait for the job to render, then switch to compact table view
-    await findByText('Machine verified');
+    // Wait for the job's tier badge to render in the jobs list (scoped past the
+    // filter control which also contains a 'Machine verified' label), then switch
+    // to compact table view.
+    const jobsList = await findByTestId('compute-jobs-list');
+    await waitFor(() => {
+      expect(within(jobsList).getByText('Machine verified')).toBeTruthy();
+    });
     const toggleBtn = await findByTestId('compute-view-mode-toggle');
     await act(async () => { toggleBtn.click(); });
     // Table should show evidence badge and runner hostname
@@ -474,13 +482,14 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       final_cost_usd: 1.0,
       completed_at: new Date().toISOString(),
     })]));
-    const { getByText: getGcp, queryByText: queryGcp, unmount: unmountGcp } = render(
+    const { getByText: getGcp, getByTestId: gtGcp, unmount: unmountGcp } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
       expect(getGcp('Attested')).toBeTruthy();
     });
-    expect(queryGcp('Machine verified')).toBeNull();
+    // Scope 'Machine verified' past the tier filter control, which carries that label.
+    expect(within(gtGcp('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
     unmountGcp();
 
     // Operator-hardware (runner-subprocess) job WITH a measurable result: must
@@ -498,11 +507,11 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       completed_at: new Date().toISOString(),
       per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
     })]));
-    const { getByText: getRunner, unmount: unmountRunner } = render(
+    const { getByTestId: gtRunner, unmount: unmountRunner } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
-      expect(getRunner('Machine verified')).toBeTruthy();
+      expect(within(gtRunner('compute-jobs-list')).getByText('Machine verified')).toBeTruthy();
     });
     unmountRunner();
 
@@ -517,13 +526,13 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       final_cost_usd: 0,
       completed_at: new Date().toISOString(),
     })]));
-    const { getByText: getNoBackend, queryByText: queryNoBackend, unmount: unmountNoBackend } = render(
+    const { getByText: getNoBackend, getByTestId: gtNoBackend, unmount: unmountNoBackend } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
       expect(getNoBackend('Self-reported')).toBeTruthy();
     });
-    expect(queryNoBackend('Machine verified')).toBeNull();
+    expect(within(gtNoBackend('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
     unmountNoBackend();
 
     // Active cloud job: no evidence-tier badge at all
@@ -535,14 +544,16 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       status: 'RUNNING',
       outcome: null,
     })]));
-    const { queryByText: queryActive } = render(
+    const { findByText: findActive, getByTestId: gtActive } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
-    await waitFor(() => {
-      expect(queryActive('Machine verified')).toBeNull();
-      expect(queryActive('Attested')).toBeNull();
-      expect(queryActive('Self-reported')).toBeNull();
-    });
+    await findActive('compute_experiment: active');
+    // No evidence-tier badge anywhere in the jobs list for an active job (scoped
+    // so the filter control's tier labels are excluded).
+    const activeList = within(gtActive('compute-jobs-list'));
+    expect(activeList.queryByText('Machine verified')).toBeNull();
+    expect(activeList.queryByText('Attested')).toBeNull();
+    expect(activeList.queryByText('Self-reported')).toBeNull();
   });
 });
 
@@ -4220,5 +4231,134 @@ describe('CompactJobsTable — evidence tier + runner identity', () => {
     expect(getByTestId('compact-table-runner').textContent).toContain('iconlab-gpu-02');
     // Badge is terminal-only, consistent with the full job card.
     expect(container.textContent).not.toContain('Machine verified');
+  });
+});
+
+describe('ComputeJobsPanel evidence-tier filter + sort', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  // A mix spanning the two coarse trust groups plus an active job (no tier).
+  //  - tierjob-alpha:   operator hardware + a result → 'covered' → machine-verified
+  //  - tierjob-bravo:  cloud + a result             → 'attested' → low-trust
+  //  - tierjob-charlie: no backend, no result        → 'uncovered' → low-trust
+  //  - tierjob-delta:    still running                 → no tier (excluded by any filter)
+  const coveredJob = makeJob({
+    id: 'tierjob-alpha',
+    task_id: 'task-covered',
+    task_title: 'tierjob-alpha',
+    backend: 'local-subprocess',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+    accrued_cost_usd: 0,
+    final_cost_usd: 0,
+    completed_at: new Date().toISOString(),
+  });
+  const attestedJob = makeJob({
+    id: 'tierjob-bravo',
+    task_id: 'task-attested',
+    task_title: 'tierjob-bravo',
+    backend: 'gcp',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    criterion_verdict: { metric: 'acc', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+    accrued_cost_usd: 1,
+    final_cost_usd: 1,
+    completed_at: new Date().toISOString(),
+  });
+  const uncoveredJob = makeJob({
+    id: 'tierjob-charlie',
+    task_id: 'task-uncovered',
+    task_title: 'tierjob-charlie',
+    backend: '',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    criterion_verdict: null,
+    per_arm_verdicts: null,
+    accrued_cost_usd: 0,
+    final_cost_usd: 0,
+    completed_at: new Date().toISOString(),
+  });
+  const activeJob = makeJob({
+    id: 'tierjob-delta',
+    task_id: 'task-active',
+    task_title: 'tierjob-delta',
+    backend: 'local-subprocess',
+    status: 'RUNNING',
+    outcome: null,
+    completed_at: null,
+  });
+
+  function mountWith(jobs: ComputeJob[]) {
+    fetchComputeJobs.mockResolvedValue(wrapJobs(jobs));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    return render(<ComputeJobsPanel projectId="proj-1" />);
+  }
+
+  test('renders the tier filter control in the filter bar', async () => {
+    const { findByTestId } = mountWith([coveredJob]);
+    const control = await findByTestId('compute-tier-filter');
+    expect(control).toBeTruthy();
+    // Both coarse groupings the operator asked for are present, plus the default.
+    expect(control.querySelector('[data-testid="compute-tier-all"]')).toBeTruthy();
+    expect(control.querySelector('[data-testid="compute-tier-machine-verified"]')).toBeTruthy();
+    expect(control.querySelector('[data-testid="compute-tier-low-trust"]')).toBeTruthy();
+  });
+
+  test('low-trust filter hides machine-verified jobs and keeps attested/self-reported ones', async () => {
+    const { findByTestId, getByTestId } = mountWith([coveredJob, attestedJob, uncoveredJob, activeJob]);
+    const jobsList = await findByTestId('compute-jobs-list');
+    // Default: everything visible.
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-alpha'));
+    expect(jobsList.textContent).toContain('tierjob-bravo');
+
+    act(() => { fireEvent.click(getByTestId('compute-tier-low-trust')); });
+
+    await waitFor(() => expect(jobsList.textContent).not.toContain('tierjob-alpha'));
+    // low-trust keeps the non-machine-verified terminal jobs...
+    expect(jobsList.textContent).toContain('tierjob-bravo');
+    expect(jobsList.textContent).toContain('tierjob-charlie');
+    // ...and excludes active jobs (they carry no tier).
+    expect(jobsList.textContent).not.toContain('tierjob-delta');
+  });
+
+  test('machine-verified filter shows only covered jobs', async () => {
+    const { findByTestId, getByTestId } = mountWith([coveredJob, attestedJob, uncoveredJob, activeJob]);
+    const jobsList = await findByTestId('compute-jobs-list');
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-bravo'));
+
+    act(() => { fireEvent.click(getByTestId('compute-tier-machine-verified')); });
+
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-alpha'));
+    expect(jobsList.textContent).not.toContain('tierjob-bravo');
+    expect(jobsList.textContent).not.toContain('tierjob-charlie');
+    expect(jobsList.textContent).not.toContain('tierjob-delta');
+  });
+
+  test('tier sort orders the compact table from highest to lowest trust', async () => {
+    const { findByTestId, findByText, getAllByTestId } = mountWith([uncoveredJob, coveredJob, attestedJob]);
+    // Switch to the compact table view.
+    await findByText('tierjob-alpha');
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('compact-jobs-table');
+
+    // Click the new Tier sort header (first click → ascending = highest trust first).
+    const [tierHeader] = getAllByTestId('jobs-table-sort-tier');
+    act(() => { fireEvent.click(tierHeader); });
+
+    await waitFor(() => {
+      const order = getAllByTestId('compact-table-job-name').map((n) => n.textContent);
+      expect(order).toEqual(['tierjob-alpha', 'tierjob-bravo', 'tierjob-charlie']);
+    });
   });
 });

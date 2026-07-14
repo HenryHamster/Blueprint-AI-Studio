@@ -68,6 +68,38 @@ export function isComputeJobActive(job: ComputeJob): boolean {
   return ACTIVE_STATUSES.has(job.status);
 }
 
+/** Coarse trust grouping for a terminal job's evidence tier — the two buckets
+ *  operators triage on. `machine-verified` is the single highest-trust tier
+ *  ('covered' — executed AND verified on operator hardware); `low-trust` is
+ *  every other terminal tier (attested / backfilled / partial /
+ *  uncovered), i.e. anything NOT machine-verified. Active jobs have no tier yet,
+ *  so they return `null` and are excluded from any tier narrowing. Reuses
+ *  {@link computeJobEvidenceTier} — does not re-derive tier semantics. */
+export function computeJobEvidenceGroup(
+  job: ComputeJob,
+): 'machine-verified' | 'low-trust' | null {
+  if (isComputeJobActive(job)) return null;
+  return computeJobEvidenceTier(job) === 'covered' ? 'machine-verified' : 'low-trust';
+}
+
+/** Deterministic sort rank for a job's evidence tier, ordered from highest-trust
+ *  ('covered' = 0) down to lowest-trust ('uncovered'). Jobs with no tier (active
+ *  jobs, which carry no evidence tier) sort consistently last. Reuses
+ *  {@link computeJobEvidenceTier} for the tier value — does not re-derive it. */
+const EVIDENCE_TIER_RANK: Record<string, number> = {
+  covered: 0,
+  attested: 1,
+  backfilled: 2,
+  partial: 3,
+  uncovered: 4,
+};
+
+export function computeJobEvidenceTierRank(job: ComputeJob): number {
+  if (isComputeJobActive(job)) return Number.MAX_SAFE_INTEGER;
+  const tier = computeJobEvidenceTier(job);
+  return EVIDENCE_TIER_RANK[tier] ?? Number.MAX_SAFE_INTEGER;
+}
+
 /** Human-readable terminal reason for a finished job, distinguishing the three
  *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {

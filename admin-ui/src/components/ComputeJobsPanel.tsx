@@ -24,6 +24,8 @@ import {
   computeJobViewableArtifacts,
   fmtBytes,
   computeJobEvidenceTier,
+  computeJobEvidenceGroup,
+  computeJobEvidenceTierRank,
   computeJobImagePinStatus,
   fmtUsd,
   fmtCountdown,
@@ -864,7 +866,7 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
   };
 }
 
-type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend';
+type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend' | 'tier';
 
 const TABLE_COL_LABELS: Record<TableSortKey, string> = {
   name: 'Name',
@@ -873,6 +875,7 @@ const TABLE_COL_LABELS: Record<TableSortKey, string> = {
   cost: 'Cost',
   runtime: 'Runtime',
   backend: 'Backend',
+  tier: 'Tier',
 };
 
 export function CompactJobsTable({
@@ -956,7 +959,7 @@ export function CompactJobsTable({
                 <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
                   {runtimeSec != null ? fmtDuration(runtimeSec) : active ? 'running' : '—'}
                 </td>
-                <td className="py-1.5 text-neutral-400 max-w-xs">
+                <td className="py-1.5 pr-3 text-neutral-400 max-w-xs">
                   <span className="flex items-center gap-1.5 flex-wrap min-w-0">
                     <span className="truncate">{backendLabel}</span>
                     {runnerName && (
@@ -968,8 +971,10 @@ export function CompactJobsTable({
                         · {runnerName}
                       </span>
                     )}
-                    {!active && <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />}
                   </span>
+                </td>
+                <td className="py-1.5 pr-3 whitespace-nowrap">
+                  {!active ? <EvidenceTierBadge tier={computeJobEvidenceTier(job)} /> : <span className="text-neutral-600">—</span>}
                 </td>
               </tr>
             );
@@ -1033,6 +1038,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   );
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'completed' | 'failed'>('all');
+  const [tierFilter, setTierFilter] = useState<'all' | 'machine-verified' | 'low-trust'>('all');
   const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
   const [sortConfig, setSortConfig] = useState<{ key: TableSortKey; dir: 'asc' | 'desc' } | null>(null);
 
@@ -1054,8 +1060,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     } else if (statusFilter === 'failed') {
       result = result.filter((job) => !isComputeJobActive(job) && job.outcome !== null && job.outcome !== 'SUCCESS');
     }
+    // Evidence tier only exists for TERMINAL jobs (active jobs render no badge and
+    // return group `null`), so any non-`all` tier narrowing is inherently a filter
+    // over finished results and drops active jobs.
+    if (tierFilter !== 'all') {
+      result = result.filter((job) => computeJobEvidenceGroup(job) === tierFilter);
+    }
     return result;
-  }, [jobs, searchText, statusFilter]);
+  }, [jobs, searchText, statusFilter, tierFilter]);
 
   const displayJobs = useMemo(() => {
     if (!sortConfig) return filteredJobs;
@@ -1070,6 +1082,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       } else if (sortConfig.key === 'cost') cmp = (computeJobSpent(a) ?? 0) - (computeJobSpent(b) ?? 0);
       else if (sortConfig.key === 'runtime') cmp = (computeJobRuntimeSec(a) ?? 0) - (computeJobRuntimeSec(b) ?? 0);
       else if (sortConfig.key === 'backend') cmp = (a.backend ?? '').localeCompare(b.backend ?? '');
+      else if (sortConfig.key === 'tier') cmp = computeJobEvidenceTierRank(a) - computeJobEvidenceTierRank(b);
       return sortConfig.dir === 'asc' ? cmp : -cmp;
     });
   }, [filteredJobs, sortConfig]);
@@ -1563,7 +1576,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <ExperimentSweepSummary jobs={jobs} />
 
-      {(jobs.length > 0 || searchText || statusFilter !== 'all') && (
+      {(jobs.length > 0 || searchText || statusFilter !== 'all' || tierFilter !== 'all') && (
         <div className="mb-2 flex flex-wrap items-center gap-2" data-testid="compute-jobs-filters">
           <div className="relative flex-1 min-w-0 max-w-xs">
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500 pointer-events-none" />
@@ -1586,6 +1599,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 data-testid={`compute-status-${s}`}
               >
                 {s === 'all' ? 'All' : s === 'active' ? 'Active' : s === 'completed' ? 'Completed' : 'Failed'}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-0.5" data-testid="compute-tier-filter">
+            {(['all', 'machine-verified', 'low-trust'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTierFilter(t)}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${tierFilter === t ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-tier-${t}`}
+                title={
+                  t === 'all'
+                    ? 'Show all evidence tiers'
+                    : t === 'machine-verified'
+                      ? 'Only machine-verified results (executed and verified on operator hardware)'
+                      : 'Only low-trust results (attested / backfilled / partial / self-reported)'
+                }
+              >
+                {t === 'all' ? 'All tiers' : t === 'machine-verified' ? 'Machine verified' : 'Low trust'}
               </button>
             ))}
           </div>
