@@ -544,7 +544,7 @@ runtime_config: Dict = {
     "provider_tier_model_map": {
         "anthropic": {
             "opus": "claude-opus-4-8",
-            "sonnet": "claude-sonnet-4-6",
+            "sonnet": "claude-sonnet-5",
             "haiku": "claude-haiku-4-5-20251001",
         },
         "openai": {
@@ -656,7 +656,7 @@ runtime_config: Dict = {
     "provider_settings_by_effort": {
         "anthropic": {
             "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
-            "medium": {"model": "claude-sonnet-4-6", "effort": "medium"},
+            "medium": {"model": "claude-sonnet-5", "effort": "medium"},
             "high": {"model": "claude-opus-4-8", "effort": "high"},
             # TEMPORARY: fable-5 has a limited availability window (~2 weeks
             # from 2026-06-09). fallback_model covers CLI-level rate limits;
