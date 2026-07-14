@@ -19810,6 +19810,7 @@ async def test_monitor_rereads_task_before_terminal_kill_so_midtick_restore_is_r
 @pytest.mark.asyncio
 async def test_provisioning_retry_deadline_starts_at_retry_time_not_stale_tick_start(
     db_session,
+    monkeypatch,
 ):
     """Retry 1 must not be dead on arrival after a slow launch.
 
@@ -19824,6 +19825,13 @@ async def test_provisioning_retry_deadline_starts_at_retry_time_not_stale_tick_s
     The persisted deadline must be in the future by ~the backoff, measured from
     the real time at retry.
     """
+    # This test provisions a `local-subprocess` backend, which resolve_backend()
+    # rejects unless LOCAL_MODE is on (compute_backends.py: "local-subprocess
+    # backend is unavailable outside LOCAL_MODE"). test-backend.sh sets
+    # LOCAL_MODE=true so it passed there; CI leaves it false, so the retry path
+    # raised ValueError and the test failed ONLY on CI. Set it explicitly (the
+    # established pattern in this file) so the test is env-independent.
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
     project = Project(name=f"doa-{uuid.uuid4().hex[:8]}", user_id="test")
     db_session.add(project)
     await db_session.commit()
