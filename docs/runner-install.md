@@ -118,11 +118,22 @@ and never deletes your credential files under `~/.blueprint`.
 
 ## 4. Restart-on-crash
 
-The unit uses `Restart=on-failure`, which means systemd restarts the runner
-whenever it exits non-zero. The runner calls `os._exit(1)` (via its internal
-`_die()` helper) on fatal conditions such as a revoked token or a thread supervisor
-failure. That non-zero exit triggers a restart. A normal shutdown (SIGTERM, Ctrl-C)
-exits `0` and is **not** restarted.
+The unit uses `Restart=always`, which restarts the runner whenever it exits, for
+any reason. Two exit paths depend on this:
+
+- **Crash / fatal condition** — the runner calls `os._exit(1)` (via its internal
+  `_die()` helper) on a revoked token or a thread-supervisor failure; systemd
+  relaunches it.
+- **Self-update** — after pulling a newer version the runner exits `0` and trusts
+  its supervisor to relaunch the fresh binary. `Restart=on-failure` would NOT
+  restart that clean exit-0, silently leaving the self-updated runner dead until
+  a manual restart — which is why the unit ships `Restart=always`.
+
+A deliberate `systemctl stop` (or `Ctrl-C` in the foreground) still stays stopped:
+systemd never applies the restart policy to an operator-initiated stop. A burst
+cap (`StartLimitIntervalSec=60` / `StartLimitBurst=3`) stops a persistent failure
+from restarting forever; run `systemctl reset-failed blueprint-runner.service`
+after fixing the root cause.
 
 Default restart delay is 5 seconds (`RestartSec=5`). Adjust in the unit file if
 needed.

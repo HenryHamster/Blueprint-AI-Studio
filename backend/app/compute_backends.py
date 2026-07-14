@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -42,6 +44,42 @@ from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.vm_lifecycle import _ensure_vm_deleted
+
+# Domain-separation prefix for the compute-job heartbeat secret (see
+# ``compute_job_heartbeat_secret``). Versioned so the derivation can be rotated
+# without colliding with any other HMAC use of ``AGENT_JWT_SECRET``.
+_COMPUTE_JOB_HB_SECRET_PREFIX = b"compute-job-heartbeat:v1:"
+
+
+def compute_job_heartbeat_secret(job_id: object) -> str:
+    """Derive the per-job bearer secret the compute VM sends on its heartbeat.
+
+    The compute-job VM heartbeat endpoint used to authenticate with the bare job
+    UUID as its bearer token. But the job UUID is a *resource identifier* — it
+    appears in URL paths, agent poll responses, and serial-console/log output — so
+    anyone who merely observes it could POST heartbeats and mutate watchdog-relevant
+    state (feed the no-progress watchdog fake progress samples, or transition a
+    stuck STARTING job to RUNNING to suppress the provisioning-deadline timeout).
+
+    This returns a per-job secret that is NOT the UUID: an HMAC-SHA256 of the job
+    id keyed by the orchestrator's ``AGENT_JWT_SECRET`` (the same signing secret
+    the agent-JWT machinery already uses — no new key material to manage). The
+    secret is derivable ONLY by the orchestrator; it is embedded into the VM's
+    startup script (delivered as encrypted instance metadata) and never returned
+    by any API, so knowing the job UUID does not let a caller compute it. The VM
+    sends it as its heartbeat bearer; the endpoint recomputes and constant-time
+    compares. See ``app.routers.agent_compute_jobs.compute_job_vm_heartbeat``.
+    """
+    secret = os.getenv("AGENT_JWT_SECRET")
+    if not secret:
+        # AGENT_JWT_SECRET is validated at auth-module import; if it is somehow
+        # absent we must fail loudly rather than fall back to a guessable token.
+        raise RuntimeError(
+            "AGENT_JWT_SECRET is required to derive the compute-job heartbeat secret"
+        )
+    message = _COMPUTE_JOB_HB_SECRET_PREFIX + str(job_id).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
 
 # Scripts baked into the GCP compute-job startup script as base64 blobs.
 # Loaded at module import time so a missing file fails fast at startup, not
@@ -2870,6 +2908,11 @@ def _build_gcp_startup_script(
     heartbeat_body_b64 = _HEARTBEAT_BODY_B64
     orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
     job_id_q = shlex.quote(str(spec.job_id))
+    # Per-job heartbeat bearer secret (NOT the raw job UUID). Embedded into the
+    # startup script — which is delivered as encrypted instance metadata and never
+    # echoed by any API — so a mere UUID observer cannot forge a heartbeat and
+    # quiet the no-progress watchdog or keep a stuck STARTING job alive.
+    hb_token_q = shlex.quote(compute_job_heartbeat_secret(spec.job_id))
     np_timeout = (
         max(60, int(spec.no_progress_timeout_seconds))
         if spec.no_progress_timeout_seconds is not None
@@ -2935,6 +2978,7 @@ _NP_WATCHDOG_PID=
 echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
+_COMPUTE_HB_TOKEN={hb_token_q}
 _compute_heartbeat() {{
   # Build the heartbeat body off-VM in a real, tested Python file (base64-baked
   # above): it merges the live-output tail with the latest {{"metric","value"}}
@@ -2945,7 +2989,7 @@ _compute_heartbeat() {{
   if [ -z "$_HB_BODY" ]; then
     _HB_BODY='{{}}'
   fi
-  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_HB_TOKEN" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
 }}
 _compute_heartbeat
 (

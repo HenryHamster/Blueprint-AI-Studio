@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import hmac
 import json
 import logging
 import uuid
@@ -11,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.compute_backends import compute_job_heartbeat_secret
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
     _COMPUTE_JOB_TERMINAL_STATUSES,
@@ -195,19 +197,29 @@ async def compute_job_vm_heartbeat(
 ):
     """Liveness push from a GCP compute-job VM.
 
-    The VM's startup script POSTs here (bearer = job UUID) every ~60 s so the
-    orchestrator can confirm the VM is alive without relying on serial-console
-    polls or the GCP insert long-running-operation.  The first heartbeat also
-    transitions the job from STARTING to RUNNING so provisioning success is
-    declared on boot rather than on LRO completion.
+    The VM's startup script POSTs here every ~60 s so the orchestrator can confirm
+    the VM is alive without relying on serial-console polls or the GCP insert
+    long-running-operation.  The first heartbeat also transitions the job from
+    STARTING to RUNNING so provisioning success is declared on boot rather than on
+    LRO completion, and the body may carry progress samples that feed the
+    no-progress watchdog.
 
-    Authentication: the bearer token is the job UUID (128 bits of entropy —
-    equivalent to a random secret).  The endpoint is rate-limited and only
-    accepts active (non-terminal) job IDs.
+    Authentication: the bearer token is NOT the job UUID.  The UUID is a resource
+    identifier — it is in the URL path, agent poll responses, and log/serial
+    output — so authenticating with it would let any observer suppress the
+    no-progress watchdog or keep a stuck STARTING job alive.  Instead the VM sends
+    a per-job secret derived by ``compute_job_heartbeat_secret`` (HMAC of the job
+    id keyed by ``AGENT_JWT_SECRET``), embedded only in the encrypted startup
+    script and never echoed by any API.  The endpoint recomputes it and does a
+    constant-time compare; a bare-UUID caller is rejected with 403.  The endpoint
+    is also rate-limited and only mutates active (non-terminal) jobs.
     """
     auth = request.headers.get("Authorization", "")
     bearer = auth.removeprefix("Bearer ").strip()
-    if bearer != str(job_id):
+    expected = compute_job_heartbeat_secret(job_id)
+    # Compare as bytes (constant-time): hmac.compare_digest raises on a str with
+    # non-ASCII chars, so a hostile Authorization header must not 500 the endpoint.
+    if not hmac.compare_digest(bearer.encode("utf-8"), expected.encode("ascii")):
         raise HTTPException(status_code=403, detail="Invalid compute job token")
 
     job = await session.get(ComputeJob, job_id)

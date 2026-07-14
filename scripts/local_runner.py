@@ -4507,9 +4507,19 @@ def _preflight(
         supervisor_state["evidence"] = f"supervisor detection error: {exc}"
     supervisor = supervisor_state["supervisor"] if supervisor_state["supervised"] else None
     if supervisor is not None:
+        # The detector confirms a systemd *service* unit but cannot read its
+        # Restart= policy. Update-survival (the runner exits 0 after a self-update
+        # and trusts systemd to relaunch it) needs Restart=always — Restart=on-failure
+        # would leave the clean exit-0 dead. `blueprint-runner install` ships always,
+        # so surface the requirement rather than assume a hand-rolled unit provides it.
+        note = (
+            " — needs Restart=always (blueprint-runner install sets it)"
+            if supervisor == "systemd"
+            else ""
+        )
         _fmt(
             "supervisor",
-            f"{supervisor} (auto-restart on crash/update) "
+            f"{supervisor} (auto-restart on crash/update{note}) "
             f"[{supervisor_state['evidence']}]",
         )
     else:

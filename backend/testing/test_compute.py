@@ -12485,13 +12485,110 @@ async def test_compute_job_vm_heartbeat_wrong_bearer_rejected(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
+    client, db_session, monkeypatch
+):
+    """A bare job-UUID bearer must NOT quiet the watchdog or keep a job alive.
+
+    Regression for the weak-auth finding: the job UUID is a resource identifier
+    (URL path / poll responses / logs), so it must not authenticate the heartbeat.
+    A caller presenting only the bare UUID is rejected with 403 and mutates
+    NOTHING — it cannot transition a stuck STARTING job to RUNNING (which would
+    suppress the provisioning-deadline timeout) nor append a progress sample
+    (which would quiet the no-progress watchdog). The properly-authenticated
+    runner — presenting the per-job secret derived by ``compute_job_heartbeat_secret``
+    — still can.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Bare UUID Guard", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.STARTING
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
+
+    # 1) A bare job-UUID bearer is rejected and changes nothing.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {job.id}",
+            "Content-Type": "application/json",
+        },
+        content=progress_body,
+    )
+    assert resp.status_code == 403, "bare job-UUID bearer must be rejected"
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.STARTING, (
+        "a rejected heartbeat must NOT keep a stuck STARTING job alive"
+    )
+    assert job.last_heartbeat_at is None, "a rejected heartbeat must not refresh liveness"
+    assert "progress_series" not in (job.polling_metadata or {}), (
+        "a rejected heartbeat must not feed the no-progress watchdog"
+    )
+
+    # 2) The properly-authenticated runner (per-job secret) still works.
+    secret = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    assert secret != str(job.id), "the heartbeat secret must NOT be the job UUID"
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Content-Type": "application/json",
+        },
+        content=progress_body,
+    )
+    assert resp.status_code == 204, "the properly-authenticated runner must succeed"
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING, (
+        "the authenticated first heartbeat transitions STARTING→RUNNING"
+    )
+    assert job.last_heartbeat_at is not None, "authenticated heartbeat refreshes liveness"
+    series = (job.polling_metadata or {}).get("progress_series")
+    assert series, "authenticated heartbeat must record the progress sample"
+    assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_compute_job_vm_heartbeat_missing_job_returns_404(client, monkeypatch):
-    """POST /compute-jobs/{id}/heartbeat for an unknown ID returns 404."""
+    """POST /compute-jobs/{id}/heartbeat for an unknown ID returns 404.
+
+    The caller must present the correctly-derived per-job secret to get PAST auth
+    and reach the existence check; a bare-UUID caller is rejected at auth (403)
+    and never learns whether the job exists.
+    """
     monkeypatch.setattr(compute, "LOCAL_MODE", True)
     fake_id = uuid.uuid4()
     resp = await client.post(
         f"/api/agent/compute-jobs/{fake_id}/heartbeat",
-        headers={"Authorization": f"Bearer {fake_id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(fake_id)}"
+            )
+        },
     )
     assert resp.status_code == 404
 
@@ -12532,7 +12629,11 @@ async def test_compute_job_vm_heartbeat_transitions_starting_to_running(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -12578,7 +12679,11 @@ async def test_compute_job_vm_heartbeat_updates_running_job(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -12624,7 +12729,11 @@ async def test_compute_job_vm_heartbeat_noop_for_terminal_job(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204, "terminal job heartbeat must not error"
 
@@ -13749,7 +13858,9 @@ async def test_compute_job_vm_heartbeat_stores_live_output(
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
         headers={
-            "Authorization": f"Bearer {job.id}",
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            ),
             "Content-Type": "application/json",
         },
         content=body,
@@ -13800,7 +13911,11 @@ async def test_compute_job_vm_heartbeat_empty_body_unchanged(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -13869,6 +13984,40 @@ def test_gcp_startup_script_heartbeat_emits_live_tail_and_progress():
     assert '-d "$_HB_BODY"' in hb_func_body, (
         "_compute_heartbeat must POST the helper-built JSON body"
     )
+
+
+def test_gcp_startup_script_heartbeat_bearer_is_derived_secret_not_uuid():
+    """The VM heartbeat must authenticate with the per-job secret, NOT the raw UUID.
+
+    Delivery-side guard for the weak-auth finding: the startup script embeds the
+    HMAC-derived per-job secret and sends it as the heartbeat bearer, so a mere
+    observer of the job UUID cannot forge a heartbeat. The job UUID stays only as
+    the resource identifier in the URL path.
+    """
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    expected = compute_backends_module.compute_job_heartbeat_secret(job_id)
+    assert expected != str(job_id), "derived secret must differ from the job UUID"
+    assert f"_COMPUTE_HB_TOKEN={shlex.quote(expected)}" in script, (
+        "startup script must embed the derived per-job heartbeat secret"
+    )
+    # The Authorization header uses the secret variable, never the raw job UUID.
+    assert 'Authorization: Bearer $_COMPUTE_HB_TOKEN' in script
+    assert 'Authorization: Bearer $_COMPUTE_JOB_ID' not in script, (
+        "the heartbeat must NOT authenticate with the bare job UUID"
+    )
+    # The UUID still identifies the resource in the heartbeat URL path.
+    assert "/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" in script
 
 
 def test_heartbeat_body_helper_emits_live_tail_and_progress(tmp_path):
@@ -15534,7 +15683,11 @@ async def test_compute_job_vm_heartbeat_stores_progress_sample(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
         json={"progress": {"metric": "loss", "value": 0.42}},
     )
     assert resp.status_code == 204
@@ -15582,7 +15735,11 @@ async def test_compute_job_vm_heartbeat_invalid_progress_still_204(
     # Invalid: metric key has a space, value is a non-numeric string
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
         json={"progress": {"metric": "bad key!", "value": "not a number"}},
     )
     assert resp.status_code == 204

@@ -5231,7 +5231,12 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
         self.assertIn("StartLimitBurst=3", unit_text,
                       "burst count must be in rendered unit")
         self.assertIn("RestartSec=5", unit_text)
-        self.assertIn("Restart=on-failure", unit_text)
+        # Restart=always (NOT on-failure): the runner exits 0 after a self-update
+        # and relies on systemd to relaunch the fresh binary; on-failure would
+        # leave a self-updated runner silently dead. See the unit's RESTART block.
+        self.assertIn("Restart=always", unit_text)
+        # The active directive is always (the comment may still explain on-failure).
+        self.assertNotIn("\nRestart=on-failure\n", unit_text)
         # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
         self.assertLess(
             unit_text.index("StartLimitIntervalSec=60"), unit_text.index("[Service]"),
