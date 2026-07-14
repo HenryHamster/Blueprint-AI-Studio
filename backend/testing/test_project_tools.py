@@ -281,6 +281,41 @@ async def test_register_tool_duplicate_slug(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_create_tool_rejects_invalid_placement(client: AsyncClient, db_session):
+    """POST /tools rejects a bogus placement string with 400."""
+    project = await _make_project_member(db_session)
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "bad-placement", "placement": "floating_panel"},
+    )
+    assert resp.status_code == 400
+    msg = resp.json()["error"]["message"]
+    assert "placement" in msg.lower()
+    assert "floating_panel" in msg
+
+
+@pytest.mark.asyncio
+async def test_update_tool_rejects_invalid_placement(client: AsyncClient, db_session):
+    """PATCH /tools/{id} rejects a bogus placement string with 400."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "upd-placement"},
+        )
+    ).json()
+    tool_id = created["id"]
+
+    resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "nowhere"},
+    )
+    assert resp.status_code == 400
+    msg = resp.json()["error"]["message"]
+    assert "placement" in msg.lower()
+
+
+@pytest.mark.asyncio
 async def test_register_tool_requires_owner(client: AsyncClient, db_session):
     """A member (below owner) cannot register a tool -> 403."""
     project = await _make_project_member(db_session, role="member")

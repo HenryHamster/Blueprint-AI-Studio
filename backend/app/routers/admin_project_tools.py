@@ -789,6 +789,11 @@ async def register_project_tool(
     placement = (payload.placement or spec["default_placement"]).strip()
     if not placement:
         placement = spec["default_placement"]
+    if placement not in _VALID_PLACEMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
+        )
     config = payload.config if isinstance(payload.config, dict) else {}
     _validate_config(kind, config, spec)
 
@@ -848,6 +853,11 @@ async def update_project_tool(
         placement = payload.placement.strip()
         if not placement:
             raise HTTPException(status_code=400, detail="placement must not be empty")
+        if placement not in _VALID_PLACEMENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
+            )
         tool.placement = placement
     if payload.config is not None:
         if not isinstance(payload.config, dict):

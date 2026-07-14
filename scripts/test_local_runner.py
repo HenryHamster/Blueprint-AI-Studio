@@ -161,6 +161,54 @@ class TestEnvVarValidation(unittest.TestCase):
     # the main loop's _locate_agent_binary re-resolution.
 
 
+class TestCheckModeAggregatesFailures(unittest.TestCase):
+    """`--check` reports ALL missing prerequisites in one pass (not first-fail)."""
+
+    def _run_check(self, env_overrides=None, strip_vars=None):
+        env = os.environ.copy()
+        env.pop("BLUEPRINT_RUNNER_TOKEN", None)
+        env.pop("BLUEPRINT_ORCHESTRATOR_URL", None)
+        # Point the credential file at an empty temp dir so a real saved token on
+        # the test box can't mask a "missing token" case.
+        with tempfile.TemporaryDirectory() as tmp:
+            env["BLUEPRINT_CREDENTIAL_DIR"] = tmp
+            if env_overrides:
+                env.update(env_overrides)
+            if strip_vars:
+                for k in strip_vars:
+                    env.pop(k, None)
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "local_runner.py"), "--check"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+    def test_check_missing_both_reports_both_and_exits_1(self):
+        # Regression: today --check dies naming only the token; it must name BOTH.
+        result = self._run_check()
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN", combined)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+
+    def test_check_missing_url_still_runs_preflight_probes(self):
+        # Token present, URL absent: the preflight report must still print (the
+        # probes ran despite the missing URL) rather than a bare first-fail exit.
+        result = self._run_check(env_overrides={"BLUEPRINT_RUNNER_TOKEN": "tok-abc-123456"})
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", combined.split("missing prerequisite")[-1])
+        # Preflight probe output (isolation / task classes) proves probes ran.
+        self.assertTrue(
+            ("isolation" in combined.lower()) or ("task class" in combined.lower())
+            or ("claimable" in combined.lower()),
+            msg=f"expected preflight probe output, got:\n{combined}",
+        )
+
+
 # ── Agent binary detection ─────────────────────────────────────────────────────
 
 class TestAgentBinaryDetection(unittest.TestCase):

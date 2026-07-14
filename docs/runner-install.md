@@ -210,6 +210,13 @@ Exit code `0` means the orchestrator is reachable, the token is valid, and at
 least one task class is claimable. Non-zero means something is misconfigured —
 read the preflight output for details.
 
+`--check` reports **all** detected problems in one pass. If both
+`BLUEPRINT_RUNNER_TOKEN` and `BLUEPRINT_ORCHESTRATOR_URL` are missing (and any
+diagnostic probe fails), it prints the full list together and exits non-zero,
+rather than stopping at the first missing variable — so you can fix everything
+at once instead of one-fix-rerun at a time. (Normal boot without `--check`
+still fails fast on the first missing prerequisite.)
+
 The preflight now also checks for missing agent Node.js dependencies. If the
 agent source (`agent/src/index.ts`) exists on this host but `npm install` was
 never run, you will see:

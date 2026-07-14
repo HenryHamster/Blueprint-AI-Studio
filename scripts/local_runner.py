@@ -4818,6 +4818,12 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # In --check we AGGREGATE every missing prerequisite into this list and report
+    # them all in one pass at the end, instead of hard-exiting on the first miss —
+    # so an operator fixes the whole list at once rather than one-fix-rerun at a
+    # time. Normal boot keeps its fail-fast semantics (first missing → exit 1).
+    missing_prereqs: list[str] = []
+
     token = os.environ.get("BLUEPRINT_RUNNER_TOKEN", "").strip()
     if token:
         # Persist for future restarts so re-enrolling after a reboot is unnecessary.
@@ -4842,12 +4848,31 @@ def main() -> None:
                 f"  (credential file checked: {cred_path})",
                 file=sys.stderr,
             )
-            sys.exit(1)
-        print(
-            f"[runner] token loaded from credential file ({_credential_path()})",
-            flush=True,
-        )
-    orchestrator_url = _require_env("BLUEPRINT_ORCHESTRATOR_URL").rstrip("/")
+            if not check_mode:
+                sys.exit(1)
+            # --check: record it and press on with an empty token so the preflight
+            # probes (isolation/capability/supervisor) still run and print.
+            missing_prereqs.append("BLUEPRINT_RUNNER_TOKEN")
+            token = ""
+        else:
+            print(
+                f"[runner] token loaded from credential file ({_credential_path()})",
+                flush=True,
+            )
+    if check_mode:
+        orchestrator_url = os.environ.get("BLUEPRINT_ORCHESTRATOR_URL", "").strip().rstrip("/")
+        if not orchestrator_url:
+            print(
+                "ERROR: required environment variable BLUEPRINT_ORCHESTRATOR_URL is not set.",
+                file=sys.stderr,
+            )
+            print(
+                "  Set it and re-run: export BLUEPRINT_ORCHESTRATOR_URL=<value>",
+                file=sys.stderr,
+            )
+            missing_prereqs.append("BLUEPRINT_ORCHESTRATOR_URL")
+    else:
+        orchestrator_url = _require_env("BLUEPRINT_ORCHESTRATOR_URL").rstrip("/")
     agent_binary = _locate_agent_binary()
 
     # Guarded env parsing: a malformed knob must NOT crash the runner into a
@@ -4961,7 +4986,21 @@ def main() -> None:
     compute_claimable = claimable[iso.CLASS_COMPUTE]
 
     if check_mode:
-        # Claim no work; exit reflects whether the box is ready.
+        # Claim no work; exit reflects whether the box is ready. Surface EVERY
+        # missing prerequisite together (not one-at-a-time) so the operator can
+        # fix the whole list in a single pass.
+        if missing_prereqs:
+            print(
+                "\n[runner] --check found "
+                f"{len(missing_prereqs)} missing prerequisite(s): "
+                + ", ".join(missing_prereqs),
+                file=sys.stderr,
+            )
+            print(
+                "[runner] Set the variable(s) above and re-run `--check`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         sys.exit(0 if result["setup_ok"] else 1)
 
     # Hard prereq: orchestrator must be reachable. A 401 is NOT fatal (the row may
