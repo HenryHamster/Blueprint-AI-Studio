@@ -5637,6 +5637,7 @@ class TestFailureClassificationInvariants:
             PROVISION_FAILURE,
             RATE_LIMIT,
             REASSIGNED,
+            REPO_UNINITIALIZED,
             SCOPE_EMPTY,
             SCOPE_OVERFLOW,
         )
@@ -5651,6 +5652,10 @@ class TestFailureClassificationInvariants:
                 SCOPE_OVERFLOW,
                 BLOCKED_PRECONDITION,
                 BRANCH_GONE,
+                # Empty/uninitialized repo (no commits to clone) — an onboarding
+                # infra precondition, not a code defect: budget-exempt and must
+                # not penalize direction health. See fix: onboard empty repos.
+                REPO_UNINITIALIZED,
                 SCOPE_EMPTY,
                 REASSIGNED,
                 NO_PROGRESS_TIMEOUT,

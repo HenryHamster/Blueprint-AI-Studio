@@ -208,18 +208,20 @@ interface VerifyTestsResult {
     // Whether the declared test FILE is among the PR's own changed files — the
     // SAME changed-files requirement the backend acceptance gate
     // (acceptance_gate._evaluate_named_test) checks FIRST, before any green/
-    // verification logic. A declared test that runs green but is NOT in the PR's
-    // diff can never earn machine-proven coverage: the gate hard-fails
-    // ``proven=False`` for "declared named_test … is not among the PR's changed
-    // files". Surfacing it HERE makes that verdict visible PRE-merge (the agent
-    // already has the diff for the documented-command / disabled-tests probes)
-    // instead of only after the badge-only merge. true = the test file is in the
-    // diff; false = it is NOT (green run will not be credited proven); omitted
-    // when the diff could not be computed (base ref unavailable) so the check is
-    // indeterminate. ADDITIVE: an older backend that ignores it is unaffected;
-    // the sibling ci_resolution change withholds the targeted-green mint when it
-    // is explicitly false, so no spurious green is advertised for a test the gate
-    // will reject.
+    // verification logic. Matched with the SAME tolerance the backend
+    // ``_paths_match`` uses (exact / suffix / basename). A declared test that runs
+    // green but is NOT in the PR's diff can never earn machine-proven coverage:
+    // the gate hard-fails ``proven=False`` for "declared named_test … is not among
+    // the PR's changed files". Surfacing it HERE makes that verdict visible
+    // PRE-merge (the agent already has the diff for the documented-command /
+    // disabled-tests probes) instead of only after the badge-only merge. true =
+    // the test file is in the diff; false = it is NOT (green run will not be
+    // credited proven); omitted when the diff could not be computed (base ref
+    // unavailable) so the check is indeterminate. ADDITIVE: an older backend that
+    // ignores it is unaffected; the sibling ci_resolution change withholds the
+    // targeted-green mint when it is explicitly false AND surfaces it as a clear
+    // pre-merge failure (acceptance_test_not_in_diff_is_clear_failure), so no
+    // spurious green is advertised for a test the gate will reject.
     in_diff?: boolean;
   };
 }
@@ -733,7 +735,8 @@ function parseDeclaredAcceptanceTest(
 // the backend acceptance_gate._paths_match so the agent's pre-merge in_diff
 // signal matches the gate's authoritative changed-files check byte-for-byte:
 // tolerant of leading-directory differences — an exact match, a suffix match in
-// either direction, or a basename match all count.
+// either direction, or a basename match all count. ``lstrip("./")`` is mirrored
+// by stripping any leading ``.``/``/`` chars.
 function acceptanceTestPathMatches(changed: string, declared: string): boolean {
   const c = changed.trim().replace(/^[./]+/, '');
   const d = declared.trim().replace(/^[./]+/, '');

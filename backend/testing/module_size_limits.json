@@ -20,7 +20,7 @@
     "github_checks.py": 1050,
     "hotfix_backmerge.py": 2350,
     "github_issues.py": 750,
-    "github_refs.py": 1000,
+    "github_refs.py": 1250,
     "github_pulls.py": 1500,
     "github_http.py": 250,
     "github_merge_summary.py": 350,

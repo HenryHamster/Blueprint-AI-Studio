@@ -2450,6 +2450,148 @@ def test_classify_verdict_ran_acceptance_test_keeps_pass():
     assert detail == ""
 
 
+def test_acceptance_test_block_parses_in_diff_field():
+    # Only a literal True/False is meaningful; anything else omits the key.
+    in_diff_true = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "x",
+                "status": "ran",
+                "ran": True,
+                "in_diff": True,
+            }
+        }
+    )
+    assert in_diff_true["in_diff"] is True
+    in_diff_false = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "x",
+                "status": "ran",
+                "ran": True,
+                "in_diff": False,
+            }
+        }
+    )
+    assert in_diff_false["in_diff"] is False
+    # Older agent (no in_diff) / non-bool value → key absent (indeterminate).
+    absent = ci_resolution.acceptance_test_block(
+        {"acceptanceTest": {"declared": True, "descriptor": "x", "status": "ran"}}
+    )
+    assert "in_diff" not in absent
+    non_bool = ci_resolution.acceptance_test_block(
+        {
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "x",
+                "status": "ran",
+                "in_diff": "yes",
+            }
+        }
+    )
+    assert "in_diff" not in non_bool
+
+
+def test_acceptance_test_not_in_diff_is_clear_failure_predicate():
+    # Ran green but file not in the PR diff → clear failure.
+    assert ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": True, "ran": True, "status": "ran", "in_diff": False}
+    )
+    # In the diff → not a failure.
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": True, "ran": True, "status": "ran", "in_diff": True}
+    )
+    # in_diff absent (indeterminate) → never blocks.
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": True, "ran": True, "status": "ran"}
+    )
+    # Absent/skipped are handled by acceptance_test_is_clear_failure, not here.
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": True, "ran": False, "status": "absent", "in_diff": False}
+    )
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": True, "ran": False, "status": "skipped", "in_diff": False}
+    )
+    # Non-declared / non-dict / None → not a failure.
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
+        {"declared": False, "ran": True, "status": "ran", "in_diff": False}
+    )
+    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(None)
+
+
+def test_classify_verdict_ran_green_test_not_in_diff_blocks_passing_suite():
+    # A declared test that name-drops a PRE-EXISTING, unmodified test runs green
+    # but would merge proven=False — block it PRE-merge so it can be fixed.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+                "in_diff": False,
+            },
+        }
+    )
+    assert outcome == "fail"
+    assert "not among" in detail.lower()
+    assert "testing/test_seam.py::test_x" in detail
+    assert "proven=false" in detail.lower()
+    ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+
+def test_classify_verdict_ran_green_test_in_diff_keeps_pass():
+    # The co-modified case produces NO block signal.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+                "in_diff": True,
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_ran_test_indiff_absent_keeps_pass():
+    # An older agent (or diff-unavailable run) that omits in_diff keeps today's
+    # non-blocking pass — the signal never fires on absence.
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "selector": "testing/test_seam.py::test_x",
+                "present": True,
+                "ran": True,
+                "status": "ran",
+                "passed": True,
+            },
+        }
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
 def test_classify_verdict_could_not_run_acceptance_test_does_not_block():
     # A check that could not run (no targetable suite) must NOT hard-block; it
     # degrades to a fall-open instead.
