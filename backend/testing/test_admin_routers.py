@@ -20357,6 +20357,133 @@ class TestRequeueStuckTask:
         mock_delete_vm.assert_awaited_once_with("stuck-vm-abc123", reason="admin_requeue")
 
 
+class TestTriggerForcePromote:
+    """Router-level coverage for the PLAIN force-promote lever
+    (``POST /projects/{id}/promote/force``): the operator's ``reason`` +
+    ``candidate_sha`` must be threaded through to
+    ``force_promote_current_version`` (which persists ``forced_promote_reason``
+    on the audit trail), and no-op statuses must map to the right HTTP codes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reason_threaded_to_force_promote(self, db_session, mocker):
+        """The operator justification + explicit candidate_sha are plumbed into
+        force_promote_current_version alongside the acting user as ``actor``."""
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+
+        force = mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "promoted"}),
+        )
+
+        body = _ForcePromoteRequest(
+            candidate_sha="cafef00d" * 5,
+            reason="prod gate false-block — machinery-only fix",
+        )
+        result = await trigger_force_promote(
+            project.id,
+            body=body,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result == {"status": "promoted"}
+        force.assert_awaited_once()
+        kwargs = force.await_args.kwargs
+        assert kwargs["candidate_sha"] == "cafef00d" * 5
+        assert kwargs["reason"] == "prod gate false-block — machinery-only fix"
+        # The audit trail must attribute the force-promote to the acting operator.
+        assert kwargs["actor"] == TEST_USER_ID
+
+    @pytest.mark.asyncio
+    async def test_missing_body_threads_none_reason(self, db_session, mocker):
+        """With no request body the lever still fires, threading reason=None and
+        candidate_sha=None (default: current integration HEAD) — the reason key
+        is always present on the trail, never silently dropped."""
+        from app.routers.admin_operator_triggers import trigger_force_promote
+
+        project = await _make_project(db_session)
+
+        force = mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "promoted"}),
+        )
+
+        result = await trigger_force_promote(
+            project.id,
+            body=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result == {"status": "promoted"}
+        force.assert_awaited_once()
+        kwargs = force.await_args.kwargs
+        assert kwargs["reason"] is None
+        assert kwargs["candidate_sha"] is None
+        assert kwargs["actor"] == TEST_USER_ID
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_maps_to_404(self, db_session, mocker):
+        """A ``no_open_version`` result surfaces as HTTP 404, not a silent pass."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+        mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "no_open_version"}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_force_promote(
+                project.id,
+                body=_ForcePromoteRequest(reason="x"),
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_promotion_in_flight_maps_to_409(self, db_session, mocker):
+        """A ``promotion_in_flight`` guard result surfaces as HTTP 409 with the
+        blocking PR number embedded in the detail."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+        mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(
+                return_value={
+                    "status": "promotion_in_flight",
+                    "promotion_pr_number": 4242,
+                }
+            ),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_force_promote(
+                project.id,
+                body=_ForcePromoteRequest(reason="x"),
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 409
+        assert "4242" in exc_info.value.detail
+
+
 class TestTriggerRollup:
     @pytest.mark.asyncio
     async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
