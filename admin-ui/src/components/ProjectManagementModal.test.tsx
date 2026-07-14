@@ -61,6 +61,43 @@ describe('ProjectManagementModal', () => {
     expect(el.textContent).toContain('owner/repo');
   });
 
+  test('does not render the raw lifecycle status enum string', async () => {
+    // Project.status is a deprecated, meaningless-to-operators value (autonomous
+    // projects sit at DEPLOYING forever). It must not be surfaced as a subtitle.
+    const el = render(
+      <ProjectManagementModal
+        {...defaultProps}
+        projects={[makeProject({ status: 'DEPLOYING' })]}
+      />,
+    );
+    await act(async () => {});
+    expect(el.textContent).not.toContain('DEPLOYING');
+  });
+
+  test('shows a Paused chip for a paused project', async () => {
+    const el = render(
+      <ProjectManagementModal
+        {...defaultProps}
+        projects={[makeProject({ paused: true })]}
+      />,
+    );
+    await act(async () => {});
+    const row = el.querySelector('[data-testid="project-row-proj-1"]');
+    expect(row?.textContent).toContain('Paused');
+  });
+
+  test('shows no Paused chip for an un-paused project', async () => {
+    const el = render(
+      <ProjectManagementModal
+        {...defaultProps}
+        projects={[makeProject({ paused: false })]}
+      />,
+    );
+    await act(async () => {});
+    const row = el.querySelector('[data-testid="project-row-proj-1"]');
+    expect(row?.textContent).not.toContain('Paused');
+  });
+
   test('shows empty state when no active projects', async () => {
     const el = render(<ProjectManagementModal {...defaultProps} projects={[]} />);
     await act(async () => {});

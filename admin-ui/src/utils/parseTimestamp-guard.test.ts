@@ -19,22 +19,6 @@ function expectNamedImport(file: string, name: string, source: string) {
  * This test validates that fixed files use parseTimestamp correctly.
  */
 describe('parseTimestamp guard: prevent direct new Date(apiString)', () => {
-  it('projectStatus.ts imports parseTimestamp', () => {
-    const file = readFileSync(
-      path.join(__dirname, 'projectStatus.ts'),
-      'utf-8'
-    );
-    expect(file).toContain("import { parseTimestamp } from './time'");
-  });
-
-  it('projectStatus.ts uses parseTimestamp for created_at', () => {
-    const file = readFileSync(
-      path.join(__dirname, 'projectStatus.ts'),
-      'utf-8'
-    );
-    expect(file).toContain('parseTimestamp(createdAt)');
-  });
-
   it('TaskFixLoopPanel.tsx imports parseTimestamp', () => {
     const file = readFileSync(
       path.join(__dirname, '../components/TaskFixLoopPanel.tsx'),

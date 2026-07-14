@@ -731,7 +731,9 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
 async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     """
     Tests an agent updating task status and creating an artifact.
-    Also verifies that completing the last task completes the project.
+    Also verifies that completing the last task does NOT flip the project's
+    (deprecated) lifecycle status — the finite-project all-terminal aggregation
+    was removed, so project.status stays untouched by task completion.
     """
     # VM deletion on task completion now uses fire_and_forget_vm_delete (a
     # non-awaited background task) to avoid holding the DB FOR UPDATE lock
@@ -739,9 +741,10 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     # captures the synchronous call rather than racing a background asyncio task.
     mock_fire_forget = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
 
-    # Finite (non-autonomous) project: terminal-status aggregation only applies
-    # to finite projects — live autonomous projects are never flipped to a
-    # terminal status by task-completion aggregation (see task_lifecycle.py).
+    # Project.status is a deprecated legacy field; task completion no longer
+    # aggregates it to a terminal status (the all-terminal aggregation was
+    # removed). The project's status must stay at its default after the last
+    # task completes.
     project = Project(
         name="Agent Status Test",
         user_id="test-user-123",
@@ -776,7 +779,9 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     assert task.status == TaskStatus.COMPLETED
 
     await db_session.refresh(project)
-    assert project.status == ProjectStatus.COMPLETED
+    # Aggregation removed: completing the last task leaves project.status at its
+    # creation default (DRAFT) rather than flipping it to COMPLETED.
+    assert project.status == ProjectStatus.DRAFT
 
     mock_fire_forget.assert_called_once_with("agent-vm-888", reason="agent_completion")
 

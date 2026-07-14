@@ -478,6 +478,14 @@ class Project(SQLModel, table=True):
     # between allowlist seeding and project creation that the bootstrap
     # flow doesn't otherwise need. Loose-coupled by design.
     user_id: str = Field(index=True)
+    # DEPRECATED: legacy finite-project lifecycle status (DRAFT/DEPLOYING/
+    # COMPLETED/FAILED/CANCELLED). Autonomous, long-lived projects are created
+    # DEPLOYING and never move, so this value is not a meaningful operator
+    # signal — use ``paused``/``archived`` instead. The all-terminal aggregation
+    # that used to auto-flip this to COMPLETED/FAILED has been removed; only the
+    # explicit /cancel path still writes CANCELLED (and dispatch/spawn gating
+    # reads it). The column is retained (and still returned in API responses)
+    # for backward compatibility; do not surface it as project state in new UI.
     status: ProjectStatus = Field(
         default=ProjectStatus.DRAFT,
         sa_column=Column(String, default=ProjectStatus.DRAFT),
