@@ -16916,6 +16916,127 @@ def test_scan_image_layers_oci_format_clean_passes():
     assert findings == []
 
 
+# ---------------------------------------------------------------------------
+# scan_image_layers_for_credentials ALSO scans the image config .Env: a platform
+# secret baked into the runtime environment (base image, --build-arg, RUN export)
+# is invisible to both the layer-file pattern scan and the source-Dockerfile scan.
+# ---------------------------------------------------------------------------
+
+_CLEAN_LAYER_FILE = b"nothing secret here\n"
+
+
+def _classic_save_archive_with_env(env_entries: list) -> bytes:
+    """Classic docker-save archive whose manifest points at a config with .Env."""
+    layer_tar = _tar_bytes({"root/app": _CLEAN_LAYER_FILE})
+    config = json.dumps({"config": {"Env": env_entries}}).encode()
+    return _tar_bytes(
+        {
+            "0a1b2c/layer.tar": layer_tar,
+            "config.json": config,
+            "manifest.json": b'[{"Config":"config.json","Layers":["0a1b2c/layer.tar"]}]',
+        }
+    )
+
+
+def _oci_save_archive_with_env(env_entries: list) -> bytes:
+    """OCI-layout docker-save archive whose config blob carries .config.Env."""
+    layer_tar = _tar_bytes({"root/app": _CLEAN_LAYER_FILE})
+    layer_digest = "l" * 64
+    config_digest = "c" * 64
+    config = json.dumps({"config": {"Env": env_entries}}).encode()
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": "sha256:" + config_digest},
+            "layers": [{"digest": "sha256:" + layer_digest}],
+        }
+    ).encode()
+    manifest_digest = "m" * 64
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [{"digest": "sha256:" + manifest_digest}],
+        }
+    ).encode()
+    return _tar_bytes(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": index,
+            "blobs/sha256/" + manifest_digest: manifest,
+            "blobs/sha256/" + layer_digest: layer_tar,
+            "blobs/sha256/" + config_digest: config,
+        }
+    )
+
+
+def test_scan_config_env_pure_flags_secret_name_with_value():
+    """The pure config-Env scanner flags a secret-named var carrying a value."""
+    findings = _bci._scan_config_env_for_secrets(
+        "config:x", ["PATH=/usr/bin", "RUNNER_TOKEN=deadbeef-uuid-not-a-regex-match"]
+    )
+    assert any("RUNNER_TOKEN" in f for f in findings), findings
+    assert all("PATH" not in f for f in findings)
+
+
+def test_scan_config_env_pure_ignores_empty_and_benign():
+    """Empty secret values and benign names produce no findings."""
+    findings = _bci._scan_config_env_for_secrets(
+        "config:x", ["ANTHROPIC_API_KEY=", "LANG=C.UTF-8", "NODE_ENV=production"]
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_classic_config_env_secret_detected():
+    """A platform secret baked into the classic-layout image config .Env is caught.
+
+    The value (a bare UUID-ish orchestrator runner token) matches NO credential
+    regex and appears in no layer file — only the config Env name-scan catches it.
+    """
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/local/bin", "BLUEPRINT_RUNNER_TOKEN=11111111-2222-3333"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert any(
+        "BLUEPRINT_RUNNER_TOKEN" in f and "config Env" in f for f in findings
+    ), findings
+
+
+def test_scan_image_layers_classic_config_env_clean_passes():
+    """A classic image whose config Env holds only benign vars yields no findings."""
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/local/bin", "LANG=C.UTF-8", "PYTHONUNBUFFERED=1"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_oci_config_env_secret_detected():
+    """A platform secret baked into an OCI-layout image config .Env is caught."""
+    archive = _oci_save_archive_with_env(
+        ["PATH=/usr/bin", "BLUEPRINT_ORCHESTRATOR_URL=https://orch.internal"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert any(
+        "BLUEPRINT_ORCHESTRATOR_URL" in f and "config Env" in f for f in findings
+    ), findings
+
+
+def test_scan_image_layers_oci_config_env_clean_passes():
+    """A clean OCI-layout config Env yields no findings."""
+    archive = _oci_save_archive_with_env(["PATH=/usr/bin", "TERM=xterm"])
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert findings == []
+
+
 def test_scan_image_layers_no_recognizable_layers_fails_closed():
     """An archive with neither layer.tar members nor an OCI store must ERROR, not pass."""
     # Only a manifest.json — no layer.tar, no index.json/blobs.
@@ -18190,9 +18311,13 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
     image_name = "img"
     full_repo = f"{repo_base}/{image_name}"
     d_referenced = _digest("a")
+    # A genuinely orphaned digest: it has NO ProjectComputeImage row and no
+    # live/recent job — only a leftover ``inuse-`` tag in the registry. (A digest
+    # that DID have a ProjectComputeImage row would be a standing pin and stay
+    # protected regardless of age — see test_reaper_sweeps_compute_image.py.)
     d_unreferenced = _digest("d")
 
-    # Two baked images: one still referenced by a running job, one orphaned.
+    # One baked image, still referenced by a running job.
     db_session.add(
         ProjectComputeImage(
             project_id=project.id,
@@ -18205,21 +18330,9 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
             built=True,
         )
     )
-    db_session.add(
-        ProjectComputeImage(
-            project_id=project.id,
-            image_name=image_name,
-            registry_repo=repo_base,
-            dep_hash="dep-orphan",
-            tag="tag-orphan",
-            pinned_ref=f"{full_repo}@{d_unreferenced}",
-            digest=d_unreferenced,
-            built=True,
-        )
-    )
     await db_session.commit()
 
-    # A live job references only the first digest.
+    # A live job references the digest.
     await _make_compute_job(
         db_session,
         project,
@@ -18227,10 +18340,10 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
         container_image=f"{full_repo}@{d_referenced}",
     )
 
-    # Run the sweep from a point 60 days in the future: both image rows were
-    # just built, so pushing "now" past the 30-day freshness window ensures
-    # neither is auto-protected as a recent bake. Protection then comes purely
-    # from the live job's reference — isolating the referenced-digest behaviour.
+    # Run the sweep from a point 60 days in the future: the image row was just
+    # built, so pushing "now" past the 30-day freshness window shows protection
+    # holds via BOTH the standing pin and the live job's reference, while the
+    # orphaned registry tag (no row, no job) is correctly pruned.
     sweep_now = _utcnow() + timedelta(days=60)
 
     applied_tags = []

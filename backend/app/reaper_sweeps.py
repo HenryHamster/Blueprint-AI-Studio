@@ -1834,9 +1834,12 @@ async def sweep_protect_referenced_compute_image_digests(
     time-based retention can reclaim the image on a later pass.
 
     A digest is "referenced" when it is the ``container_image`` of a live compute
-    job, of a job completed within the protection window, OR the digest of a
-    ``ProjectComputeImage`` row (re)built within that window (protect the current
-    project default even before its first job lands).
+    job, of a job completed within the protection window, OR the digest of ANY
+    ``ProjectComputeImage`` row. A ``ProjectComputeImage`` row is a STANDING PIN
+    with no expiry — it maps a project's ``dep_hash`` to a digest and IS the
+    project's (current or historical) default image — so its digest is protected
+    regardless of when the row was last rebuilt, not only when it falls inside the
+    time window that governs job-provenance decay.
 
     Cadence-gated to hourly on an independent timer. Returns a summary dict
     (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
@@ -1870,15 +1873,16 @@ async def sweep_protect_referenced_compute_image_digests(
 
     # ORDER BY recency is load-bearing, not cosmetic. This query is capped at
     # ``max_images`` rows; WITHOUT an order the cap silently drops an arbitrary
-    # subset, and a recently-rebuilt digest beyond the (arbitrary) window would
-    # lose its ``inuse-`` protection tag — actively pruned below and then GC-able
-    # out from under the project default that still points at it. Ordering by
-    # ``updated_at`` DESC guarantees the cap keeps the MOST RECENT rows (exactly
-    # the ones inside the protection window that need protecting); older rows that
-    # fall off are, by definition, outside the window and not protection-eligible.
-    # Digests referenced by a LIVE/recent job are protected independently via
-    # ``_referenced_compute_image_repo_digests`` below, so the cap can only ever
-    # drop rows that need no protection.
+    # subset, and any dropped digest loses its ``inuse-`` protection tag — actively
+    # pruned below and then GC-able out from under the project default that still
+    # points at it. EVERY ``ProjectComputeImage.digest`` is now protection-eligible
+    # (a standing pin, not just rows inside the window), so the cap genuinely
+    # governs which pins get protected on a given pass. Ordering by ``updated_at``
+    # DESC keeps the MOST RECENTLY updated rows under the cap; if the cap drops
+    # rows the truncation warning below fires so an operator can raise
+    # ``max_images`` before a still-pinned digest is reclaimed. Digests referenced
+    # by a LIVE/recent job are protected independently via
+    # ``_referenced_compute_image_repo_digests`` below.
     image_where = ProjectComputeImage.digest.is_not(None)
     total_images = (
         await session.scalar(
@@ -1915,11 +1919,16 @@ async def sweep_protect_referenced_compute_image_digests(
             len(images),
         )
 
-    # A freshly-(re)built image is protected even before its first job lands, so
-    # the current project default is never GC'd between bake and first use.
+    # Every ProjectComputeImage.digest is a STANDING PIN with no expiry: the row
+    # maps a project's dep_hash -> digest and is the project's (current or
+    # historical) default image, so the digest must stay pullable no matter when
+    # the row was last rebuilt. Protecting only rows rebuilt inside the window
+    # (the old behavior) stranded a stable, un-rebaked project default with no
+    # ``inuse-`` tag and let ``delete-old-tagged`` reclaim it — the follow-up
+    # explicitly flagged in infra/terraform/registry.tf. Protect them all; this
+    # also covers the freshly-(re)built default before its first job lands.
     for img in images:
-        updated = getattr(img, "updated_at", None)
-        if img.digest and updated is not None and updated >= cutoff:
+        if img.digest:
             referenced.add(img.digest)
 
     protected_tags = {protection_tag_for_digest(d) for d in referenced}

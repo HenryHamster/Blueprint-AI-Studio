@@ -374,16 +374,184 @@ def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, str]]:
     return layers
 
 
+def _read_control_member(outer: tarfile.TarFile, members: Dict[str, tarfile.TarInfo], name: str) -> bytes | None:
+    """Read a small control document (manifest / config JSON) out of *outer*.
+
+    Guarded by the same ``_MAX_CONTROL_DOC_BYTES`` cap as the layer resolver so a
+    hostile archive cannot pass off a multi-GB blob as a config document and
+    reintroduce an unbounded read.
+    """
+    m = members.get(name)
+    if m is None or not m.isfile() or m.size > _MAX_CONTROL_DOC_BYTES:
+        return None
+    fh = outer.extractfile(m)
+    if fh is None:
+        return None
+    return fh.read(_MAX_CONTROL_DOC_BYTES)
+
+
+def _config_env_entries(raw: bytes) -> List[str]:
+    """Extract the ``.config.Env`` (``KEY=VALUE`` strings) from an image config doc.
+
+    Handles both the Docker image config schema and the OCI image config schema —
+    both nest the runtime env under a lowercase ``"config"`` object with an
+    ``"Env"`` list. Returns [] for anything that does not parse or has no Env.
+    """
+    try:
+        doc = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(doc, dict):
+        return []
+    cfg = doc.get("config")
+    if not isinstance(cfg, dict):
+        return []
+    env = cfg.get("Env")
+    if not isinstance(env, list):
+        return []
+    return [e for e in env if isinstance(e, str)]
+
+
+def _resolve_image_config_envs(outer: tarfile.TarFile) -> List[Tuple[str, List[str]]]:
+    """Resolve ``(label, env_entries)`` for every image CONFIG in a docker-save archive.
+
+    The layer scan reads layer FILE bytes for credential patterns, but a platform
+    secret can also be baked into the image's runtime environment — ``ENV
+    RUNNER_TOKEN=…`` inherited from a base image, injected via ``--build-arg`` +
+    ``ENV FOO=$ARG``, or exported by a ``RUN`` step. None of those appear in the
+    project's source Dockerfile (so :func:`_scan_dockerfile_directives` misses
+    them) yet all land in the built image's ``.config.Env``. This resolves that
+    config document so the pre-push gate can scan it.
+
+    Both docker-save layouts are handled:
+      * **Classic** — ``manifest.json`` is ``[{"Config": "<name>", …}]``; the
+        named member is the image config JSON.
+      * **OCI** — ``index.json`` → image-manifest blob → ``manifest["config"]
+        ["digest"]`` → config blob under ``blobs/<algo>/<hex>`` (multi-arch index
+        references are walked recursively).
+
+    Config documents are kilobytes and read under ``_MAX_CONTROL_DOC_BYTES``.
+    Returns [] when no config is found — config scanning is ADDITIVE; the layer
+    resolver is what fails closed on an unscannable archive.
+    """
+    members = {m.name: m for m in outer.getmembers()}
+    configs: List[Tuple[str, List[str]]] = []
+
+    # ── Classic docker-save layout: manifest.json -> Config member ────────────
+    manifest_raw = _read_control_member(outer, members, "manifest.json")
+    if manifest_raw is not None:
+        try:
+            manifest = json.loads(manifest_raw)
+        except (ValueError, UnicodeDecodeError):
+            manifest = None
+        if isinstance(manifest, list):
+            for entry in manifest:
+                if not isinstance(entry, dict):
+                    continue
+                cfg_name = entry.get("Config")
+                if not isinstance(cfg_name, str):
+                    continue
+                raw = _read_control_member(outer, members, cfg_name)
+                if raw is not None:
+                    env = _config_env_entries(raw)
+                    if env:
+                        configs.append((f"config:{cfg_name}", env))
+
+    # ── OCI image layout: index.json -> manifest blob -> config blob ──────────
+    index_bytes = _read_control_member(outer, members, "index.json")
+    if index_bytes is not None:
+        def _blob_path(digest: object) -> Optional[str]:
+            if not isinstance(digest, str) or ":" not in digest:
+                return None
+            algo, _, hexd = digest.partition(":")
+            if not algo or not hexd:
+                return None
+            return f"blobs/{algo}/{hexd}"
+
+        seen: Set[str] = set()
+
+        def _walk(digest: str) -> None:
+            if digest in seen:
+                return
+            seen.add(digest)
+            path = _blob_path(digest)
+            if path is None:
+                return
+            raw = _read_control_member(outer, members, path)
+            if raw is None:
+                return
+            try:
+                doc = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(doc, dict):
+                return
+            for sub in doc.get("manifests", []) or []:
+                if isinstance(sub, dict) and isinstance(sub.get("digest"), str):
+                    _walk(sub["digest"])
+            cfg = doc.get("config")
+            if isinstance(cfg, dict):
+                cpath = _blob_path(cfg.get("digest"))
+                if cpath is not None:
+                    craw = _read_control_member(outer, members, cpath)
+                    if craw is not None:
+                        env = _config_env_entries(craw)
+                        if env:
+                            configs.append((f"config-blob:{cpath}", env))
+
+        try:
+            index_doc = json.loads(index_bytes)
+        except (ValueError, UnicodeDecodeError):
+            index_doc = None
+        if isinstance(index_doc, dict):
+            for man in index_doc.get("manifests", []) or []:
+                if isinstance(man, dict) and isinstance(man.get("digest"), str):
+                    _walk(man["digest"])
+
+    return configs
+
+
+def _scan_config_env_for_secrets(label: str, env_entries: Sequence[str]) -> List[str]:
+    """Findings for platform-secret env-var NAMES baked into an image config's Env.
+
+    ``env_entries`` are the build-time-resolved ``KEY=VALUE`` literals from an
+    image config's ``.config.Env``. A key in :data:`_SECRET_ENV_NAMES` carrying a
+    non-empty value is a baked platform credential regardless of how it got there
+    — the whole point of scanning the built image rather than only the source
+    Dockerfile. Reuses the SAME secret-name set as the Dockerfile-directive scan,
+    which the drift-guard test keeps in sync with runner_isolation.
+    """
+    findings: List[str] = []
+    for entry in env_entries:
+        if not isinstance(entry, str) or "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        if key in _SECRET_ENV_NAMES and value.strip():
+            findings.append(
+                f"{label}: image config Env bakes platform secret {key}"
+            )
+    return findings
+
+
 def scan_image_layers_for_credentials(
     image_ref: str, *, _run=subprocess.run
 ) -> List[str]:
-    """Scan a locally-built image's layers for platform credentials.
+    """Scan a locally-built image's layers AND config env for platform credentials.
 
     Exports the image via ``docker save``, then walks every file in every
     layer tarball and applies the same credential patterns used for build
     inputs.  This catches secrets baked in at build-time (e.g. via
     ``RUN curl http://secrets-server/token > /root/.creds`` or a pip package
     that installs a credential helper) that are invisible in the source inputs.
+
+    It ALSO scans the built image's ``.config.Env`` (see
+    :func:`_resolve_image_config_envs` / :func:`_scan_config_env_for_secrets`)
+    for platform-secret env-var NAMES — a ``RUNNER_TOKEN`` / orchestrator URL
+    baked into the runtime environment via a base image, ``--build-arg``, or a
+    ``RUN`` export does not appear as a credential PATTERN in a layer file nor in
+    the project's source Dockerfile, but is just as much a leaked platform
+    credential in a layer that lands in a shared, readable registry.
 
     **Streaming, never buffered.** ``docker save`` writes STRAIGHT TO A TEMP FILE
     (``-o``) instead of a pipe the parent drains into memory, and layers are read
@@ -489,6 +657,15 @@ def scan_image_layers_for_credentials(
                         pass
                     finally:
                         layer_stream.close()
+
+                # Also scan the built image's CONFIG env: a platform secret can
+                # be baked into ``.config.Env`` (base image, --build-arg, or a
+                # RUN export) without ever appearing as a credential-pattern in a
+                # layer file or in the source Dockerfile.
+                for cfg_label, env_entries in _resolve_image_config_envs(outer):
+                    findings.extend(
+                        _scan_config_env_for_secrets(cfg_label, env_entries)
+                    )
         except tarfile.TarError as exc:
             raise RuntimeError(f"failed to parse docker save output: {exc}") from exc
 

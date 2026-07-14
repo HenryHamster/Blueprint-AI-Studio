@@ -467,10 +467,20 @@ async def test_recently_built_image_is_protected_before_any_job(db):
 
 
 @pytest.mark.asyncio
-async def test_old_image_with_no_live_jobs_is_not_protected(db):
-    """An old ProjectComputeImage with no live jobs referencing it is not protected."""
+async def test_old_image_row_is_protected_as_standing_pin(db):
+    """An old ProjectComputeImage row is a STANDING PIN — protected regardless of age.
+
+    A ProjectComputeImage row maps dep_hash -> digest and IS the project's default
+    image; the pin has no expiry. Even far outside the 30-day job-provenance window
+    (and with no live job referencing it) the digest must keep its ``inuse-`` tag,
+    or ``delete-old-tagged`` reclaims an image the DB still pins — the follow-up
+    called out in infra/terraform/registry.tf. (Previously such a row lost
+    protection once it aged past the window; that regression is what this asserts
+    against.)
+    """
     project = await _make_project(db)
-    # updated_at far outside the 30-day protection window
+    # updated_at far outside the 30-day protection window — a stable, un-rebaked
+    # project default that nobody has touched in two months.
     old_date = _NOW - timedelta(days=60)
     await _add_image(db, project.id, _DIGEST_A, updated_at=old_date)
 
@@ -492,8 +502,48 @@ async def test_old_image_with_no_live_jobs_is_not_protected(db):
             _delete_tag=lambda repo, tag: False,
         )
 
-    assert _DIGEST_A not in protected_digests
-    assert result["applied"] == 0
+    assert _DIGEST_A in protected_digests, (
+        f"Standing-pin digest {_DIGEST_A!r} was not protected; "
+        f"apply_tag was called with: {protected_digests}"
+    )
+    assert result["applied"] == 1
+
+
+@pytest.mark.asyncio
+async def test_old_standing_pin_tag_is_not_pruned(db):
+    """An old standing-pin's existing ``inuse-`` tag must NOT be pruned.
+
+    Regression: the pruner deletes any ``inuse-`` tag whose digest is not in the
+    protected set. Before every ProjectComputeImage.digest became protection-
+    eligible, an aged row's own live protection tag was pruned — actively
+    UNprotecting a digest the DB still pins. It must now survive.
+    """
+    from app.compute_image_build import protection_tag_for_digest
+
+    project = await _make_project(db)
+    old_date = _NOW - timedelta(days=90)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=old_date)
+
+    current_tag = protection_tag_for_digest(_DIGEST_A)
+    deleted: list[str] = []
+
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+        _PAST_NOW,
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: "inuse-tag",
+            _list_tags=lambda repo: [current_tag],
+            _delete_tag=lambda repo, tag: deleted.append(tag) or True,
+        )
+
+    assert current_tag not in deleted, (
+        f"standing-pin tag {current_tag!r} for an aged ProjectComputeImage was "
+        f"pruned (deleted={deleted}) — the digest is still DB-pinned"
+    )
+    assert result["pruned"] == 0
 
 
 # ── No-image baseline ─────────────────────────────────────────────────────────
@@ -763,6 +813,8 @@ async def test_recent_digests_protected_when_image_rows_exceed_cap(db):
         "dropped them instead of ORDER BY updated_at DESC keeping the recent set — "
         "a GC trap that would let a live project default be reclaimed"
     )
-    # Only the 5 recent digests are protection-eligible (the 505 old rows are
-    # outside the window and referenced by no job).
-    assert result["applied"] == len(recent_digests)
+    # Every ProjectComputeImage row is a standing pin, so all rows that fit under
+    # the max_images=500 cap are protected; ORDER BY updated_at DESC guarantees the
+    # 5 recent digests are among the protected 500 (the specific GC trap this test
+    # guards). Applied therefore equals the cap, not just the recent count.
+    assert result["applied"] == 500

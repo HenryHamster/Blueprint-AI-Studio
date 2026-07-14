@@ -117,15 +117,16 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
     action = "DELETE"
     condition {
       tag_state = "TAGGED"
-      # 180 days. KEEP keep-recent-tagged + keep-inuse-tagged run first, but the
-      # guard only marks a `ProjectComputeImage` digest in-use when the row was
-      # rebuilt inside its 30-day window — a stable project image that nobody has
-      # rebaked (and whose jobs are older than the window) is pinned by the DB yet
-      # carries no `inuse-` tag. Doubling the window does not close that gap; it
-      # bounds the exposure while the follow-up lands (see PR: the guard should
-      # protect EVERY ProjectComputeImage.digest — a row is a standing pin with no
-      # expiry — not only rows touched in the last 30 days).
-      older_than = "15552000s" # 180 days
+      # 90 days. KEEP keep-recent-tagged + keep-inuse-tagged run first. The guard
+      # (sweep_protect_referenced_compute_image_digests) now stamps an `inuse-`
+      # tag on EVERY `ProjectComputeImage.digest` — a row is a standing pin with
+      # no expiry — not only rows rebuilt inside the last 30 days, so a stable
+      # project image that nobody has rebaked is protected regardless of age. The
+      # window was previously doubled to 180 days ONLY to bound the exposure while
+      # that follow-up landed; with the gap closed it returns to the 90-day
+      # sibling default. (Job-provenance-only digests — no ProjectComputeImage row
+      # — remain protected for the 30-day completed-job window, then age out here.)
+      older_than = "7776000s" # 90 days
     }
   }
 }
