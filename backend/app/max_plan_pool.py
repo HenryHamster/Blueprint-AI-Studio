@@ -695,6 +695,29 @@ def _settings_bag_model(settings: Mapping[str, Any] | None) -> str | None:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
+def _settings_for_selected_model(
+    task: Any,
+    runtime_config: Mapping[str, Any],
+    provider_name: str,
+    model: str | None,
+) -> dict[str, Any]:
+    """Return provider settings with the selector's model made authoritative.
+
+    Effort-matrix bags normally include a model. A concrete model preference or
+    explicit payload pin is resolved later and can choose a different model; if
+    the old bag model survives into LLM_CLI_TRANSLATION, the agent trusts its
+    -m argument and silently runs the bag model instead of LLM_MODEL. Preserve
+    every other validated knob, but stamp the model actually selected.
+    """
+    settings = resolve_task_provider_settings(task, runtime_config, provider_name)
+    bag_model = _settings_bag_model(settings)
+    if not model or not bag_model:
+        return settings
+    if bag_model == model:
+        return settings
+    return {**settings, "model": model}
+
+
 def _account_runtime_ready(acct: dict) -> bool:
     provider = (
         _normalize_provider_name(acct.get("provider"))
@@ -3426,8 +3449,8 @@ async def select_llm_runtime_for_task(
                         provider_name, model_name, runtime_config
                     ),
                     account=account,
-                    settings=resolve_task_provider_settings(
-                        task, runtime_config, provider_name
+                    settings=_settings_for_selected_model(
+                        task, runtime_config, provider_name, model_name
                     ),
                 )
 
@@ -3513,8 +3536,8 @@ async def select_llm_runtime_for_task(
                     model=chosen_model,
                     quality_tier=quality_tier,
                     account=account,
-                    settings=resolve_task_provider_settings(
-                        task, runtime_config, provider_name
+                    settings=_settings_for_selected_model(
+                        task, runtime_config, provider_name, chosen_model
                     ),
                 )
             # Fall through to per-provider iteration so the unaccounted-for
@@ -3570,8 +3593,8 @@ async def select_llm_runtime_for_task(
                 model=model,
                 quality_tier=quality_tier,
                 account=account,
-                settings=resolve_task_provider_settings(
-                    task, runtime_config, provider_name
+                settings=_settings_for_selected_model(
+                    task, runtime_config, provider_name, model
                 ),
             )
 
@@ -3620,8 +3643,8 @@ async def select_llm_runtime_for_task(
                     model=fallback,
                     quality_tier=quality_tier,
                     account=account,
-                    settings=resolve_task_provider_settings(
-                        task, runtime_config, provider_name
+                    settings=_settings_for_selected_model(
+                        task, runtime_config, provider_name, fallback
                     ),
                 )
 
@@ -3641,8 +3664,8 @@ async def select_llm_runtime_for_task(
             model=explicit_model,
             quality_tier=quality_tier,
             account=None,
-            settings=resolve_task_provider_settings(
-                task, runtime_config, explicit_provider
+            settings=_settings_for_selected_model(
+                task, runtime_config, explicit_provider, explicit_model
             ),
         )
 
@@ -3657,6 +3680,9 @@ async def select_llm_runtime_for_task(
             explicit_model
             or _settings_bag_model(fallback_settings)
             or provider.tier_to_model(quality_tier, runtime_config)
+        )
+        fallback_settings = _settings_for_selected_model(
+            task, runtime_config, fallback_provider, fallback_model
         )
         fallback_auth_mode = (
             LLMAuthMode.API_KEY.value

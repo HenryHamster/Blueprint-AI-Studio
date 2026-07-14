@@ -294,7 +294,8 @@ class OpenAIProvider(LLMProvider):
                     "enum": ["flex", "fast"],
                     "description": (
                         "`flex` = cheaper, higher-latency billing (model-gated: "
-                        "gpt-5.5, gpt-5.4, gpt-5.4-mini). `fast` = ChatGPT-OAuth-only "
+                        "gpt-5.6 picker family plus gpt-5.5, gpt-5.4, and "
+                        "gpt-5.4-mini). `fast` = ChatGPT-OAuth-only "
                         "priority routing that consumes Fast-mode credits. "
                         "Incompatible combinations are dropped with an "
                         "unsupported marker rather than letting the request 400."
@@ -368,13 +369,13 @@ class OpenAIProvider(LLMProvider):
                 )
             elif service_tier == "flex" and not _model_supports_flex(model):
                 # Model-level gate for API-key flows: flex is pricing-tier-
-                # gated to specific models (gpt-5.5, gpt-5.4, gpt-5.4-mini).
+                # gated to the explicit _FLEX_SUPPORTED_MODELS inventory.
                 # Admin-level defaults can stamp flex across the matrix; drop
                 # instead of erroring when a tier downgrade lands on a
                 # non-flex model.
                 unsupported.append(
                     f"service_tier=flex requires a flex-capable model "
-                    f"(gpt-5.5, gpt-5.4, gpt-5.4-mini); effective model "
+                    f"({', '.join(sorted(_FLEX_SUPPORTED_MODELS))}); effective model "
                     f"{model!r} — dropped"
                 )
             elif service_tier == "fast" and not is_oauth:

@@ -21,6 +21,14 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert "provider_settings_defaults" in body
     assert "task_type_provider_overrides" in body
     assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-4-8"
+    assert body["provider_tier_model_map"]["openai"] == {
+        "opus": "gpt-5.6-sol",
+        "sonnet": "gpt-5.6-terra",
+        "haiku": "gpt-5.6-luna",
+    }
+    assert body["task_type_model_preferences"]["smoketest"] == [
+        {"provider": "openai", "model": "gpt-5.6-sol"}
+    ]
     # Categories ship with sensible defaults; user can move task types between them.
     assert "build" in body["task_type_categories"]
     assert "create" in body["task_type_categories"]["build"]
@@ -182,6 +190,98 @@ def test_migrate_legacy_provider_config_is_stable_across_repeated_syncs():
         ), f"category_routing.{category} was rewritten by backfill"
         assert migrated["category_routing"][category]["effort"] == route["effort"]
     assert migrated["provider_selection_mode"] == "exclusive"
+
+
+def test_migrate_live_openai_constraint_to_gpt_5_6_smoke():
+    """The known live 5.5/5.4-mini shape was a staged-rollout constraint.
+
+    Once the backend schema accepts the 5.6 ids, config sync advances that exact
+    shape, its stock effort bags, and the missing smoketest preference together.
+    Custom settings survive and the migration is idempotent.
+    """
+    import copy
+
+    from app.max_plan_pool import infer_provider_for_model
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    config = {
+        "category_routing": {
+            "_default": {"providers": ["openai"], "effort": "medium"}
+        },
+        "provider_tier_model_map": {
+            "openai": {
+                "opus": "gpt-5.5",
+                "sonnet": "gpt-5.5",
+                "haiku": "gpt-5.4-mini",
+            }
+        },
+        "provider_settings_by_effort": {
+            "openai": {
+                "low": {
+                    "model": "gpt-5.4-mini",
+                    "reasoning_effort": "low",
+                    "verbosity": "low",
+                },
+                "medium": {
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "medium",
+                    "verbosity": "high",
+                },
+                "high": {"model": "gpt-5.5", "reasoning_effort": "high"},
+                # A custom model is operator-owned even when the tier map is the
+                # known rollout shape.
+                "max": {"model": "gpt-custom-internal", "reasoning_effort": "xhigh"},
+            }
+        },
+        "task_type_model_preferences": {
+            "create": [{"provider": "anthropic", "model": "claude-opus-4-8"}]
+        },
+    }
+
+    migrated = _migrate_legacy_provider_config(copy.deepcopy(config))
+
+    assert migrated["provider_tier_model_map"]["openai"] == {
+        "opus": "gpt-5.6-sol",
+        "sonnet": "gpt-5.6-terra",
+        "haiku": "gpt-5.6-luna",
+    }
+    openai_bags = migrated["provider_settings_by_effort"]["openai"]
+    assert openai_bags["low"]["model"] == "gpt-5.6-luna"
+    assert openai_bags["medium"]["model"] == "gpt-5.6-terra"
+    assert openai_bags["medium"]["verbosity"] == "high"
+    assert openai_bags["high"]["model"] == "gpt-5.6-sol"
+    assert openai_bags["max"]["model"] == "gpt-custom-internal"
+    assert migrated["task_type_model_preferences"]["smoketest"] == [
+        {"provider": "openai", "model": "gpt-5.6-sol"}
+    ]
+    assert infer_provider_for_model("gpt-5.6-sol", migrated) == "openai"
+    assert _migrate_legacy_provider_config(copy.deepcopy(migrated)) == migrated
+
+
+def test_migrate_preserves_custom_openai_map_and_explicit_smoke_disable():
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    config = {
+        "category_routing": {
+            "_default": {"providers": ["anthropic"], "effort": "medium"}
+        },
+        "provider_tier_model_map": {
+            "openai": {
+                "opus": "gpt-custom-frontier",
+                "sonnet": "gpt-5.5",
+                "haiku": "gpt-5.4-mini",
+            }
+        },
+        "provider_settings_by_effort": {},
+        "task_type_model_preferences": {"smoketest": []},
+    }
+
+    migrated = _migrate_legacy_provider_config(config)
+
+    assert migrated["provider_tier_model_map"]["openai"]["opus"] == (
+        "gpt-custom-frontier"
+    )
+    assert migrated["task_type_model_preferences"]["smoketest"] == []
 
 
 async def test_patch_settings_accepts_routing_and_matrix(client):
