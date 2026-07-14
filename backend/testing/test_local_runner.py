@@ -8010,6 +8010,91 @@ class TestInputArtifactDownloadEndpoint:
         assert resp.json()["input_artifact_job_id"] == predecessor_id
 
 
+@pytest.mark.asyncio
+async def test_compute_claim_mints_token_for_claimed_job_project(db_session):
+    """The GitHub installation token minted at claim time must be scoped to the
+    CLAIMED JOB's owning project, not the runner's enrollment project.
+
+    Today the claim filter forces ``job.project_id == runner.project_id`` so the
+    two are always equal and the distinction is a no-op. But the in-flight
+    multi-project allow-list replaces that filter with allow-list membership — at
+    which point a runner enrolled under project A can legitimately claim a job for
+    project B. The repo token clones project B's repo, so it MUST be minted from
+    project B's GitHub installation, never project A's. We stub the claim SELECT
+    (the "claim filter") to yield the cross-project job while exercising the REAL
+    token-minting block that follows.
+    """
+    from fastapi import Response
+
+    from app.routers.runner import next_compute_job
+
+    project_a = await _make_project(db_session, name="Runner Enrollment Project A")
+    project_b = await _make_project(db_session, name="Job Owner Project B")
+    runner, _token = await _make_runner(db_session, project_a.id)
+
+    job = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "command": "python train.py",
+            # repo_clone must be present for the token-minting block to run.
+            "repo_clone": {"url": "https://github.com/acme/repo.git", "ref": "main"},
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Stub the claim query so it returns project B's job to a runner enrolled
+    # under project A — simulating the allow-list having relaxed the project
+    # filter. Everything downstream (token minting) runs for real.
+    class _ClaimResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            # allowed_project_ids() -> bound_project_ids() runs first and calls
+            # .scalars().all(); an empty allow-list is fine here because the
+            # claim SELECT is stubbed to yield the cross-project job directly.
+            return []
+
+        def first(self):
+            return job
+
+    fake_session = MagicMock()
+    fake_session.execute = AsyncMock(return_value=_ClaimResult())
+    fake_session.add = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.refresh = AsyncMock()
+
+    async def _get(_model, pk):
+        if pk == project_b.id:
+            return project_b
+        if pk == project_a.id:
+            return project_a
+        return None
+
+    fake_session.get = AsyncMock(side_effect=_get)
+
+    token_mock = AsyncMock(return_value="ghs_scoped_to_job_project")
+    with patch("app.branch_cleanup._get_project_github_token", token_mock):
+        resp = await next_compute_job(Response(), runner=runner, session=fake_session)
+
+    # The token minted and returned to the runner comes from project B.
+    assert resp["repo_token"] == "ghs_scoped_to_job_project"
+    assert token_mock.await_count == 1
+    minted_for = token_mock.await_args.args[0]
+    assert minted_for.id == project_b.id, (
+        "repo token must be minted for the CLAIMED JOB's project (B), not the "
+        "runner's enrollment project (A)"
+    )
+    assert minted_for.id != project_a.id
+    # And the Project row was fetched by the job's project id, not the runner's.
+    fake_session.get.assert_awaited_once_with(Project, project_b.id)
+
+
 class TestReportInterimProgressAndLiveOutput:
     """Interim-report protocol: live_output tail + self-reported progress records.
 
