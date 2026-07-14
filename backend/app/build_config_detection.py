@@ -26,6 +26,9 @@ _redetect_empty_cooldown: Dict[str, float] = {}
 # Cooldown for the bidirectional emptiness-disagreement re-detect path
 # (maybe_redetect_on_emptiness_disagreement).
 _redetect_disagreement_cooldown: Dict[str, float] = {}
+# Cooldown for the stale-``repo_is_empty=False`` self-heal (the inverse walk of
+# ``maybe_refresh_empty_build_config``): keyed by str(project.id).
+_redetect_stale_empty_cooldown: Dict[str, float] = {}
 # 6-hour window: a no-test repo walks the tree at most once per window.
 _REDETECT_COOLDOWN_S: float = 6 * 3600.0
 
@@ -306,6 +309,132 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         logger.warning(
             "[BUILD_CONFIG] Auto-refresh of empty build_config failed for "
             "project %s; leaving config unchanged",
+            getattr(project, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 — keep the caller's session usable
+            pass
+        return False
+
+
+async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -> bool:
+    """Self-heal a durable ``build_config.repo_is_empty=False`` that is stale on a
+    genuinely empty/near-empty repo.
+
+    This is the INVERSE of :func:`maybe_refresh_empty_build_config`. When a
+    project's stored ``repo_is_empty`` is False but the repo is actually empty/
+    near-empty, the agent's clone-time ``verifyCloneDelivered`` guard throws
+    ``clone_failed`` on every task (durable-says-non-empty vs. live-tree-empty
+    disagreement) and the project can NEVER self-correct — every task dies
+    ``clone_failed`` forever (the live external-project wedge). This helper
+    re-verifies the durable signal against GitHub on the disagreement path and
+    flips it to True ONLY when fresh detection authoritatively confirms the repo
+    is empty.
+
+    Fail-loud is preserved: the flip is gated on an AUTHORITATIVE empty verdict
+    (``detected['repo_is_empty'] is True`` AND ``detected['source_file_count'] is
+    not None`` — a complete, successful listing). A transient GitHub failure
+    (detector returns ``{}``), an indeterminate/partial read (``source_file_count
+    is None``), or a repo that genuinely HAS content the clone failed to deliver
+    (``repo_is_empty`` stays False) all leave the stored signal untouched, so a
+    real clone shortfall keeps failing loud instead of being masked as greenfield.
+
+    Fires ONLY while stored ``repo_is_empty`` is exactly False; a config that is
+    already True, absent, or non-boolean is left untouched. Bounded by the same
+    per-project ``_REDETECT_COOLDOWN_S`` window used by the sibling re-detect
+    helpers so the BFS tree walk never fires on every disagreement report.
+
+    Returns True iff the signal was corrected and persisted, else False.
+    Best-effort: never raises into the caller; logs, rolls back the session on
+    failure, and returns False.
+    """
+    try:
+        existing = project.build_config or {}
+        # Only fire when the durable signal is EXACTLY False. True/absent/non-bool
+        # need no correction, and firing on them would either be a no-op walk or
+        # risk flipping a legitimately-non-empty repo.
+        if existing.get("repo_is_empty") is not False:
+            return False
+        if not getattr(project, "github_owner", None) or not getattr(
+            project, "github_repo", None
+        ):
+            return False
+
+        # Cooldown: one bounded re-detection per project per window, so a project
+        # that dies clone_failed repeatedly does not walk the tree every report.
+        _proj_id_key = str(getattr(project, "id", None) or "")
+        _now_mono = time.monotonic()
+        _last_attempt = _redetect_stale_empty_cooldown.get(_proj_id_key)
+        if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
+            return False
+        # Stamp before any API call so concurrent callers in the same window skip
+        # rather than duplicate the expensive walk.
+        if _proj_id_key:
+            _redetect_stale_empty_cooldown[_proj_id_key] = _now_mono
+
+        from pydantic import ValidationError
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.github import get_repo_installation_token
+        from app.routers.admin_onboard import _detect_build_config
+        from app.schemas import BuildConfig as BuildConfigSchema
+        from app.shared_state import get_project_integration_branch
+
+        integration_branch = ref or get_project_integration_branch(project)
+
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
+        if not token:
+            return False
+
+        detected = await _detect_build_config(
+            token,
+            project.github_owner,
+            project.github_repo,
+            ref=integration_branch,
+        )
+        if not detected:
+            # Transient GitHub failure (detector returned {}). Leave the durable
+            # signal untouched — fail-loud is preserved for the clone shortfall.
+            return False
+
+        # AUTHORITATIVE empty verdict required to flip. A repo that genuinely has
+        # content (repo_is_empty False) or an indeterminate/partial read
+        # (source_file_count None) must NOT correct the signal, so a real clone
+        # shortfall keeps failing loud.
+        if not (
+            detected.get("repo_is_empty") is True
+            and detected.get("source_file_count") is not None
+        ):
+            return False
+
+        detected = apply_operator_build_config_overrides(detected, existing)
+
+        try:
+            validated = BuildConfigSchema(**detected)
+            project.build_config = validated.model_dump(exclude_none=True)
+        except ValidationError:
+            # Detection produced a shape the schema rejects — store raw so the
+            # operator can fix it in the UI (mirrors the manual re-detect path).
+            project.build_config = detected
+        flag_modified(project, "build_config")
+        await session.commit()
+        logger.info(
+            "[BUILD_CONFIG] Self-healed stale repo_is_empty=False for project %s "
+            "(integration branch %s) — fresh detection authoritatively confirms "
+            "the repo is empty (source_file_count=%s); next task proceeds greenfield",
+            getattr(project, "id", None),
+            integration_branch,
+            detected.get("source_file_count"),
+        )
+        return True
+    except Exception:  # noqa: BLE001 — best-effort, must never break the report path
+        logger.warning(
+            "[BUILD_CONFIG] Self-heal of stale repo_is_empty failed for project "
+            "%s; leaving config unchanged",
             getattr(project, "id", None),
             exc_info=True,
         )

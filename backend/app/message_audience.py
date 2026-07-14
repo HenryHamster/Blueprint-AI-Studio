@@ -95,6 +95,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "capacity.all_accounts_blocked": OPERATOR_ACTION_NEEDED,
     "runner.deactivated": OPERATOR_ACTION_NEEDED,
     "runner.degraded": OPERATOR_FYI,
+    # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
+    # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet
+    # health summary BEFORE the VM is killed, not only via teardown forensics.
+    "vm.low_disk": OPERATOR_FYI,
+    "vm.low_memory": OPERATOR_FYI,
     "deployment.halted": OPERATOR_ACTION_NEEDED,
     "deployment.rollback_recommended": OPERATOR_ACTION_NEEDED,
     "deployment.rollback_detected": OPERATOR_ACTION_NEEDED,

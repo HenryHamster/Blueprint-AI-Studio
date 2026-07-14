@@ -2021,3 +2021,289 @@ async def test_cross_project_access_alert_resolves(db_session, mocker):
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None
     broadcast.assert_awaited_once()
+
+
+# ── GCE task-VM low-disk / low-memory alerts (warm-pool VM monitoring parity) ──
+
+from app.alert_dispatch import (  # noqa: E402
+    _VM_LOW_DISK_EVENT_TYPE,
+    _VM_LOW_MEMORY_EVENT_TYPE,
+    _maybe_create_vm_low_disk_alert,
+    _maybe_create_vm_low_memory_alert,
+    _resolve_vm_low_memory_alert,
+)
+from app.models import TaskStatus as _TaskStatus  # noqa: E402
+
+
+async def _vm_low_disk_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _VM_LOW_DISK_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _vm_low_memory_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _VM_LOW_MEMORY_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_vm_low_disk_alert_creates_and_broadcasts(db_session, mocker):
+    """A GCE task VM below the disk floor raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_vm_low_disk_alert(
+        db_session,
+        project_id=project.id,
+        vm_instance_id="agent-vm-deadbeef",
+        task_id=_uuid_module.uuid4(),
+        disk_free_bytes=500_000_000,  # ≈ 0.5 GB — below 1 GiB threshold
+        threshold_bytes=1_073_741_824,
+    )
+
+    assert created is True
+    alerts = await _vm_low_disk_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "low disk" in alert.title.lower()
+    assert "agent-vm-deadbeef" in alert.title
+    assert "0.5" in alert.message  # 500 MB free ≈ 0.5 GB
+    assert "1.0" in alert.message  # 1.0 GB threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_vm_low_memory_alert_creates_and_broadcasts(db_session, mocker):
+    """A GCE task VM approaching OOM raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_vm_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        vm_instance_id="agent-vm-cafef00d",
+        task_id=_uuid_module.uuid4(),
+        memory_free_bytes=100 * 1024 * 1024,  # 100 MB — below 512 MB threshold
+        threshold_bytes=536_870_912,
+    )
+
+    assert created is True
+    alerts = await _vm_low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "low memory" in alert.title.lower()
+    assert "agent-vm-cafef00d" in alert.title
+    assert "100 MB" in alert.message  # free memory
+    assert "512 MB" in alert.message  # threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_vm_low_memory_alert_deduped(db_session, mocker):
+    """Repeated sweep passes create exactly one VM low-memory alert row."""
+    mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        await _maybe_create_vm_low_memory_alert(
+            db_session,
+            project_id=project.id,
+            vm_instance_id="agent-vm-dedupe01",
+            memory_free_bytes=50 * 1024 * 1024,
+            threshold_bytes=536_870_912,
+        )
+
+    alerts = await _vm_low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated sweep passes must dedup to one alert"
+
+
+@pytest.mark.asyncio
+async def test_vm_low_memory_alert_auto_resolves(db_session, mocker):
+    """VM low-memory alert fires then auto-resolves when memory recovers."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _maybe_create_vm_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        vm_instance_id="agent-vm-recover1",
+        memory_free_bytes=10 * 1024 * 1024,
+        threshold_bytes=536_870_912,
+    )
+    alerts = await _vm_low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    resolved = await _resolve_vm_low_memory_alert(
+        db_session, project.id, "agent-vm-recover1"
+    )
+    assert resolved == 1
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None
+    assert bcast.await_count == 2  # create + dismiss
+
+
+@pytest.mark.asyncio
+async def test_low_memory_vms_check_integration(db_session, mocker):
+    """_check_degraded_runners raises a VM OOM alert from heartbeat metrics and
+    auto-resolves it once the task completes; runner-pinned and terminal-status
+    tasks are ignored.
+    """
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+
+    mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active agent VM near OOM: cgroup 7900/8192 MB → ~292 MB headroom < 512 MB.
+    oom_task = make_task(
+        project_id=project.id,
+        status=_TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-oom0001",
+        last_metrics_json={"cgroup_mb": 7900.0, "cgroup_limit_mb": 8192.0},
+    )
+    # Runner-pinned task with low headroom — must be ignored (runner sweeps own it).
+    runner_task = make_task(
+        project_id=project.id,
+        status=_TaskStatus.IN_PROGRESS,
+        vm_instance_id="runner:abc123",
+        last_metrics_json={"cgroup_mb": 7900.0, "cgroup_limit_mb": 8192.0},
+    )
+    # Terminal task on an agent VM — must be ignored (no longer running).
+    done_task = make_task(
+        project_id=project.id,
+        status=_TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-done001",
+        last_metrics_json={"cgroup_mb": 7900.0, "cgroup_limit_mb": 8192.0},
+    )
+    # Healthy agent VM with plenty of headroom — must NOT alert.
+    healthy_task = make_task(
+        project_id=project.id,
+        status=_TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-healthy1",
+        last_metrics_json={"cgroup_mb": 1000.0, "cgroup_limit_mb": 8192.0},
+    )
+    db_session.add_all([oom_task, runner_task, done_task, healthy_task])
+    await db_session.commit()
+
+    await _check_degraded_runners(db_session)
+    alerts = await _vm_low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1, "exactly one VM (the agent OOM VM) should alert"
+    assert "agent-vm-oom0001" in alerts[0].title
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → dedup.
+    await _check_degraded_runners(db_session)
+    alerts = await _vm_low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # The task completes → sweep must auto-resolve the alert.
+    await db_session.refresh(oom_task)
+    oom_task.status = _TaskStatus.COMPLETED
+    db_session.add(oom_task)
+    await db_session.commit()
+
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, (
+        "VM OOM alert must auto-resolve once the task leaves an active state"
+    )
+
+
+@pytest.mark.asyncio
+async def test_low_disk_vms_check_integration(db_session, mocker):
+    """_check_degraded_runners raises a VM low-disk alert from heartbeat metrics
+    and auto-resolves it on recovery.
+    """
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+
+    mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active agent VM reporting 200 MB free disk — below the 1 GiB default floor.
+    disk_task = make_task(
+        project_id=project.id,
+        status=_TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-disk001",
+        last_metrics_json={"disk_free_mb": 200.0, "disk_total_mb": 50_000.0},
+    )
+    db_session.add(disk_task)
+    await db_session.commit()
+
+    await _check_degraded_runners(db_session)
+    alerts = await _vm_low_disk_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "agent-vm-disk001" in alerts[0].title
+    assert alerts[0].dismissed_at is None
+
+    # VM frees disk (10 GB free) → sweep auto-resolves.
+    await db_session.refresh(disk_task)
+    disk_task.last_metrics_json = {"disk_free_mb": 10_240.0, "disk_total_mb": 50_000.0}
+    db_session.add(disk_task)
+    await db_session.commit()
+
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "low-disk VM alert must auto-resolve on recovery"

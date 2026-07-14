@@ -1836,6 +1836,15 @@ from app.runner_health_alerts import (  # noqa: F401
     _resolve_runner_cross_project_access_alert,
     _runner_cross_project_access_dedupe_key,
     _runner_cross_project_mismatch_timestamps,
+    # GCE task-VM low-disk / low-memory alerts (warm-pool VM monitoring parity)
+    _VM_LOW_DISK_EVENT_TYPE,
+    _VM_LOW_MEMORY_EVENT_TYPE,
+    _maybe_create_vm_low_disk_alert,
+    _maybe_create_vm_low_memory_alert,
+    _resolve_vm_low_disk_alert,
+    _resolve_vm_low_memory_alert,
+    _vm_low_disk_dedupe_key,
+    _vm_low_memory_dedupe_key,
 )
 
 # Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.

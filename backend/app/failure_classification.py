@@ -604,6 +604,34 @@ _REPO_UNINITIALIZED_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Signature emitted by the agent's clone-delivery guard (verifyCloneDelivered in
+# agent/src/prompts/discovery.ts) when the DURABLE signal says the repo is NOT
+# empty (repo_is_empty === false) but the freshly-cloned working tree is
+# empty/near-empty. This is the specific "durable-vs-live disagreement" that a
+# stale ``repo_is_empty=False`` on a genuinely empty repo produces on EVERY task
+# — distinct from an ordinary transient clone_failed (network blip, partial
+# fetch) so the report path can self-heal the durable signal instead of looping
+# clone_failed forever. Cross-language contract: the substring must stay in sync
+# with the message thrown in discovery.ts (branch (2) of verifyCloneDelivered).
+_CLONE_DELIVERY_DISAGREEMENT_PATTERNS: tuple[str, ...] = (
+    "the clone did not deliver the expected content",
+)
+
+
+def is_clone_delivery_disagreement(combined: str) -> bool:
+    """True when a clone_failed report is the durable/live emptiness disagreement.
+
+    Matches the ``verifyCloneDelivered`` message emitted when the stored
+    ``repo_is_empty=False`` contradicts an empty cloned tree — the signature of
+    a STALE durable signal — and NOT a generic transient clone failure (missing
+    HEAD, wrong checkout, network error). Case-insensitive; safe on empty/None.
+    """
+    if not combined:
+        return False
+    lowered = combined.lower()
+    return any(kw in lowered for kw in _CLONE_DELIVERY_DISAGREEMENT_PATTERNS)
+
+
 def _is_repo_uninitialized(combined: str) -> bool:
     """True when the failure text shows the remote repo has zero commits.
 

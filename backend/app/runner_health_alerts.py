@@ -2,7 +2,10 @@
 
 Owns the deduplicated create/resolve helpers for all self-hosted-runner alert
 types: runner-deactivated, runner-degraded, runner-low-disk,
-fleet-no-healthy-runner, and the compute require-local hold warning.
+fleet-no-healthy-runner, and the compute require-local hold warning.  Also owns
+the GCE task-VM low-disk/low-memory alerts (``vm.low_disk`` / ``vm.low_memory``)
+that give warm-pool task VMs the same proactive resource monitoring runners
+already have.
 ``app.alert_dispatch`` re-exports every symbol here so existing
 ``from app.alert_dispatch import ...`` callers keep working unchanged.
 
@@ -1693,6 +1696,275 @@ async def _resolve_runner_low_memory_alert(
     dismissed (0 or 1 in practice).
     """
     dedupe_key = _runner_low_memory_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+# ---------------------------------------------------------------------------
+# GCE task-VM low-disk / low-memory alerts.
+#
+# Parity with the self-hosted runner low-disk/low-memory pair above, but keyed
+# on ``vm_instance_id`` (an ``agent-vm-<hex>`` GCE instance name) instead of a
+# runner UUID.  GCE agent task VMs already report ``disk_free_mb`` /
+# ``cgroup_mb`` / ``cgroup_limit_mb`` on every heartbeat (persisted to
+# ``Task.last_metrics_json``); nothing proactively swept them, so an OOM- or
+# disk-full-bound VM was only diagnosed reactively via teardown serial-console
+# forensics.  These helpers raise a deduplicated WARNING alert BEFORE the VM is
+# killed, so the operator sees the capacity risk in the fleet health summary.
+#
+# The dedupe key encodes the instance name (which contains no ':'), so the
+# resolve path can recover it with ``dedupe_key.split(":", 1)[-1]`` — the same
+# scheme the runner helpers use with the runner UUID.
+_VM_LOW_DISK_EVENT_TYPE = "vm.low_disk"
+
+
+def _vm_low_disk_dedupe_key(vm_instance_id: str) -> str:
+    return f"{_VM_LOW_DISK_EVENT_TYPE}:{vm_instance_id}"
+
+
+async def _maybe_create_vm_low_disk_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    vm_instance_id: str,
+    task_id: "uuid.UUID | str | None" = None,
+    disk_free_bytes: int,
+    threshold_bytes: int,
+) -> bool:
+    """Create a deduplicated WARNING alert when a GCE task VM's free disk is low.
+
+    Fires when an active agent task VM reports ``disk_free_mb`` below the
+    configured floor during the orchestrator's degraded-runner sweep. Surfaces
+    the capacity risk before the VM fills its disk and its task fails.
+
+    Deduplicated on ``vm.low_disk:{vm_instance_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. The alert
+    clears automatically when :func:`_resolve_vm_low_disk_alert` is called once
+    disk recovers above the threshold or the task leaves an active state.
+    Returns ``True`` when a NEW alert was created, else ``False``.
+    """
+    free_gb = disk_free_bytes / (1024 ** 3)
+    threshold_gb = threshold_bytes / (1024 ** 3)
+    task_note = f" (task {str(task_id)[:8]})" if task_id else ""
+    title = f"Task VM low disk: {vm_instance_id}"
+    message = (
+        f"GCE task VM {vm_instance_id}{task_note} has only {free_gb:.1f} GB of "
+        f"free disk space, below the {threshold_gb:.1f} GB threshold. Low disk "
+        f"may cause the task to fail before the VM is torn down. The alert "
+        f"clears automatically when free disk recovers above the threshold or "
+        f"the task completes."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_VM_LOW_DISK_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_vm_low_disk_dedupe_key(vm_instance_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "VM_LOW_DISK",
+                {
+                    "vm_instance_id": vm_instance_id,
+                    "task_id": str(task_id) if task_id else None,
+                    "disk_free_bytes": disk_free_bytes,
+                    "threshold_bytes": threshold_bytes,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] VM_LOW_DISK dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_vm_low_disk_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    vm_instance_id: str,
+) -> int:
+    """Dismiss any open VM-low-disk alert for a VM whose disk has recovered.
+
+    The companion to :func:`_maybe_create_vm_low_disk_alert`. Called from the
+    degraded-runner sweep when a task VM's free disk rises back above the
+    threshold, it stops reporting, or its task leaves an active state. Returns
+    the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _vm_low_disk_dedupe_key(vm_instance_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+_VM_LOW_MEMORY_EVENT_TYPE = "vm.low_memory"
+
+
+def _vm_low_memory_dedupe_key(vm_instance_id: str) -> str:
+    return f"{_VM_LOW_MEMORY_EVENT_TYPE}:{vm_instance_id}"
+
+
+async def _maybe_create_vm_low_memory_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    vm_instance_id: str,
+    task_id: "uuid.UUID | str | None" = None,
+    memory_free_bytes: int,
+    threshold_bytes: int,
+) -> bool:
+    """Create a deduplicated WARNING alert when a GCE task VM's free memory is low.
+
+    Fires when an active agent task VM's cgroup headroom
+    (``cgroup_limit_mb - cgroup_mb``) falls below the configured floor during
+    the orchestrator's degraded-runner sweep. Surfaces the OOM risk BEFORE the
+    kernel OOM-kills the VM's process — the parity gap this task closes, since
+    OOM-killed GCE VMs were previously only diagnosed via teardown forensics.
+
+    Deduplicated on ``vm.low_memory:{vm_instance_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. The alert
+    clears automatically when :func:`_resolve_vm_low_memory_alert` is called
+    once memory recovers above the threshold or the task leaves an active
+    state. Returns ``True`` when a NEW alert was created, else ``False``.
+    """
+    free_mb = memory_free_bytes / (1024 ** 2)
+    threshold_mb = threshold_bytes / (1024 ** 2)
+    task_note = f" (task {str(task_id)[:8]})" if task_id else ""
+    title = f"Task VM low memory: {vm_instance_id}"
+    message = (
+        f"GCE task VM {vm_instance_id}{task_note} has only {free_mb:.0f} MB of "
+        f"free memory (cgroup headroom), below the {threshold_mb:.0f} MB "
+        f"threshold. The VM is approaching OOM and may be killed before its "
+        f"task completes. The alert clears automatically when free memory "
+        f"recovers above the threshold or the task completes."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_VM_LOW_MEMORY_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_vm_low_memory_dedupe_key(vm_instance_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "VM_LOW_MEMORY",
+                {
+                    "vm_instance_id": vm_instance_id,
+                    "task_id": str(task_id) if task_id else None,
+                    "memory_free_bytes": memory_free_bytes,
+                    "threshold_bytes": threshold_bytes,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] VM_LOW_MEMORY dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_vm_low_memory_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    vm_instance_id: str,
+) -> int:
+    """Dismiss any open VM-low-memory alert for a VM whose memory has recovered.
+
+    The companion to :func:`_maybe_create_vm_low_memory_alert`. Called from the
+    degraded-runner sweep when a task VM's cgroup headroom rises back above the
+    threshold, it stops reporting, or its task leaves an active state. Returns
+    the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _vm_low_memory_dedupe_key(vm_instance_id)
     result = await session.execute(
         select(Alert).where(
             Alert.project_id == project_id,

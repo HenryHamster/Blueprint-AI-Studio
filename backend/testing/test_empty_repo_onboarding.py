@@ -548,3 +548,117 @@ class TestLegacyUndeterminedEmptinessSelfHeal:
 
         assert result.outcome == "spawned"
         token_mock.assert_not_awaited()
+
+
+# ── Self-heal: a stale repo_is_empty=False that can never self-correct ───────
+# A project whose durable build_config.repo_is_empty is stale-False on a
+# genuinely empty/near-empty repo makes the agent's clone-delivery guard
+# (verifyCloneDelivered) throw clone_failed on EVERY task — the durable signal
+# says non-empty, the cloned tree is empty, and the two disagree forever. The
+# self-heal re-verifies the durable signal against GitHub on that disagreement
+# path and flips it to True ONLY when fresh detection authoritatively confirms
+# the repo is empty — while a repo with real content the clone failed to deliver
+# still fails loud (the signal is NOT flipped).
+
+
+class TestStaleEmptySignalSelfHeal:
+    """maybe_correct_stale_repo_empty_signal self-corrects an authoritatively-empty
+    repo and preserves fail-loud for a genuine clone shortfall."""
+
+    def _stale_project(self):
+        return Project(
+            name="wedged-external",
+            github_owner="HenryHamster",
+            github_repo="wedged-external",
+            build_config={"repo_is_empty": False, "source_file_count": 12},
+        )
+
+    @pytest.mark.asyncio
+    async def test_authoritatively_empty_repo_self_corrects_to_true(self):
+        # The wedge case: durable says non-empty, but the repo is really empty.
+        # Fresh detection authoritatively confirms empty → the signal flips and
+        # the next task proceeds greenfield instead of looping clone_failed.
+        from app.build_config_detection import (
+            _redetect_stale_empty_cooldown,
+            maybe_correct_stale_repo_empty_signal,
+        )
+
+        _redetect_stale_empty_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+        detected_empty = {
+            "language": None,
+            "directories": [],
+            "env_vars": {},
+            "repo_is_empty": True,
+            "source_file_count": 0,
+            "has_ci": False,
+        }
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=detected_empty,
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified"),
+            patch(
+                "app.shared_state.get_project_integration_branch",
+                return_value="main",
+            ),
+        ):
+            healed = await maybe_correct_stale_repo_empty_signal(project, session)
+
+        assert healed is True
+        assert project.build_config["repo_is_empty"] is True
+        # The next task now claims a greenfield signal — isGreenfieldRepo short
+        # circuits on repo_is_empty=True and verifyCloneDelivered never throws.
+        session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_real_content_that_failed_to_clone_still_fails_loud(self):
+        # The other half of the fix: a repo that genuinely HAS content (fresh
+        # detection says repo_is_empty=False) must NOT flip. The durable signal
+        # stays False so the agent's verifyCloneDelivered keeps failing loud on
+        # the next clone shortfall rather than masking it as greenfield.
+        from app.build_config_detection import (
+            _redetect_stale_empty_cooldown,
+            maybe_correct_stale_repo_empty_signal,
+        )
+
+        _redetect_stale_empty_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+        detected_non_empty = {
+            "language": "python",
+            "directories": [{"path": "./", "type": "python"}],
+            "repo_is_empty": False,
+            "source_file_count": 12,
+        }
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=detected_non_empty,
+            ),
+            patch(
+                "app.shared_state.get_project_integration_branch",
+                return_value="main",
+            ),
+        ):
+            healed = await maybe_correct_stale_repo_empty_signal(project, session)
+
+        assert healed is False
+        assert project.build_config["repo_is_empty"] is False
+        session.commit.assert_not_awaited()
