@@ -12761,6 +12761,154 @@ async def test_dispatch_holds_when_container_image_declared_but_no_capable_runne
     )
 
 
+@pytest.mark.asyncio
+async def test_gpu_in_container_ineligible_holds_with_honest_reason(
+    db_session, mocker
+):
+    """A non-pinned compute_experiment declaring BOTH an accelerator and a
+    container_image that cannot place because every live runner HAS a container
+    runtime but lacks GPU-in-container passthrough (no CDI daemon, no verified
+    nvidia docker hook) is held with an HONEST reason — it must NOT reuse the
+    generic 'no live runner has docker_usable capability' message, which is false
+    (docker IS present) and would send the operator to reinstall docker instead of
+    enabling CDI / the nvidia container runtime.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="GpuInContainerHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # A live runner that HAS docker (container runtime present) but reports no CDI
+    # and no verified GPU → it cannot expose a GPU inside the container.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    active_runners_cache = {project.id: [runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED, (
+        "task must remain QUEUED when held for GPU-in-container passthrough"
+    )
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "awaiting_container_runner_since must be stamped so the bounded-wait "
+        "sweep covers the hold"
+    )
+    msg = refreshed.latest_status_message or ""
+    # The honest reason names the ACTUAL blocker (GPU passthrough), not docker.
+    assert "GPU inside the container" in msg or "GPU-in-container" in msg, (
+        f"status message must name the GPU-in-container passthrough blocker: {msg!r}"
+    )
+    assert "CDI" in msg, (
+        f"status message should point the operator at CDI / nvidia runtime: {msg!r}"
+    )
+    # The FALSE generic docker-missing wording must NOT be used for this fleet.
+    assert "no live runner has docker_usable capability" not in msg, (
+        "must not claim docker is missing when it is present — that is the bug "
+        f"this hold fixes: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_container_image_only_still_holds_with_generic_docker_reason(
+    db_session, mocker
+):
+    """Regression guard for hold ORDERING: a container_image job with NO accelerator
+    whose only runner lacks a container runtime entirely must still hit the GENERIC
+    container-capable hold (unchanged docker_usable wording) — the new
+    GPU-in-container branch (guarded on ``accelerator and container_image``) must
+    not divert it.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="GenericContainerHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "echo hello",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    incapable_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+    active_runners_cache = {project.id: [incapable_runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert "docker_usable" in (refreshed.latest_status_message or ""), (
+        "a fleet with NO container runtime must still get the generic "
+        "docker_usable hold reason, not the GPU-in-container reason"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Images-first USE-default on the DISPATCH path: a compute_experiment dispatched
 # WITHOUT an explicit container_image defaults to the project's digest-pinned

@@ -2007,6 +2007,57 @@ async def _dispatch_compute_experiment_directly(
             )
             return "held"
 
+    # ── GPU-in-container hold: image + accelerator declared and at least one live
+    # runner HAS a container runtime but cannot expose a GPU INSIDE the container
+    # (no CDI daemon and no verified nvidia docker hook) → keep QUEUED with an
+    # HONEST reason. Placed BEFORE the generic container-image hold so such a fleet
+    # is NOT told "no live runner has docker_usable capability" — that is false and
+    # actively misleading: docker IS present, only GPU passthrough is missing, so
+    # the operator would waste time reinstalling docker that is already there
+    # instead of enabling CDI / the nvidia container runtime. Fires only when a
+    # container-capable-but-not-GPU-in-container runner exists (the genuine,
+    # recoverable blocker for this fleet); a fleet with NO container runtime at all
+    # falls through to the generic hold below, and a fleet with no live runner at
+    # all falls through to the cloud backend. Reuses the container-runner hold stamp
+    # so the existing bounded-wait sweep covers it unchanged.
+    if runner is None and accelerator and container_image:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        gpu_in_container_blocked = any(
+            _runner_has_container_capability(r)
+            and not _runner_gpu_in_container_capable(r)
+            for r in project_runners
+        )
+        if gpu_in_container_blocked:
+            hold_msg = (
+                "Waiting for a runner that can expose a GPU inside the container: "
+                f"job declares both container_image={container_image!r} and an "
+                "accelerator, but every container-capable runner lacks GPU-in-"
+                "container passthrough (no CDI daemon and no verified nvidia docker "
+                "hook). Docker/the container runtime IS present — enable CDI "
+                "(nvidia-ctk) or the nvidia container runtime so the GPU can be "
+                "passed into the container."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image (%r) + "
+                "accelerator declared but no live runner has GPU-in-container "
+                "passthrough (docker present, CDI/nvidia-hook missing)",
+                task.id,
+                container_image,
+            )
+            return "held"
+
     # ── Container-image hold: image declared + registered runners but none
     # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.
     # Only fires when the project has at least one live runner (runners exist but
