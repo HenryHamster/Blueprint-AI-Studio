@@ -331,4 +331,53 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(img).not.toBeNull();
     expect(img!.getAttribute('src')).toContain('fresh.example.com');
   });
+
+  test('renders the EvidenceTierBadge and run-provenance details for a compute artifact', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art:compute-1',
+          kind: 'resource_detail',
+          title: 'RL training run',
+          status: 'completed',
+          evidence_tier: 'covered',
+          details: [
+            { label: 'Executed on', value: 'local-runner' },
+            { label: 'Runner', value: 'gpu-box-01 (runner-42)' },
+          ],
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    // The shared badge renders the canonical tier label.
+    expect(host!.textContent).toContain('Machine verified');
+    // Run provenance surfaces via the generic details list.
+    expect(host!.textContent).toContain('Executed on');
+    expect(host!.textContent).toContain('local-runner');
+    expect(host!.textContent).toContain('Runner');
+    expect(host!.textContent).toContain('gpu-box-01 (runner-42)');
+  });
+
+  test('omits the EvidenceTierBadge for a descriptor without an evidence_tier', async () => {
+    const pkg = makePackage({
+      descriptors: [
+        {
+          schema_version: 1,
+          id: 'art:plain-1',
+          kind: 'resource_detail',
+          title: 'Plain artifact',
+          status: 'ready',
+          details: [{ label: 'Type', value: 'design_doc' }],
+        },
+      ],
+    });
+
+    await render(pkg, 'proj-1');
+
+    expect(host!.textContent).not.toContain('Machine verified');
+    expect(host!.textContent).not.toContain('Self-reported');
+  });
 });

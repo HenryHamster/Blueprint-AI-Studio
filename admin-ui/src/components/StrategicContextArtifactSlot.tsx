@@ -7,6 +7,7 @@ import type {
 } from '../strategicStateApi';
 import { resolveArtifactDownloadUrl } from '../api';
 import { StrategicContextMap } from './StrategicContextMap';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
@@ -527,6 +528,11 @@ function DescriptorCard({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
             <h3 className="min-w-0 flex-1 break-words text-xs font-semibold text-neutral-100">{descriptor.title}</h3>
+            {descriptor.evidence_tier && (
+              <span className="shrink-0">
+                <EvidenceTierBadge tier={descriptor.evidence_tier} />
+              </span>
+            )}
             <span className={`shrink-0 rounded border px-1.5 py-0.5 text-ui-sm font-semibold uppercase ${statusToneClass(descriptor)}`}>
               {descriptor.status || descriptorLabel(descriptor.kind)}
             </span>

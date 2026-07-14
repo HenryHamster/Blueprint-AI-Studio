@@ -1,6 +1,7 @@
 import { useState, type JSX } from 'react';
 import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry } from '../api';
 import { isSafeUrl } from './TaskCard';
+import { EvidenceTierBadge } from './EvidenceTierBadge';
 
 function formatExpiresIn(expiresAt: string): string {
   try {
@@ -165,14 +166,6 @@ const BUCKET_META: Record<string, { label: string; className: string }> = {
   malformed:                 { label: 'malformed',       className: 'text-red-400' },
 };
 
-const COVERAGE_BADGE: Record<CriterionCoverageEntry['coverage'], { label: string; className: string }> = {
-  covered:   { label: 'covered',   className: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' },
-  attested:  { label: 'attested',  className: 'bg-amber-600/20 text-amber-400 border border-amber-600/40' },
-  backfilled:{ label: 'backfilled',className: 'bg-slate-600/40 text-slate-300 border border-slate-500/40' },
-  probed:    { label: 'probed',    className: 'bg-sky-600/20 text-sky-300 border border-sky-600/40' },
-  partial:   { label: 'partial',   className: 'bg-amber-500/20 text-amber-400 border border-amber-500/30' },
-  uncovered: { label: 'uncovered', className: 'bg-slate-700/60 text-slate-400 border border-slate-600/40' },
-};
 
 const STATUS_BADGE: Record<NonNullable<CriterionCoverageEntry['status']>, { label: string; className: string }> = {
   active:     { label: 'active',     className: 'bg-slate-700/50 text-slate-500 border border-slate-600/40' },
@@ -238,7 +231,6 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
       <MergeEvidenceGapBreakdown gaps={coverage.merge_evidence_gaps} />
       <ul className="space-y-1">
         {coverage.criteria.map((c) => {
-          const badge = COVERAGE_BADGE[c.coverage];
           const status = c.status ?? 'active';
           const statusBadge = STATUS_BADGE[status];
           const stuckLabel = c.stuck_reason === 'no_mapping'
@@ -253,9 +245,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
               className={`flex items-start gap-2 ${status !== 'active' ? 'opacity-80' : ''}`}
               data-testid={`criterion-row-${c.criterion_key}`}
             >
-              <span className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${badge.className}`}>
-                {badge.label}
-              </span>
+              <EvidenceTierBadge tier={c.coverage} />
               {status !== 'active' && (
                 <span
                   className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${statusBadge.className}`}

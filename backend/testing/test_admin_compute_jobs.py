@@ -684,6 +684,71 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
     assert jobs[0]["criterion_verdict"] == verdict
     assert jobs[0]["criterion_verdict"]["met"] is True
     assert jobs[0]["criterion_verdict"]["value"] == 0.95
+    # The canonical evidence tier is served first-class so the UI stops
+    # re-deriving it: operator hardware + a measured verdict → "Machine verified".
+    assert jobs[0]["evidence_tier"] == "covered"
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_serves_canonical_evidence_tier(
+    client: AsyncClient, db_session
+):
+    """evidence_tier is served first-class per job, matching the canonical
+    server derivation (knowledge_completion._compute_evidence_tier):
+      - operator hardware with NO result → partial (execution, nothing verified)
+      - cloud execution → attested (trusted report, not operator-verified)."""
+    project = await _make_project(db_session, name="Evidence Tier Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # (1) Local run with NO criterion/verdict → partial.
+    local_task = Task(
+        project_id=project.id,
+        title="local no-result task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+    )
+    # (2) Cloud run → attested regardless of result.
+    cloud_task = Task(
+        project_id=project.id,
+        title="cloud task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+    )
+    db_session.add(local_task)
+    db_session.add(cloud_task)
+    await db_session.commit()
+    await db_session.refresh(local_task)
+    await db_session.refresh(cloud_task)
+
+    local_job = ComputeJob(
+        task_id=local_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        spend_cap_usd=2.0,
+        accrued_cost_usd=0.0,
+        completed_at=_utcnow(),
+    )
+    cloud_job = ComputeJob(
+        task_id=cloud_task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.0,
+        completed_at=_utcnow(),
+    )
+    db_session.add(local_job)
+    db_session.add(cloud_job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = {j["id"]: j for j in resp.json()["compute_jobs"]}
+    assert jobs[str(local_job.id)]["evidence_tier"] == "partial"
+    assert jobs[str(cloud_job.id)]["evidence_tier"] == "attested"
 
 
 @pytest.mark.asyncio
@@ -733,6 +798,8 @@ async def test_list_compute_jobs_per_arm_verdicts_exposed(
     assert jobs[0]["per_arm_verdicts"] == per_arm
     assert jobs[0]["per_arm_verdicts"]["arm_a"]["cost_usd"] == pytest.approx(0.30)
     assert jobs[0]["per_arm_verdicts"]["arm_b"]["met"] is False
+    # Operator hardware + per-arm results is a measured run → "Machine verified".
+    assert jobs[0]["evidence_tier"] == "covered"
 
 
 @pytest.mark.asyncio

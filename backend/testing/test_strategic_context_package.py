@@ -959,3 +959,122 @@ async def test_load_strategic_context_evidence_artifact_no_logs(db_session):
     # No-leak contract: the raw gs:// reference never rides on the item.
     assert "storage_uri" not in item
     assert "viewable_previews" not in item
+
+
+@pytest.mark.asyncio
+async def test_compute_artifact_stamped_with_provenance_and_evidence_tier(
+    db_session,
+):
+    """A compute_experiment artifact is stamped with run provenance + evidence
+    tier from its backing compute knowledge doc, and the descriptor surfaces
+    both."""
+    project, task = await _make_project_task(db_session, name="ProvTest")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type="COMPUTE_RESULT",
+            storage_uri="gs://bucket/result",
+            logs=None,
+        )
+    )
+    # Canonical source: the compute doc's forward_quality_verdict carries the
+    # earned evidence tier and terminal_diagnostics (execution location).
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind="compute_experiment",
+            title="Compute run",
+            summary="A run",
+            body="body",
+            lifecycle_status="consumed",
+            forward_quality_verdict={
+                "evidence_tier": "covered",
+                "terminal_diagnostics": {
+                    "executing_backend": "local-runner",
+                    "runner_target_id": "runner-42",
+                    "runner_hostname": "gpu-box-01",
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    result = await load_strategic_context_evidence(db_session, project.id)
+    items = result["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["evidence_tier"] == "covered"
+    assert item["executing_backend"] == "local-runner"
+    assert item["runner_target_id"] == "runner-42"
+    assert item["runner_hostname"] == "gpu-box-01"
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["evidence_tier"] == "covered"
+    detail_by_label = {d["label"]: d["value"] for d in descriptor["details"]}
+    assert detail_by_label["Executed on"] == "local-runner"
+    assert detail_by_label["Runner"] == "gpu-box-01 (runner-42)"
+
+
+@pytest.mark.asyncio
+async def test_non_compute_artifact_gets_no_provenance_or_tier(db_session):
+    """An artifact without a backing compute_experiment doc gains no provenance
+    or evidence-tier keys, and its descriptor stays unchanged."""
+    project, task = await _make_project_task(db_session, name="NoProvTest")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type="COMPUTE_RESULT",
+            storage_uri="gs://bucket/result",
+            logs=None,
+        )
+    )
+    # A non-compute knowledge doc for the same task must not stamp provenance.
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind="web_research",
+            title="Research",
+            summary="A doc",
+            body="body",
+            lifecycle_status="pending",
+            forward_quality_verdict={"evidence_tier": "covered"},
+        )
+    )
+    await db_session.commit()
+
+    result = await load_strategic_context_evidence(db_session, project.id)
+    items = result["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert "evidence_tier" not in item
+    assert "executing_backend" not in item
+    assert "runner_target_id" not in item
+    assert "runner_hostname" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert "evidence_tier" not in descriptor
+    labels = {d["label"] for d in descriptor["details"]}
+    assert "Executed on" not in labels
+    assert "Runner" not in labels
+
+
+def test_artifact_descriptor_runner_falls_back_to_target_id_only():
+    """When only the runner id (no hostname) is stamped, the Runner detail uses
+    the bare id."""
+    item = {
+        "id": "art-1",
+        "kind": "resource_detail",
+        "label": "run",
+        "artifact_type": "COMPUTE_RESULT",
+        "task_status": "completed",
+        "executing_backend": "cloud-gpu",
+        "runner_target_id": "runner-9",
+        "evidence_tier": "attested",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc["evidence_tier"] == "attested"
+    detail_by_label = {d["label"]: d["value"] for d in desc["details"]}
+    assert detail_by_label["Executed on"] == "cloud-gpu"
+    assert detail_by_label["Runner"] == "runner-9"

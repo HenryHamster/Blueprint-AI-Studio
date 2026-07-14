@@ -1,6 +1,6 @@
 import { AlertCircle, AlertTriangle, CheckCircle, HelpCircle, XCircle } from 'lucide-react';
 
-type EvidenceTier = 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered';
+type EvidenceTier = 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
 
 const TIER_CONFIG: Record<EvidenceTier, {
   label: string;
@@ -25,6 +25,12 @@ const TIER_CONFIG: Record<EvidenceTier, {
     cls: 'bg-neutral-800 border-neutral-700 text-neutral-400',
     Icon: HelpCircle,
     tooltip: 'Metrics present without direct execution evidence',
+  },
+  probed: {
+    label: 'Probed',
+    cls: 'bg-sky-950/30 border-sky-900/50 text-sky-300',
+    Icon: AlertCircle,
+    tooltip: 'Lower-confidence machine signal — time-bounded probe, not fully verified',
   },
   partial: {
     label: 'Partial',

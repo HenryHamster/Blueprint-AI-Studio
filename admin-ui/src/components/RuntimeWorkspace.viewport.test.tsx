@@ -19,6 +19,7 @@ vi.mock('./FleetRunnersPanel', () => ({
 
 vi.mock('./ComputeJobsPanel', () => ({
   ComputeJobsPanel: () => <div className="min-h-[320px] rounded-md border border-neutral-800 p-3">Compute jobs</div>,
+  CompactJobsTable: () => <div>Compact jobs table</div>,
   default: () => <div className="min-h-[320px] rounded-md border border-neutral-800 p-3">Compute jobs</div>,
 }));
 

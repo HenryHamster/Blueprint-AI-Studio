@@ -75,6 +75,27 @@ describe('computeJobEvidenceTier', () => {
   it('no backend and no result is uncovered', () => {
     expect(computeJobEvidenceTier(job({}))).toBe('uncovered');
   });
+
+  it('prefers the server-provided evidence_tier over client derivation', () => {
+    // A payload whose client-derived tier would be `partial` (operator hardware,
+    // no result) but which carries a canonical server tier must render the
+    // server value — the single source of truth on fresh responses.
+    expect(
+      computeJobEvidenceTier(
+        job({ backend: 'local-bwrap', evidence_tier: 'covered' } as Partial<TierJob>),
+      ),
+    ).toBe('covered');
+  });
+
+  it('falls back to client derivation when server tier is absent/invalid', () => {
+    // Older/cached payloads omit evidence_tier (undefined) — the client rule
+    // still applies for backward compatibility.
+    expect(
+      computeJobEvidenceTier(
+        job({ backend: 'gcp', per_arm_verdicts: A_RESULT, evidence_tier: undefined } as Partial<TierJob>),
+      ),
+    ).toBe('attested');
+  });
 });
 
 describe('computeJobViewableArtifacts', () => {

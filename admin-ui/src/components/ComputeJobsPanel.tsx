@@ -875,7 +875,7 @@ const TABLE_COL_LABELS: Record<TableSortKey, string> = {
   backend: 'Backend',
 };
 
-function CompactJobsTable({
+export function CompactJobsTable({
   jobs,
   sortConfig,
   onSort,
@@ -910,6 +910,7 @@ function CompactJobsTable({
             const spent = computeJobSpent(job);
             const runtimeSec = computeJobRuntimeSec(job);
             const { label: backendLabel } = computeJobExecutionLocation(job.backend ?? '');
+            const runnerName = job.runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
             const cv = job.criterion_verdict;
             const sc = job.success_criterion;
             return (
@@ -955,8 +956,20 @@ function CompactJobsTable({
                 <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
                   {runtimeSec != null ? fmtDuration(runtimeSec) : active ? 'running' : '—'}
                 </td>
-                <td className="py-1.5 text-neutral-400 max-w-xs truncate">
-                  {backendLabel}
+                <td className="py-1.5 text-neutral-400 max-w-xs">
+                  <span className="flex items-center gap-1.5 flex-wrap min-w-0">
+                    <span className="truncate">{backendLabel}</span>
+                    {runnerName && (
+                      <span
+                        className="text-neutral-300 truncate max-w-[10rem]"
+                        title={job.runner?.hostname ?? job.runner_target_id ?? undefined}
+                        data-testid="compact-table-runner"
+                      >
+                        · {runnerName}
+                      </span>
+                    )}
+                    {!active && <EvidenceTierBadge tier={computeJobEvidenceTier(job)} />}
+                  </span>
                 </td>
               </tr>
             );

@@ -1,19 +1,33 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 
-/** Derive the evidence tier for a compute job, mirroring backend
- *  knowledge_completion.py::_compute_evidence_tier.
+/** Evidence tier for a compute job. Prefers the canonical `evidence_tier` served
+ *  first-class by the backend (knowledge_completion.py::_compute_evidence_tier),
+ *  and falls back to the client derivation below only for older/cached payloads
+ *  that omit the field — keeping a single source of truth on fresh responses
+ *  while remaining backward compatible.
  *
- *  `covered` renders as "Machine verified", so it requires BOTH that the job ran
- *  on operator hardware AND that it produced a measurable result. A local run
- *  that reported no metric proves only WHERE it ran — labelling that
- *  "Machine verified" is a claimed, not earned, status. It is demoted to
- *  `partial`: real execution provenance, nothing verified. */
+ *  Fallback semantics mirror the backend: `covered` renders as "Machine
+ *  verified", so it requires BOTH that the job ran on operator hardware AND that
+ *  it produced a measurable result. A local run that reported no metric proves
+ *  only WHERE it ran — labelling that "Machine verified" is a claimed, not
+ *  earned, status. It is demoted to `partial`: real execution provenance,
+ *  nothing verified. */
 export function computeJobEvidenceTier(
   job: Pick<
     ComputeJob,
     'backend' | 'status' | 'outcome' | 'criterion_verdict' | 'per_arm_verdicts'
-  >,
+  > & { evidence_tier?: ComputeJob['evidence_tier'] },
 ): 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' {
+  const served = job.evidence_tier;
+  if (
+    served === 'covered' ||
+    served === 'attested' ||
+    served === 'backfilled' ||
+    served === 'partial' ||
+    served === 'uncovered'
+  ) {
+    return served;
+  }
   const backend = job.backend ?? '';
   const ranOnOperatorHardware =
     backend.startsWith('local-') || backend === 'runner-subprocess';

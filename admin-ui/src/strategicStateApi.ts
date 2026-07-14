@@ -169,6 +169,11 @@ export interface StrategicContextRenderableDescriptor {
   empty?: boolean;
   stale?: boolean;
   unsupported_reason?: string | null;
+  /** Earned-vs-claimed evidence tier for compute_experiment artifacts
+   *  (machine-verified / attested / backfilled / partial / self-reported).
+   *  Rendered via the shared EvidenceTierBadge; absent for non-compute
+   *  artifacts. */
+  evidence_tier?: string | null;
   metrics?: StrategicContextDescriptorMetric[];
   columns?: StrategicContextDescriptorTableColumn[];
   rows?: StrategicContextDescriptorTableRow[];
@@ -285,6 +290,12 @@ export interface StrategicContextArtifactEvidence {
   has_logs?: boolean | null;
   storage_uri?: string | null;
   viewable_previews?: StrategicContextArtifactViewablePreview[] | null;
+  // Run provenance + evidence tier for compute_experiment artifacts, stamped
+  // from the backing compute knowledge document (canonical source).
+  executing_backend?: string | null;
+  runner_target_id?: string | null;
+  runner_hostname?: string | null;
+  evidence_tier?: string | null;
 }
 
 export interface StrategicContextEvidenceCollection<T> {

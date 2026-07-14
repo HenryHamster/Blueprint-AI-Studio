@@ -833,6 +833,11 @@ export interface ComputeJob {
     met: boolean | null;
     cost_usd: number | null;
   }> | null;
+  // Canonical earned-vs-claimed evidence tier, derived server-side by
+  // knowledge_completion._compute_evidence_tier and served here as a first-class
+  // field. Prefer this over any client re-derivation. Older/cached responses may
+  // omit it (undefined), in which case consumers fall back to client derivation.
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
   // Runner identity fields — present when the job was dispatched to a registered
   // local runner. Absent on legacy rows or cloud-dispatched jobs. Older backends
   // may omit these fields entirely; consumers must treat absence as null.

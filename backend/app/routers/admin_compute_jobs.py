@@ -257,6 +257,11 @@ async def _build_compute_job_payload(
         )
         runner_map = {r.id: r for r in runner_rows}
 
+    # Canonical evidence-tier derivation lives server-side in knowledge_completion;
+    # import it once here so the compute-job payload can serve the tier as a
+    # first-class field instead of the UI forking a second copy of the logic.
+    from app.knowledge_completion import _compute_evidence_tier
+
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
@@ -338,6 +343,17 @@ async def _build_compute_job_payload(
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id
         data["per_arm_verdicts"] = per_arm_verdicts
+        # Serve the canonical evidence tier (machine-verified / attested /
+        # self-reported) as a first-class field so the UI stops re-deriving it.
+        # A run "produced a result" when it yielded either a criterion verdict or
+        # any per-arm verdict — the same signals the client derivation used.
+        _produced_result = (
+            (per_arm_verdicts is not None and len(per_arm_verdicts) > 0)
+            or criterion_verdict is not None
+        )
+        data["evidence_tier"] = _compute_evidence_tier(
+            job, {"_produced": True} if _produced_result else None
+        )
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis

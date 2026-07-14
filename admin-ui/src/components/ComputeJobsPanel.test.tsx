@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
-import { ComputeJobsPanel } from './ComputeJobsPanel';
+import { ComputeJobsPanel, CompactJobsTable } from './ComputeJobsPanel';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -4130,5 +4130,66 @@ describe('ComputeJobsPanel — runner identity on finished jobs', () => {
     expect(runnerEl.textContent).toContain('my-gpu-host');
     expect(runnerEl.textContent).toContain('claimed');
     expect(runnerEl.textContent).toContain('ago');
+  });
+});
+
+describe('CompactJobsTable — evidence tier + runner identity', () => {
+  test('terminal job renders the server-provided tier badge and runner hostname', () => {
+    const job = makeJob({
+      id: 'job-local',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      evidence_tier: 'covered',
+      runner_target_id: 'dd59526e-0001-0002-0003-000000000004',
+      runner: { id: 'dd59526e-0001-0002-0003-000000000004', hostname: 'iconlab-gpu-01', status: 'active' },
+    });
+    const { getByTestId, container } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    // Runner identity surfaces via the dedicated chip.
+    expect(getByTestId('compact-table-runner').textContent).toContain('iconlab-gpu-01');
+    // The badge reflects the canonical server tier ('covered' → "Machine verified"),
+    // not a client re-derivation.
+    expect(container.textContent).toContain('Machine verified');
+  });
+
+  test('runner chip falls back to a truncated target id when hostname is absent', () => {
+    const job = makeJob({
+      id: 'job-local-2',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      evidence_tier: 'partial',
+      runner_target_id: 'abcdef12-0000-0000-0000-000000000000',
+      runner: null,
+    });
+    const { getByTestId } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    const chip = getByTestId('compact-table-runner');
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef12-0000-0000-0000-000000000000');
+  });
+
+  test('active job suppresses the tier badge but still shows its runner', () => {
+    const job = makeJob({
+      id: 'job-active',
+      backend: 'runner-subprocess',
+      status: 'RUNNING',
+      outcome: null,
+      completed_at: null,
+      evidence_tier: 'covered',
+      runner_target_id: 'aa000000-0000-0000-0000-000000000001',
+      runner: { id: 'aa000000-0000-0000-0000-000000000001', hostname: 'iconlab-gpu-02', status: 'active' },
+    });
+    const { getByTestId, container } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    expect(getByTestId('compact-table-runner').textContent).toContain('iconlab-gpu-02');
+    // Badge is terminal-only, consistent with the full job card.
+    expect(container.textContent).not.toContain('Machine verified');
   });
 });

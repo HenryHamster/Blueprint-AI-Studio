@@ -25,6 +25,7 @@ from app.models import (
     KnowledgeDocument,
     Project,
     ProjectMessage,
+    SourceKind,
     StrategicCycle,
     Task,
 )
@@ -965,6 +966,69 @@ async def load_strategic_context_evidence(
             item["viewable_previews"] = viewable_previews
         artifact_items.append(item)
 
+    # Stamp run provenance + earned evidence tier onto compute_experiment
+    # artifacts from their backing compute knowledge document. This is the
+    # canonical source (forward_quality_verdict.evidence_tier +
+    # .terminal_diagnostics, written by knowledge_completion) — do NOT re-derive
+    # the tier or execution location from raw job state. One bounded, batched
+    # query keyed on the ≤4 artifact task ids already loaded above (no N+1).
+    artifact_task_ids: List[uuid.UUID] = []
+    for item in artifact_items:
+        raw_task_id = item.get("task_id")
+        if not raw_task_id:
+            continue
+        try:
+            artifact_task_ids.append(uuid.UUID(str(raw_task_id)))
+        except (ValueError, TypeError):
+            continue
+    if artifact_task_ids:
+        compute_doc_rows = (
+            await session.execute(
+                select(
+                    KnowledgeDocument.source_task_id,
+                    KnowledgeDocument.forward_quality_verdict,
+                )
+                .where(
+                    KnowledgeDocument.project_id == project_id,
+                    KnowledgeDocument.source_kind
+                    == SourceKind.COMPUTE_EXPERIMENT.value,
+                    KnowledgeDocument.source_task_id.in_(artifact_task_ids),
+                )
+                .order_by(
+                    KnowledgeDocument.updated_at.desc(),
+                    KnowledgeDocument.created_at.desc(),
+                )
+            )
+        ).all()
+        provenance_by_task: Dict[str, Dict[str, Any]] = {}
+        for source_task_id, verdict in compute_doc_rows:
+            if not source_task_id or not isinstance(verdict, dict):
+                continue
+            task_key = str(source_task_id)
+            # Newest doc per task wins (rows ordered updated_at desc above).
+            if task_key in provenance_by_task:
+                continue
+            provenance: Dict[str, Any] = {}
+            tier = verdict.get("evidence_tier")
+            if isinstance(tier, str) and tier:
+                provenance["evidence_tier"] = tier
+            diagnostics = verdict.get("terminal_diagnostics")
+            if isinstance(diagnostics, dict):
+                for key in (
+                    "executing_backend",
+                    "runner_target_id",
+                    "runner_hostname",
+                ):
+                    value = diagnostics.get(key)
+                    if value:
+                        provenance[key] = str(value)
+            if provenance:
+                provenance_by_task[task_key] = provenance
+        for item in artifact_items:
+            provenance = provenance_by_task.get(item.get("task_id") or "")
+            if provenance:
+                item.update(provenance)
+
     return {
         "knowledge": {
             "total": int(knowledge_total or 0),
@@ -1295,10 +1359,21 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         or _compact_text(artifact.get("artifact_type"), max_chars=90)
         or "Artifact"
     )
+    # Run provenance for compute_experiment artifacts (stamped onto the item in
+    # load_strategic_context_evidence from the backing compute knowledge doc).
+    # Renders generically via the shared _descriptor_detail helper.
+    runner_hostname = artifact.get("runner_hostname")
+    runner_target_id = artifact.get("runner_target_id")
+    if runner_hostname and runner_target_id:
+        runner_label: Any = f"{runner_hostname} ({runner_target_id})"
+    else:
+        runner_label = runner_hostname or runner_target_id
     details = [
         _descriptor_detail("Task", artifact.get("task_title"), target=artifact.get("target")),
         _descriptor_detail("Type", artifact.get("artifact_type") or artifact.get("kind")),
         _descriptor_detail("Status", artifact.get("task_status")),
+        _descriptor_detail("Executed on", artifact.get("executing_backend")),
+        _descriptor_detail("Runner", runner_label),
         _descriptor_detail("Created", artifact.get("created_at")),
     ]
     descriptor: Dict[str, Any] = {
@@ -1312,6 +1387,13 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         "target": artifact.get("target"),
         "details": [detail for detail in details if detail],
     }
+    # Earned-vs-claimed evidence tier (canonical value from the compute doc's
+    # forward_quality_verdict.evidence_tier). Additive/backward-compatible — the
+    # frontend maps it to the shared EvidenceTierBadge; absent for non-compute
+    # artifacts.
+    evidence_tier = _compact_text(artifact.get("evidence_tier"), max_chars=60)
+    if evidence_tier:
+        descriptor["evidence_tier"] = evidence_tier
     if kind == "markdown":
         descriptor["body"] = (
             descriptor["summary"] or "Read-only artifact metadata is available."

@@ -541,10 +541,10 @@ describe('VersionSummaryPanel — viewport regression', () => {
     if (row === null) throw new Error('Expected criterion-row-c-attested element');
     const badge = row.querySelector('span.rounded');
     if (badge === null) throw new Error('Expected coverage badge span in attested row');
-    expect(badge.textContent).toBe('attested');
+    expect(badge.textContent).toContain('Attested');
     // Amber tier — visually distinct from emerald "covered" and slate "uncovered".
     expect(badge.className).toContain('text-amber-400');
-    expect(badge.className).toContain('bg-amber-600/20');
+    expect(badge.className).toContain('bg-amber-950/30');
   });
 
   test('header shows split "verified + attested" fraction when attested > 0', async () => {
