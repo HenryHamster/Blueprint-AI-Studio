@@ -499,6 +499,73 @@ def test_cap_bump_resolves_github_refs_breach():
     )
 
 
+def _resolve_agent_src_root() -> str | None:
+    """Resolve the agent/src tree, mirroring resolve_section_root's candidates.
+
+    The dev checkout lives at <repo>/agent/src (testing/../../agent/src); the
+    backend Docker test harness mounts it read-only at /agent/src (see
+    scripts/test-backend.sh). Returns the first that exists, else None so the
+    caller skips when the agent tree is absent (e.g. CI's backend-only Docker
+    build context that mounts neither).
+    """
+    candidates = [
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
+        ),
+        os.path.join(os.sep, "agent", "src"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def test_cap_bump_resolves_discovery_ts_breach():
+    """After bumping caps via check_size_limits --fix, agent prompts/discovery.ts
+    must be within its new cap on the real file tree.
+
+    This is the breach the 2026-07-14 ci-compliance remediation targets: automain
+    HEAD 21927aa8 reported agent/prompts/discovery.ts at 1064 lines over its old
+    cap of 1050. The fix bumps that cap in the agent section of
+    module_size_limits.json; this merge-test gate proves the bumped JSON is
+    consistent with the actual file size on disk, so the test fails if the cap is
+    reverted (or the file grows past the new cap) before the CI invariant suite
+    runs.
+
+    Skips when agent/src is absent (CI's backend-only Docker build context that
+    mounts neither /agent/src nor the repo), mirroring the agent-section skip in
+    test_invariants.TestAgentModuleSizeGuardrails.
+    """
+    agent_root = _resolve_agent_src_root()
+    if agent_root is None:
+        pytest.skip("agent/src not available in this test environment")
+
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    agent_caps = data.get("agent", {})
+
+    target_rel = "prompts/discovery.ts"
+    assert target_rel in agent_caps, (
+        f"{target_rel} must have a cap entry in the agent section of "
+        "module_size_limits.json"
+    )
+
+    target_path = os.path.join(agent_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = agent_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "agent", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_capped_backend_modules_within_cap_on_disk():
     """Every capped backend module must be at or under its cap on the real tree.
 

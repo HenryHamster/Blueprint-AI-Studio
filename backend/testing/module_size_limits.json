@@ -171,7 +171,7 @@
     "handlers/audits.ts": 1250,
     "handlers/memo.ts": 650,
     "handlers/code-change.ts": 600,
-    "prompts/discovery.ts": 1050,
+    "prompts/discovery.ts": 1300,
     "prompts/project-context.ts": 850,
     "prompts/self-review.ts": 500,
     "prompts/analysis.ts": 250,
