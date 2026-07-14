@@ -1156,6 +1156,9 @@ async def record_task_merge_evidence(
     session: AsyncSession,
     task: Any,
     project_id: uuid.UUID,
+    *,
+    preloaded_direction: Any | None = None,
+    preloaded_open_ver: Any | None = None,
 ) -> int:
     """Record task_merge evidence for each criterion a task carries, when proven.
 
@@ -1183,6 +1186,11 @@ async def record_task_merge_evidence(
     Direction row is missing or the query fails (``direction_fetch_failed``),
     only ``task.criterion_ids`` is used.
 
+    ``preloaded_direction`` and ``preloaded_open_ver`` are optional batch
+    optimisation kwargs: callers that process many tasks for the same direction /
+    project can preload the shared objects once and pass them here to avoid one
+    DB round-trip each per task.  Falls back to individual queries when absent.
+
     Best-effort: errors are logged and not re-raised so a failure here never
     blocks merge finalization.
 
@@ -1197,12 +1205,15 @@ async def record_task_merge_evidence(
     direction_id_key: str | None = task_context.get("direction_id")
     if direction_id_key:
         try:
-            direction_row = await session.scalar(
-                select(Direction).where(
-                    Direction.project_id == project_id,
-                    Direction.direction_key == direction_id_key,
+            if preloaded_direction is not None:
+                direction_row = preloaded_direction
+            else:
+                direction_row = await session.scalar(
+                    select(Direction).where(
+                        Direction.project_id == project_id,
+                        Direction.direction_key == direction_id_key,
+                    )
                 )
-            )
             if direction_row is not None and direction_row.criterion_keys:
                 merged_keys = list(
                     dict.fromkeys(criterion_ids + list(direction_row.criterion_keys))
@@ -1284,9 +1295,11 @@ async def record_task_merge_evidence(
     try:
         _release_version_id: uuid.UUID | None = None
         try:
-            from app.release_version import current_open_version as _cur_open_ver
-
-            _open_ver = await _cur_open_ver(session, project_id)
+            if preloaded_open_ver is not None:
+                _open_ver = preloaded_open_ver
+            else:
+                from app.release_version import current_open_version as _cur_open_ver
+                _open_ver = await _cur_open_ver(session, project_id)
             if _open_ver is not None:
                 _release_version_id = _open_ver.id
         except Exception:
@@ -1419,6 +1432,16 @@ async def backfill_direction_merge_evidence(
             return 0
         version_opened_at = open_version.opened_at
 
+        # Preload the Direction row once for the whole backfill — all tasks in
+        # this call share the same direction_key, so fetching per-task wastes
+        # N round-trips.
+        preloaded_direction = await session.scalar(
+            select(Direction).where(
+                Direction.project_id == project_id,
+                Direction.direction_key == direction_key,
+            )
+        )
+
         dialect = resolve_dialect_name(session)
         if dialect == "sqlite":
             from sqlalchemy import func as _func
@@ -1453,7 +1476,11 @@ async def backfill_direction_merge_evidence(
                 if not is_merged_completion(task):
                     continue
                 try:
-                    total += await record_task_merge_evidence(session, task, project_id)
+                    total += await record_task_merge_evidence(
+                        session, task, project_id,
+                        preloaded_direction=preloaded_direction,
+                        preloaded_open_ver=open_version,
+                    )
                 except Exception:
                     logger.warning(
                         "backfill_direction_merge_evidence: failed for task %s, skipping",
@@ -1512,6 +1539,18 @@ async def backfill_all_directions_merge_evidence(
         version_opened_at = open_version.opened_at
         direction_keys_set = frozenset(direction_keys)
 
+        # Preload all needed Direction rows in one query — one per key, not one
+        # per task — so record_task_merge_evidence can skip the per-task fetch.
+        dir_result = await session.execute(
+            select(Direction).where(
+                Direction.project_id == project_id,
+                Direction.direction_key.in_(list(direction_keys_set)),
+            )
+        )
+        preloaded_directions: dict[str, Any] = {
+            d.direction_key: d for d in dir_result.scalars().all()
+        }
+
         totals: dict[str, int] = {}
         _BATCH_LIMIT = 500
         offset = 0
@@ -1543,7 +1582,11 @@ async def backfill_all_directions_merge_evidence(
                 if direction_id_key not in direction_keys_set:
                     continue
                 try:
-                    count = await record_task_merge_evidence(session, task, project_id)
+                    count = await record_task_merge_evidence(
+                        session, task, project_id,
+                        preloaded_direction=preloaded_directions.get(direction_id_key),
+                        preloaded_open_ver=open_version,
+                    )
                     if count:
                         totals[direction_id_key] = totals.get(direction_id_key, 0) + count
                 except Exception:
@@ -1937,6 +1980,26 @@ async def backfill_rollup_child_changed_files(
             if not batch:
                 break
             offset += len(batch)
+
+            # Bulk-prime the SQLAlchemy identity map with the direct parent of
+            # every qualifying child in this batch.  The walk inside
+            # _github_verified_ancestor_changed calls session.get(Task, id),
+            # which hits the identity map on a cache hit, avoiding N×depth
+            # individual point-queries.  We load only the immediate parents
+            # here; deeper ancestors are loaded on demand (rare — most chains
+            # are ≤1 hop deep) and are cached after the first walk.
+            batch_parent_ids = {
+                t.parent_task_id
+                for t in batch
+                if t.parent_task_id is not None
+                and is_merged_completion(t)
+                and not _acceptance_gate._changed_files(t)
+                and t.parent_task_id not in resolved_parent_changed
+            }
+            if batch_parent_ids:
+                await session.execute(
+                    select(Task).where(Task.id.in_(list(batch_parent_ids)))
+                )
 
             batch_stamped = 0
             for task in batch:

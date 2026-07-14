@@ -6360,7 +6360,26 @@ async def _handle_strategic_completion(
         link_message_to_outcome as _link_message_to_outcome,
     )
 
-    for entry in resolved_entries[:10]:
+    # Batch-fetch all messages upfront to avoid N+1 SELECTs in the loop below.
+    _resolve_batch = resolved_entries[:10]
+    _msg_ids: list[uuid.UUID] = []
+    for _entry in _resolve_batch:
+        try:
+            _raw_id = _entry.get("id") if isinstance(_entry, dict) else str(_entry)
+            _msg_ids.append(uuid.UUID(str(_raw_id)))
+        except (ValueError, TypeError):
+            pass
+    if _msg_ids:
+        _batch_result = await session.execute(
+            select(ProjectMessage).where(ProjectMessage.id.in_(_msg_ids))
+        )
+        _messages_by_id: dict[uuid.UUID, ProjectMessage] = {
+            m.id: m for m in _batch_result.scalars().all()
+        }
+    else:
+        _messages_by_id = {}
+
+    for entry in _resolve_batch:
         try:
             msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
             resolution_text = (
@@ -6375,7 +6394,7 @@ async def _handle_strategic_completion(
             owned_by_task = (
                 entry.get("owned_by_task") if isinstance(entry, dict) else None
             )
-            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
+            msg = _messages_by_id.get(uuid.UUID(str(msg_id)))
             # Accept both 'open' and 'linked' so an explicit terminal resolve can
             # always move a linked message to 'resolved' (the operator's escape hatch).
             if (

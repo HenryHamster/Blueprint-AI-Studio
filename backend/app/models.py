@@ -2300,6 +2300,10 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
+        Index(
+            "ix_computejob_polling_metadata_runner_target_id",
+            "polling_metadata",
+        ),
     )
 
     project: Project = Relationship(back_populates="compute_jobs")
