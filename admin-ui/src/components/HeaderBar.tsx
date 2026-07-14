@@ -1,7 +1,9 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Search, Settings, Bell } from 'lucide-react';
+import { Activity, Microscope, BookOpen, Command, MoreHorizontal, Search, Settings, Bell } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
+import { AccountMenu } from './AccountMenu';
+import type { StoredAccount } from '../accountManager';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
 import type { FailingTaskTypeEntry } from '../types/diagnostics';
@@ -28,9 +30,19 @@ export interface HeaderBarProps {
   onToggleAlertsPopover?: () => void;
   onOpenNewTaskModal: () => void;
   onOpenSettings: () => void;
+  /** Sign out the active account only. */
   onSignOut: () => void;
   onNewProject?: () => void;
   userEmail: string;
+  /** Multi-account switcher state. When omitted, the menu shows only the current account + sign out. */
+  accounts?: StoredAccount[];
+  activeAccountId?: string | null;
+  /** Begin Google sign-in for an additional account. */
+  onAddAccount?: () => void;
+  /** Switch the active account. */
+  onSwitchAccount?: (id: string) => void;
+  /** Sign out of every signed-in account. */
+  onSignOutAll?: () => void;
   wsRef: RefObject<WebSocket | null>;
   apiHealthy: boolean;
   wsConnected: boolean;
@@ -314,13 +326,16 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <Settings className="h-3.5 w-3.5" />
           </button>
-          <button
-            onClick={props.onSignOut}
-            title={props.userEmail ? `Sign out ${props.userEmail}` : 'Sign out'}
-            className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-500 transition-colors hover:bg-red-950/20 hover:text-red-300 md:inline-flex"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-          </button>
+          <AccountMenu
+            variant="desktop"
+            accounts={props.accounts ?? []}
+            activeAccountId={props.activeAccountId ?? null}
+            currentEmail={props.userEmail}
+            onAddAccount={props.onAddAccount ?? (() => {})}
+            onSwitchAccount={props.onSwitchAccount ?? (() => {})}
+            onSignOut={props.onSignOut}
+            onSignOutAll={props.onSignOutAll ?? props.onSignOut}
+          />
 
           {/* Mobile-only autonomy control */}
           <div className="md:hidden flex items-center mr-1">
@@ -402,13 +417,17 @@ export function HeaderBar(props: HeaderBarProps) {
                   <Settings className="w-4 h-4 shrink-0" />
                   <span>Runtime settings</span>
                 </button>
-                <button
-                  onClick={() => { props.onSignOut(); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-400 hover:bg-red-950/20 hover:text-red-300"
-                >
-                  <LogOut className="w-4 h-4 shrink-0" />
-                  <span>Sign out</span>
-                </button>
+                <AccountMenu
+                  variant="mobile"
+                  accounts={props.accounts ?? []}
+                  activeAccountId={props.activeAccountId ?? null}
+                  currentEmail={props.userEmail}
+                  onAddAccount={props.onAddAccount ?? (() => {})}
+                  onSwitchAccount={props.onSwitchAccount ?? (() => {})}
+                  onSignOut={props.onSignOut}
+                  onSignOutAll={props.onSignOutAll ?? props.onSignOut}
+                  onAfterAction={() => setShowMobileMenu(false)}
+                />
               </div>
             )}
           </div>

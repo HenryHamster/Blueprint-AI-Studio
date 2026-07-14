@@ -13,7 +13,15 @@ const ResearchBrowser = lazy(() => import('./components/ResearchBrowser').then(m
 const KnowledgeBrowser = lazy(() => import('./components/KnowledgeBrowser').then(m => ({ default: m.KnowledgeBrowser })));
 const NewTaskModal = lazy(() => import('./components/NewTaskModal').then(m => ({ default: m.NewTaskModal })));
 const NewProjectModal = lazy(() => import('./components/NewProjectModal').then(m => ({ default: m.NewProjectModal })));
-import { auth, signInWithGoogle, signOut } from './firebase';
+import {
+  addAccount,
+  switchAccount,
+  signInWithGoogle,
+  signOut,
+  signOutAll,
+  getAccounts,
+  getActiveAccountId,
+} from './accountManager';
 import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
@@ -1091,7 +1099,7 @@ export default function App() {
           </p>
           <p className="text-xs text-neutral-600 mb-6">Contact an administrator to request access.</p>
           <button
-            onClick={() => signOut(auth)}
+            onClick={() => { void signOut(); }}
             className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
           >
             Sign out
@@ -1139,7 +1147,12 @@ export default function App() {
         onOpenSettings={() => openRuntimeSettings('general')}
         onNewProject={() => setShowNewProjectModal(true)}
         onManageProjects={() => setShowProjectManagement(true)}
-        onSignOut={() => signOut(auth)}
+        onSignOut={() => { void signOut(); }}
+        onSignOutAll={() => { void signOutAll(); }}
+        onAddAccount={() => { addAccount().catch(e => s.setError(String(e))); }}
+        onSwitchAccount={(id) => switchAccount(id)}
+        accounts={getAccounts()}
+        activeAccountId={getActiveAccountId()}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
         apiHealthy={s.apiHealthy}
@@ -1223,7 +1236,7 @@ export default function App() {
       {showWelcomeScreen ? (
         <WelcomeScreen
           onCreateProject={() => setShowNewProjectModal(true)}
-          onSignOut={() => signOut(auth)}
+          onSignOut={() => { void signOut(); }}
         />
       ) : (
         <WorkbenchFrame>
